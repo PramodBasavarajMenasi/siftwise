@@ -214,7 +214,9 @@ class TestResultOut(BaseModel):
     status: Status
     attempt: int
     duration_ms: int | None
-    file_path: str | None
+    file_path: str | None = Field(
+        description="The test's latest reported file path (results don't keep their own)"
+    )
     message: str | None
 
 

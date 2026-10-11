@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from siftwise.api.main import create_app
 from siftwise.config import Settings
 from siftwise.core.junit import Status
-from siftwise.core.models import ChangedFile, Repo, Run, TestResult
+from siftwise.core.models import ChangedFile, Repo, Run, Test, TestResult
 from siftwise.db import get_session
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -103,9 +103,9 @@ def test_new_upload_creates_run(client: TestClient, db_session: Session) -> None
     assert paths == ["src/cart.py", "src/pay.py"]  # normalized, de-duplicated, empty dropped
 
     failed = db_session.scalars(
-        select(TestResult).where(
-            TestResult.test_id == "tests.test_math.TestDivide::test_divide_by_zero"
-        )
+        select(TestResult)
+        .join(Test, Test.id == TestResult.test_key)
+        .where(Test.test_id == "tests.test_math.TestDivide::test_divide_by_zero")
     ).one()
     assert (failed.status, failed.duration_ms, failed.message) == (
         Status.FAILED,
@@ -152,7 +152,8 @@ def test_same_test_in_several_files_gets_increasing_attempts(
     assert response.status_code == 201, response.text
     attempts = db_session.scalars(
         select(TestResult.attempt)
-        .where(TestResult.test_id == "github.com/acme/shop/cart::TestAddItem")
+        .join(Test, Test.id == TestResult.test_key)
+        .where(Test.test_id == "github.com/acme/shop/cart::TestAddItem")
         .order_by(TestResult.attempt)
     ).all()
     assert attempts == [1, 2]

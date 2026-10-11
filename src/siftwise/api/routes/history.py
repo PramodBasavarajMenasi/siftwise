@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from siftwise.core.history import get_recent_results, get_test_stats
+from siftwise.core.history import get_recent_results, get_test, get_test_stats
 from siftwise.core.schemas import TestHistoryResponse, TestResultOut, TestStatsOut
 from siftwise.db import get_session
 
@@ -25,12 +25,13 @@ def get_test_history(
     repo: Annotated[str, Query(min_length=1, description="Repository name, e.g. acme/shop")],
     session: Annotated[Session, Depends(get_session)],
 ) -> TestHistoryResponse:
-    stats = get_test_stats(session, repo, test_id)
-    if stats is None:
+    test = get_test(session, repo, test_id)
+    stats = get_test_stats(session, repo, test_id) if test else None
+    if test is None or stats is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, f"no history for test {test_id!r} in repo {repo!r}"
         )
-    rows = get_recent_results(session, stats.repo_id, test_id, HISTORY_LIMIT)
+    rows = get_recent_results(session, test.id, HISTORY_LIMIT)
     return TestHistoryResponse(
         repo=repo,
         test_id=test_id,
@@ -48,7 +49,7 @@ def get_test_history(
                 status=result.status,
                 attempt=result.attempt,
                 duration_ms=result.duration_ms,
-                file_path=result.file_path,
+                file_path=test.file_path,
                 message=result.message,
             )
             for result, run in rows

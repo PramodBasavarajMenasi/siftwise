@@ -65,6 +65,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from siftwise.core.junit import normalize_path
+from siftwise.core.models import FAILED_CODES_SQL
 
 
 class Mode(StrEnum):
@@ -927,10 +928,11 @@ def load_history(
         text(
             f"""
             WITH {_REPO_RUNS}, {recent_ci_runs_sql("repo_runs", "is_main")}
-            SELECT DISTINCT ON (tr.test_id) tr.test_id, recent.id, recent.commit_sha
+            SELECT DISTINCT ON (t.test_id) t.test_id, recent.id, recent.commit_sha
             FROM recent JOIN test_results tr ON tr.run_id = recent.id
-            WHERE tr.status IN ('failed', 'error')
-            ORDER BY tr.test_id, recent.run_at DESC, recent.id DESC
+            JOIN tests t ON t.id = tr.test_key
+            WHERE tr.status IN {FAILED_CODES_SQL}
+            ORDER BY t.test_id, recent.run_at DESC, recent.id DESC
             """
         ),
         {**params, "n": config.recent_main_runs},
@@ -940,9 +942,10 @@ def load_history(
         text(
             f"""
             WITH {_REPO_RUNS}, {recent_ci_runs_sql("repo_runs", "changed_files_known")}
-            SELECT recent.id, recent.commit_sha, array_agg(DISTINCT tr.test_id)
+            SELECT recent.id, recent.commit_sha, array_agg(DISTINCT t.test_id)
             FROM recent JOIN test_results tr ON tr.run_id = recent.id
-            WHERE tr.status IN ('failed', 'error')
+            JOIN tests t ON t.id = tr.test_key
+            WHERE tr.status IN {FAILED_CODES_SQL}
             GROUP BY recent.id, recent.commit_sha, recent.run_at
             ORDER BY recent.run_at DESC, recent.id DESC
             """

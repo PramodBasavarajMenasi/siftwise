@@ -13,6 +13,7 @@ from siftwise.core.models import (
     ChangedFile,
     Repo,
     Run,
+    Test,
     TestResult,
     TestStats,
     truncate_utf8,
@@ -29,6 +30,13 @@ def add_run(session: Session, repo_name: str = "acme/shop") -> Run:
     return run
 
 
+def add_test(session: Session, run: Run, test_id: str) -> int:
+    test = Test(repo_id=run.repo_id, test_id=test_id)
+    session.add(test)
+    session.flush()
+    return test.id
+
+
 def test_migrations_match_models(db_engine: Engine) -> None:
     with db_engine.connect() as connection:
         diff = compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -37,10 +45,11 @@ def test_migrations_match_models(db_engine: Engine) -> None:
 
 def test_round_trip_and_defaults(db_session: Session) -> None:
     run = add_run(db_session)
+    key = add_test(db_session, run, "tests.test_cart::test_total")
     db_session.add_all(
         [
             ChangedFile(run_id=run.id, path="src/cart.py"),
-            TestResult(run_id=run.id, test_id="tests.test_cart::test_total", status=Status.FAILED),
+            TestResult(run_id=run.id, test_key=key, status=Status.FAILED),
             TestStats(repo_id=run.repo_id, test_id="tests.test_cart::test_total"),
         ]
     )
@@ -50,7 +59,8 @@ def test_round_trip_and_defaults(db_session: Session) -> None:
     result = db_session.scalars(select(TestResult)).one()
     assert result.status is Status.FAILED
     assert result.attempt == 1
-    assert db_session.scalar(text("SELECT status FROM test_results")) == "failed"
+    # Stored as a smallint code.
+    assert db_session.scalar(text("SELECT status FROM test_results")) == 1
 
     stats = db_session.scalars(select(TestStats)).one()
     assert (stats.runs, stats.failures, stats.flaky_score) == (0, 0, 0.0)
@@ -61,11 +71,32 @@ def test_round_trip_and_defaults(db_session: Session) -> None:
 
 def test_status_check_constraint(db_session: Session) -> None:
     run = add_run(db_session)
-    with pytest.raises(IntegrityError, match="ck_test_results_test_status"):
+    key = add_test(db_session, run, "t::a")
+    with pytest.raises(IntegrityError, match="ck_test_results_status"):
         db_session.execute(
-            text("INSERT INTO test_results (run_id, test_id, status) VALUES (:r, 't', 'bogus')"),
-            {"r": run.id},
+            text("INSERT INTO test_results (run_id, test_key, status) VALUES (:r, :k, 9)"),
+            {"r": run.id, "k": key},
         )
+
+
+def test_result_key_is_run_test_and_attempt(db_session: Session) -> None:
+    run = add_run(db_session)
+    key = add_test(db_session, run, "t::a")
+    db_session.add(TestResult(run_id=run.id, test_key=key, attempt=1, status=Status.FAILED))
+    db_session.add(TestResult(run_id=run.id, test_key=key, attempt=2, status=Status.PASSED))
+    db_session.flush()
+    with db_session.begin_nested(), pytest.raises(IntegrityError, match="pk_test_results"):
+        db_session.add(TestResult(run_id=run.id, test_key=key, attempt=2, status=Status.PASSED))
+        db_session.flush()
+
+
+def test_test_id_is_unique_per_repo(db_session: Session) -> None:
+    run = add_run(db_session)
+    other = add_run(db_session, "acme/other")
+    add_test(db_session, run, "t::a")
+    add_test(db_session, other, "t::a")  # another repo: fine
+    with db_session.begin_nested(), pytest.raises(IntegrityError, match="uq_tests_repo_id_test_id"):
+        add_test(db_session, run, "t::a")
 
 
 def test_repo_name_is_unique(db_session: Session) -> None:
@@ -129,25 +160,30 @@ def test_truncate_utf8(value: str, max_bytes: int, expected: str) -> None:
 def test_message_is_truncated_on_orm_and_bulk_insert(db_session: Session) -> None:
     run = add_run(db_session)
     long_message = "€" * 2000  # 3 bytes each = 6000 bytes
+    keys = {t: add_test(db_session, run, t) for t in ("t::orm", "t::bulk", "t::none")}
     db_session.add(
-        TestResult(run_id=run.id, test_id="t::orm", status=Status.FAILED, message=long_message)
-    )
+        TestResult(run_id=run.id, test_key=keys["t::orm"], status=Status.FAILED,
+                   message=long_message)
+    )  # fmt: skip
     db_session.execute(
         insert(TestResult),
         [
             {
                 "run_id": run.id,
-                "test_id": "t::bulk",
+                "test_key": keys["t::bulk"],
                 "status": Status.FAILED,
                 "message": long_message,
             },
-            {"run_id": run.id, "test_id": "t::none", "status": Status.PASSED, "message": None},
+            {"run_id": run.id, "test_key": keys["t::none"], "status": Status.PASSED,
+             "message": None},
         ],
-    )
+    )  # fmt: skip
     db_session.commit()
 
     # Read back with raw SQL so we see what Postgres stored, not the ORM's view of it.
-    rows = db_session.execute(text("SELECT test_id, message FROM test_results"))
+    rows = db_session.execute(
+        text("SELECT t.test_id, tr.message FROM test_results tr JOIN tests t ON t.id = tr.test_key")
+    )
     stored: dict[str, str | None] = {test_id: message for test_id, message in rows}
     for test_id in ("t::orm", "t::bulk"):
         message = stored[test_id]
@@ -188,10 +224,11 @@ def test_unique_key_is_per_variant(db_session: Session) -> None:
 
 def test_deleting_repo_cascades(db_session: Session) -> None:
     run = add_run(db_session)
-    db_session.add(TestResult(run_id=run.id, test_id="t::x", status=Status.PASSED))
+    key = add_test(db_session, run, "t::x")
+    db_session.add(TestResult(run_id=run.id, test_key=key, status=Status.PASSED))
     db_session.add(ChangedFile(run_id=run.id, path="a.py"))
     db_session.flush()
 
     db_session.execute(text("DELETE FROM repos"))
-    for model in (Run, TestResult, ChangedFile):
+    for model in (Run, Test, TestResult, ChangedFile):
         assert db_session.scalar(select(func.count()).select_from(model)) == 0

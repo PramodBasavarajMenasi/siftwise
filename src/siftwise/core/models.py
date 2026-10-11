@@ -1,7 +1,9 @@
 """SQLAlchemy ORM models.
 
-``runs``, ``changed_files`` and ``test_results`` are append-only raw ingest data.
-``test_stats`` is a rollup recomputed from them and may be rebuilt at any time.
+``runs``, ``changed_files`` and ``test_results`` are append-only raw ingest data. ``tests`` holds
+each test's identity once per repo, so the ~29M-row ``test_results`` stores a 4-byte key
+instead of the test ID text. ``test_stats`` is a rollup recomputed from them and may be rebuilt
+at any time.
 """
 
 from datetime import datetime
@@ -9,16 +11,18 @@ from datetime import datetime
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
-    Enum,
     Float,
     ForeignKey,
     Index,
     Integer,
     MetaData,
+    SmallInteger,
     String,
     Text,
     TypeDecorator,
+    UniqueConstraint,
     func,
     text,
     true,
@@ -40,6 +44,19 @@ NAMING_CONVENTION = {
 
 
 RUN_UNIQUE_INDEX = "uq_runs_repo_ci_run_attempt_variant"
+
+# test_results.status is a smallint. Raw SQL uses these codes (see FAILED_CODES_SQL).
+STATUS_CODES: dict[Status, int] = {
+    Status.PASSED: 0,
+    Status.FAILED: 1,
+    Status.SKIPPED: 2,
+    Status.ERROR: 3,
+}
+STATUS_BY_CODE = {code: status for status, code in STATUS_CODES.items()}
+PASSED_CODE = STATUS_CODES[Status.PASSED]
+SKIPPED_CODE = STATUS_CODES[Status.SKIPPED]
+# "failed or error": both count as a failure everywhere. For raw SQL: ``status IN (1, 3)``.
+FAILED_CODES_SQL = f"({STATUS_CODES[Status.FAILED]}, {STATUS_CODES[Status.ERROR]})"
 
 MESSAGE_MAX_BYTES = 4096
 TRUNCATION_MARKER = "…[truncated]"
@@ -70,6 +87,19 @@ class TruncatedText(TypeDecorator[str]):
 
     def process_bind_param(self, value: str | None, dialect: Dialect) -> str | None:
         return None if value is None else truncate_utf8(value, self.max_bytes)
+
+
+class StatusCode(TypeDecorator[Status]):
+    """``Status`` stored as a smallint code (``STATUS_CODES``)."""
+
+    impl = SmallInteger
+    cache_ok = True
+
+    def process_bind_param(self, value: Status | str | None, dialect: Dialect) -> int | None:
+        return None if value is None else STATUS_CODES[Status(value)]
+
+    def process_result_value(self, value: int | None, dialect: Dialect) -> Status | None:
+        return None if value is None else STATUS_BY_CODE[value]
 
 
 class Base(DeclarativeBase):
@@ -128,36 +158,47 @@ class ChangedFile(Base):
     path: Mapped[str] = mapped_column(Text, primary_key=True)
 
 
+class Test(Base):
+    """A test's identity in a repo: ``test_results`` refer to it by ``id`` (the test key)."""
+
+    __tablename__ = "tests"
+    __test__ = False  # not a pytest test class
+    __table_args__ = (UniqueConstraint("repo_id", "test_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    repo_id: Mapped[int] = mapped_column(ForeignKey("repos.id", ondelete="CASCADE"))
+    test_id: Mapped[str] = mapped_column(Text)
+    # The latest file path reported for the test, by run time: ``file_path_at`` is that run's
+    # time, so a backfilled older run never overwrites a newer path. Results don't keep their
+    # own path.
+    file_path: Mapped[str | None] = mapped_column(Text)
+    file_path_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class TestResult(Base):
     __tablename__ = "test_results"
-    __test__ = False  # not a pytest test class
+    __test__ = False
     __table_args__ = (
+        CheckConstraint(f"status BETWEEN 0 AND {max(STATUS_CODES.values())}", name="status"),
         # Failures only (a tiny fraction of rows): the selector's co-change and recently-failed
         # queries read failures through this, never the passing results around them.
         Index(
             "ix_test_results_failed",
             "run_id",
-            "test_id",
-            postgresql_where=text("status IN ('failed', 'error')"),
+            "test_key",
+            postgresql_where=text(f"status IN {FAILED_CODES_SQL}"),
         ),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
-    test_id: Mapped[str] = mapped_column(Text, index=True)
-    file_path: Mapped[str | None] = mapped_column(Text)
-    status: Mapped[Status] = mapped_column(
-        Enum(
-            Status,
-            name="test_status",
-            native_enum=False,
-            create_constraint=True,
-            length=16,
-            values_callable=lambda enum: [member.value for member in enum],
-        )
+    # Columns in storage order (8-byte, 4-byte, then 2-byte fields): 20 bytes plus the message.
+    # The primary key's run_id prefix serves per-run lookups; test_key has its own index.
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    test_key: Mapped[int] = mapped_column(
+        ForeignKey("tests.id", ondelete="CASCADE"), primary_key=True, index=True
     )
     duration_ms: Mapped[int | None] = mapped_column(Integer)
-    attempt: Mapped[int] = mapped_column(Integer, server_default="1")
+    attempt: Mapped[int] = mapped_column(SmallInteger, primary_key=True, server_default="1")
+    status: Mapped[Status] = mapped_column(StatusCode())
     message: Mapped[str | None] = mapped_column(TruncatedText(MESSAGE_MAX_BYTES))
 
 

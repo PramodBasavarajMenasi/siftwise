@@ -60,6 +60,8 @@ if not __package__:  # run as a file path: make the repo root importable
 from siftwise.cli.gograph import GoGraph, build_graph, parse_go_list
 from siftwise.cli.pygraph import PyGraph, build_py_graph, module_of_test
 from siftwise.cli.repoconfig import load_repo_config, read_go_module
+from siftwise.core.junit import Status
+from siftwise.core.models import FAILED_CODES_SQL, PASSED_CODE, STATUS_CODES
 from siftwise.core.selector import (
     FailedRun,
     KnownTest,
@@ -76,7 +78,7 @@ from siftwise.core.selector import (
 )
 from siftwise.db import get_sessionmaker
 
-FAILED = ("failed", "error")
+FAILED_CODES = (STATUS_CODES[Status.FAILED], STATUS_CODES[Status.ERROR])
 # Main CI runs read to recompute broken-on-main per target (see broken_on_main_before).
 BROKEN_LOOKBACK_CI_RUNS = 20
 COMPARE_FILE_CAP = 300
@@ -173,6 +175,9 @@ class HistoryIndex:
     results per target on a matrix repo. So every result is read once here: per run, a bitmask
     of the tests it reported, the tests that failed, and for main runs each test's final
     outcome. ``history_before`` then applies the selector's definitions in memory.
+
+    File paths are the one exception to "no peeking": results don't keep their own, so every
+    target sees each test's latest reported path (``tests.file_path``).
     """
 
     def __init__(self, session: Session, repo_id: int) -> None:
@@ -196,63 +201,60 @@ class HistoryIndex:
             key=lambda r: r.order,
         )
         self._orders = [r.order for r in self.runs]
-        position = {r.id: i for i, r in enumerate(self.runs)}
+        # One bit per test of the repo, in test key order.
         self._tests: list[str] = []
-        bit_of: dict[str, int] = {}
+        self._paths: list[str | None] = []
+        bit_of: dict[int, int] = {}
+        for key, test_id, file_path in session.execute(
+            text("SELECT id, test_id, file_path FROM tests WHERE repo_id = :repo_id ORDER BY id"),
+            params,
+        ):
+            bit_of[key] = len(self._tests)
+            self._tests.append(test_id)
+            self._paths.append(file_path)
         seen: dict[int, bytearray] = defaultdict(bytearray)
-        # test bit -> {file path: position of the first run that reported it}
-        paths: dict[int, dict[str, int]] = defaultdict(dict)
-        for run_id, test_id, file_path in session.execute(
+        for run_id, test_key in session.execute(
             text(
-                "SELECT tr.run_id, tr.test_id, tr.file_path FROM test_results tr "
+                "SELECT tr.run_id, tr.test_key FROM test_results tr "
                 "JOIN runs ru ON ru.id = tr.run_id WHERE ru.repo_id = :repo_id"
             ),
             params,
             execution_options=stream,
         ):
-            bit = bit_of.get(test_id)
-            if bit is None:
-                bit = bit_of[test_id] = len(self._tests)
-                self._tests.append(test_id)
-            _set_bit(seen[run_id], bit)
-            if file_path:
-                pos, first = position[run_id], paths[bit].get(file_path)
-                if first is None or pos < first:
-                    paths[bit][file_path] = pos
+            _set_bit(seen[run_id], bit_of[test_key])
         self._seen = {run_id: int.from_bytes(b, "little") for run_id, b in seen.items()}
-        self._paths = dict(paths)
 
         # Any failed/error result (all attempts), as the selector's failure queries read them.
         self._failed: dict[int, set[str]] = defaultdict(set)
-        for run_id, test_id in session.execute(
+        for run_id, test_key in session.execute(
             text(
-                "SELECT tr.run_id, tr.test_id FROM test_results tr "
+                "SELECT tr.run_id, tr.test_key FROM test_results tr "
                 "JOIN runs ru ON ru.id = tr.run_id "
-                "WHERE ru.repo_id = :repo_id AND tr.status IN ('failed', 'error')"
+                f"WHERE ru.repo_id = :repo_id AND tr.status IN {FAILED_CODES_SQL}"
             ),
             params,
         ):
-            self._failed[run_id].add(test_id)
+            self._failed[run_id].add(self._tests[bit_of[test_key]])
 
         # Main runs: each test's final outcome (non-skipped), for broken-on-main.
         main_failed: dict[int, bytearray] = defaultdict(bytearray)
         main_passed: dict[int, bytearray] = defaultdict(bytearray)
-        for run_id, test_id, status in session.execute(
+        for run_id, test_key, status in session.execute(
             text(
                 """
-                SELECT DISTINCT ON (tr.run_id, tr.test_id) tr.run_id, tr.test_id, tr.status
+                SELECT DISTINCT ON (tr.run_id, tr.test_key) tr.run_id, tr.test_key, tr.status
                 FROM test_results tr JOIN runs ru ON ru.id = tr.run_id
                 WHERE ru.repo_id = :repo_id AND ru.is_main
-                ORDER BY tr.run_id, tr.test_id, tr.attempt DESC, tr.id DESC
+                ORDER BY tr.run_id, tr.test_key, tr.attempt DESC
                 """
             ),
             params,
             execution_options=stream,
         ):
-            if status in FAILED:
-                _set_bit(main_failed[run_id], bit_of[test_id])
-            elif status == "passed":
-                _set_bit(main_passed[run_id], bit_of[test_id])
+            if status in FAILED_CODES:
+                _set_bit(main_failed[run_id], bit_of[test_key])
+            elif status == PASSED_CODE:
+                _set_bit(main_passed[run_id], bit_of[test_key])
         self._main_failed = {r: int.from_bytes(b, "little") for r, b in main_failed.items()}
         self._main_passed = {r: int.from_bytes(b, "little") for r, b in main_passed.items()}
 
@@ -286,12 +288,10 @@ class HistoryIndex:
         mask = 0
         for r in recent(config.known_test_runs, lambda r: True):
             mask |= self._seen.get(r.id, 0)
-        cutoff = len(prior)
         tests = {}
         for bit in _bits(mask):
             test_id = self._tests[bit]
-            reported = [(pos, p) for p, pos in self._paths.get(bit, {}).items() if pos < cutoff]
-            tests[test_id] = KnownTest(test_id, max(reported)[1] if reported else None)
+            tests[test_id] = KnownTest(test_id, self._paths[bit])
 
         recent_main_failures: dict[str, tuple[int, str]] = {}
         for r in recent(config.recent_main_runs, lambda r: r.is_main):
@@ -360,11 +360,12 @@ def actual_failures(session: Session, run_ids: list[int]) -> list[str]:
     """Tests whose final attempt failed in any of these runs (any variant of a CI run)."""
     rows = session.execute(
         text(
-            """
-            SELECT DISTINCT test_id FROM (
-                SELECT DISTINCT ON (run_id, test_id) test_id, status FROM test_results
-                WHERE run_id = ANY(:run_ids) ORDER BY run_id, test_id, attempt DESC, id DESC
-            ) final WHERE status IN ('failed', 'error') ORDER BY test_id
+            f"""
+            SELECT DISTINCT t.test_id FROM (
+                SELECT DISTINCT ON (run_id, test_key) test_key, status FROM test_results
+                WHERE run_id = ANY(:run_ids) ORDER BY run_id, test_key, attempt DESC
+            ) final JOIN tests t ON t.id = final.test_key
+            WHERE final.status IN {FAILED_CODES_SQL} ORDER BY t.test_id
             """
         ),
         {"run_ids": run_ids},
@@ -404,9 +405,9 @@ GROUP BY COALESCE(r.ci_run_id, r.id::text), r.run_attempt, r.ci_run_id, r.commit
 def pr_targets(session: Session, repo_id: int, limit: int, failing: bool) -> list[TargetRun]:
     query = _CI_RUNS.format(
         where="NOT r.is_main AND r.changed_files_known",
-        having="""HAVING NOT :failing OR bool_or(EXISTS (
+        having=f"""HAVING NOT :failing OR bool_or(EXISTS (
             SELECT 1 FROM test_results tr
-            WHERE tr.run_id = r.id AND tr.status IN ('failed', 'error')))""",
+            WHERE tr.run_id = r.id AND tr.status IN {FAILED_CODES_SQL}))""",
     )
     rows = session.execute(
         text(f"{query} ORDER BY run_at DESC, id DESC LIMIT :limit"),

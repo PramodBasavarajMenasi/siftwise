@@ -15,7 +15,7 @@ from siftwise.core import history
 from siftwise.core.history import get_test_stats
 from siftwise.core.ingest import create_run
 from siftwise.core.junit import ParsedTestResult, Status
-from siftwise.core.models import Run, TestResult, TestStats
+from siftwise.core.models import Run, Test, TestResult, TestStats
 from siftwise.core.schemas import RunMetadata
 from siftwise.db import get_session
 
@@ -385,11 +385,11 @@ def test_rollup_reads_only_the_window_not_old_history(db_session: Session) -> No
                 FROM generate_series(1, 300) n
                 RETURNING id
             )
-            INSERT INTO test_results (run_id, test_id, status, duration_ms, attempt)
-            SELECT old.id, t, 'passed', 5, 1 FROM old CROSS JOIN unnest(CAST(:tests AS text[])) t
+            INSERT INTO test_results (run_id, test_key, status, duration_ms, attempt)
+            SELECT old.id, t.id, 0, 5, 1 FROM old CROSS JOIN tests t WHERE t.repo_id = :repo_id
             """
         ),
-        {"repo_id": repo_id, "t0": T0, "tests": tests},
+        {"repo_id": repo_id, "t0": T0},
     )
     newest = ingest(db_session, commit=2, hour=1, tests=dict.fromkeys(tests, F))
     in_window = 2 * len(tests)  # two runs inside the window
@@ -429,6 +429,42 @@ def test_run_rollup_reads_the_runs_test_list_once(db_session: Session) -> None:
 
     window_rows, run_rows = 10 * len(tests), len(tests)
     assert _rows_read_from(plan, "test_results") <= window_rows + run_rows  # not 300 x 30
+
+
+# --- tests table: keys and file paths -----------------------------------------------------
+
+
+def test_each_test_is_stored_once_per_repo(db_session: Session) -> None:
+    ingest(db_session, commit=1, hour=1, tests={"t::a": P, "t::b": [F, P]})
+    ingest(db_session, commit=2, hour=2, tests={"t::a": P})
+    ingest(db_session, commit=3, hour=3, tests={"t::a": P}, repo="acme/other")
+
+    rows = db_session.execute(
+        text("SELECT r.name, t.test_id FROM tests t JOIN repos r ON r.id = t.repo_id ORDER BY 1, 2")
+    ).all()
+    assert [tuple(r) for r in rows] == [("acme/other", "t::a"), (REPO, "t::a"), (REPO, "t::b")]
+    assert db_session.scalar(select(func.count()).select_from(TestResult)) == 5
+
+
+def ingest_path(session: Session, commit: int, hour: int, path: str | None) -> None:
+    meta = RunMetadata(repo=REPO, commit_sha=sha(commit), branch="main", is_main=True,
+                       started_at=at(hour))  # fmt: skip
+    create_run(session, meta, [ParsedTestResult("t::a", "t", "a", path, P, 1, 1)])
+
+
+def test_file_path_is_the_latest_by_run_time(db_session: Session) -> None:
+    ingest_path(db_session, 2, 2, "tests/new/test_a.py")
+    ingest_path(db_session, 1, 1, "tests/old/test_a.py")  # backfilled, older: ignored
+    ingest_path(db_session, 3, 3, None)  # no path reported: keeps the last one
+
+    test = history.get_test(db_session, REPO, "t::a")
+    assert test is not None
+    assert (test.file_path, test.file_path_at) == ("tests/new/test_a.py", at(2))
+    assert stats(db_session).file_path == "tests/new/test_a.py"
+
+    ingest_path(db_session, 4, 4, "tests/test_a.py")  # moved
+    db_session.expire_all()
+    assert stats(db_session).file_path == "tests/test_a.py"
 
 
 # --- last seen (the selector's known tests) -----------------------------------------------
@@ -562,7 +598,9 @@ def test_results_are_inserted_in_one_batch(db_session: Session) -> None:
 
     assert len(inserts) == 1
     stored = db_session.execute(
-        select(TestResult.file_path, TestResult.message).where(TestResult.test_id == "t::case3")
+        select(Test.file_path, TestResult.message)
+        .join(Test, Test.id == TestResult.test_key)
+        .where(Test.test_id == "t::case3")
     ).one()
     assert tuple(stored) == ("tests/t.py", "boom")  # values still land in the right columns
 

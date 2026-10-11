@@ -3,7 +3,7 @@
 from collections.abc import Iterable
 
 from psycopg.errors import UniqueViolation
-from sqlalchemy import func, insert, select
+from sqlalchemy import func, insert, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -75,11 +75,12 @@ def create_run(
             session.execute(
                 insert(ChangedFile), [{"run_id": run.id, "path": p} for p in meta.changed_files]
             )
+        results = list(results)
+        keys = _test_keys(session, repo_id, run.id, results)
         rows = [
             {
                 "run_id": run.id,
-                "test_id": r.test_id,
-                "file_path": r.file_path,
+                "test_key": keys[r.test_id],
                 "status": r.status,
                 "duration_ms": r.duration_ms,
                 "attempt": r.attempt,
@@ -105,6 +106,49 @@ def create_run(
             raise
         return existing, False
     return run, True
+
+
+def _test_keys(
+    session: Session, repo_id: int, run_id: int, results: list[ParsedTestResult]
+) -> dict[str, int]:
+    """Test ID -> ``tests.id`` for the run's tests, creating missing ones, and record the file
+    paths the run reports (kept only if no newer run reported one)."""
+    test_ids = sorted({r.test_id for r in results})
+    if not test_ids:
+        return {}
+    # Sorted, so concurrent uploads lock new keys in the same order (no deadlock).
+    session.execute(
+        text(
+            "INSERT INTO tests (repo_id, test_id) "
+            "SELECT :repo_id, t FROM unnest(CAST(:test_ids AS text[])) t ORDER BY t "
+            "ON CONFLICT (repo_id, test_id) DO NOTHING"
+        ),
+        {"repo_id": repo_id, "test_ids": test_ids},
+    )
+    keys: dict[str, int] = {
+        test_id: key
+        for key, test_id in session.execute(
+            text("SELECT id, test_id FROM tests WHERE repo_id = :repo_id AND test_id = ANY(:ids)"),
+            {"repo_id": repo_id, "ids": test_ids},
+        )
+    }
+    paths = {keys[r.test_id]: r.file_path for r in results if r.file_path}
+    if paths:
+        # Latest by run time, like everything "latest": a backfilled older run keeps its hands
+        # off a path reported by a newer one. Ties go to the later upload.
+        session.execute(
+            text(
+                """
+                UPDATE tests t SET file_path = p.path, file_path_at = ru.run_at
+                FROM unnest(CAST(:keys AS integer[]), CAST(:paths AS text[])) AS p(key, path),
+                     (SELECT COALESCE(started_at, created_at) AS run_at
+                      FROM runs WHERE id = :run_id) AS ru
+                WHERE t.id = p.key AND (t.file_path_at IS NULL OR t.file_path_at <= ru.run_at)
+                """
+            ),
+            {"keys": list(paths), "paths": list(paths.values()), "run_id": run_id},
+        )
+    return keys
 
 
 def count_results(session: Session, run_id: int) -> StatusCounts:

@@ -1087,7 +1087,7 @@ def test_load_history_does_not_read_passing_raw_results(db_session: Session) -> 
     db_session.execute(text("ANALYZE runs"))
     db_session.execute(text("ANALYZE test_stats"))
     failing_rows = db_session.scalar(
-        text("SELECT count(*) FROM test_results WHERE status IN ('failed', 'error')")
+        text("SELECT count(*) FROM test_results WHERE status IN (1, 3)")
     )
 
     statements: list[tuple[str, Any]] = []
@@ -1124,8 +1124,10 @@ def test_known_tests_come_from_test_stats(db_session: Session) -> None:
     run = ingest(db_session, 2, {"tests.test_a::test_x": P})
     db_session.execute(
         text(
-            "INSERT INTO test_results (run_id, test_id, status, attempt) "
-            "VALUES (:run, 'tests.test_raw::only', 'passed', 1)"
+            "WITH t AS (INSERT INTO tests (repo_id, test_id) "
+            "SELECT repo_id, 'tests.test_raw::only' FROM runs WHERE id = :run RETURNING id) "
+            "INSERT INTO test_results (run_id, test_key, status, attempt) "
+            "SELECT :run, id, 0, 1 FROM t"
         ),
         {"run": run},
     )
