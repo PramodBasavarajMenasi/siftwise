@@ -526,6 +526,41 @@ def test_documentation_changes_are_ignored() -> None:
     assert selection.reason == "no tests affected"
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".pre-commit-config.yaml",
+        ".editorconfig",
+        ".prettierrc",
+        ".prettierrc.json",
+        "web/.prettierrc.cjs",  # nested, and JS: still not source
+        "prettier.config.js",
+        ".prettierignore",
+        ".markdownlint.yaml",
+        ".yamllint",
+        "commitlint.config.ts",
+        ".lintstagedrc.json",
+        "_typos.toml",
+        ".git-blame-ignore-revs",
+    ],
+)
+def test_lint_and_format_configs_never_force_the_full_suite(path: str) -> None:
+    alone = select(PY, path)
+    assert (alone.mode, alone.tests, alone.reason) == (Mode.SELECTIVE, (), "no tests affected")
+
+    with_code = select(PY, path, "src/shop/cart.py")
+    assert with_code.mode is Mode.SELECTIVE
+    assert set(ids(with_code)) == set(ids(select(PY, "src/shop/cart.py")))
+
+
+@pytest.mark.parametrize(
+    "path", [".flake8", "ruff.toml", ".pylintrc", "mypy.ini", ".eslintrc.json", "eslint.config.js"]
+)
+def test_code_linter_configs_are_still_test_inputs(path: str) -> None:
+    # pytest-ruff, pytest-mypy, jest-runner-eslint and the like run these as tests.
+    assert select(PY, path).mode is Mode.FULL
+
+
 def test_co_change_selects_tests_that_failed_with_these_files() -> None:
     hist = history(
         *PY.tests.values(),

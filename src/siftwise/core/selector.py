@@ -134,8 +134,21 @@ _IGNORABLE_EXTENSIONS = frozenset(
 _IGNORABLE_BASENAMES = frozenset(
     {
         "LICENSE", "NOTICE", "AUTHORS", "CODEOWNERS", "CONTRIBUTORS", "CHANGELOG",
-        ".gitignore", ".gitattributes", ".editorconfig", ".mailmap",
+        ".gitignore", ".gitattributes", ".editorconfig", ".mailmap", ".git-blame-ignore-revs",
+        # Configs of tools that check or reformat code outside the test run: git hooks,
+        # formatters, prose and spelling linters.
+        ".pre-commit-config.yaml", ".pre-commit-hooks.yaml", ".prettierignore",
+        ".markdownlintignore", ".codespellrc", ".gitlint", "_typos.toml", ".typos.toml",
+        "typos.toml", ".cspell.json", "cspell.json",
     }
+)  # fmt: skip
+# Same, by pattern (every file format these tools accept, e.g. .prettierrc.json, .cjs, .yaml).
+# Not code linters (ruff, flake8, pylint, mypy, eslint): pytest and jest plugins can run them
+# as tests, so their configs stay test inputs.
+_IGNORABLE_GLOBS = (
+    ".prettierrc*", "prettier.config.*", ".markdownlint*", ".yamllint*", ".commitlintrc*",
+    "commitlint.config.*", ".lintstagedrc*", "lint-staged.config.*", "cspell.config.*",
+    ".cspell.config.*",
 )  # fmt: skip
 _IGNORABLE_DIRS = ("docs/",)
 
@@ -547,6 +560,7 @@ def is_ignorable(path: str) -> bool:
         ext.lower() in _IGNORABLE_EXTENSIONS
         or base in _IGNORABLE_BASENAMES
         or stem in _IGNORABLE_BASENAMES  # LICENSE.txt, CHANGELOG.txt
+        or any(fnmatch.fnmatchcase(base, glob) for glob in _IGNORABLE_GLOBS)
         or path.startswith(_IGNORABLE_DIRS)
     )
 
