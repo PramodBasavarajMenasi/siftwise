@@ -25,7 +25,7 @@
 </p>
 
 <p align="center">
-  <b>2,050 / 2,050</b> real failures caught on rdflib · <b><code>/select</code> in ~0.3 s</b> on 18,000 tests · <b>self-hosted</b>, Apache-2.0
+  <b>2,049 / 2,050</b> real failures caught on rdflib (the miss: a flaky test) · <b><code>/select</code> in ~0.3 s</b> on 18,000 tests · <b>self-hosted</b>, Apache-2.0
 </p>
 
 <p align="center"><sub>If siftwise looks useful, a ⭐ helps others find it.</sub></p>
@@ -71,11 +71,14 @@ Replays of real CI history with no peeking at the future. Full details: [docs/ev
 | Repo | Failures caught | Test time skipped |
 |---|---|---|
 | [ipfs/kubo](https://github.com/ipfs/kubo) (Go, ~4,100 tests) | 19 of 19 in failing PRs | 30.7% over 20 main commits replayed as PRs; 0% on recent PRs (all dependency/CI bumps) |
-| [RDFLib/rdflib](https://github.com/RDFLib/rdflib) (Python, ~18,000 tests) | 2,050 of 2,050 in 39 failing PRs; 140 of 140 in selective runs | 0.2–0.6% |
+| [RDFLib/rdflib](https://github.com/RDFLib/rdflib) (Python, ~18,000 tests) | 2,049 of 2,050 in 39 failing PRs; 140 of 141 in selective runs. The miss is a flaky remote-service test (see below) | 10.4% on the 10 most recent PRs (was 0.4% before lint-only configs stopped forcing the full suite); 0.6% over 19 main commits |
 
-rdflib saves almost nothing: its `__init__.py` and plugin registry connect nearly every module
-to nearly every test file, so safe file-level selection still runs ~99% of the suite. Bigger
-savings need codebases with independent parts (monorepos), or per-test coverage.
+rdflib's code changes save almost nothing: its `__init__.py` and plugin registry connect nearly
+every module to nearly every test file, so safe file-level selection still runs ~99% of the
+suite. The 10.4% comes from PRs that only touch lint configs. Bigger savings need codebases with
+independent parts (monorepos), or per-test coverage. The one miss, `test_service_with_bound_solutions`,
+calls a remote SPARQL service and also failed in 2 earlier unrelated runs: it's flaky, and
+flaky-test detection (planned) should label it rather than count it as a miss.
 
 ## Quickstart
 
@@ -208,7 +211,9 @@ SIFTWISE_TEST_DATABASE_URL=postgresql+psycopg://siftwise:siftwise@localhost:5432
 ```
 
 Database tests are skipped when `SIFTWISE_TEST_DATABASE_URL` is unset. After upgrading an existing
-database past migration 0005, run `POST /repos/{repo}/rollup` once per repo. Replay the selector
+database past migration 0005, run `POST /repos/{repo}/rollup` once per repo. Migration 0006
+rewrites `test_results` in place (it needs free disk for a second, smaller copy while it runs);
+run `VACUUM ANALYZE test_results` afterwards. Replay the selector
 on a backfilled repo with `uv run python -m scripts.eval.run_eval --repo owner/name --checkout <clone>`.
 
 ## Roadmap

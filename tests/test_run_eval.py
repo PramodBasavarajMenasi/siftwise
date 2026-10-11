@@ -163,6 +163,20 @@ def test_go_miss_outside_the_import_graph_needs_a_declared_dependency(
 # --- savings ------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("caught", "total", "shown"),
+    [
+        (2049, 2050, "2049/2050 (99.95%)"),
+        (99_999, 100_000, "99999/100000 (99.99%)"),  # never rounded up to 100%
+        (140, 140, "140/140 (100.00%)"),
+        (1, 3, "1/3 (33.33%)"),
+        (0, 0, "0/0"),
+    ],
+)
+def test_recall_shows_exact_counts_and_never_rounds_up(caught: int, total: int, shown: str) -> None:
+    assert ev.recall(caught, total) == shown
+
+
 def test_skipped_percentages() -> None:
     hist = history("t::a", "t::b", "t::c", "t::d")
     durations = {"t::a": 100.0, "t::b": 100.0, "t::c": 600.0, "t::d": 200.0}

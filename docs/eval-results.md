@@ -219,9 +219,12 @@ GitHub compares and import graphs are cached in `.eval-cache/`.
 
 ### Summary
 
-- **Final: no misses in selective runs.** All 2,050 failures in the 39 failing PR runs were
-  caught, 140 of 140 in the 17 runs that went selective, plus 1 of 1 in the main replay.
-  Round 1 (path mapping only) caught 1 of 7 in selective runs.
+- **Final: 2,049 of 2,050 failures caught** in the 39 failing PR runs, 140 of 141 in the 18
+  runs that went selective, plus 1 of 1 in the main replay. The one miss is
+  `test_service_with_bound_solutions`, a remote-service test that also failed in 2 earlier
+  unrelated runs: flaky, for week-4 flaky detection to handle. It failed in a PR that only
+  changed `.pre-commit-config.yaml`, which no longer forces the full suite. Round 1 (path
+  mapping only) caught 1 of 7 in selective runs.
 - **What closed the gaps:** a static Python import graph from the CLI (including parent
   packages, conftests and module names in strings), whole-file runs for changed or new test
   files, doctest modules, and running changed modules under `--doctest-modules` when the repo
@@ -229,7 +232,8 @@ GitHub compares and import graphs are cached in `.eval-cache/`.
 - **But rdflib saves almost nothing.** Its package `__init__.py` and plugin registry connect
   nearly every module to nearly every test file, so a selective run still runs about 99% of
   test time. Estimated time skipped across all runs fell from 10–19% (round 1, with misses)
-  to 0.2–0.6%.
+  to 0.2–0.6%. Since lint and format-only configs stopped forcing the full suite, two
+  pre-commit-only PRs skip everything: on the 10 most recent PRs that's **0.4% → 10.4%**.
 - **`/select` takes 0.3–1.4 s**, down from 79–124 s, after the history and collection-error
   fixes below.
 
@@ -369,21 +373,21 @@ Items 1–3 are addressed in round 2.
 
 **Before and after**
 
-| | Round 1 (path mapping) | Graph, first version | + module names in strings | **Final** |
-|---|---|---|---|---|
-| **39 PR runs with failures** | | | | |
-| Full / selective | 35 / 4 | 24 / 15 | 22 / 17 | **22 / 17** |
-| Failures caught | 2,044 / 2,050 | 1,991 / 2,050 | 2,037 / 2,050 | **2,050 / 2,050** |
-| **Caught in selective runs** | 1 / 7 | 58 / 117 | 127 / 140 | **140 / 140** |
-| Caught without fallbacks (full runs) | 1,160 / 1,954 | 1,873 / 1,931 | 1,864 / 1,908 | **1,880 / 1,908** |
-| Estimated time skipped, all runs | 10.2% | 5.0% | 0.2% | **0.2%** |
-| **10 most recent PR runs** | | | | |
-| Full / selective | 8 / 2 | 6 / 4 | 5 / 5 | **5 / 5** |
-| Estimated time skipped, all runs | 19.3% | 0.3% | 0.4% | **0.4%** |
-| **Main replay (19 commits)** | | | | |
-| Full / selective | 17 / 2 | 8 / 11 | 7 / 12 | **7 / 12** |
-| Failures caught (in selective runs) | 1 / 1 (by the fallback) | 1 / 1 (1 / 1) | 1 / 1 (1 / 1) | **1 / 1 (1 / 1)** |
-| Estimated time skipped, all runs | 9.9% | 25.8% | 0.6% | **0.6%** |
+| | Round 1 (path mapping) | Graph, first version | + module names in strings | + new modules' collection errors | **+ lint-only configs (final)** |
+|---|---|---|---|---|---|
+| **39 PR runs with failures** | | | | | |
+| Full / selective | 35 / 4 | 24 / 15 | 22 / 17 | 22 / 17 | **21 / 18** |
+| Failures caught | 2,044 / 2,050 | 1,991 / 2,050 | 2,037 / 2,050 | 2,050 / 2,050 | **2,049 / 2,050** |
+| **Caught in selective runs** | 1 / 7 | 58 / 117 | 127 / 140 | 140 / 140 | **140 / 141** |
+| Caught without fallbacks (full runs) | 1,160 / 1,954 | 1,873 / 1,931 | 1,864 / 1,908 | 1,880 / 1,908 | **1,880 / 1,908** |
+| Estimated time skipped, all runs | 10.2% | 5.0% | 0.2% | 0.2% | **2.8%** |
+| **10 most recent PR runs** | | | | | |
+| Full / selective | 8 / 2 | 6 / 4 | 5 / 5 | 5 / 5 | **4 / 6** |
+| Estimated time skipped, all runs | 19.3% | 0.3% | 0.4% | 0.4% | **10.4%** |
+| **Main replay (19 commits)** | | | | | |
+| Full / selective | 17 / 2 | 8 / 11 | 7 / 12 | 7 / 12 | **7 / 12** |
+| Failures caught (in selective runs) | 1 / 1 (by the fallback) | 1 / 1 (1 / 1) | 1 / 1 (1 / 1) | 1 / 1 (1 / 1) | **1 / 1 (1 / 1)** |
+| Estimated time skipped, all runs | 9.9% | 25.8% | 0.6% | 0.6% | **0.6%** |
 
 What each step fixed:
 
@@ -394,18 +398,24 @@ What each step fixed:
   change), which reach the serializers only through `rdflib/plugin.py`. It also selects
   `test_service`, the recurring network test, after a JSON-LD context change, which it reaches
   through the same registry.
-- **→ final:** catches the 13 failures of an `owlrl` run that added the new package
-  `rdflib/plugins/inference/`, whose modules failed to import (`pytest::rdflib.plugins.inference.closure`, ...).
+- **→ new modules' collection errors:** catches the 13 failures of an `owlrl` run that added
+  the new package `rdflib/plugins/inference/`, whose modules failed to import
+  (`pytest::rdflib.plugins.inference.closure`, ...).
+- **→ lint-only configs (final):** `.pre-commit-config.yaml` and other lint/format-only configs
+  no longer force the full suite. Two `pre-commit-ci-update-config` PRs that changed only that
+  file now run one recently failed test (run 287) or nothing (run 999). Run 999 had one
+  failure, now missed: `test_service_with_bound_solutions`, a remote-service test that also failed in 2 earlier unrelated runs. It's flaky, not caused by the change; week-4 flaky
+  detection should label it rather than count it as a miss.
 
-**Remaining full-suite reasons** (8 failing PR runs, 1 recent PR run): files that no known test
-reaches. These are `.pre-commit-config.yaml`, `examples/datasets.py`, and new modules that
-nothing imports yet (`rdflib/plugins/serializers/longturtle.py`, a new `rdflib/inference/`
+**Remaining full-suite reasons** (7 failing PR runs): files that no known test reaches. These
+are `examples/datasets.py` and new modules that nothing imports yet (`rdflib/plugins/serializers/longturtle.py`, a new `rdflib/inference/`
 package). Without fallbacks, 28 failures would be missed: all are collection errors of modules the
 run didn't change, in runs that went full anyway.
 
 **Findings**
 
-1. **0 misses in selective runs, but almost no savings on rdflib.** `rdflib/__init__.py`
+1. **One miss in selective runs, a flaky one; almost no savings on code changes.** The miss
+   is a remote-service test that fails intermittently (see above). `rdflib/__init__.py`
    imports most of the library, and `rdflib/plugin.py` names every plugin. So a change to
    almost any module reaches 325 of 326 test files: selective runs skip about 1% of test
    time. That's correct for this codebase: statically, nearly every test can reach nearly

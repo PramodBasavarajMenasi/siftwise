@@ -37,6 +37,7 @@ from __future__ import annotations
 import bisect
 import itertools
 import json
+import math
 import os
 import posixpath
 import subprocess
@@ -907,13 +908,12 @@ def print_summary(title: str, results: list[Result]) -> None:
     caught = sum(len(r.caught) for r in results)
     typer.echo(
         f"  failures: {failures} total in {sum(1 for r in results if r.failures)} runs, "
-        f"{caught} caught, {failures - caught} missed"
-        + (f" ({100 * caught / failures:.0f}% recall)" if failures else "")
+        f"{failures - caught} missed; caught {recall(caught, failures)}"
     )
     sel_failures = sum(len(r.failures) for r in selective)
     sel_caught = sum(len(r.caught) for r in selective)
     if sel_failures:
-        typer.echo(f"    in selective runs: {sel_caught}/{sel_failures} caught")
+        typer.echo(f"    in selective runs: caught {recall(sel_caught, sel_failures)}")
     cfs = [r for r in results if r.counterfactual is not None]
     if cfs:
         covered = [r for r in cfs if r.counterfactual and r.counterfactual.selection]
@@ -923,7 +923,7 @@ def print_summary(title: str, results: list[Result]) -> None:
             len(r.failures) for r in cfs if r.counterfactual and not r.counterfactual.selection
         )
         typer.echo(
-            f"  full runs, without fallbacks: {cf_caught}/{cf_failures} caught; "
+            f"  full runs, without fallbacks: caught {recall(cf_caught, cf_failures)}; "
             f"{only_fallback} more failures had nothing but a fallback"
         )
     _print_miss_signals("missed", [m for r in results for m in r.missed])
@@ -935,6 +935,15 @@ def print_summary(title: str, results: list[Result]) -> None:
     for r in results:
         notes[r.graph_note.split(" at ")[0]] += 1
     typer.echo("  import graph: " + ", ".join(f"{k} ({v})" for k, v in notes.items()))
+
+
+def recall(caught: int, total: int) -> str:
+    """``caught/total (pct)``, the percentage truncated, never rounded up: 2049 of 2050 is
+    99.95%, not 100%."""
+    if not total:
+        return "0/0"
+    pct = math.floor(10_000 * caught / total) / 100
+    return f"{caught}/{total} ({pct:.2f}%)"
 
 
 def _print_miss_signals(label: str, missed: list[Missed]) -> None:
