@@ -343,14 +343,11 @@ def get_recent_results(
     session: Session, test_key: int, limit: int = 20
 ) -> list[tuple[TestResult, Run]]:
     """The test's latest result rows (every attempt), newest run first."""
-    return list(
-        session.execute(
-            select(TestResult, Run)
-            .join(Run, TestResult.run_id == Run.id)
-            .where(TestResult.test_key == test_key)
-            .order_by(Run.occurred_at.desc(), Run.id.desc(), TestResult.attempt.desc())
-            .limit(limit)
-        )
-        .tuples()
-        .all()
-    )
+    rows = session.execute(
+        select(TestResult, Run)
+        .join(Run, TestResult.run_id == Run.id)
+        .where(TestResult.test_key == test_key)
+        .order_by(Run.occurred_at.desc(), Run.id.desc(), TestResult.attempt.desc())
+        .limit(limit)
+    ).all()
+    return [(result, run) for result, run in rows]

@@ -297,12 +297,16 @@ runs. siftwise uses no instrumentation; when its graphs can't see a dependency, 
 `.siftwise.toml` at the repo root, read by `siftwise select`:
 
 ```toml
-always_run = ["tests/smoke/**"]           # always selected
+always_run = ["tests/smoke/**", "tests.test_health::*"]  # test file paths or test IDs
 
 [[depends]]                               # dependencies no import graph can see
 tests = "test/cli/**"                     # test file paths, or <Go package dir>/<TestName>
-on = ["**/*.go", "!**/*_test.go"]         # ** spans directories; ! excludes
+on = ["**/*.go", "!**/*_test.go"]         # ! excludes
 ```
+
+Both use the same globs: `**` spans directories, while `*` and `?` stay within one path
+segment (`tests/*` matches `tests/test_a.py`, not `tests/unit/test_b.py`). Go test IDs contain
+their package's import path, so match them with `**::TestName` or `<import path>::*`.
 
 | Variable | Used by | Default |
 |---|---|---|

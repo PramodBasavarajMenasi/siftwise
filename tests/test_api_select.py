@@ -172,7 +172,7 @@ def test_docs_only_change_selects_nothing(client: TestClient) -> None:
     [
         ({"changed_files": ["src/shop/cart.py"], "changed_files_known": False},
          "changed files are unknown for this change"),
-        ({}, "no changed files were given"),
+        ({}, "this PR has no net changes"),
         ({"changed_files": ["go.mod"]}, "build/config file changed: go.mod"),
         ({"changed_files": ["src/shop/util.py"]},
          "changed file maps to no known tests: src/shop/util.py"),

@@ -42,7 +42,8 @@ Otherwise it selects the union of these signals, and every test carries its reas
 * **Co-change**: tests that failed in recent runs whose changed files overlap this change.
 * **Recently failed**: tests that failed in the last ``recent_main_runs`` main runs, or are
   currently broken on main.
-* **Always-run**: ``always_run`` glob patterns, matched against test IDs and file paths.
+* **Always-run**: ``always_run`` globs (as in ``[[depends]]``), matched against test IDs and
+  file paths.
 
 Matching is deliberately loose (by file name or package suffix anywhere in the repo): extra
 tests are cheap, missed ones are not. Path mapping only sees direct naming relationships, not
@@ -89,6 +90,8 @@ FULL_SUITE_COMMANDS: dict[Runner, str] = {
 
 # Reason for a selective result with nothing to run (e.g. a docs-only change).
 NO_TESTS_AFFECTED = "no tests affected"
+# Reason for the full suite when the changed files are known but there are none.
+NO_NET_CHANGES = "this PR has no net changes"
 
 JS_EXTENSIONS = frozenset({".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"})
 
@@ -358,7 +361,9 @@ def _select(
         return full("changed files are unknown for this change")
     paths = sorted({p for p in (normalize_path(f) for f in changed_files) if p})
     if not paths:
-        return full("no changed files were given")
+        # A known but empty diff: e.g. a PR whose commits cancel out. Still "unsure": nothing
+        # to select on, so the full suite.
+        return full(NO_NET_CHANGES)
     scoped_build = {p: d for p in paths if (d := build_file_scope(p)) is not None}
     build = [p for p in paths if is_build_file(p) and p not in scoped_build]
     if build:
@@ -509,11 +514,12 @@ def _select(
         if test_id in tests:
             add(test_id, f"failed on main in run {run_id} ({sha[:7]})")
 
-    # Always-run patterns.
+    # Always-run patterns: the same globs as [[depends]] (`**` spans directories, `*` and `?`
+    # stay within one), against the test ID and the test's file path.
     for pattern in config.always_run:
         for test in tests.values():
-            if fnmatch.fnmatchcase(test.test_id, pattern) or (
-                test.file_path and fnmatch.fnmatchcase(test.file_path, pattern)
+            if glob_match(test.test_id, pattern) or (
+                test.file_path and glob_match(test.file_path, pattern)
             ):
                 add(test.test_id, f"always-run pattern {pattern!r}")
 

@@ -93,7 +93,7 @@ def test_unknown_changed_files_run_the_full_suite() -> None:
 def test_empty_changed_files_run_the_full_suite(changed: tuple[str, ...]) -> None:
     selection = select(PY, *changed)
     assert selection.mode is Mode.FULL
-    assert selection.reason == "no changed files were given"
+    assert selection.reason == "this PR has no net changes"
 
 
 @pytest.mark.parametrize(
@@ -631,6 +631,35 @@ def test_always_run_globs_match_test_ids_and_file_paths() -> None:
         "smoke::boots": "always-run pattern 'e2e/*'",
         "tests.test_io::test_read": "always-run pattern 'tests.test_io::*'",
     }
+
+
+@pytest.mark.parametrize(
+    ("pattern", "matched"),
+    [
+        # `*` stays within one path segment, as in [[depends]]...
+        ("e2e/*", {"smoke::boots"}),
+        ("tests/*", {"tests.test_api::test_get"}),  # not tests/unit/test_cart.py
+        # ...and `**` spans directories.
+        ("tests/**", {"tests.unit.test_cart::test_unit", "tests.test_api::test_get"}),
+        ("**/test_api.py", {"tests.test_api::test_get"}),
+        # Go test IDs contain the import path: `*` can't skip over its slashes, `**` can.
+        ("*::TestAdd", set()),
+        ("**::TestAdd", {f"{CLI}::TestAdd"}),
+        (f"{CLI}::*", {f"{CLI}::TestAdd"}),
+        # `?` is one character, never a slash.
+        ("tests/unit?test_cart.py", set()),
+    ],
+)
+def test_always_run_uses_the_depends_glob_rules(pattern: str, matched: set[str]) -> None:
+    hist = history(
+        ("smoke::boots", "e2e/smoke.test.ts"),
+        ("tests.unit.test_cart::test_unit", "tests/unit/test_cart.py"),
+        ("tests.test_api::test_get", "tests/test_api.py"),
+        KnownTest(f"{CLI}::TestAdd"),
+    )
+    selection = select(hist, "README.md", always_run=(pattern,))
+
+    assert set(ids(selection)) == matched
 
 
 def test_signals_combine_into_one_entry_with_all_reasons() -> None:

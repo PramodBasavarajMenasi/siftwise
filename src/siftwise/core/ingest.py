@@ -170,7 +170,7 @@ def count_results(session: Session, run_id: int) -> StatusCounts:
         select(TestResult.status, func.count())
         .where(TestResult.run_id == run_id)
         .group_by(TestResult.status)
-    ).tuples()
+    ).all()
     counts = {status.value: n for status, n in rows}
     return StatusCounts(**counts, total=sum(counts.values()))
 
