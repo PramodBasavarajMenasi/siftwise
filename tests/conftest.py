@@ -18,6 +18,17 @@ def alembic_config(url: str) -> Config:
     return config
 
 
+@pytest.fixture(autouse=True)
+def isolated_from_ci(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never see the CI job they run in. In GitHub Actions, earlier steps export
+    ``GITHUB_*``/``SIFTWISE_*`` variables (action-e2e's select step sets SIFTWISE_JUNIT_DIR),
+    and the job sets GITHUB_OUTPUT and the like: a test reading them would depend on where it
+    runs, or write into the real job's outputs."""
+    for name in list(os.environ):
+        if name.startswith(("GITHUB_", "SIFTWISE_")) and name != "SIFTWISE_TEST_DATABASE_URL":
+            monkeypatch.delenv(name)
+
+
 @pytest.fixture(scope="session")
 def db_url() -> str:
     url = os.environ.get("SIFTWISE_TEST_DATABASE_URL")
