@@ -20,9 +20,20 @@ from sqlalchemy.orm import Session
 
 from siftwise.api.deps import get_app_settings
 from siftwise.config import Settings
-from siftwise.core.ingest import count_results, create_run, find_existing_run, find_run
+from siftwise.core.ingest import (
+    count_results,
+    create_run,
+    find_existing_run,
+    find_run,
+    stored_variants,
+)
 from siftwise.core.junit import JUnitParseError, ParsedTestResult, parse_junit
-from siftwise.core.schemas import RunLookupResponse, RunMetadata, RunResponse
+from siftwise.core.schemas import (
+    RunLookupResponse,
+    RunMetadata,
+    RunResponse,
+    RunVariantsResponse,
+)
 from siftwise.db import get_session
 
 # Auth is enforced by BearerAuthMiddleware, before the request body is read.
@@ -56,6 +67,23 @@ def lookup_run(
         run_attempt=run_attempt,
         variant=run.variant,
         commit_sha=run.commit_sha,
+    )
+
+
+@router.get("/runs/variants")
+def run_variants(
+    session: Annotated[Session, Depends(get_session)],
+    repo: Annotated[str, Query(min_length=1)],
+    ci_run_id: Annotated[str, Query(min_length=1)],
+    run_attempt: Annotated[int, Query(ge=1)] = 1,
+) -> RunVariantsResponse:
+    """Every variant stored for a CI run attempt (empty if none), so an uploader can tell
+    whether another uploader already recorded the run under its own variant names."""
+    return RunVariantsResponse(
+        repo=repo,
+        ci_run_id=ci_run_id,
+        run_attempt=run_attempt,
+        variants=stored_variants(session, repo, ci_run_id, run_attempt),
     )
 
 

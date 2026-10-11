@@ -90,6 +90,13 @@ class RollupResponse(BaseModel):
     seconds: float
 
 
+class RunVariantsResponse(BaseModel):
+    repo: str
+    ci_run_id: str
+    run_attempt: int
+    variants: list[str | None] = Field(description="Stored variants; null = no variant")
+
+
 class RunLookupResponse(BaseModel):
     run_id: int
     repo: str
@@ -142,6 +149,16 @@ class SelectRequest(BaseModel):
     depends: list[DependsRuleIn] = Field(default_factory=list, max_length=100)
     always_run: list[Glob] = Field(default_factory=list, max_length=1000)
     go_module: NonEmpty255 | None = None
+    junit_dir: Annotated[str, StringConstraints(min_length=1, max_length=1024)] | None = Field(
+        default=None,
+        description="Directory for pytest JUnit reports: each pytest command gets "
+        "--junitxml=<junit_dir>/siftwise-<n>.xml",
+    )
+
+
+class EstimatedMs(BaseModel):
+    total: float = Field(description="Average durations of all known tests (Go: top-level)")
+    would_run: float = Field(description="Of those, the tests the commands would run")
 
 
 class SelectedTestOut(BaseModel):
@@ -167,6 +184,9 @@ class SelectResponse(BaseModel):
         default_factory=list,
         description="Python files passed to pytest whole (changed or importing changed code, "
         "collection errors, doctest modules)",
+    )
+    estimated_ms: EstimatedMs = Field(
+        description="Estimated test time from history; full mode runs everything"
     )
     tests: list[SelectedTestOut] = Field(description="Selected tests; empty in full mode")
 

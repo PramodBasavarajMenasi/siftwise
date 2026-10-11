@@ -1,5 +1,9 @@
+import os
 import shlex
+import shutil
+import subprocess
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -1181,7 +1185,7 @@ def test_known_tests_keep_the_latest_file_path(db_session: Session) -> None:
     hist = load_history(db_session, REPO)
     assert hist is not None
     assert hist.tests["tests.test_a::test_x"] == KnownTest(
-        "tests.test_a::test_x", "tests/test_a.py"
+        "tests.test_a::test_x", "tests/test_a.py", avg_duration_ms=1.0
     )
 
 
@@ -1212,3 +1216,75 @@ def test_select_for_repo_end_to_end(db_session: Session) -> None:
     assert selection.command == (
         "pytest tests/test_cart.py::test_total tests/test_io.py::test_read"
     )
+
+
+# --- commands are safe to eval ------------------------------------------------------------
+
+HOSTILE = [
+    "tests.test_a::test_x; rm -rf /",
+    "tests.test_a::test_y[$(touch pwned)]",
+    "tests.test_a::test_z[`touch pwned`|&>x]",
+    "tests.test_a::test_q['\"]",
+]
+
+
+def test_command_quotes_every_test_id(tmp_path: Path) -> None:
+    selection = select(history(*HOSTILE), "src/a.py")  # a.py -> test_a.py: node IDs, not the file
+    nodes = sorted(f"tests/test_a.py::{t.partition('::')[2]}" for t in HOSTILE)
+    assert shlex.split(selection.command) == ["pytest", *nodes]
+
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("no bash to eval the command with")
+    # Eval it with pytest stubbed to print its arguments: every node ID arrives as one
+    # argument, and nothing in them runs.
+    script = 'pytest() { printf "%s\\n" "$@"; }; eval "$CMD"'
+    proc = subprocess.run([bash, "-c", script], env={**os.environ, "CMD": selection.command},
+                          cwd=tmp_path, capture_output=True, text=True, check=True)  # fmt: skip
+    assert proc.stdout.splitlines() == nodes
+    assert list(tmp_path.iterdir()) == []  # no "pwned", no "x"
+
+
+# --- JUnit reports per pytest command -----------------------------------------------------
+
+
+def test_junit_dir_gives_each_pytest_command_its_own_report() -> None:
+    hist = history("tests.test_cart::test_total", "rdflib.container::rdflib.container.Seq")
+    selection = select_tests(hist, ["src/shop/cart.py", "rdflib/container.py"], True,
+                             junit_dir="/tmp/junit dir")  # fmt: skip
+
+    assert selection.commands == (
+        "pytest '--junitxml=/tmp/junit dir/siftwise-1.xml' tests/test_cart.py::test_total",
+        "{ pytest '--junitxml=/tmp/junit dir/siftwise-2.xml' --doctest-modules "
+        "rdflib/container.py src/shop/cart.py || test $? -eq 5; }",  # repo collects modules
+    )
+
+
+def test_junit_dir_in_full_mode_and_go_untouched() -> None:
+    hist = history("tests.test_cart::test_total", f"{CLI}::TestAdd")
+    selection = select_tests(hist, [], False, junit_dir="out")
+
+    assert selection.mode is Mode.FULL
+    assert selection.commands == ("pytest --junitxml=out/siftwise-1.xml", "go test ./...")
+
+
+# --- estimated test time ------------------------------------------------------------------
+
+
+def test_estimate_counts_what_would_run() -> None:
+    hist = history(
+        KnownTest("tests.test_cart::test_total", avg_duration_ms=100),
+        KnownTest("tests.test_cart::test_new_in_file", avg_duration_ms=10),
+        KnownTest("tests.test_io::test_read", avg_duration_ms=1000),
+        KnownTest(f"{CLI}::TestAdd", avg_duration_ms=50),
+        KnownTest(f"{CLI}::TestAdd/sub", avg_duration_ms=40),  # inside TestAdd's 50
+        KnownTest("tests.test_db::test_q"),  # no duration yet
+    )
+
+    # The changed test file runs whole: both of its tests count.
+    selective = select(hist, "tests/test_cart.py")
+    assert (selective.estimated_ms_total, selective.estimated_ms_would_run) == (1160, 110)
+
+    full = select(hist, "pyproject.toml")
+    assert full.mode is Mode.FULL
+    assert full.estimated_ms_would_run == full.estimated_ms_total == 1160

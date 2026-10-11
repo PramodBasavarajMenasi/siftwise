@@ -30,6 +30,20 @@ def find_run(
     ).one_or_none()
 
 
+def stored_variants(
+    session: Session, repo: str, ci_run_id: str, run_attempt: int
+) -> list[str | None]:
+    """The variants stored for this CI run attempt (None = a run without a variant)."""
+    return list(
+        session.scalars(
+            select(Run.variant)
+            .join(Repo, Run.repo_id == Repo.id)
+            .where(Repo.name == repo, Run.ci_run_id == ci_run_id, Run.run_attempt == run_attempt)
+            .order_by(Run.variant.nulls_first())
+        )
+    )
+
+
 def find_existing_run(session: Session, meta: RunMetadata) -> Run | None:
     """The run already stored for this upload, if any. Runs without a CI id never match."""
     if meta.ci_run_id is None:

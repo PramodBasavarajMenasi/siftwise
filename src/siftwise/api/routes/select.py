@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from siftwise.core.schemas import SelectedTestOut, SelectRequest, SelectResponse
+from siftwise.core.schemas import EstimatedMs, SelectedTestOut, SelectRequest, SelectResponse
 from siftwise.core.selector import DependsRule, SelectorConfig, load_history, select_tests
 from siftwise.db import get_session
 
@@ -33,6 +33,7 @@ def post_select(
         affected_packages=body.affected_packages,
         affected_files=body.affected_files,
         deleted_files=body.deleted_files,
+        junit_dir=body.junit_dir,
     )
     return SelectResponse(
         repo=body.repo,
@@ -44,6 +45,9 @@ def post_select(
         commands=list(selection.commands),
         go_packages_run_whole=list(selection.go_packages_run_whole),
         python_files_run_whole=list(selection.python_files_run_whole),
+        estimated_ms=EstimatedMs(
+            total=selection.estimated_ms_total, would_run=selection.estimated_ms_would_run
+        ),
         tests=[
             SelectedTestOut(
                 test_id=t.test_id,

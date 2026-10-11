@@ -52,6 +52,7 @@ recently-failed partly cover that. The kubo real-data check measures what is mis
 
 from __future__ import annotations
 
+import dataclasses
 import fnmatch
 import functools
 import posixpath
@@ -227,6 +228,9 @@ def glob_match(path: str, pattern: str) -> bool:
 class KnownTest:
     test_id: str
     file_path: str | None = None
+    # Mean duration in history (test_stats.avg_duration_ms): only sizes the estimate of test
+    # time saved, never affects which tests are selected.
+    avg_duration_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -275,6 +279,10 @@ class Selection:
     # Python files passed to pytest as a whole file: changed/added test files, test files that
     # import a changed module, collection errors and doctest modules. New tests in them run too.
     python_files_run_whole: tuple[str, ...] = ()
+    # Estimated test time from history: all known tests, and the ones the commands would run
+    # (see WouldRun). Go subtests are left out: their time is inside their parent's.
+    estimated_ms_total: float = 0.0
+    estimated_ms_would_run: float = 0.0
 
     @property
     def command(self) -> str:
@@ -293,6 +301,7 @@ def select_tests(
     affected_packages: Mapping[str, Sequence[str]] | None = None,
     affected_files: Mapping[str, Sequence[str]] | None = None,
     deleted_files: Iterable[str] = (),
+    junit_dir: str | None = None,
 ) -> Selection:
     """Select tests for a change.
 
@@ -301,8 +310,26 @@ def select_tests(
     ``affected_files`` maps a Python test file to the changed modules it imports (directly,
     transitively, via parent packages or conftest.py), from the CLI's static import graph.
     ``deleted_files`` are changed files that no longer exist: no command names them.
+    ``junit_dir``: each pytest command writes ``--junitxml=<junit_dir>/siftwise-<n>.xml``, so
+    a line of several pytest commands doesn't overwrite one report with the next.
     """
-    config = config or SelectorConfig()
+    selection = _select(
+        history, changed_files, changed_files_known, config or SelectorConfig(),
+        affected_packages, affected_files, deleted_files, junit_dir,
+    )  # fmt: skip
+    return _with_estimate(selection, history)
+
+
+def _select(
+    history: RepoHistory | None,
+    changed_files: Iterable[str],
+    changed_files_known: bool,
+    config: SelectorConfig,
+    affected_packages: Mapping[str, Sequence[str]] | None,
+    affected_files: Mapping[str, Sequence[str]] | None,
+    deleted_files: Iterable[str],
+    junit_dir: str | None,
+) -> Selection:
     affected_packages = affected_packages or {}
     affected_files = {
         path: modules
@@ -320,7 +347,11 @@ def select_tests(
             tests=(),
             selected_count=len(tests),
             total_known=len(tests),
-            commands=tuple(cmd for r, cmd in FULL_SUITE_COMMANDS.items() if r in runners),
+            commands=tuple(
+                _with_junit(cmd, junit_dir, n) if r is Runner.PYTEST else cmd
+                for n, (r, cmd) in enumerate(FULL_SUITE_COMMANDS.items(), start=1)
+                if r in runners
+            ),
         )
 
     if not changed_files_known:
@@ -523,11 +554,62 @@ def select_tests(
         selected_count=len(chosen),
         total_known=len(tests),
         commands=_build_commands(
-            chosen, config.go_module, whole_packages, py_whole_files, py_module_files
+            chosen, config.go_module, whole_packages, py_whole_files, py_module_files, junit_dir
         ),
         go_packages_run_whole=tuple(sorted(whole_packages)),
         python_files_run_whole=tuple(sorted(files_run_whole)),
     )
+
+
+class WouldRun:
+    """Whether a selection's commands would execute a test, including tests that history
+    doesn't name: everything in a Python file or Go package run whole, and the subtests of a
+    Go test selected with ``-run``. Precomputed, for many lookups."""
+
+    def __init__(self, selection: Selection) -> None:
+        self.full = selection.mode is Mode.FULL
+        self.selected = {t.test_id for t in selection.tests}
+        self.go_packages = set(selection.go_packages_run_whole)
+        self.py_files = set(selection.python_files_run_whole)
+        # go test -run '^(TestX)$' runs TestX with all of its subtests.
+        self.go_top_level = {
+            (package, name.split("/", 1)[0])
+            for t in selection.tests
+            if t.runner is Runner.GO
+            for package, _, name in [t.test_id.partition("::")]
+        }
+
+    def __call__(self, test_id: str) -> bool:
+        if self.full or test_id in self.selected:
+            return True
+        package, _, name = test_id.partition("::")
+        if package in self.go_packages:
+            return True  # `go test ./pkg` with no -run: every test in the package, new ones too
+        if (package, name.split("/", 1)[0]) in self.go_top_level:
+            return True
+        # `pytest path/test_x.py`: every test in the file, new ones too.
+        return bool(self.py_files) and pytest_file(test_id) in self.py_files
+
+
+def _with_estimate(selection: Selection, history: RepoHistory | None) -> Selection:
+    if history is None:
+        return selection
+    runs = WouldRun(selection)
+    total = would_run = 0.0
+    for test in history.tests.values():
+        if not test.avg_duration_ms or _is_go_subtest(test.test_id):
+            continue
+        total += test.avg_duration_ms
+        if runs(test.test_id):
+            would_run += test.avg_duration_ms
+    return dataclasses.replace(
+        selection, estimated_ms_total=total, estimated_ms_would_run=would_run
+    )
+
+
+def _is_go_subtest(test_id: str) -> bool:
+    classname, _, name = test_id.partition("::")
+    return "/" in name and _looks_like_go(classname, name)
 
 
 def is_build_file(path: str) -> bool:
@@ -798,8 +880,12 @@ def _build_commands(
     go_whole_packages: Collection[str] = (),
     py_whole_files: Collection[str] = (),
     py_module_files: Collection[str] = (),
+    junit_dir: str | None = None,
 ) -> tuple[str, ...]:
     """One command per runner (per package for Go), in a stable order.
+
+    Every argument is shell-quoted (``shlex.join``): test IDs come from uploaded JUnit, and the
+    command is meant for ``eval``.
 
     Go packages in ``go_whole_packages`` run without -run, so tests that history doesn't
     know yet (added in this change) run too. Other Go packages only had tests pulled in by
@@ -816,12 +902,17 @@ def _build_commands(
     pytest_ids = sorted(
         node for node in nodes if "::" not in node or node.partition("::")[0] not in whole_files
     )
+    pytest_runs = 0
     if pytest_ids:
-        commands.append(shlex.join(["pytest", *pytest_ids]))
+        pytest_runs += 1
+        commands.append(_with_junit(shlex.join(["pytest", *pytest_ids]), junit_dir, pytest_runs))
     known_doctest_files = {t.py_node for t in tests if t.doctest and t.py_node}
     doctest_files = sorted(known_doctest_files | set(py_module_files))
     if doctest_files:
-        command = shlex.join(["pytest", "--doctest-modules", *doctest_files])
+        pytest_runs += 1
+        command = _with_junit(
+            shlex.join(["pytest", "--doctest-modules", *doctest_files]), junit_dir, pytest_runs
+        )
         if set(doctest_files) - known_doctest_files:
             # A module may have no doctests: pytest then exits 5 ("no tests collected"),
             # which isn't a failure. Import errors (exit 2) and doctest failures (1) still are.
@@ -845,6 +936,14 @@ def _build_commands(
     if jest_files:
         commands.append(shlex.join(["jest", *jest_files]))
     return tuple(commands)
+
+
+def _with_junit(command: str, junit_dir: str | None, n: int) -> str:
+    """``pytest ...`` -> ``pytest --junitxml=<junit_dir>/siftwise-<n>.xml ...``."""
+    if not junit_dir:
+        return command
+    report = posixpath.join(junit_dir.rstrip("/"), f"siftwise-{n}.xml")
+    return command.replace("pytest", shlex.join(["pytest", f"--junitxml={report}"]), 1)
 
 
 def _go_target(package: str, module: str | None) -> str:
@@ -922,7 +1021,7 @@ def load_history(
         text(
             f"""
             WITH {_REPO_RUNS}, {recent_ci_runs_sql("repo_runs")}
-            SELECT ts.test_id, ts.file_path
+            SELECT ts.test_id, ts.file_path, ts.avg_duration_ms
             FROM test_stats ts JOIN recent ON recent.id = ts.last_seen_run_id
             WHERE ts.repo_id = :repo_id
             """
@@ -975,7 +1074,10 @@ def load_history(
             changed.setdefault(run_id, set()).add(path)
 
     return RepoHistory(
-        tests={test_id: KnownTest(test_id, file_path) for test_id, file_path in known},
+        tests={
+            test_id: KnownTest(test_id, file_path, duration)
+            for test_id, file_path, duration in known
+        },
         broken_on_main=dict(broken),
         recent_main_failures={test_id: (run_id, sha) for test_id, run_id, sha in recent_failures},
         failed_runs=tuple(
