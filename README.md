@@ -25,7 +25,7 @@
 </p>
 
 <p align="center">
-  <b>2,049 / 2,050</b> real failures caught on rdflib (the miss: a flaky test) · <b><code>/select</code> in ~0.3 s</b> on 18,000 tests · <b>self-hosted</b>, Apache-2.0
+  <b>2,049 / 2,050</b> real failures caught on rdflib (the miss: a flaky test) · <b><code>/select</code> in ~0.6 s</b> on 18,000 tests · <b>self-hosted</b>, Apache-2.0
 </p>
 
 <p align="center"><sub>If siftwise looks useful, a ⭐ helps others find it.</sub></p>
