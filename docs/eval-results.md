@@ -324,7 +324,7 @@ Items 1–3 are addressed in round 2.
    rdflib's dependencies. It forces the full suite for 33 of the 60 full runs here, and when it
    does select, it missed 5 of 7 failures. Imports are the signal for 685 of the 794
    counterfactual misses and 5 of the 6 real ones. Like `go list` for kubo, the CLI could
-   compute the importers of each changed module, using `scripts/eval/pygraph.py` as a
+   compute the importers of each changed module, using `src/siftwise/cli/pygraph.py` as a
    starting point. That should both catch these misses and turn many full runs selective.
 2. **Tests new in the PR are never run by a selective Python run.** Commands name only known
    pytest node IDs, so a test added in the change isn't run, even when its file changed (106
