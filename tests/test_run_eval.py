@@ -1,6 +1,7 @@
 """Core logic of scripts/eval/run_eval.py: what would run, why misses happen, no peeking."""
 
 import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -281,3 +282,64 @@ def test_history_index_matches_load_history_after_the_last_run(db_session: Sessi
     assert from_index.recent_main_failures == from_db.recent_main_failures
     assert set(from_index.recent_main_failures) == {"t::a", "t::b"}
     assert from_index.failed_runs == tuple(from_db.failed_runs)
+
+
+def git(repo: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+        capture_output=True, check=True, text=True,
+    )  # fmt: skip
+    return proc.stdout.strip()
+
+
+def test_deleted_files_come_from_the_commit_file_list_and_are_cached(tmp_path: Path) -> None:
+    repo, cache = tmp_path / "repo", tmp_path / "cache"
+    (repo / "tests").mkdir(parents=True)
+    cache.mkdir()
+    git(repo, "init", "-q")
+    (repo / "tests" / "test_old.py").write_text("")
+    (repo / "tests" / "test_keep.py").write_text("")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "one")
+    git(repo, "rm", "-q", "tests/test_old.py")
+    git(repo, "commit", "-q", "-m", "two")
+    sha = git(repo, "rev-parse", "HEAD")
+    changed = ["tests/test_keep.py", "tests/test_old.py"]
+
+    assert ev.GraphProvider(repo, "go", cache).deleted_at(sha, changed) == ("tests/test_old.py",)
+    # Cached: no checkout needed the second time.
+    assert ev.GraphProvider(None, "go", cache).deleted_at(sha, changed) == ("tests/test_old.py",)
+    # No checkout and no cache: unknown.
+    assert ev.GraphProvider(None, "go", cache).deleted_at("b" * 40, changed) is None
+
+
+def test_evaluate_never_runs_a_deleted_test_file(db_session: Session, tmp_path: Path) -> None:
+    def upload(ci: int, hour: int, changed: list[str]) -> None:
+        results = [
+            ParsedTestResult(f"tests.{m}::t", f"tests.{m}", "t", None, P, 1, 1)
+            for m in ("test_old", "test_keep")
+        ]
+        meta = RunMetadata(
+            repo=REPO, commit_sha=f"{ci:040x}", branch="feature", is_main=False,
+            ci_run_id=str(ci), started_at=T0 + timedelta(hours=hour), changed_files=changed,
+        )  # fmt: skip
+        create_run(db_session, meta, results)
+
+    upload(1, 1, ["src/a.py"])
+    # The target deletes tests/test_old.py and edits tests/test_keep.py.
+    upload(2, 2, ["tests/test_keep.py", "tests/test_old.py"])
+    repo_id = db_session.execute(
+        text("SELECT id FROM repos WHERE name = :n"), {"n": REPO}
+    ).scalar_one()
+    target = next(t for t in ev.pr_targets(db_session, repo_id, 10, False) if t.ci_run_id == "2")
+    (tmp_path / f"files-{target.commit_sha}.json").write_text(json.dumps(["tests/test_keep.py"]))
+    graphs = ev.GraphProvider(None, "go", tmp_path)
+
+    result = ev.evaluate(
+        db_session, ev.HistoryIndex(db_session, repo_id), target, SelectorConfig(), graphs, {},
+        go=False,
+    )  # fmt: skip
+
+    assert result.selection.mode is Mode.SELECTIVE
+    assert result.selection.python_files_run_whole == ("tests/test_keep.py",)
+    assert result.selection.command == "pytest tests/test_keep.py"

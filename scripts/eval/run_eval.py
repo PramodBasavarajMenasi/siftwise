@@ -487,7 +487,8 @@ class GitHubCompare:
 class GraphProvider:
     """Import graphs at a commit, from a checkout, cached per commit.
 
-    Go: ``go list`` (fed to the selector). Python: ``pygraph`` (only to explain misses).
+    Go: ``go list``. Python: ``pygraph``. Both are fed to the selector, as ``siftwise select``
+    does; the Python graph also explains misses. The commit's file list gives the deleted files.
     """
 
     def __init__(self, checkout: Path | None, go: str, cache_dir: Path) -> None:
@@ -534,17 +535,45 @@ class GraphProvider:
         cache.write_text(json.dumps(graph.to_json()))
         return graph
 
+    def deleted_at(self, sha: str, paths: list[str]) -> tuple[str, ...] | None:
+        """The ``paths`` that don't exist at ``sha``: what ``siftwise select`` sends as
+        ``deleted_files``. None if the commit's file list is unavailable."""
+        files = self._files_at(sha)
+        if files is None:
+            return None
+        return tuple(sorted(p for p in paths if p not in files))
+
+    def _files_at(self, sha: str) -> frozenset[str] | None:
+        cache = self.cache_dir / f"files-{sha}.json"
+        if cache.exists():
+            return frozenset(json.loads(cache.read_text()))
+        if self.checkout is None or not self._fetch(sha):
+            return None
+        proc = self._run_git("ls-tree", "-r", "--name-only", "-z", sha)
+        if proc.returncode != 0:
+            return None
+        files = sorted(f for f in proc.stdout.decode("utf-8", errors="replace").split("\0") if f)
+        cache.write_text(json.dumps(files))
+        return frozenset(files)
+
+    def _fetch(self, sha: str) -> bool:
+        """Whether the checkout has commit ``sha``, fetching it if needed."""
+        if self._git("cat-file", "-e", f"{sha}^{{commit}}"):
+            return True
+        return self._git("fetch", "-q", "origin", sha)
+
     def _checkout(self, sha: str) -> bool:
-        if not self._git("cat-file", "-e", f"{sha}^{{commit}}"):
-            self._git("fetch", "-q", "origin", sha)
+        self._fetch(sha)
         return self._git("checkout", "-q", "-f", "--detach", sha)
 
     def _git(self, *args: str) -> bool:
+        return self._run_git(*args).returncode == 0
+
+    def _run_git(self, *args: str) -> subprocess.CompletedProcess[bytes]:
         assert self.checkout is not None
-        proc = subprocess.run(
+        return subprocess.run(
             ["git", "-C", str(self.checkout), *args], capture_output=True, timeout=600, check=False
         )
-        return proc.returncode == 0
 
 
 # --- evaluation ---------------------------------------------------------------------------
@@ -677,12 +706,13 @@ def counterfactual(
     config: SelectorConfig,
     affected: dict[str, list[str]],
     affected_files: dict[str, list[str]],
+    deleted: tuple[str, ...],
     explain: Explainer,
 ) -> Counterfactual:
     """Select from only the changed files that are covered by a signal on their own."""
 
     def select(files: list[str]) -> Selection:
-        return select_tests(history, files, True, config, affected, affected_files)
+        return select_tests(history, files, True, config, affected, affected_files, deleted)
 
     mapped = [
         p
@@ -746,14 +776,21 @@ def evaluate(
             affected_files = py_graph.affected(changed)
             graph_note = f"python imports at {run.commit_sha[:7]}"
     affected = graph.affected(changed) if graph else {}
+    # As `siftwise select` does: changed files that no longer exist are never run.
+    deleted = graphs.deleted_at(run.commit_sha, changed) if known else ()
+    if deleted is None:
+        deleted = ()
+        graph_note += "; deleted files unknown (no file list)"
     explain = Explainer(history, changed, config.go_module, go, graph, graphs, run.commit_sha)
-    selection = select_tests(history, changed, known, config, affected, affected_files)
+    selection = select_tests(history, changed, known, config, affected, affected_files, deleted)
     failures = actual_failures(session, list(run.run_ids or (run.run_id,)))
     runs = WouldRun(selection)
     caught = [f for f in failures if runs(f)]
     missed = [explain(f) for f in failures if f not in caught]
     cf = (
-        counterfactual(history, changed, failures, config, affected, affected_files, explain)
+        counterfactual(
+            history, changed, failures, config, affected, affected_files, deleted, explain
+        )
         if failures and selection.mode is Mode.FULL and known
         else None
     )
@@ -971,7 +1008,9 @@ def main(
             raise typer.Exit(2)
         durations = top_level_durations(session, repo_id, go=is_go)
         rules = f"{len(config.depends)} declared rule(s)" if config.depends else "no declared rules"
-        graph = ("go list" if is_go else "python imports (misses only)") if checkout else "none"
+        graph = "go list" if is_go else "python imports"
+        if not checkout:
+            graph += " (cached only, no --checkout)"
         typer.echo(f"# {repo} ({'go' if is_go else 'python'}): {rules}; import graph: {graph}")
         started = time.perf_counter()
         index = HistoryIndex(session, repo_id)
