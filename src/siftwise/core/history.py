@@ -40,9 +40,17 @@ Definitions (all counts are within the window):
 * ``file_path``: the test's latest reported file path (``tests.file_path``).
 
 Batch ingest (``POST /runs?defer_rollup=true``) skips the rollup; ``recompute_repo_stats``
-(``POST /repos/{repo}/rollup``) then recomputes every test in the window at once. Until it
-runs, ``test_stats`` is stale.
+(``POST /repos/{repo}/rollup``) then recomputes every test in the window. Until it runs,
+``test_stats`` is stale.
+
+Tests are rolled up in batches of test keys sized so a batch has at most ``BATCH_ROWS``
+(test, run) rows: each statement's working set fits in memory (no temp files), and the cost
+grows linearly with the window. Within a batch there are no sorts of the window's rows:
+per-run outcomes come from the primary key's order, and everything else is hash aggregates
+(see ``_ROLLUP_SQL``).
 """
+
+from collections.abc import Iterator, Sequence
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -64,157 +72,146 @@ _ROLLUP_LOCK_NAMESPACE = 1
 # 0 means "no window": use a span longer than any repo's history.
 _ALL_HISTORY_DAYS = 365 * 100
 
-# Recompute stats for the tests selected by {test_filter}, from the window of :repo_id.
+# (test, run) rows per rollup statement, at most: a batch has BATCH_ROWS // (runs in the
+# window) test keys. The work_mem below holds this many (rdflib: 2,959 runs, 253 tests a batch).
+BATCH_ROWS = 750_000
+_MAX_BATCH_TESTS = 10_000
+_ROLLUP_WORK_MEM = "64MB"
+
+# Final attempt's status without sorting: attempts are unique per (run, test) and statuses are
+# 0..3, so the highest attempt * 4 + status belongs to the final attempt.
+_OUTCOME = "(max(attempt * 4 + status) % 4)"
+
+# Recompute stats for the test keys in [:lo, :hi] (and in :keys, if {key_filter} uses it).
 #
-# Deliberately a single pass: per-(test, run) rows, window functions for the per-commit and
-# per-main-streak facts, then one GROUP BY test_key. An earlier version built four per-test
-# CTEs and LEFT JOINed them; during a backfill the planner's row estimates lag far behind the
-# table (estimating 1 row where there are thousands), it chose nested loops over those CTEs,
-# and one ingest's rollup took ~16s instead of <1s. No CTE-to-CTE joins means no such plan.
+# The window's runs drive the reads: for each, a LATERAL lookup by the primary key prefix
+# (run_id, test_key) reads only this batch's results, already in test_key order, so the
+# per-run GROUP BY needs no sort. Everything after that is hash aggregation over at most a
+# batch of (test, run) rows; positions in time order (``ord``) and in the selector's CI-run
+# order (``seen_ord``) are precomputed per run, so "latest" and "oldest" are plain max/min.
 #
-# Window results are read through LATERAL lookups by run_id, starting from the window's runs.
-# Each LATERAL subquery has OFFSET 0: without it Postgres flattens the subquery into a plain
-# join, and with fresh table statistics it then hash-joins a sequential scan of *all*
-# test_results, which is exactly the cost the window exists to avoid.
-# test_history.py::test_rollup_reads_only_the_window_not_old_history checks this.
-_ROLLUP_TEMPLATE = """
-WITH {run_tests}bounds AS MATERIALIZED (
+# The previous version computed all of this with window functions over the whole window in
+# one statement: several sorts of every row, ~16 min and up to 15 GB of temp files on rdflib.
+_ROLLUP_SQL = """
+WITH bounds AS MATERIALIZED (
     SELECT max(COALESCE(started_at, created_at)) - make_interval(days => :window_days)
                AS window_start
     FROM runs WHERE repo_id = :repo_id
 ),
-repo_runs AS (  -- with each run's CI run position, ordered like selector.recent_ci_runs_sql
+repo_runs AS MATERIALIZED (  -- every run, with its position in run-time order and CI run
     SELECT id, commit_sha, is_main, variant, COALESCE(started_at, created_at) AS run_at,
+           -- int, not bigint: per_run below carries these on every row of the batch
+           dense_rank() OVER (ORDER BY COALESCE(variant, ''))::int AS variant_no,
+           row_number() OVER (ORDER BY COALESCE(started_at, created_at), id)::int AS ord,
+           -- ordered like selector.recent_ci_runs_sql: latest leg time, then highest run id
            max(COALESCE(started_at, created_at)) OVER ci AS ci_at, max(id) OVER ci AS ci_id
     FROM runs WHERE repo_id = :repo_id
     WINDOW ci AS (PARTITION BY COALESCE(ci_run_id, 'run:' || id), run_attempt)
 ),
 win_runs AS MATERIALIZED (
-    SELECT ru.id, ru.commit_sha, ru.is_main, ru.variant,
-           COALESCE(ru.variant, '') AS variant_key, ru.run_at, ru.ci_at, ru.ci_id
+    SELECT ru.id, ru.is_main, ru.variant_no, ru.ord,
+           dense_rank() OVER (ORDER BY ru.commit_sha, ru.variant_no)::int AS pair,  -- flaky's unit
+           row_number() OVER (ORDER BY ru.ci_at, ru.ci_id, ru.id)::int AS seen_ord
     FROM repo_runs ru CROSS JOIN bounds
     WHERE ru.run_at >= bounds.window_start
 ),
-win_results AS (
-    SELECT tr.test_key, tr.run_id, tr.status, tr.attempt, tr.duration_ms,
-           wr.commit_sha, wr.is_main, wr.variant, wr.variant_key, wr.run_at, wr.ci_at, wr.ci_id,
-           true AS in_window
+per_run AS MATERIALIZED (  -- one row per (test, window run)
+    SELECT tr.test_key, wr.ord, wr.seen_ord, wr.pair, wr.is_main, wr.variant_no, tr.outcome,
+           tr.any_failed, tr.any_passed, tr.duration_sum, tr.duration_count
     FROM win_runs wr
     CROSS JOIN LATERAL (
-        SELECT test_key, run_id, status, attempt, duration_ms
-        FROM test_results WHERE run_id = wr.id
-        OFFSET 0  -- fence: stops Postgres flattening this into a scan of all test_results
+        SELECT test_key, {outcome}::smallint AS outcome,
+               bool_or(status IN {failed}) AS any_failed,
+               bool_or(status = {passed}) AS any_passed,
+               sum(duration_ms) FILTER (WHERE status <> {skipped}) AS duration_sum,
+               count(duration_ms) FILTER (WHERE status <> {skipped})::int AS duration_count
+        FROM test_results
+        WHERE run_id = wr.id AND test_key BETWEEN :lo AND :hi{key_filter}
+        GROUP BY test_key
     ) tr
-    {test_filter}
 ),
-win_final AS (  -- final attempt per (test, run), for the edge check below
-    SELECT DISTINCT ON (test_key, run_id) test_key, variant_key, is_main, status
-    FROM win_results
-    ORDER BY test_key, run_id, attempt DESC
+per_test AS (
+    SELECT test_key,
+           count(*) FILTER (WHERE outcome <> {skipped}) AS runs,
+           count(*) FILTER (WHERE outcome IN {failed}) AS failures,
+           max(ord) FILTER (WHERE outcome IN {failed}) AS last_failed_ord,
+           sum(duration_sum)::numeric / NULLIF(sum(duration_count), 0) AS avg_duration_ms,
+           max(ord) AS last_seen_ord,
+           max(seen_ord) AS last_seen_pos
+    FROM per_run GROUP BY test_key
 ),
-edge AS (  -- (test, variant) failing on main for the whole window: the streak may be older
-    SELECT test_key, variant_key FROM win_final
-    WHERE is_main AND status <> {skipped}
-    GROUP BY test_key, variant_key
-    HAVING bool_and(status IN {failed})
+pairs AS (  -- per (test, commit, variant)
+    SELECT test_key, bool_or(any_failed) AND bool_or(any_passed) AS flaky,
+           bool_or(any_failed OR any_passed) AS ran
+    FROM per_run GROUP BY test_key, pair
 ),
-old_results AS (  -- older main results, only for those, to find where the streak started
-    SELECT tr.test_key, tr.run_id, tr.status, tr.attempt, tr.duration_ms,
-           ru.commit_sha, ru.is_main, ru.variant, edge.variant_key,
-           COALESCE(ru.started_at, ru.created_at) AS run_at,
-           NULL::timestamptz, NULL::bigint,  -- only window runs count as "seen"
-           false AS in_window
+flaky AS (
+    SELECT test_key, avg(CASE WHEN flaky THEN 1.0 ELSE 0.0 END) FILTER (WHERE ran) AS score
+    FROM pairs GROUP BY test_key
+),
+main_v AS (  -- per (test, variant) on main in the window
+    SELECT test_key, variant_no, max(ord) FILTER (WHERE outcome = {passed}) AS last_pass
+    FROM per_run WHERE is_main AND outcome <> {skipped}
+    GROUP BY test_key, variant_no
+),
+edge AS (  -- failing on main for the whole window: the streak may have started earlier
+    SELECT test_key, variant_no FROM main_v WHERE last_pass IS NULL
+),
+old_main AS (  -- older main outcomes, only for those, to find where the streak started
+    SELECT edge.test_key, edge.variant_no, ru.ord, {outcome} AS outcome
     FROM edge
     CROSS JOIN LATERAL (
-        SELECT test_key, run_id, status, attempt, duration_ms
-        FROM test_results WHERE test_key = edge.test_key
+        SELECT run_id, attempt, status FROM test_results WHERE test_key = edge.test_key
         OFFSET 0  -- fence: read only these tests' history, by test_key
     ) tr
-    JOIN runs ru ON ru.id = tr.run_id
+    JOIN repo_runs ru ON ru.id = tr.run_id
     CROSS JOIN bounds
-    WHERE ru.repo_id = :repo_id AND ru.is_main
-      AND COALESCE(ru.variant, '') = edge.variant_key
-      AND COALESCE(ru.started_at, ru.created_at) < bounds.window_start
+    WHERE ru.is_main AND ru.variant_no = edge.variant_no AND ru.run_at < bounds.window_start
+    GROUP BY edge.test_key, edge.variant_no, ru.ord
 ),
-results AS (
-    SELECT * FROM win_results UNION ALL SELECT * FROM old_results
+last_pass AS (  -- the latest pass on main per (test, variant), before the window if need be
+    SELECT mv.test_key, mv.variant_no,
+           COALESCE(mv.last_pass,
+                    (SELECT max(om.ord) FROM old_main om
+                     WHERE om.test_key = mv.test_key AND om.variant_no = mv.variant_no
+                       AND om.outcome = {passed}),
+                    0) AS ord
+    FROM main_v mv
 ),
-per_run AS (  -- one row per (test, run); each run is one variant of a CI run
-    SELECT test_key, run_id, commit_sha, is_main, variant, variant_key, run_at, ci_at, ci_id,
-           in_window,
-           (array_agg(status ORDER BY attempt DESC))[1] AS outcome,
-           sum(duration_ms) FILTER (WHERE status <> {skipped}) AS duration_sum,
-           count(duration_ms) FILTER (WHERE status <> {skipped}) AS duration_count,
-           bool_or(status IN {failed}) AS any_failed,
-           bool_or(status = {passed}) AS any_passed
-    FROM results
-    GROUP BY test_key, run_id, commit_sha, is_main, variant, variant_key, run_at, ci_at, ci_id,
-             in_window
+main_failures AS (  -- non-skipped main outcomes; after the last pass they are all failures
+    SELECT test_key, variant_no, ord FROM per_run
+    WHERE is_main AND outcome IN {failed}
+    UNION ALL
+    SELECT test_key, variant_no, ord FROM old_main WHERE outcome IN {failed}
 ),
-annotated AS (
-    SELECT *,
-           -- flaky: a failure and a pass for the same commit *and variant* (so passing on
-           -- linux and failing on macos is a platform difference, not flakiness)
-           bool_or(any_failed) OVER by_commit AND bool_or(any_passed) OVER by_commit
-               AS commit_flaky,
-           bool_or(any_failed OR any_passed) OVER by_commit AS commit_ran,
-           row_number() OVER (
-               PARTITION BY test_key, commit_sha, variant_key, in_window ORDER BY run_id
-           ) AS commit_row,
-           is_main AND outcome <> {skipped} AS main_ran,
-           -- passes at or after this run on main, per variant; 0 = in the failing streak
-           count(*) FILTER (WHERE outcome = {passed}) OVER (
-               PARTITION BY test_key, variant_key, is_main AND outcome <> {skipped}
-               ORDER BY run_at DESC, run_id DESC
-           ) AS newer_main_passes
-    FROM per_run
-    WINDOW by_commit AS (PARTITION BY test_key, commit_sha, variant_key, in_window)
+streaks AS (  -- per broken (test, variant): the oldest failure after its last pass
+    SELECT f.test_key, min(f.ord) AS start_ord
+    FROM main_failures f JOIN last_pass lp USING (test_key, variant_no)
+    WHERE f.ord > lp.ord
+    GROUP BY f.test_key, f.variant_no
 ),
-streaks AS (
-    SELECT *,
-           main_ran AND newer_main_passes = 0 AS in_streak,
-           -- 1 = the oldest run of this variant's current failing streak on main
-           row_number() OVER (
-               PARTITION BY test_key, variant_key, main_ran AND newer_main_passes = 0
-               ORDER BY run_at, run_id
-           ) AS streak_pos
-    FROM annotated
-),
-stats AS (
-    SELECT :repo_id AS repo_id, test_key,
-           count(*) FILTER (WHERE in_window AND outcome <> {skipped}) AS runs,
-           count(*) FILTER (WHERE in_window AND outcome IN {failed}) AS failures,
-           max(run_at) FILTER (WHERE in_window AND outcome IN {failed})
-               AS last_failed_at,
-           COALESCE(
-               avg(CASE WHEN commit_flaky THEN 1.0 ELSE 0.0 END)
-                   FILTER (WHERE in_window AND commit_row = 1 AND commit_ran),
-               0
-           )::float8 AS flaky_score,
-           (sum(duration_sum) FILTER (WHERE in_window)::numeric
-               / NULLIF(sum(duration_count) FILTER (WHERE in_window), 0))::float8
-               AS avg_duration_ms,
-           (array_agg(commit_sha ORDER BY run_at, run_id)
-               FILTER (WHERE in_streak AND streak_pos = 1))[1] AS broken_on_main_since_sha,
-           jsonb_agg(
-               jsonb_build_object('variant', variant, 'since_sha', commit_sha)
-               ORDER BY run_at, run_id
-           ) FILTER (WHERE in_streak AND streak_pos = 1) AS broken_on_main_variants,
-           max(run_at) FILTER (WHERE in_window) AS last_seen_at,
-           (array_agg(run_id ORDER BY ci_at DESC, ci_id DESC, run_id DESC)
-               FILTER (WHERE in_window))[1] AS last_seen_run_id
-    FROM streaks
-    GROUP BY test_key
-    HAVING bool_or(in_window)
+broken AS (
+    SELECT s.test_key,
+           (array_agg(ru.commit_sha ORDER BY s.start_ord))[1] AS since_sha,
+           jsonb_agg(jsonb_build_object('variant', ru.variant, 'since_sha', ru.commit_sha)
+                     ORDER BY s.start_ord) AS variants
+    FROM streaks s JOIN repo_runs ru ON ru.ord = s.start_ord
+    GROUP BY s.test_key
 )
 INSERT INTO test_stats AS ts (
     repo_id, test_id, runs, failures, last_failed_at, flaky_score, avg_duration_ms,
     broken_on_main_since_sha, broken_on_main_variants, last_seen_at, last_seen_run_id, file_path
 )
-SELECT s.repo_id, t.test_id, s.runs, s.failures, s.last_failed_at, s.flaky_score,
-       s.avg_duration_ms, s.broken_on_main_since_sha, s.broken_on_main_variants, s.last_seen_at,
-       s.last_seen_run_id, t.file_path
-FROM stats s JOIN tests t ON t.id = s.test_key
+SELECT :repo_id, t.test_id, pt.runs, pt.failures, failed_run.run_at,
+       COALESCE(flaky.score, 0)::float8, pt.avg_duration_ms::float8,
+       broken.since_sha, broken.variants, seen_run.run_at, seen.id, t.file_path
+FROM per_test pt
+JOIN tests t ON t.id = pt.test_key
+JOIN repo_runs seen_run ON seen_run.ord = pt.last_seen_ord
+JOIN win_runs seen ON seen.seen_ord = pt.last_seen_pos
+LEFT JOIN repo_runs failed_run ON failed_run.ord = pt.last_failed_ord
+LEFT JOIN flaky ON flaky.test_key = pt.test_key
+LEFT JOIN broken ON broken.test_key = pt.test_key
 ON CONFLICT (repo_id, test_id) DO UPDATE SET
     runs = EXCLUDED.runs,
     failures = EXCLUDED.failures,
@@ -228,24 +225,18 @@ ON CONFLICT (repo_id, test_id) DO UPDATE SET
     file_path = EXCLUDED.file_path
 """
 
-# After one ingest: only the tests in that run. Their list is materialized once: as a plain
-# IN (subquery) the planner sometimes picked a nested loop that re-read the run's results for
-# every result row in the window (18,000 loops, ~40 s, for a 150-test run with 120 uploads).
 _CODES = {
+    "outcome": _OUTCOME,
     "failed": FAILED_CODES_SQL,
     "passed": str(PASSED_CODE),
     "skipped": str(SKIPPED_CODE),
 }
-_RUN_ROLLUP_SQL = text(
-    _ROLLUP_TEMPLATE.format(
-        run_tests="run_tests AS MATERIALIZED ("
-        "SELECT DISTINCT test_key FROM test_results WHERE run_id = :run_id),\n",
-        test_filter="WHERE tr.test_key IN (SELECT test_key FROM run_tests)",
-        **_CODES,
-    )
+# Batch rollup: every test key in [lo, hi].
+_RANGE_ROLLUP_SQL = text(_ROLLUP_SQL.format(key_filter="", **_CODES))
+# After one ingest: only the run's tests within [lo, hi].
+_KEYS_ROLLUP_SQL = text(
+    _ROLLUP_SQL.format(key_filter=" AND test_key = ANY(CAST(:keys AS integer[]))", **_CODES)
 )
-# Batch: every test with results in the window.
-_REPO_ROLLUP_SQL = text(_ROLLUP_TEMPLATE.format(run_tests="", test_filter="", **_CODES))
 
 
 def _window_days(window_days: int) -> int:
@@ -253,9 +244,9 @@ def _window_days(window_days: int) -> int:
 
 
 def _lock(session: Session, repo_id: int) -> None:
-    """Per-repo transaction advisory lock.
+    """Per-repo transaction advisory lock, and memory for the rollup's hash aggregates.
 
-    Without it, two concurrent ingests touching the same tests could each compute stats
+    Without the lock, two concurrent ingests touching the same tests could each compute stats
     without seeing the other's uncommitted results, and the later upsert would overwrite with
     stale numbers. With the lock, the second rollup starts after the first commits.
     """
@@ -263,15 +254,50 @@ def _lock(session: Session, repo_id: int) -> None:
         text("SELECT pg_advisory_xact_lock(:ns, :key)"),
         {"ns": _ROLLUP_LOCK_NAMESPACE, "key": repo_id},
     )
+    session.execute(text(f"SET LOCAL work_mem = '{_ROLLUP_WORK_MEM}'"))
+    # Batches are small, and parallel hash joins would put work_mem-sized tables in shared
+    # memory: Docker's default /dev/shm is 64MB, so they can fail there.
+    session.execute(text("SET LOCAL max_parallel_workers_per_gather = 0"))
+
+
+def _batches(
+    session: Session, repo_id: int, window_days: int, keys: Sequence[int]
+) -> Iterator[Sequence[int]]:
+    window_runs = session.scalar(
+        text(
+            "SELECT count(*) FROM runs WHERE repo_id = :repo_id"
+            " AND COALESCE(started_at, created_at) >= ("
+            "   SELECT max(COALESCE(started_at, created_at)) - make_interval(days => :days)"
+            "   FROM runs WHERE repo_id = :repo_id)"
+        ),
+        {"repo_id": repo_id, "days": window_days},
+    )
+    size = max(1, min(_MAX_BATCH_TESTS, BATCH_ROWS // max(int(window_runs or 0), 1)))
+    for start in range(0, len(keys), size):
+        yield keys[start : start + size]
 
 
 def recompute_test_stats(session: Session, repo_id: int, run_id: int, window_days: int) -> None:
     """Recompute ``test_stats`` for the tests in ``run_id`` over the window. Does not commit."""
     _lock(session, repo_id)
-    session.execute(
-        _RUN_ROLLUP_SQL,
-        {"repo_id": repo_id, "run_id": run_id, "window_days": _window_days(window_days)},
+    days = _window_days(window_days)
+    keys = list(
+        session.scalars(
+            text("SELECT DISTINCT test_key FROM test_results WHERE run_id = :run ORDER BY 1"),
+            {"run": run_id},
+        )
     )
+    for batch in _batches(session, repo_id, days, keys):
+        session.execute(
+            _KEYS_ROLLUP_SQL,
+            {
+                "repo_id": repo_id,
+                "window_days": days,
+                "lo": batch[0],
+                "hi": batch[-1],
+                "keys": list(batch),
+            },
+        )
 
 
 def recompute_repo_stats(session: Session, repo_id: int, window_days: int) -> int:
@@ -280,10 +306,21 @@ def recompute_repo_stats(session: Session, repo_id: int, window_days: int) -> in
     Returns the number of tests updated. Used after a batch (``defer_rollup``) ingest.
     """
     _lock(session, repo_id)
-    result = session.execute(
-        _REPO_ROLLUP_SQL, {"repo_id": repo_id, "window_days": _window_days(window_days)}
-    )
-    return int(getattr(result, "rowcount", 0) or 0)
+    days = _window_days(window_days)
+    keys = list(session.scalars(select(Test.id).where(Test.repo_id == repo_id).order_by(Test.id)))
+    updated = 0
+    for batch in _batches(session, repo_id, days, keys):
+        result = session.execute(
+            _RANGE_ROLLUP_SQL,
+            {
+                "repo_id": repo_id,
+                "window_days": days,
+                "lo": batch[0],
+                "hi": batch[-1],
+            },
+        )
+        updated += int(getattr(result, "rowcount", 0) or 0)
+    return updated
 
 
 def get_test(session: Session, repo: str, test_id: str) -> Test | None:

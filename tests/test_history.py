@@ -1,5 +1,8 @@
 import json
+import random
+from collections import defaultdict
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
@@ -398,22 +401,32 @@ def test_rollup_reads_only_the_window_not_old_history(db_session: Session) -> No
     db_session.execute(text("ANALYZE test_results"))
     db_session.execute(text("ANALYZE runs"))
 
-    plan = db_session.execute(
-        text("EXPLAIN (ANALYZE, FORMAT JSON) " + str(history._RUN_ROLLUP_SQL)),
-        {"repo_id": repo_id, "run_id": newest.id, "window_days": 90},
-    ).scalar_one()[0]["Plan"]
+    plan = explain_run_rollup(db_session, repo_id, newest.id)
 
     read = _rows_read_from(plan, "test_results")
-    assert in_window <= read <= in_window * 2  # window rows (+ the run's test list), not 6,000
+    assert read == in_window  # the window's rows, not 6,000
     assert db_session.scalar(select(func.count()).select_from(TestResult)) == 300 * 20 + in_window
     assert stats(db_session, "t::case0").runs == 2
 
 
-def test_run_rollup_reads_the_runs_test_list_once(db_session: Session) -> None:
-    # The run's test list used to be an IN (subquery) on test_results that the planner could
-    # run as a nested loop, re-reading the run's results once per result row in the window.
-    # Push the planner into that shape (old SQL: 5,100 rows read here); the list must still be
-    # read once.
+def explain_run_rollup(session: Session, repo_id: int, run_id: int) -> dict[str, Any]:
+    """EXPLAIN ANALYZE of the per-run rollup statement for all of the run's tests."""
+    keys = sorted(
+        session.scalars(
+            text("SELECT DISTINCT test_key FROM test_results WHERE run_id = :r"), {"r": run_id}
+        )
+    )
+    params = {"repo_id": repo_id, "window_days": 90, "lo": keys[0], "hi": keys[-1], "keys": keys}
+    plan: dict[str, Any] = session.execute(
+        text("EXPLAIN (ANALYZE, FORMAT JSON) " + str(history._KEYS_ROLLUP_SQL)), params
+    ).scalar_one()[0]["Plan"]
+    return plan
+
+
+def test_run_rollup_reads_each_window_result_once_whatever_the_plan(db_session: Session) -> None:
+    # An earlier version let the planner re-read the run's results once per result row in the
+    # window (a nested loop over an IN (subquery)). Push the planner away from hashing,
+    # merging and sorting: the window's rows must still be read once.
     tests: dict[str, Status | Sequence[Status]] = {f"t::case{i}": P for i in range(30)}
     newest = None
     for n in range(1, 11):
@@ -422,13 +435,195 @@ def test_run_rollup_reads_the_runs_test_list_once(db_session: Session) -> None:
     for setting in ("hashjoin", "mergejoin", "hashagg", "material", "sort"):
         db_session.execute(text(f"SET LOCAL enable_{setting} = off"))
 
-    plan = db_session.execute(
-        text("EXPLAIN (ANALYZE, FORMAT JSON) " + str(history._RUN_ROLLUP_SQL)),
-        {"repo_id": newest.repo_id, "run_id": newest.id, "window_days": 90},
-    ).scalar_one()[0]["Plan"]
+    plan = explain_run_rollup(db_session, newest.repo_id, newest.id)
 
-    window_rows, run_rows = 10 * len(tests), len(tests)
-    assert _rows_read_from(plan, "test_results") <= window_rows + run_rows  # not 300 x 30
+    assert _rows_read_from(plan, "test_results") <= 10 * len(tests)  # not 300 x 30
+
+
+# --- batched rollup vs the definitions ----------------------------------------------------
+#
+# A random history (matrix CI runs with reruns and retries, main and branches, skips, runs
+# outside the window, out-of-order ingest), rolled up in batches, compared with a direct
+# Python implementation of the definitions in core/history.py.
+
+
+@dataclass(frozen=True)
+class RefRun:
+    id: int
+    commit: str
+    is_main: bool
+    variant: str | None
+    run_at: datetime
+    ci_key: tuple[str, int]
+
+
+@dataclass(frozen=True)
+class RefResult:
+    run_id: int
+    test_id: str
+    attempt: int
+    status: Status
+    duration_ms: int | None
+
+
+FAILED_STATUSES = (F, E)
+
+
+def reference_stats(
+    runs: list[RefRun], results: list[RefResult], window_days: int = 90
+) -> dict[str, dict[str, Any]]:
+    by_id = {r.id: r for r in runs}
+    window_start = max(r.run_at for r in runs) - timedelta(days=window_days)
+    in_window = {r.id for r in runs if r.run_at >= window_start}
+    order = {r.id: (r.run_at, r.id) for r in runs}
+    # CI runs are ordered by their latest leg's time, then their highest run id.
+    ci_at: dict[tuple[str, int], datetime] = {}
+    ci_id: dict[tuple[str, int], int] = {}
+    for r in runs:
+        ci_at[r.ci_key] = max(ci_at.get(r.ci_key, r.run_at), r.run_at)
+        ci_id[r.ci_key] = max(ci_id.get(r.ci_key, r.id), r.id)
+    ci_order = {r.id: (ci_at[r.ci_key], ci_id[r.ci_key], r.id) for r in runs}
+
+    attempts: dict[tuple[str, int], list[RefResult]] = defaultdict(list)
+    for res in results:
+        attempts[(res.test_id, res.run_id)].append(res)
+    outcome = {k: max(v, key=lambda a: a.attempt).status for k, v in attempts.items()}
+
+    expected: dict[str, dict[str, Any]] = {}
+    for test_id in sorted({res.test_id for res in results}):
+        window_runs = sorted((rid for t, rid in attempts if t == test_id and rid in in_window),
+                             key=order.__getitem__)  # fmt: skip
+        if not window_runs:
+            continue
+        outcomes = {rid: outcome[(test_id, rid)] for rid in window_runs}
+        failed_runs = [rid for rid in window_runs if outcomes[rid] in FAILED_STATUSES]
+        durations = [a.duration_ms for rid in window_runs for a in attempts[(test_id, rid)]
+                     if a.status is not S and a.duration_ms is not None]  # fmt: skip
+        pairs: dict[tuple[str, str | None], list[Status]] = defaultdict(list)
+        for rid in window_runs:
+            run = by_id[rid]
+            pairs[(run.commit, run.variant)] += [a.status for a in attempts[(test_id, rid)]]
+        ran = [s for s in pairs.values() if any(x is not S for x in s)]
+        flaky = [s for s in ran if any(x in FAILED_STATUSES for x in s) and P in s]
+
+        broken: list[tuple[tuple[datetime, int], dict[str, str | None]]] = []
+        for variant in sorted({by_id[rid].variant or "" for rid in window_runs}):
+            main = sorted(
+                (rid for t, rid in attempts if t == test_id and by_id[rid].is_main
+                 and (by_id[rid].variant or "") == variant and outcome[(test_id, rid)] is not S),
+                key=order.__getitem__,
+            )  # fmt: skip
+            if not any(rid in in_window for rid in main):
+                continue  # no main outcome in the window: not broken
+            passes = [i for i, rid in enumerate(main) if outcome[(test_id, rid)] is P]
+            streak = main[passes[-1] + 1 :] if passes else main
+            if streak:
+                start = by_id[streak[0]]
+                broken.append((order[start.id], {"variant": start.variant,
+                                                 "since_sha": start.commit}))  # fmt: skip
+        broken.sort(key=lambda b: b[0])
+        latest_seen = max(window_runs, key=ci_order.__getitem__)
+        expected[test_id] = {
+            "runs": sum(o is not S for o in outcomes.values()),
+            "failures": len(failed_runs),
+            "last_failed_at": by_id[failed_runs[-1]].run_at if failed_runs else None,
+            "flaky_score": len(flaky) / len(ran) if ran else 0.0,
+            "avg_duration_ms": sum(durations) / len(durations) if durations else None,
+            "broken_on_main_since_sha": broken[0][1]["since_sha"] if broken else None,
+            "broken_on_main_variants": [b[1] for b in broken] or None,
+            "last_seen_at": by_id[window_runs[-1]].run_at,
+            "last_seen_run_id": latest_seen,
+        }
+    return expected
+
+
+def random_history(session: Session, seed: int) -> tuple[list[RefRun], list[RefResult]]:
+    """Ingest a random history (no rollup) and return it for ``reference_stats``."""
+    rng = random.Random(seed)
+    tests = [f"t::case{i}" for i in range(12)]
+    specs = []
+    for n_ci in range(24):
+        day = rng.choice([0, 5, 20, 40, 60, 80, 95, 100, 110, 120, 130, 140, 150])
+        commit = rng.randrange(14)  # commits repeat: reruns and branch + main of one commit
+        is_main = rng.random() < 0.5
+        for attempt in range(1, rng.choice([1, 1, 2]) + 1):
+            for leg, variant in enumerate(rng.sample([None, "linux", "macos"], rng.randint(1, 2))):
+                hour = day * DAY + attempt + rng.choice([0, 0, leg])  # equal times happen
+                specs.append((str(n_ci), attempt, variant, commit, is_main, hour))
+    rng.shuffle(specs)  # backfill ingests in any order
+    runs: list[RefRun] = []
+    results: list[RefResult] = []
+    for ci, attempt, variant, commit, is_main, hour in specs:
+        parsed = []
+        for test_id in rng.sample(tests, rng.randint(6, len(tests))):
+            for n in range(1, rng.choice([1, 1, 1, 2, 3]) + 1):
+                status = rng.choice([P, P, P, F, F, E, S])
+                duration = None if rng.random() < 0.1 else rng.randrange(1000)
+                parsed.append(ParsedTestResult(test_id, "t", test_id[3:], None, status,
+                                               duration, n))  # fmt: skip
+        meta = RunMetadata(repo=REPO, commit_sha=sha(commit), branch="main" if is_main else "b",
+                           is_main=is_main, ci_run_id=ci, run_attempt=attempt, variant=variant,
+                           started_at=at(hour))  # fmt: skip
+        run, _ = create_run(session, meta, parsed, rollup=False)
+        runs.append(RefRun(run.id, sha(commit), is_main, variant, at(hour), (ci, attempt)))
+        results += [RefResult(run.id, r.test_id, r.attempt, r.status, r.duration_ms)
+                    for r in parsed]  # fmt: skip
+    return runs, results
+
+
+def stored_stats(session: Session) -> dict[str, dict[str, Any]]:
+    session.expire_all()
+    rows = session.scalars(select(TestStats).order_by(TestStats.test_id)).all()
+    return {
+        row.test_id: {
+            "runs": row.runs,
+            "failures": row.failures,
+            "last_failed_at": row.last_failed_at,
+            "flaky_score": pytest.approx(row.flaky_score),
+            "avg_duration_ms": None if row.avg_duration_ms is None
+            else pytest.approx(row.avg_duration_ms),
+            "broken_on_main_since_sha": row.broken_on_main_since_sha,
+            "broken_on_main_variants": row.broken_on_main_variants,
+            "last_seen_at": row.last_seen_at,
+            "last_seen_run_id": row.last_seen_run_id,
+        }
+        for row in rows
+    }  # fmt: skip
+
+
+@pytest.mark.parametrize("seed", range(6))
+@pytest.mark.parametrize("batch_rows", [1, 300, 750_000])  # 1 test a batch, ~5, all
+def test_repo_rollup_matches_the_definitions(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch, seed: int, batch_rows: int
+) -> None:
+    runs, results = random_history(db_session, seed)
+    monkeypatch.setattr(history, "BATCH_ROWS", batch_rows)
+
+    updated = history.recompute_repo_stats(db_session, repo_id(db_session), 90)
+
+    expected = reference_stats(runs, results)
+    assert updated == len(expected)
+    assert stored_stats(db_session) == expected
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_run_rollup_matches_the_definitions(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch, seed: int
+) -> None:
+    runs, results = random_history(db_session, seed)
+    monkeypatch.setattr(history, "BATCH_ROWS", 200)  # a few tests a batch
+    # A final run with every test recomputes all of them through the per-run rollup.
+    tests = sorted({r.test_id for r in results})
+    last = ingest(db_session, commit=99, hour=200 * DAY, tests=dict.fromkeys(tests, F),
+                  ci_run_id="last")  # fmt: skip
+    runs.append(RefRun(last.id, sha(99), True, None, at(200 * DAY), ("last", 1)))
+    results += [RefResult(last.id, t, 1, F, 10) for t in tests]
+
+    assert stored_stats(db_session) == reference_stats(runs, results)
+
+
+def repo_id(session: Session) -> int:
+    return int(session.scalars(text("SELECT id FROM repos WHERE name = :n"), {"n": REPO}).one())
 
 
 # --- tests table: keys and file paths -----------------------------------------------------
