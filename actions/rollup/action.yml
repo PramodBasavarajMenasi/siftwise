@@ -1,0 +1,32 @@
+name: siftwise rollup
+description: >-
+  Update siftwise's test stats once after a matrix whose legs recorded with a variant (deferred
+  rollup). Run it in a job with needs: on every leg and if: always(). Never fails the job.
+inputs:
+  server-url:
+    description: siftwise server URL (e.g. secrets.SIFTWISE_URL).
+    required: true
+  token:
+    description: siftwise API token (e.g. secrets.SIFTWISE_TOKEN). Empty means skip, with a warning.
+    required: false
+    default: ""
+  repo:
+    description: Repository name in siftwise.
+    required: false
+    default: ${{ github.repository }}
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: false
+    - name: Install siftwise
+      shell: bash
+      run: uv tool install --quiet --force --python 3.12 "$GITHUB_ACTION_PATH/../.."
+    - name: Update test stats
+      shell: bash
+      env:
+        SIFTWISE_SERVER: ${{ inputs.server-url }}
+        SIFTWISE_API_TOKEN: ${{ inputs.token }}
+        SIFTWISE_REPO: ${{ inputs.repo }}
+      run: '"$(uv tool dir --bin)/siftwise" gha rollup'

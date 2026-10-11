@@ -129,6 +129,7 @@ def router() -> Iterator[respx.MockRouter]:
         mock.get(f"{GH}/repos/{REPO}").respond(json={"default_branch": "main"})
         # By default siftwise has none of the runs; tests override router["lookup"].
         mock.get(f"{SIFTWISE}/runs/lookup", name="lookup").respond(404)
+        mock.get(f"{SIFTWISE}/runs/variants", name="variants").respond(json={"variants": []})
         yield mock
 
 
@@ -310,6 +311,7 @@ def test_rerun_of_full_backfill_downloads_nothing(
         f"/repos/{REPO}",
         f"/repos/{REPO}/actions/runs",
         *(f"/repos/{REPO}/actions/runs/{run_id}/artifacts" for run_id in (1, 2, 3)),
+        "/runs/variants",
         "/runs/lookup",
     }
 
@@ -492,6 +494,48 @@ def test_rerun_uploads_only_the_missing_variant(router: respx.MockRouter, clock:
     assert counts(summary) == {"skipped": 1, "new": 1}
     assert not linux.called
     assert parse_upload(siftwise.calls.last.request)[0]["variant"] == "3.12-macos-latest"
+
+
+def test_partial_backfill_resumes_when_only_its_own_variants_are_stored(
+    router: respx.MockRouter, clock: FakeClock
+) -> None:
+    # An earlier backfill stored the Linux leg and stopped: the stored variant is one of
+    # backfill's own names, so the run isn't someone else's and the macOS leg is uploaded.
+    mock_runs(router, gh_run(1))
+    mock_artifacts(router, 1, artifact(10, "3.12-ubuntu-latest-pytest-junit-xml"),
+                   artifact(11, "3.12-macos-latest-pytest-junit-xml"))  # fmt: skip
+    mock_download(router, 11, make_zip({"mac.xml": GO_XML}))
+    mock_changed_files(router, [])
+    router["variants"].respond(json={"variants": ["3.12-ubuntu-latest"]})
+    router["lookup"].mock(side_effect=lookup_finds(1, variants={"3.12-ubuntu-latest"}))
+    siftwise = mock_siftwise(router, 201)
+
+    summary, _ = run_backfill(clock, pattern=MATRIX)
+
+    assert counts(summary) == {"skipped": 1, "new": 1}
+    assert parse_upload(siftwise.calls.last.request)[0]["variant"] == "3.12-macos-latest"
+
+
+@pytest.mark.parametrize("stored", [["ubuntu-py3.12"], [None]])
+def test_run_recorded_by_another_uploader_is_skipped_whole(
+    router: respx.MockRouter, clock: FakeClock, stored: list[str | None]
+) -> None:
+    # The GitHub Action recorded this CI run under its own variant names (or with no variant,
+    # for a single job). Backfill's artifact-derived names differ, so per-variant lookups would
+    # miss and every result would be stored twice.
+    mock_runs(router, gh_run(1))
+    mock_artifacts(router, 1, artifact(10, "3.12-ubuntu-latest-pytest-junit-xml"))
+    download = mock_download(router, 10, make_zip({"linux.xml": PYTEST_XML}))
+    router["variants"].respond(json={"variants": stored})
+    siftwise = mock_siftwise(router, 201)
+
+    summary, lines = run_backfill(clock, pattern=MATRIX)
+
+    assert counts(summary) == {"skipped": 1}
+    assert not download.called and not siftwise.called
+    assert repr(stored[0]) in lines[-1]
+    variants = router["variants"].calls.last.request
+    assert dict(variants.url.params) == {"repo": REPO, "ci_run_id": "1", "run_attempt": "1"}
 
 
 @pytest.mark.parametrize(

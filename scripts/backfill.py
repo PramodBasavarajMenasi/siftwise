@@ -387,6 +387,16 @@ class SiftwiseClient:
         found: Json = response.json()
         return found
 
+    def stored_variants(self, repo: str, ci_run_id: str, run_attempt: int) -> list[str | None]:
+        """Variants siftwise already has for this CI run attempt (None = no variant)."""
+        response = self._http.get(
+            "/runs/variants",
+            params={"repo": repo, "ci_run_id": ci_run_id, "run_attempt": run_attempt},
+        )
+        response.raise_for_status()
+        variants: list[str | None] = response.json()["variants"]
+        return variants
+
     def upload(self, files: list[tuple[str, bytes]], metadata: Json) -> httpx.Response:
         return self._http.post(
             "/runs",
@@ -517,6 +527,16 @@ def backfill_run(
         return [(None, Outcome.NO_ARTIFACTS, f"no artifact matches {pattern!r}")]
 
     variants = artifact_variants([a["name"] for a in artifacts], pattern)
+    # The GitHub Action records a CI run under variant names from its own input, which differ
+    # from backfill's artifact-derived names. A stored variant backfill wouldn't produce means
+    # someone else recorded this run: uploading it again would count every result twice. A
+    # stored variant of backfill's own (a partial earlier backfill) only skips that variant.
+    ours = set(variants.values())
+    foreign = [
+        v for v in siftwise.stored_variants(repo, str(run["id"]), _attempt(run)) if v not in ours
+    ]
+    if foreign:
+        return [(None, Outcome.SKIPPED, f"already recorded under variant {foreign[0]!r}")]
     diff: list[tuple[list[str], bool]] = []  # fetched once, only if something is uploaded
 
     def changed_files() -> tuple[list[str], bool]:

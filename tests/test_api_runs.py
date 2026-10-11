@@ -528,3 +528,23 @@ def test_oversized_chunked_upload_without_content_length_returns_413(
     assert response.status_code == 413
     assert response.json() == {"detail": f"request body exceeds {MAX_UPLOAD} bytes"}
     assert count(db_session, Run) == 0
+
+
+def test_run_variants_lists_every_stored_variant(client: TestClient) -> None:
+    for variant in ("macos", "linux"):
+        assert post_run(client, [fixture("go.xml")], metadata(variant=variant)).status_code == 201
+    other = metadata(ci_run_id="9002")
+    assert post_run(client, [fixture("go.xml")], other).status_code == 201
+
+    def variants(ci_run_id: str) -> Any:
+        response = client.get(
+            "/runs/variants",
+            params={"repo": "acme/shop", "ci_run_id": ci_run_id, "run_attempt": 1},
+            headers=AUTH,
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["variants"]
+
+    assert variants("9001") == ["linux", "macos"]
+    assert variants("9002") == [None]  # uploaded without a variant
+    assert variants("404") == []

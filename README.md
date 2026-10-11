@@ -30,9 +30,9 @@
 
 <p align="center"><sub>If siftwise looks useful, a ⭐ helps others find it.</sub></p>
 
-> **Alpha, early development.** The server, CLI and test selection work, and have been evaluated
-> on two real repos. The GitHub Action, MCP server and failure triage don't exist yet. APIs and
-> the database schema may change.
+> **Alpha, early development.** The server, CLI, test selection and GitHub Action work, and
+> selection has been evaluated on two real repos. The MCP server and failure triage don't
+> exist yet. APIs and the database schema may change.
 
 ## The problem
 
@@ -123,20 +123,145 @@ error, 3 full suite needed but no command known. In CI, check out with `fetch-de
 
 ### Record results from CI
 
-Until the GitHub Action exists, upload JUnit XML after each test run:
+On GitHub, use the [GitHub Action](#github-action). Elsewhere, upload JUnit XML after each test
+run with the CLI:
 
 ```sh
-cat > meta.json <<EOF
-{"repo": "acme/shop", "commit_sha": "$(git rev-parse HEAD)", "branch": "feature-x",
- "is_main": false, "ci_run_id": "1234", "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
- "changed_files": ["src/cart.py"]}
-EOF
-curl -X POST http://localhost:8000/runs -H "Authorization: Bearer $SIFTWISE_API_TOKEN" \
-    -F files=@junit.xml -F "metadata=<meta.json"
+siftwise record junit.xml --repo acme/shop --branch feature-x --ci-run-id 1234 \
+    --base origin/main --started-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ```
 
 Uploads are idempotent per `(repo, ci_run_id, run_attempt, variant)`: a re-upload returns 200
-and stores nothing new. Set `variant` (e.g. `ubuntu-py3.12`) for each matrix leg.
+and stores nothing new. For a matrix, give each leg a `--variant` (e.g. `ubuntu-py3.12`) and
+`--defer-rollup`, then run `siftwise rollup --repo acme/shop` once after all legs.
+
+## GitHub Action
+
+Three composite actions in this repo. They install the CLI from the action's own checkout
+(siftwise isn't on PyPI yet), and they never block CI: if the server is unreachable, times out
+or returns an error, `select` outputs `mode: full` and `record`/`rollup` log a warning.
+
+| Action | When | What |
+|---|---|---|
+| `actions/select` | before tests | picks tests; outputs `mode`, `command`, `selected`, `total`, `reason`, `junit-dir`; posts one sticky PR comment and a job summary |
+| `actions/record` | after tests, `if: always()` | uploads JUnit with the run ID and attempt, the PR head commit (not the merge commit), branch, variant, start time and changed files |
+| `actions/rollup` | once after a matrix | updates test stats once for all legs (`POST /repos/{repo}/rollup`) |
+
+**Setup:**
+- **Secrets:** add `SIFTWISE_URL` (your server) and `SIFTWISE_TOKEN` (its `SIFTWISE_API_TOKEN`).
+- **Permissions:** `contents: read`, `actions: read` (the run's start time) and
+  `pull-requests: write` (the comment).
+- **Full history:** check out with `fetch-depth: 0`. `select` fails with a clear message on a
+  shallow clone, the only way it fails.
+
+The examples use `@main` until a `v0` tag exists.
+
+**Never use this action with `pull_request_target`.** That event runs with secrets on code
+from the PR, so a fork could read your siftwise token. Use `pull_request`: on fork PRs, secrets
+are empty, so `select` runs the full suite and skips the comment (the job summary says why),
+and `record` skips the upload.
+
+### Single job
+
+```yaml
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt   # your install step
+
+      - id: siftwise
+        uses: PramodBasavarajMenasi/siftwise/actions/select@main
+        with:
+          server-url: ${{ secrets.SIFTWISE_URL }}
+          token: ${{ secrets.SIFTWISE_TOKEN }}
+
+      - name: Tests
+        env:
+          MODE: ${{ steps.siftwise.outputs.mode }}
+          COMMAND: ${{ steps.siftwise.outputs.command }}
+          JUNIT_DIR: ${{ steps.siftwise.outputs.junit-dir }}
+        run: |
+          if [ "$MODE" = selective ]; then
+            # Shell-quoted by siftwise; each pytest command writes its own report to JUNIT_DIR.
+            if [ -n "$COMMAND" ]; then eval "$COMMAND"; else echo "No tests affected."; fi
+          else
+            pytest --junitxml="$JUNIT_DIR/full.xml"   # your normal full suite
+          fi
+
+      - if: always()
+        uses: PramodBasavarajMenasi/siftwise/actions/record@main
+        with:
+          server-url: ${{ secrets.SIFTWISE_URL }}
+          token: ${{ secrets.SIFTWISE_TOKEN }}
+```
+
+Pass the command through `env:` as above, never as `${{ }}` inside `run:`, so the shell sees
+it once, quoted. `record` uploads `**/junit*.xml` plus everything in the select step's
+`junit-dir` (its `junit` input takes other globs). For Go, write JUnit with
+`gotestsum --junitfile` or go-junit-report.
+
+### Matrix
+
+Each leg records its own `variant`. Each upload then skips the per-upload stats rollup, which
+costs about as much as a full rollup on a large repo, and one `rollup` job runs after every leg:
+
+```yaml
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # ... set up Python and install, as above ...
+      - id: siftwise
+        uses: PramodBasavarajMenasi/siftwise/actions/select@main
+        with:
+          server-url: ${{ secrets.SIFTWISE_URL }}
+          token: ${{ secrets.SIFTWISE_TOKEN }}
+          comment: ${{ strategy.job-index == 0 }}   # one leg comments, or they race
+      # ... the Tests step, as above ...
+      - if: always()
+        uses: PramodBasavarajMenasi/siftwise/actions/record@main
+        with:
+          server-url: ${{ secrets.SIFTWISE_URL }}
+          token: ${{ secrets.SIFTWISE_TOKEN }}
+          variant: ${{ matrix.os }}-py${{ matrix.python }}
+
+  siftwise-rollup:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: PramodBasavarajMenasi/siftwise/actions/rollup@main
+        with:
+          server-url: ${{ secrets.SIFTWISE_URL }}
+          token: ${{ secrets.SIFTWISE_TOKEN }}
+```
+
+`.github/workflows/action-e2e.yml` runs all three actions against a real server on every push
+and PR of this repo.
+
 
 ## Features
 
@@ -147,7 +272,7 @@ and stores nothing new. Set `variant` (e.g. `ubuntu-py3.12`) for each matrix leg
 - ✅ Go import graph (`go list`) and static Python import graph
 - ✅ Safe full-suite fallbacks, `.siftwise.toml` for dependencies no graph can see
 - ✅ Self-hosted: one FastAPI service and Postgres, stateless workers
-- 🔜 GitHub Action (record + select) and PR summary comment
+- ✅ GitHub Action (select, record, rollup) with a sticky PR comment; fails open
 - 🔜 MCP server, so coding agents can ask which tests to run and why a test failed
 - 🔜 Failure triage: new regression vs pre-existing on main vs flaky
 
@@ -218,8 +343,7 @@ on a backfilled repo with `uv run python -m scripts.eval.run_eval --repo owner/n
 
 ## Roadmap
 
-- **Next:** smaller storage, faster rollups, a monorepo eval, the GitHub Action with a PR
-  summary comment.
+- **Next:** a monorepo eval and a `v0` tag for the GitHub Action.
 - **Then:** flaky and pre-existing failure triage, and an MCP server for coding agents.
 - **Later:** a recall harness, docs and launch.
 

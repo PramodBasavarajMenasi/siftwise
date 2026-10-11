@@ -68,13 +68,12 @@ from siftwise.core.selector import (
     KnownTest,
     Mode,
     RepoHistory,
-    Runner,
     Selection,
     SelectorConfig,
+    WouldRun,
     build_file_scope,
     is_build_file,
     is_ignorable,
-    pytest_file,
     select_tests,
 )
 from siftwise.db import get_sessionmaker
@@ -579,34 +578,6 @@ class GraphProvider:
 
 
 # --- evaluation ---------------------------------------------------------------------------
-
-
-class WouldRun:
-    """Whether a selection's commands would execute a test (precomputed for many lookups)."""
-
-    def __init__(self, selection: Selection) -> None:
-        self.full = selection.mode is Mode.FULL
-        self.selected = {t.test_id for t in selection.tests}
-        self.go_packages = set(selection.go_packages_run_whole)
-        self.py_files = set(selection.python_files_run_whole)
-        # go test -run '^(TestX)$' runs TestX with all of its subtests.
-        self.go_top_level = {
-            (package, name.split("/", 1)[0])
-            for t in selection.tests
-            if t.runner is Runner.GO
-            for package, _, name in [t.test_id.partition("::")]
-        }
-
-    def __call__(self, test_id: str) -> bool:
-        if self.full or test_id in self.selected:
-            return True
-        package, _, name = test_id.partition("::")
-        if package in self.go_packages:
-            return True  # `go test ./pkg` with no -run: every test in the package, new ones too
-        if (package, name.split("/", 1)[0]) in self.go_top_level:
-            return True
-        # `pytest path/test_x.py`: every test in the file, new ones too.
-        return bool(self.py_files) and pytest_file(test_id) in self.py_files
 
 
 def would_run(selection: Selection, test_id: str) -> bool:

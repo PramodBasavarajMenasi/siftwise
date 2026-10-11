@@ -1,0 +1,70 @@
+name: siftwise record
+description: >-
+  Upload the run's JUnit reports to siftwise (use with if: always()). Never fails the job:
+  problems are warnings.
+inputs:
+  server-url:
+    description: siftwise server URL (e.g. secrets.SIFTWISE_URL).
+    required: true
+  token:
+    description: siftwise API token (e.g. secrets.SIFTWISE_TOKEN). Empty means skip, with a warning.
+    required: false
+    default: ""
+  repo:
+    description: Repository name in siftwise.
+    required: false
+    default: ${{ github.repository }}
+  base-ref:
+    description: Diff base for the recorded changed files; same default as actions/select.
+    required: false
+    default: ""
+  junit:
+    description: >-
+      Glob(s) of JUnit XML files, whitespace-separated. The select step's junit-dir is always
+      included.
+    required: false
+    default: "**/junit*.xml"
+  junit-dir:
+    description: >-
+      Extra directory of JUnit reports (default: the one actions/select used).
+    required: false
+    default: ""
+  variant:
+    description: >-
+      Matrix leg, e.g. "<os>-py<python>" from the matrix. Each leg is its own run; set
+      it in a matrix, and add an actions/rollup job after the matrix.
+    required: false
+    default: ""
+  defer-rollup:
+    description: >-
+      'auto' (defer when variant is set), 'true' or 'false'. Deferred stats are updated by
+      actions/rollup.
+    required: false
+    default: auto
+  github-token:
+    description: Reads the run's start time from the Actions API (needs actions read).
+    required: false
+    default: ${{ github.token }}
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: false
+    - name: Install siftwise
+      shell: bash
+      run: uv tool install --quiet --force --python 3.12 "$GITHUB_ACTION_PATH/../.."
+    - name: Record results
+      shell: bash
+      env:
+        SIFTWISE_SERVER: ${{ inputs.server-url }}
+        SIFTWISE_API_TOKEN: ${{ inputs.token }}
+        SIFTWISE_REPO: ${{ inputs.repo }}
+        SIFTWISE_BASE_REF: ${{ inputs.base-ref }}
+        SIFTWISE_JUNIT_GLOB: ${{ inputs.junit }}
+        # Falls back to the directory the select step exported to the job's environment.
+        SIFTWISE_JUNIT_DIR: ${{ inputs.junit-dir || env.SIFTWISE_JUNIT_DIR }}
+        SIFTWISE_VARIANT: ${{ inputs.variant }}
+        SIFTWISE_DEFER_ROLLUP: ${{ inputs.defer-rollup }}
+        SIFTWISE_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: '"$(uv tool dir --bin)/siftwise" gha record'

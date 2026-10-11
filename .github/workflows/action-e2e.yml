@@ -1,0 +1,195 @@
+name: Action e2e
+
+# Dogfoods actions/select, record and rollup on siftwise itself, against a real server: an
+# empty history (full suite), recording this run's JUnit, the rollup, a second selection that
+# sees the history, and the fail-open paths (server down, no token, shallow clone).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  actions: read          # record reads the run's start time
+  pull-requests: write   # select's sticky PR comment
+
+concurrency:
+  group: action-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SERVER: http://localhost:8000
+  TOKEN: e2e-token
+  DOWN: http://127.0.0.1:9   # nothing listens here: the fail-open checks
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # The official image from AWS's public mirror (Docker Hub rate-limits shared runners).
+        image: public.ecr.aws/docker/library/postgres:16-alpine
+        env:
+          POSTGRES_USER: siftwise
+          POSTGRES_PASSWORD: siftwise
+          POSTGRES_DB: siftwise
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U siftwise -d siftwise"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      SIFTWISE_API_TOKEN: e2e-token   # the server's token
+      SIFTWISE_DATABASE_URL: postgresql+psycopg://siftwise:siftwise@localhost:5432/siftwise
+      # The repo's own test suite uses a separate database on the same server.
+      SIFTWISE_TEST_DATABASE_URL: postgresql+psycopg://siftwise:siftwise@localhost:5432/siftwise_test
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # select diffs against the PR base
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Start a siftwise server
+        run: |
+          PGPASSWORD=siftwise psql -h localhost -U siftwise -d siftwise -c 'CREATE DATABASE siftwise_test'
+          uv run alembic upgrade head
+          nohup uv run uvicorn siftwise.api.main:app --port 8000 > "$RUNNER_TEMP/server.log" 2>&1 &
+          for _ in $(seq 60); do curl -sf "$SERVER/healthz" && exit 0; sleep 1; done
+          cat "$RUNNER_TEMP/server.log"
+          exit 1
+
+      - name: Select (empty history)
+        id: first
+        uses: ./actions/select
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          comment: false
+
+      - name: Check the first selection
+        env:
+          MODE: ${{ steps.first.outputs.mode }}
+          REASON: ${{ steps.first.outputs.reason }}
+        run: |
+          test "$MODE" = full
+          test "$REASON" = "no test history for this repo yet"
+
+      - name: Tests (full suite, JUnit into the select step's directory)
+        env:
+          JUNIT_DIR: ${{ steps.first.outputs.junit-dir }}
+        run: uv run pytest --junitxml="$JUNIT_DIR/full.xml"
+
+      - name: "Record (a matrix-style leg: deferred rollup)"
+        if: always()
+        uses: ./actions/record
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          variant: e2e
+
+      - name: Rollup
+        if: always()
+        uses: ./actions/rollup
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+
+      - name: Check the recorded run
+        run: |
+          url="$SERVER/runs/lookup?repo=$GITHUB_REPOSITORY&ci_run_id=$GITHUB_RUN_ID&run_attempt=$GITHUB_RUN_ATTEMPT&variant=e2e"
+          run=$(curl -sf -H "Authorization: Bearer $TOKEN" "$url")
+          echo "$run"
+          # The PR's head commit, not the merge commit actions/checkout tested.
+          echo "$run" | jq -e '.commit_sha == env.HEAD_SHA'
+
+      - name: Select (with history; updates the PR comment)
+        id: second
+        uses: ./actions/select
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+
+      - name: Check the second selection
+        env:
+          MODE: ${{ steps.second.outputs.mode }}
+          TOTAL: ${{ steps.second.outputs.total }}
+          SELECTED: ${{ steps.second.outputs.selected }}
+          COMMAND: ${{ steps.second.outputs.command }}
+        run: |
+          echo "mode=$MODE selected=$SELECTED total=$TOTAL"
+          test "$TOTAL" -gt 0
+          case "$MODE" in
+            full) test -z "$COMMAND" || [[ "$COMMAND" == pytest* ]] ;;
+            selective) test -z "$COMMAND" || [[ "$COMMAND" == *pytest* ]] ;;
+            *) exit 1 ;;
+          esac
+
+      - name: Fail open - select with the server down
+        id: down
+        uses: ./actions/select
+        with:
+          server-url: ${{ env.DOWN }}
+          token: ${{ env.TOKEN }}
+          comment: false
+
+      - name: Fail open - select without a token (as on a fork PR)
+        id: notoken
+        uses: ./actions/select
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ""
+          comment: false
+
+      - name: Fail open - record and rollup with the server down
+        uses: ./actions/record
+        with:
+          server-url: ${{ env.DOWN }}
+          token: ${{ env.TOKEN }}
+
+      - uses: ./actions/rollup
+        with:
+          server-url: ${{ env.DOWN }}
+          token: ${{ env.TOKEN }}
+
+      - name: Check the fail-open selections
+        env:
+          DOWN_MODE: ${{ steps.down.outputs.mode }}
+          DOWN_COMMAND: ${{ steps.down.outputs.command }}
+          NOTOKEN_MODE: ${{ steps.notoken.outputs.mode }}
+        run: |
+          test "$DOWN_MODE" = full
+          test -z "$DOWN_COMMAND"  # the workflow runs its own full-suite command
+          test "$NOTOKEN_MODE" = full
+
+      - name: Server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/server.log"
+
+  shallow:
+    # select can't diff a shallow clone: the one deliberate failure, with a clear message.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4  # fetch-depth 1
+      - name: Select on a shallow clone
+        id: select
+        continue-on-error: true
+        uses: ./actions/select
+        with:
+          server-url: http://127.0.0.1:9
+          comment: false
+      - name: Check that it failed
+        env:
+          OUTCOME: ${{ steps.select.outcome }}
+        run: test "$OUTCOME" = failure

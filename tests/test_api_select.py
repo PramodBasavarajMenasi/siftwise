@@ -243,3 +243,14 @@ def test_invalid_body_returns_422(client: TestClient, body: dict[str, Any]) -> N
 def test_select_is_post_only(client: TestClient) -> None:
     response = client.get("/select", params={"repo": REPO}, headers=AUTH)
     assert response.status_code == 405
+
+
+@pytest.mark.usefixtures("seeded")
+def test_estimated_time_and_junit_dir(client: TestClient) -> None:
+    body = post_select(
+        client, changed_files=["src/shop/cart.py", "cart/total.go"], junit_dir="reports"
+    ).json()
+
+    # 1 ms each; the Go subtest's time is inside TestAdd's. test_db::test_query doesn't run.
+    assert body["estimated_ms"] == {"total": 4.0, "would_run": 3.0}
+    assert body["commands"][0].startswith("pytest --junitxml=reports/siftwise-1.xml ")

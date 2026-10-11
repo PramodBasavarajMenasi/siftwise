@@ -10,6 +10,7 @@ import httpx
 import typer
 
 from siftwise import __version__
+from siftwise.cli import gha
 from siftwise.cli.gograph import build_graph, run_go_list
 from siftwise.cli.pygraph import build_py_graph
 from siftwise.cli.repoconfig import (
@@ -21,11 +22,20 @@ from siftwise.cli.repoconfig import (
 )
 
 app = typer.Typer(help="Siftwise: test impact analysis for CI.", no_args_is_help=True)
+app.add_typer(gha.app, name="gha")
 
 # `siftwise select` exit codes, besides 0 (success, including "no tests affected").
 EXIT_API_ERROR = 1
 EXIT_USAGE = 2
 EXIT_FULL_SUITE_NO_COMMAND = 3
+
+
+class SiftwiseError(Exception):
+    """The server couldn't be reached, timed out, or answered with an error."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status  # the HTTP status, if the server answered
 
 
 @app.callback()
@@ -66,52 +76,18 @@ def select_command(
     to stderr. Needs SIFTWISE_API_TOKEN. Exit codes: 0 ok (stdout is empty if no tests are
     affected), 1 API error, 2 usage error, 3 full suite needed but no command is known.
     """
-    token = os.environ.get("SIFTWISE_API_TOKEN")
-    if not token:
-        _err("error: set SIFTWISE_API_TOKEN")
-        raise typer.Exit(EXIT_USAGE)
-
-    root = git_toplevel() or Path.cwd()
-    config_path = root / FILE_NAME
+    token = _token()
     try:
-        config = load_repo_config(config_path) if config_path.is_file() else RepoConfig()
+        body = selection_request(repo, base, head, go_list=go_list, py_imports=py_imports)
     except RepoConfigError as exc:
         _err(f"error: {exc}")
         raise typer.Exit(EXIT_USAGE) from exc
-
-    diff = git_diff(base, head)
-    changed = diff[0] if diff else None
-    body: dict[str, Any] = {
-        "repo": repo,
-        "changed_files": changed or [],
-        "changed_files_known": changed is not None,
-        "depends": [{"tests": r.tests, "on": list(r.on)} for r in config.depends],
-        "always_run": list(config.always_run),
-    }
-    if diff and diff[1]:
-        body["deleted_files"] = diff[1]
-    go_module = read_go_module(root)
-    if go_module:
-        body["go_module"] = go_module
-        if go_list and changed:
-            body["affected_packages"] = go_dependents(root, changed)
-    if py_imports and changed and any(p.endswith(".py") for p in changed):
-        body["affected_files"] = python_dependents(root, changed)
     try:
-        response = httpx.post(
-            f"{server.rstrip('/')}/select",
-            json=body,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=60,
-        )
-    except httpx.HTTPError as exc:
-        _err(f"error: could not reach siftwise at {server}: {exc}")
+        result = post_json(server, token, "/select", body)
+    except SiftwiseError as exc:
+        _err(f"error: {exc}")
         raise typer.Exit(EXIT_API_ERROR) from exc
-    if response.status_code != httpx.codes.OK:
-        _err(f"error: siftwise returned {response.status_code}: {_detail(response)}")
-        raise typer.Exit(EXIT_API_ERROR)
 
-    result: dict[str, Any] = response.json()
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -126,6 +102,190 @@ def select_command(
         # Never let "run nothing" be mistaken for "run everything".
         _err("error: the full suite is needed, but siftwise knows no command for this repo's tests")
         raise typer.Exit(EXIT_FULL_SUITE_NO_COMMAND)
+
+
+@app.command("record")
+def record_command(
+    junit: Annotated[list[Path], typer.Argument(help="JUnit XML files to upload.")],
+    repo: Annotated[str, typer.Option(help="Repository name in siftwise, e.g. acme/shop.")],
+    branch: Annotated[str, typer.Option(help="Branch the run tested.")],
+    commit: Annotated[str | None, typer.Option(help="Full commit SHA (default: HEAD).")] = None,
+    main: Annotated[bool, typer.Option("--main", help="The run is on the main branch.")] = False,
+    ci_run_id: Annotated[str | None, typer.Option(help="CI run ID (makes re-uploads no-ops).")] = (
+        None
+    ),
+    run_attempt: Annotated[int, typer.Option(min=1, help="CI run attempt.")] = 1,
+    variant: Annotated[str | None, typer.Option(help="Matrix leg, e.g. ubuntu-py3.12.")] = None,
+    started_at: Annotated[str | None, typer.Option(help="ISO 8601 run start time.")] = None,
+    base: Annotated[
+        str | None, typer.Option(help="Base ref: changed files are BASE...HEAD (else unknown).")
+    ] = None,
+    head: Annotated[str, typer.Option(help="Head ref for the diff.")] = "HEAD",
+    defer_rollup: Annotated[
+        bool, typer.Option(help="Skip the stats rollup; run `siftwise rollup` after all legs.")
+    ] = False,
+    server: Annotated[str, typer.Option(help="siftwise server URL.")] = "http://localhost:8000",
+) -> None:
+    """Upload a CI run's JUnit XML. Exit codes: 0 ok, 1 API error, 2 usage error."""
+    token = _token()
+    missing = [str(path) for path in junit if not path.is_file()]
+    if missing:
+        _err(f"error: not a file: {', '.join(missing)}")
+        raise typer.Exit(EXIT_USAGE)
+    diff = git_diff(base, head) if base else None
+    metadata: dict[str, Any] = {
+        "repo": repo,
+        "commit_sha": commit or git_rev_parse("HEAD"),
+        "branch": branch,
+        "is_main": main,
+        "ci_run_id": ci_run_id,
+        "run_attempt": run_attempt,
+        "variant": variant,
+        "started_at": started_at,
+        "changed_files": diff[0] if diff else [],
+        "changed_files_known": diff is not None,
+    }
+    try:
+        result = upload_run(server, token, junit, metadata, defer_rollup=defer_rollup)
+    except SiftwiseError as exc:
+        _err(f"error: {exc}")
+        raise typer.Exit(EXIT_API_ERROR) from exc
+    _err(f"siftwise: run {result['run_id']} {'stored' if result['created'] else 'already stored'}"
+         f" ({result['counts']['total']} results)")  # fmt: skip
+
+
+@app.command("rollup")
+def rollup_command(
+    repo: Annotated[str, typer.Option(help="Repository name in siftwise, e.g. acme/shop.")],
+    server: Annotated[str, typer.Option(help="siftwise server URL.")] = "http://localhost:8000",
+) -> None:
+    """Recompute a repo's test stats, after uploads with --defer-rollup."""
+    try:
+        result = rollup_repo(server, _token(), repo)
+    except SiftwiseError as exc:
+        _err(f"error: {exc}")
+        raise typer.Exit(EXIT_API_ERROR) from exc
+    _err(f"siftwise: {result['tests_updated']} tests updated in {result['seconds']}s")
+
+
+# --- reusable steps (also used by siftwise.cli.gha) ----------------------------------------
+
+
+def selection_request(
+    repo: str,
+    base: str | None,
+    head: str,
+    *,
+    go_list: bool = True,
+    py_imports: bool = True,
+    junit_dir: str | None = None,
+) -> dict[str, Any]:
+    """The ``POST /select`` body for BASE...HEAD in the current checkout. ``base`` None (or a
+    failing git diff) means the changed files are unknown, so the server picks the full suite.
+
+    Raises RepoConfigError for an invalid .siftwise.toml.
+    """
+    root = git_toplevel() or Path.cwd()
+    config_path = root / FILE_NAME
+    config = load_repo_config(config_path) if config_path.is_file() else RepoConfig()
+
+    diff = git_diff(base, head) if base else None
+    changed = diff[0] if diff else None
+    body: dict[str, Any] = {
+        "repo": repo,
+        "changed_files": changed or [],
+        "changed_files_known": changed is not None,
+        "depends": [{"tests": r.tests, "on": list(r.on)} for r in config.depends],
+        "always_run": list(config.always_run),
+    }
+    if junit_dir:
+        body["junit_dir"] = junit_dir
+    if diff and diff[1]:
+        body["deleted_files"] = diff[1]
+    go_module = read_go_module(root)
+    if go_module:
+        body["go_module"] = go_module
+        if go_list and changed:
+            body["affected_packages"] = go_dependents(root, changed)
+    if py_imports and changed and any(p.endswith(".py") for p in changed):
+        body["affected_files"] = python_dependents(root, changed)
+    return body
+
+
+def post_json(
+    server: str, token: str, path: str, body: dict[str, Any] | None, timeout: float = 60
+) -> dict[str, Any]:
+    """POST to the siftwise API. Raises SiftwiseError on any transport or HTTP error."""
+    try:
+        response = httpx.post(
+            f"{server.rstrip('/')}{path}",
+            json=body,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=timeout,
+        )
+    except httpx.HTTPError as exc:
+        raise SiftwiseError(f"could not reach siftwise at {server}: {exc}") from exc
+    return _ok(response)
+
+
+def upload_run(
+    server: str,
+    token: str,
+    junit: list[Path],
+    metadata: dict[str, Any],
+    *,
+    defer_rollup: bool = False,
+    timeout: float = 300,
+) -> dict[str, Any]:
+    """``POST /runs`` with these JUnit files. Raises SiftwiseError."""
+    try:
+        response = httpx.post(
+            f"{server.rstrip('/')}/runs",
+            params={"defer_rollup": "true"} if defer_rollup else None,
+            files=[("files", (path.name, path.read_bytes(), "application/xml")) for path in junit],
+            data={"metadata": json.dumps(metadata)},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=timeout,
+        )
+    except httpx.HTTPError as exc:
+        raise SiftwiseError(f"could not reach siftwise at {server}: {exc}") from exc
+    return _ok(response)
+
+
+def rollup_repo(server: str, token: str, repo: str, timeout: float = 1800) -> dict[str, Any]:
+    """``POST /repos/{repo}/rollup``. Raises SiftwiseError."""
+    return post_json(server, token, f"/repos/{repo}/rollup", None, timeout=timeout)
+
+
+def _ok(response: httpx.Response) -> dict[str, Any]:
+    if not response.is_success:
+        raise SiftwiseError(
+            f"siftwise returned {response.status_code}: {_detail(response)}", response.status_code
+        )
+    result: dict[str, Any] = response.json()
+    return result
+
+
+def _token() -> str:
+    token = os.environ.get("SIFTWISE_API_TOKEN")
+    if not token:
+        _err("error: set SIFTWISE_API_TOKEN")
+        raise typer.Exit(EXIT_USAGE)
+    return token
+
+
+def git_rev_parse(ref: str) -> str:
+    """The full SHA of ``ref`` in the current checkout."""
+    proc = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if proc.returncode != 0:
+        _err(f"error: git rev-parse {ref} failed")
+        raise typer.Exit(EXIT_USAGE)
+    return proc.stdout.decode().strip()
 
 
 def git_toplevel() -> Path | None:

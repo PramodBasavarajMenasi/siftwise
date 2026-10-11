@@ -1,0 +1,82 @@
+name: siftwise select
+description: >-
+  Pick the tests a change needs from its test history. Falls back to the full suite whenever
+  unsure, including when siftwise is unreachable: it never blocks CI.
+inputs:
+  server-url:
+    description: siftwise server URL (e.g. secrets.SIFTWISE_URL).
+    required: true
+  token:
+    description: >-
+      siftwise API token (e.g. secrets.SIFTWISE_TOKEN). Empty on pull requests from forks,
+      which then run the full suite.
+    required: false
+    default: ""
+  repo:
+    description: Repository name in siftwise.
+    required: false
+    default: ${{ github.repository }}
+  base-ref:
+    description: >-
+      Diff base. Default: the PR's base commit; for pushes, the commit before the push.
+    required: false
+    default: ""
+  junit-dir:
+    description: >-
+      Directory for the JUnit reports of the selected pytest commands (default:
+      $RUNNER_TEMP/siftwise-junit). actions/record picks them up.
+    required: false
+    default: ""
+  comment:
+    description: >-
+      Post or update the sticky PR comment. In a matrix, enable it for one leg only (the
+      expression strategy.job-index == 0), or every leg races to post it.
+    required: false
+    default: "true"
+  github-token:
+    description: Token for the PR comment (needs pull-requests write).
+    required: false
+    default: ${{ github.token }}
+outputs:
+  mode:
+    description: "'selective' or 'full'. In full mode, run your normal full-suite command."
+    value: ${{ steps.select.outputs.mode }}
+  command:
+    description: >-
+      The test command (shell-quoted, for eval) when mode is selective; empty there means no
+      tests are affected.
+    value: ${{ steps.select.outputs.command }}
+  selected:
+    description: Number of known tests selected.
+    value: ${{ steps.select.outputs.selected }}
+  total:
+    description: Number of known tests.
+    value: ${{ steps.select.outputs.total }}
+  reason:
+    description: Why the full suite runs, or a summary of the selection.
+    value: ${{ steps.select.outputs.reason }}
+  junit-dir:
+    description: Where the selected pytest commands write their JUnit reports.
+    value: ${{ steps.select.outputs.junit-dir }}
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: false  # the cache key would come from the caller's repo, not this action
+    - name: Install siftwise
+      shell: bash
+      # siftwise isn't on PyPI yet: install the CLI from this action's own checkout.
+      run: uv tool install --quiet --force --python 3.12 "$GITHUB_ACTION_PATH/../.."
+    - id: select
+      name: Select tests
+      shell: bash
+      env:
+        SIFTWISE_SERVER: ${{ inputs.server-url }}
+        SIFTWISE_API_TOKEN: ${{ inputs.token }}
+        SIFTWISE_REPO: ${{ inputs.repo }}
+        SIFTWISE_BASE_REF: ${{ inputs.base-ref }}
+        SIFTWISE_JUNIT_DIR: ${{ inputs.junit-dir }}
+        SIFTWISE_COMMENT: ${{ inputs.comment }}
+        SIFTWISE_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: '"$(uv tool dir --bin)/siftwise" gha select'
