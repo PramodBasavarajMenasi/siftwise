@@ -7,6 +7,7 @@ import fnmatch
 import io
 import os
 import statistics
+import time
 import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -60,6 +61,11 @@ def paged(gh: httpx.Client, url: str, key: str | None, pages: int, **params: Any
     items: list[Json] = []
     for page in range(1, pages + 1):
         response = gh.get(url, params={**params, "per_page": 100, "page": page})
+        for wait in (2, 5):  # big repos' list endpoints 500 intermittently: retry before giving up
+            if response.status_code < 500:
+                break
+            time.sleep(wait)
+            response = gh.get(url, params={**params, "per_page": 100, "page": page})
         if response.status_code != httpx.codes.OK:
             break
         data = response.json()

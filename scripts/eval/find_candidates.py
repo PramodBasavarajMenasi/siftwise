@@ -5,6 +5,7 @@ Code-searches workflows that upload JUnit XML, then keeps repos that are active,
 samples one JUnit report and the failed runs among those artifacts.
 
     uv run python -m scripts.eval.find_candidates --language Python --out candidates.json
+    uv run python -m scripts.eval.find_candidates --language Go --min-packages 5  # monorepos
 
 Needs GITHUB_TOKEN (env or .env). Code search allows ~10 requests/minute; the whole pass
 takes several minutes. Follow up with ``scripts.eval.deep_check`` on the shortlist.
@@ -30,13 +31,28 @@ from scripts.eval._github import (
     since,
     ts,
 )
+from scripts.eval.deep_check import package_dirs
 
-QUERIES = (
-    'path:.github/workflows "--junitxml" "upload-artifact" language:YAML',
-    'path:.github/workflows "junit-xml" "pytest" "upload-artifact"',
-    'path:.github/workflows "--junit-xml" "upload-artifact"',
-    'path:.github/workflows "junitxml" "actions/upload-artifact@v4"',
-)
+# Code search queries for workflows that upload JUnit XML, per language. Each returns at most
+# 100 repos, so the monorepo-flavoured ones (per-package test jobs) widen the net for
+# --min-packages.
+QUERIES = {
+    "Python": (
+        'path:.github/workflows "--junitxml" "upload-artifact" language:YAML',
+        'path:.github/workflows "junit-xml" "pytest" "upload-artifact"',
+        'path:.github/workflows "--junit-xml" "upload-artifact"',
+        'path:.github/workflows "junitxml" "actions/upload-artifact@v4"',
+        'path:.github/workflows "--junitxml" "working-directory" "upload-artifact"',
+        'path:.github/workflows "--junitxml" "libs/" "upload-artifact"',
+        'path:.github/workflows "--junitxml" "packages/" "upload-artifact"',
+    ),
+    "Go": (
+        'path:.github/workflows "gotestsum" "--junitfile" "upload-artifact"',
+        'path:.github/workflows "go-junit-report" "upload-artifact"',
+        'path:.github/workflows "gotestsum" "junit" "upload-artifact" "matrix"',
+        'path:.github/workflows "--junitfile" "go.mod" "upload-artifact"',
+    ),
+}
 
 
 def search(gh: httpx.Client, query: str) -> list[str]:
@@ -118,11 +134,17 @@ def main(
     days: Annotated[int, typer.Option(help="Activity window.")] = 90,
     min_human_prs: Annotated[int, typer.Option(help="Non-bump human PRs in the window.")] = 15,
     min_tests: Annotated[int, typer.Option(help="Tests in one sampled JUnit report.")] = 100,
+    min_packages: Annotated[
+        int, typer.Option(help="Packages (dirs with go.mod/pyproject.toml/setup.py) at least.")
+    ] = 0,
+    query: Annotated[
+        list[str] | None, typer.Option(help="Search query (repeatable), instead of the defaults")
+    ] = None,
 ) -> None:
     gh = client(github_token())
     candidates: list[str] = []
-    for query in QUERIES:
-        candidates.extend(name for name in search(gh, query) if name not in candidates)
+    for query_text in query or QUERIES.get(language, QUERIES["Python"]):
+        candidates.extend(name for name in search(gh, query_text) if name not in candidates)
     typer.echo(f"{len(candidates)} repos from code search", err=True)
 
     results: list[Json] = []
@@ -134,6 +156,13 @@ def main(
         if meta.get("archived") or meta.get("fork") or meta.get("language") != language:
             continue
         if ts(meta["pushed_at"]) < since(days):
+            continue
+        tree = gh.get(f"/repos/{repo}/git/trees/{meta['default_branch']}", params={"recursive": 1})
+        packages = package_dirs(
+            e["path"] for e in (tree.json().get("tree", []) if tree.is_success else [])
+            if e["type"] == "blob"
+        )  # fmt: skip
+        if len(packages) < min_packages:
             continue
         artifacts_response = gh.get(f"/repos/{repo}/actions/artifacts", params={"per_page": 100})
         if artifacts_response.status_code != httpx.codes.OK:
@@ -152,6 +181,7 @@ def main(
         row: Json = {
             "repo": repo,
             "stars": meta["stargazers_count"],
+            "packages": len(packages),
             "junit_artifacts_live": len(artifacts),
             "artifact_names": sorted({a["name"] for a in artifacts})[:4],
             "sample": {

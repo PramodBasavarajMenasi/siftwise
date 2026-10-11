@@ -2,7 +2,12 @@
 
 For each repo: which workflow uploads the JUnit artifacts, how far back live artifacts go,
 how many of that workflow's runs failed in the window and whether their JUnit shows real test
-failures, and whether recent human PRs actually change Python source.
+failures, and whether recent human PRs actually change source code.
+
+For monorepo candidates it also reports the repo's packages (directories with a ``go.mod``,
+``pyproject.toml`` or ``setup.py``), how many packages each sampled PR touches, and an
+estimate of the backfill's size: results in one CI run (all its JUnit artifacts) times the
+workflow's runs in the window, at ``BYTES_PER_RESULT`` each.
 
     uv run python -m scripts.eval.deep_check RDFLib/rdflib chunkhound/chunkhound --out deep.json
 
@@ -12,7 +17,9 @@ Needs GITHUB_TOKEN (env or .env).
 from __future__ import annotations
 
 import json
+import posixpath
 from collections import Counter
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Annotated
 
@@ -30,6 +37,61 @@ from scripts.eval._github import (
     since,
     ts,
 )
+
+# Stored size of one test result, indexes included: rdflib after migration 0006 (2,667 MB for
+# 29.2M results).
+BYTES_PER_RESULT = 92
+MANIFESTS = frozenset({"go.mod", "pyproject.toml", "setup.py"})
+# Manifests here are fixtures, examples or tooling, not packages a PR would change.
+NOT_PACKAGES = frozenset({"testdata", "examples", "example", "docs", "doc", "tests", "test"})
+NOT_PACKAGE_PATHS = frozenset({"internal/tools"})
+SOURCE_EXTENSIONS = (".py", ".go")
+
+
+def package_dirs(tree_paths: Iterable[str]) -> list[str]:
+    """Directories holding a package manifest, below the repo root, deepest first."""
+    dirs = set()
+    for path in tree_paths:
+        directory, name = posixpath.split(path)
+        if name not in MANIFESTS or not directory:
+            continue
+        parts = directory.split("/")
+        if NOT_PACKAGES.isdisjoint(parts) and not any(
+            directory == p or directory.startswith(p + "/") or f"/{p}" in directory
+            for p in NOT_PACKAGE_PATHS
+        ):
+            dirs.add(directory)
+    return sorted(dirs, key=lambda d: (-d.count("/"), d))
+
+
+def packages_touched(files: Iterable[str], dirs: Sequence[str]) -> set[str]:
+    """The packages that changed source files belong to ("(root)" outside every package)."""
+    touched = set()
+    for name in files:
+        if not name.endswith(SOURCE_EXTENSIONS):
+            continue
+        touched.add(next((d for d in dirs if name.startswith(d + "/")), "(root)"))
+    return touched
+
+
+def estimated_gb(results_per_run: int, runs: int) -> float:
+    return round(results_per_run * runs * BYTES_PER_RESULT / 1e9, 2)
+
+
+def run_results(gh: httpx.Client, repo: str, run_id: int, cap: int = 60) -> tuple[int, int, int]:
+    """(results, JUnit artifacts, artifacts sampled) for one run: every JUnit artifact's test
+    count, extrapolated from the first ``cap`` if there are more."""
+    artifacts = [
+        a
+        for a in paged(gh, f"/repos/{repo}/actions/runs/{run_id}/artifacts", "artifacts", 3)
+        if is_junit_artifact(a)
+    ]
+    counted = [junit_sample(gh, a, max_bytes=60_000_000) for a in artifacts[:cap]]
+    tests = sum(sample.tests for sample in counted if sample)
+    sampled = sum(1 for sample in counted if sample)
+    if sampled and len(artifacts) > cap:
+        tests = round(tests * len(artifacts) / sampled)
+    return tests, len(artifacts), sampled
 
 
 def run_test_failures(gh: httpx.Client, repo: str, run_id: int) -> tuple[int, int] | None:
@@ -98,19 +160,32 @@ def check(gh: httpx.Client, repo: str, days: int, failed_runs: int, pr_sample: i
         if ts(p["created_at"]) >= cutoff
     ]
     human = [p for p in prs if not is_bot(p)]
+    tree = gh.get(f"/repos/{repo}/git/trees/{meta['default_branch']}", params={"recursive": 1})
+    dirs = package_dirs(e["path"] for e in tree.json().get("tree", []) if e["type"] == "blob")
     sample = []
     for pr in human[:pr_sample]:
         names = [
             f["filename"] for f in paged(gh, f"/repos/{repo}/pulls/{pr['number']}/files", None, 1)
         ]
+        packages = packages_touched(names, dirs)
         sample.append(
             {
                 "number": pr["number"],
+                "title": pr["title"][:70],
                 "files": len(names),
-                "python_source": sum(n.endswith(".py") and "test" not in n.lower() for n in names),
-                "python_tests": sum(n.endswith(".py") and "test" in n.lower() for n in names),
+                "source": sum(n.endswith(SOURCE_EXTENSIONS) and "test" not in n.lower()
+                              for n in names),
+                "tests": sum(n.endswith(SOURCE_EXTENSIONS) and "test" in n.lower()
+                             for n in names),
+                "packages": sorted(packages),
             }
-        )
+        )  # fmt: skip
+    code_prs = [s for s in sample if s["packages"]]
+    # The size of one full CI run: the latest successful run of the JUnit workflow.
+    full_run = next((r for r in runs if r["conclusion"] == "success"), runs[0] if runs else None)
+    results_per_run, junit_artifacts, sampled = (
+        run_results(gh, repo, full_run["id"]) if full_run else (0, 0, 0)
+    )
 
     return {
         "stars": meta["stargazers_count"],
@@ -126,6 +201,18 @@ def check(gh: httpx.Client, repo: str, days: int, failed_runs: int, pr_sample: i
         "human_prs": len(human),
         "distinct_human_authors": len({p["user"]["login"] for p in human}),
         "top_authors": Counter(p["user"]["login"] for p in human).most_common(3),
+        "packages": len(dirs),
+        "package_examples": dirs[-5:],
+        "code_prs_sampled": len(code_prs),
+        "code_prs_touching_one_package": sum(len(s["packages"]) == 1 for s in code_prs),
+        "size": {
+            "results_per_run": results_per_run,
+            "junit_artifacts_per_run": junit_artifacts,
+            "artifacts_counted": sampled,
+            "runs_in_window": len(runs),
+            "runs_capped_at_500": len(runs) >= 500,
+            "estimated_gb": estimated_gb(results_per_run, len(runs)),
+        },
         "human_pr_sample": sample,
     }
 
