@@ -7,6 +7,10 @@ selection saves and whether it would have missed real failures:
 - [RDFLib/rdflib](#rdflibrdflib): a Python project with about 18,000 known tests. Each CI run
   uploads one JUnit report per matrix leg (operating system × Python version), about 16 legs
   per run.
+- [quantumlib/Cirq](#quantumlibcirq): a Python monorepo of nine packages, about 30,000–42,000
+  known tests. Savings per package touched; no recall (no PR test results).
+- [agent-substrate/substrate](#agent-substratesubstrate): a busy Go repo (one module, ~2,000
+  packages) with real failures: recall, with and without a declared rule for its e2e suites.
 
 ## ipfs/kubo
 
@@ -439,4 +443,178 @@ This needs an rdflib clone, a siftwise server with rdflib backfilled and rolled 
 ```sh
 uv run python -m scripts.eval.run_eval --repo RDFLib/rdflib --failing --checkout ../rdflib
 uv run python -m scripts.eval.run_eval --repo RDFLib/rdflib --replay-main --checkout ../rdflib
+```
+
+## quantumlib/Cirq
+
+### Summary
+
+- **The monorepo case: savings depend on which package a PR touches.** Over 134 merged PRs,
+  93 went selective and the estimated time skipped was **37.3%** (full runs count as 0%).
+  PRs that changed only `cirq-google` skipped 80% of test time; PRs in `cirq-core`, which every
+  other package imports, skipped 19%.
+- **Recall can't be measured here.** Cirq uploads JUnit only from a push-to-main monitoring
+  workflow: there are no PR test results, and main had no failing run in the window. These
+  numbers measure selection and savings, not safety.
+- **Two monorepo bugs were found and fixed first.** Before the fixes, every Cirq code PR fell
+  back to the full suite, and the first "fixed" run claimed 59.8% saved with a nearly empty import
+  graph, which would have been unsafe. See [Bugs found](#bugs-found-by-this-eval).
+
+### Data and method
+
+- 132 main CI runs (`ci-monitoring.yml`, one `pytest-ubuntu-report` artifact each) from
+  2026-07-14 to 2026-10-07: 3.1M results, about 23,000 per run. 70,850 distinct test IDs, because
+  parametrized IDs change from run to run; about 30,000–42,000 are known at a time.
+- Nine packages (`cirq-core`, `cirq-google`, `cirq-ionq`, `cirq-aqt`, `cirq-pasqal`,
+  `cirq-web`, ...), each with its own `setup.py`, tested by one `pytest` run from the repo root.
+- **`--replay-prs`:** every PR merged in the last 90 days (134), whether or not CI recorded it.
+  The diff is the PR's base...head from the GitHub compare API, as `siftwise select` would send;
+  history is cut at the PR head commit's time (no peeking). The Python import graph is built at
+  each PR head from the commit's zipball (`--source github`, no git checkout).
+- Test time comes from the main runs' average durations.
+
+### Results
+
+| | |
+|---|---|
+| Merged PRs | 134 |
+| Full / selective | 41 (31%) / 93 (69%) |
+| Full: a changed file maps to no known tests | 19 |
+| Full: build or CI file changed | 20 |
+| Full: unknown diff / no history yet | 1 / 1 |
+| Time skipped in selective runs (average) | 53.8% |
+| **Estimated time skipped, all PRs** | **37.3%** |
+| Signal that selected the most tests, per PR | Python imports 68, path mapping 12, nothing affected 13, full suite 41 |
+| Failures | none to catch (no PR results; main never failed in the window) |
+
+**By the area a PR changed:**
+
+| Python changed in | PRs | Full / selective | Time skipped | Main signal |
+|---|---|---|---|---|
+| `cirq-core` only | 50 | 9 / 41 | 18.6% | Python imports |
+| no Python file (docs, CI, notebooks) | 33 | 20 / 13 | 39.4% | none affected, or a build-file fallback |
+| `cirq-google` only | 22 | 3 / 19 | 80.4% | Python imports |
+| several packages | 18 | 5 / 13 | 17.0% | Python imports |
+| outside the packages (`dev_tools`, `docs`) | 5 | 3 / 2 | 40.0% | path mapping |
+| `cirq-web` only | 3 | 1 / 2 | 66.0% | path mapping |
+| `cirq-pasqal` only | 3 | 0 / 3 | 99.8% | Python imports |
+
+`cirq-core` behaves like rdflib: `cirq/__init__.py` imports most of the library, so a change
+to almost any core module reaches most test files (477 for `cirq/ops/raw_types.py`). The other packages depend on
+`cirq-core` but not on each other, so their changes stay inside their own tests: a
+`cirq-google` engine change reaches 88 test files, a `cirq-ionq` service change 13.
+
+### Bugs found by this eval
+
+| Bug | Effect on Cirq | Fix |
+|---|---|---|
+| pytest classnames from a monorepo root start with the package directory (`cirq-google.cirq_google.ops.lzs_reset_test`), and `cirq-google` isn't a Python identifier, so the selector gave those tests no runner and no file | every code PR fell back to the full suite ("changed file maps to no known tests") | directories above the test module may contain `-`; the module and class parts must still be Python names |
+| The import graph named modules only by their path from the repo root (`cirq-core.cirq.ops.raw_types`), so `import cirq` resolved to nothing: 213 edges for 1,210 files | the replay looked like **59.8% saved**, but with path mapping alone: a change to `raw_types.py` reached 0 test files. Unsafe | each directory with `pyproject.toml`, `setup.py` or `setup.cfg` is a package root; modules are also named from there (and its `src/`); an ambiguous name links to every match. Now ~5,150 edges; `raw_types.py` reaches 477 test files |
+
+The 59.8% run is kept only as this example: it's what selection without a working import graph
+would have claimed.
+
+### Limits
+
+- No recall: no PR results and no failures on main. A selective PR that broke a test would go
+  unnoticed by this eval.
+- History is cut at the PR head commit's committer time, which a rebase can move.
+- Test-ID churn from parametrization makes "known tests" vary between runs.
+
+## agent-substrate/substrate
+
+### Summary
+
+- **Recall on a busy Go repo:** of 2,044 failures in 72 failing PR runs, 2,032 were caught;
+  but only **26 of 38 in the runs that went selective**. Main commits replayed as PRs: 1,308 of
+  1,308, and 33 of 33 in selective runs.
+- **The misses are binary-level e2e suites and flaky tests.** `internal/e2e/suites/*` deploy
+  the whole system and reach it through no Go import. With one declared rule (as for kubo),
+  selective runs catch **36 of 39**, and savings drop: **5.8%** of test time on PR runs and 15.1%
+  on main commits, against 19.5% and 31.7% without it.
+- **Not an independent-packages monorepo:** one Go module with about 2,000 packages, and PRs
+  often touch several. Savings come from narrow changes, not from package boundaries.
+- **Only 8 days of history.** Its artifacts expire after about two weeks; the backfill got
+  2026-10-04 to 2026-10-11.
+
+### Data and method
+
+- 798 CI runs of `pr-workflow.yaml` (1,674 uploads: variants `unit`, `e2e-envoy`,
+  `e2e-agentgateway`, `e2e-envoy-preview`), 6.4M results, 18,614 test IDs; 7,000–14,000 known
+  tests at a time.
+- **PR mode:** the 10 most recent PR runs and every PR run with failures (72; 80 targets in all).
+  **Main replay:** the 40 most recent main commits, each diffed against the previous one.
+- The Go import graph is `go list -deps -test -json ./...` at each target commit, from its
+  zipball (`--source github`, Go 1.27.2, `GOOS=linux`). All 120 targets had a graph.
+- Two configurations: no `.siftwise.toml`, and
+  [scripts/eval/substrate.siftwise.toml](../scripts/eval/substrate.siftwise.toml), which makes
+  `internal/e2e/**` depend on every non-test `.go` file.
+
+### Results
+
+| | No declared rule | **With the e2e rule** |
+|---|---|---|
+| **PR mode (80 runs)** | | |
+| Full / selective | 61 / 19 | 60 / 20 |
+| Failures caught | 2,032 / 2,044 | **2,041 / 2,044** |
+| Caught in selective runs | 26 / 38 | **36 / 39** |
+| Caught without fallbacks | 1,804 / 2,004 | 1,823 / 2,003 |
+| Estimated time skipped, all runs | 19.5% | 5.8% |
+| Time skipped in selective runs (average) | 82.3% | 23.2% |
+| **Main replay (40 commits)** | | |
+| Full / selective | 24 / 16 | 23 / 17 |
+| Failures caught (in selective runs) | 1,308 / 1,308 (33 / 33) | 1,308 / 1,308 (33 / 33) |
+| Estimated time skipped, all runs | 31.7% | 15.1% |
+
+The 10 most recent PR runs all went full: 4 for build or CI files, 6 for a file that maps to no
+known tests (Python benchmarking scripts and other non-Go files). Full runs in general: 36–37
+for an unmapped file, 24 for build or CI files.
+
+**Misses in selective runs:**
+
+| Failure | Change | Without the rule | With the rule |
+|---|---|---|---|
+| `e2e/suites/egressmitm::TestActorEgressMITMTrust` (3 runs) | `internal/atunnel`, `internal/ateomnet/dns`, benchmarking fakes | missed; failed in earlier unrelated runs too, calls external hosts: flaky | caught (runs on every Go change) |
+| `e2e/suites/egresscredinject::TestActorEgressCredentialInjection` (2 runs) | `internal/atunnel`, `cmd/atecontroller` | missed; recurring, calls `httpbin.org`: flaky | caught |
+| `e2e/suites/demo::TestMultipleDurableDirLifecycle` | `cmd/atenet/...`, `internal/atunnel` | missed: the suite drives the deployed system | caught |
+| `controlapi/functionaltest::TestResumeActor_AteletTransport...` (2) | `cmd/atecontroller` | missed: drives ateapi and atelet, no import edge | **missed** |
+| `internal/credbundle::TestLoaderConcurrentHandshakes` | `internal/ateomnet` | missed: imports nothing changed; a concurrency test, probably flaky | **missed** |
+
+### Findings
+
+1. **Go import graphs aren't enough when tests drive deployed binaries.** As with kubo's
+   `test/cli`, e2e suites need a declared dependency. With it they run on almost every change,
+   which costs most of the savings: e2e is a large share of substrate's test time.
+2. **Flaky e2e tests dominate the remaining risk.** Most misses without the rule failed in
+   earlier unrelated runs. Week-4 flaky detection should label them instead of counting them
+   as misses.
+3. **Fallbacks protect, as before.** Every miss was in a selective run; every full run caught
+   everything.
+
+### Limits
+
+- 8 days of history: co-change and recently-failed signals see little.
+- The e2e rule is coarse (any non-test Go file), and `functionaltest` needs its own rule.
+- The eval's Go graphs come from zipballs on Windows with `GOOS=linux`. The first attempt
+  shared one unpack directory between two evals and corrupted 22 graphs; all were rebuilt. The
+  7 targets that had run without a graph gave the same result with one (all were full-suite
+  runs for build or unmapped files).
+
+### Reproducing
+
+Needs Go, a siftwise server with the repo backfilled, and `GITHUB_TOKEN`. No git checkout:
+`--source github` fetches each commit's zipball.
+
+```sh
+uv run python scripts/backfill.py --repo quantumlib/Cirq --workflow ci-monitoring.yml \
+    --artifact-pattern 'pytest-*-report' --batch --workers 4
+uv run python -m scripts.eval.run_eval --repo quantumlib/Cirq --replay-prs --source github \
+    --language python --resume cirq.jsonl
+
+uv run python scripts/backfill.py --repo agent-substrate/substrate --workflow pr-workflow.yaml \
+    --artifact-pattern 'test-results-*' --max-runs 3000 --batch --workers 8
+uv run python -m scripts.eval.run_eval --repo agent-substrate/substrate --language go \
+    --go-module github.com/agent-substrate/substrate --source github --goos linux \
+    --siftwise-toml scripts/eval/substrate.siftwise.toml --failing --resume substrate-pr.jsonl
+uv run python -m scripts.eval.run_eval ... --replay-main --last 40 --resume substrate-main.jsonl
 ```

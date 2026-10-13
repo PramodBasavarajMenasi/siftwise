@@ -295,6 +295,23 @@ def test_already_ingested_run_is_skipped_without_downloading(
     assert siftwise.call_count == 1 and commit.call_count == 1  # only run 2
 
 
+def test_workers_backfill_every_run_and_report_in_run_order(
+    router: respx.MockRouter, clock: FakeClock
+) -> None:
+    run_ids = list(range(1, 9))
+    mock_runs(router, *(gh_run(run_id) for run_id in run_ids))
+    for run_id in run_ids:
+        standard_run(router, gh_run(run_id))
+    mock_changed_files(router, [])
+    siftwise = mock_siftwise(router, *([201] * len(run_ids)))
+
+    summary, lines = run_backfill(clock, workers=4)
+
+    assert counts(summary) == {"new": 8}
+    assert siftwise.call_count == 8
+    assert [line.split()[1] for line in lines] == [str(run_id) for run_id in run_ids]
+
+
 def test_rerun_of_full_backfill_downloads_nothing(
     router: respx.MockRouter, clock: FakeClock
 ) -> None:

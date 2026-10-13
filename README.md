@@ -72,6 +72,14 @@ Replays of real CI history with no peeking at the future. Full details: [docs/ev
 |---|---|---|
 | [ipfs/kubo](https://github.com/ipfs/kubo) (Go, ~4,100 tests) | 19 of 19 in failing PRs | 30.7% over 20 main commits replayed as PRs; 0% on recent PRs (all dependency/CI bumps) |
 | [RDFLib/rdflib](https://github.com/RDFLib/rdflib) (Python, ~18,000 tests) | 2,049 of 2,050 in 39 failing PRs; 140 of 141 in selective runs. The miss is a flaky remote-service test (see below) | 10.4% on the 10 most recent PRs (was 0.4% before lint-only configs stopped forcing the full suite); 0.6% over 19 main commits |
+| [quantumlib/Cirq](https://github.com/quantumlib/Cirq) (Python monorepo, 9 packages, ~40,000 tests) | not measurable: JUnit only from main, which never failed | 37.3% over 134 merged PRs; 80% for `cirq-google`-only PRs, 19% for `cirq-core` |
+| [agent-substrate/substrate](https://github.com/agent-substrate/substrate) (Go, ~9,000 tests, 8 days of history) | 2,041 of 2,044 in 72 failing PRs; 36 of 39 in selective runs, with a declared rule for its e2e suites (26 of 38 without) | 5.8% on PR runs and 15.1% over 40 main commits with the rule (19.5% / 31.7% without) |
+
+In the Cirq monorepo, savings follow package boundaries: a change to one integration package
+skips most of the suite, a change to the core package that everything imports skips little.
+substrate's misses are end-to-end suites that drive a deployed system (no import edge reaches
+them) and flaky tests; a declared dependency catches the e2e ones at the cost of most of the
+savings.
 
 rdflib's code changes save almost nothing: its `__init__.py` and plugin registry connect nearly
 every module to nearly every test file, so safe file-level selection still runs ~99% of the

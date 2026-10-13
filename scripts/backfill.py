@@ -17,6 +17,7 @@ import re
 import time
 import zipfile
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import TracebackType
@@ -614,22 +615,28 @@ def backfill(
     pattern: str = "*junit*",
     max_runs: int = 200,
     echo: Echo = typer.echo,
+    workers: int = 1,
 ) -> Summary:
-    """Backfill up to ``max_runs`` completed runs. Per-run failures are counted, not raised."""
+    """Backfill up to ``max_runs`` completed runs. Per-run failures are counted, not raised.
+
+    ``workers`` runs are processed at once: artifact downloads from GitHub's blob storage take
+    seconds each, so one at a time is slow when artifacts are about to expire. Results are
+    reported in run order either way.
+    """
     default_branch = github.default_branch(repo)
     summary = Summary()
-    for run in github.iter_completed_runs(repo, workflow, max_runs):
+
+    def one(run: Json) -> list[tuple[str | None, Outcome, str]]:
         try:
-            results = backfill_run(github, siftwise, repo, run, default_branch, pattern)
+            return backfill_run(github, siftwise, repo, run, default_branch, pattern)
         except (httpx.HTTPError, zipfile.BadZipFile, BackfillError) as exc:
-            results = [(None, Outcome.ERROR, f"{type(exc).__name__}: {exc}")]
-        label = (
-            f"run {run['id']} #{_attempt(run)} "
-            f"{str(run.get('head_sha', ''))[:7]} {run.get('head_branch')}"
-        )
-        for variant, outcome, detail in results:
-            summary.add(outcome)
-            echo(f"{label}{f' [{variant}]' if variant else ''}: {outcome.value} ({detail})")
+            return [(None, Outcome.ERROR, f"{type(exc).__name__}: {exc}")]
+
+    runs = list(github.iter_completed_runs(repo, workflow, max_runs))
+    with ThreadPoolExecutor(max_workers=max(workers, 1)) as pool:
+        outcomes = pool.map(one, runs)  # httpx clients are thread-safe
+        for run, results in zip(runs, outcomes, strict=True):
+            _report(run, results, summary, echo)
     if siftwise.defer_rollup:
         # Stats were left stale by every batch upload; bring them up to date once.
         try:
@@ -643,6 +650,18 @@ def backfill(
                 f"{result.get('seconds')}s (window {result.get('window_days')} days)"
             )
     return summary
+
+
+def _report(
+    run: Json, results: list[tuple[str | None, Outcome, str]], summary: Summary, echo: Echo
+) -> None:
+    label = (
+        f"run {run['id']} #{_attempt(run)} "
+        f"{str(run.get('head_sha', ''))[:7]} {run.get('head_branch')}"
+    )
+    for variant, outcome, detail in results:
+        summary.add(outcome)
+        echo(f"{label}{f' [{variant}]' if variant else ''}: {outcome.value} ({detail})")
 
 
 # --- CLI ----------------------------------------------------------------------------------
@@ -671,6 +690,9 @@ def main(
             "(much faster for large backfills; stats are stale until it finishes).",
         ),
     ] = False,
+    workers: Annotated[
+        int, typer.Option(min=1, max=16, help="Runs processed at once (downloads are slow).")
+    ] = 1,
 ) -> None:
     """Backfill siftwise from past GitHub Actions runs. Tokens: GITHUB_TOKEN, SIFTWISE_API_TOKEN."""
     github_token = os.environ.get("GITHUB_TOKEN")
@@ -702,6 +724,7 @@ def main(
                 workflow=workflow,
                 pattern=artifact_pattern,
                 max_runs=max_runs,
+                workers=workers,
             )
         except httpx.HTTPError as exc:
             typer.echo(f"error: {type(exc).__name__}: {exc}", err=True)

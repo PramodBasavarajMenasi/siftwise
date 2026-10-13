@@ -821,7 +821,7 @@ def test_changed_modules_are_not_imported_when_the_repo_does_not_collect_modules
     assert selection.commands == ("pytest tests/test_cart.py::test_total",)
 
 
-@pytest.mark.parametrize("test_id", ["my-pkg.mod::my-pkg.mod.f", "a..b::a..b.f"])
+@pytest.mark.parametrize("test_id", ["a..b::a..b.f"])
 def test_doctest_without_a_derivable_file_is_left_out_of_the_command(test_id: str) -> None:
     hist = history(test_id, "tests.test_cart::test_total",
                    recent_main_failures={test_id: (5, "e" * 40)})  # fmt: skip
@@ -1317,3 +1317,51 @@ def test_estimate_counts_what_would_run() -> None:
     full = select(hist, "pyproject.toml")
     assert full.mode is Mode.FULL
     assert full.estimated_ms_would_run == full.estimated_ms_total == 1160
+
+
+# --- monorepo layouts: pytest run from the root of a repo of packages ---------------------
+
+CIRQ = "cirq-google.cirq_google.ops.lzs_reset_test"
+
+
+def test_pytest_classnames_with_hyphenated_directories_are_runnable() -> None:
+    # Cirq's CI runs pytest from the repo root over cirq-core/, cirq-google/, ...: the classname
+    # is the path with "/" -> ".", and "cirq-google" is a directory, not a module name.
+    other = "cirq-core.cirq.ops.x_test::t"
+    hist = history(f"{CIRQ}::test_repr", f"{CIRQ}.TestReset::test_x", other)
+    selection = select(hist, "cirq-google/cirq_google/ops/lzs_reset.py")
+
+    assert selection.mode is Mode.SELECTIVE
+    assert set(ids(selection)) == {f"{CIRQ}::test_repr", f"{CIRQ}.TestReset::test_x"}
+    assert selection.command == (
+        "pytest cirq-google/cirq_google/ops/lzs_reset_test.py::TestReset::test_x "
+        "cirq-google/cirq_google/ops/lzs_reset_test.py::test_repr"
+    )
+
+
+def test_import_graph_files_match_hyphenated_test_paths() -> None:
+    hist = history(f"{CIRQ}::test_repr")
+    selection = select_tests(
+        hist, ["cirq-core/cirq/ops/raw_types.py"], True,
+        affected_files={"cirq-google/cirq_google/ops/lzs_reset_test.py":
+                        ["cirq-core/cirq/ops/raw_types.py"]},
+    )  # fmt: skip
+
+    assert selection.mode is Mode.SELECTIVE
+    assert selection.command == "pytest cirq-google/cirq_google/ops/lzs_reset_test.py"
+
+
+def test_collection_error_in_a_hyphenated_directory() -> None:
+    selection = select(history("pytest::cirq-core.cirq.ops.broken"), "cirq-core/cirq/ops/broken.py")
+    # A collection error in a source module: the repo imports modules, so the changed module
+    # also runs under --doctest-modules.
+    assert selection.commands[0] == "pytest cirq-core/cirq/ops/broken.py"
+
+
+@pytest.mark.parametrize(
+    "test_id", ["pkg-a.test-x::t", "pkg-a.tests.test_x.Test-Case::t", "pkg-a.helpers::t"]
+)
+def test_module_and_class_parts_must_still_be_python_names(test_id: str) -> None:
+    # Only directories above the test module may hold "-": the rest is Python names (and a
+    # classname with no test module is no pytest location at all).
+    assert select(history(test_id), "pkg-a/x.py").mode is Mode.FULL

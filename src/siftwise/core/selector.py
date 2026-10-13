@@ -157,6 +157,10 @@ _IGNORABLE_GLOBS = (
 _IGNORABLE_DIRS = ("docs/",)
 
 _PY_IDENTIFIER = re.compile(r"[A-Za-z_]\w*\Z")
+# A directory in a pytest classname: pytest run from a monorepo's root reports
+# cirq-google/cirq_google/ops/x_test.py as "cirq-google.cirq_google.ops.x_test", so directories
+# above the Python packages may hold characters no module name can, such as "-".
+_PY_DIRECTORY = re.compile(r"[A-Za-z0-9_][\w-]*\Z")
 _GO_TOP_LEVEL = re.compile(r"(Test|Fuzz|Example|Benchmark)")
 
 
@@ -760,7 +764,9 @@ def _collection_error_path(module: str, file_path: str | None) -> str | None:
     if file_path and file_path.endswith(".py"):
         return file_path
     parts = module.split(".")
-    if not module or not all(_PY_IDENTIFIER.match(p) for p in parts):
+    if not module or not _PY_IDENTIFIER.match(parts[-1]):
+        return None
+    if not all(_PY_DIRECTORY.match(p) for p in parts[:-1]):
         return None
     return "/".join(parts) + ".py"
 
@@ -784,10 +790,18 @@ def _python_location(classname: str, file_path: str | None) -> tuple[str, tuple[
     ``tests.unit.test_foo.TestBar`` -> ``("tests/unit/test_foo.py", ("TestBar",))``.
     """
     parts = classname.split(".")
-    if not classname or not all(_PY_IDENTIFIER.match(p) for p in parts):
+    if not classname or not all(_PY_DIRECTORY.match(p) for p in parts):
         return None
     py_file = file_path if file_path and file_path.endswith(".py") else None
-    module_end = max((i for i, p in enumerate(parts) if _is_python_test_module(p)), default=None)
+    module_end = max(
+        (i for i, p in enumerate(parts) if _is_python_test_module(p) and _PY_IDENTIFIER.match(p)),
+        default=None,
+    )
+    # The test module and the classes in it are Python names; only directories above may not be.
+    if module_end is not None and not all(_PY_IDENTIFIER.match(p) for p in parts[module_end:]):
+        return None
+    if module_end is None and not all(_PY_IDENTIFIER.match(p) for p in parts):
+        return None
     if module_end is None:
         if py_file is None:
             return None

@@ -1,11 +1,14 @@
 """Core logic of scripts/eval/run_eval.py: what would run, why misses happen, no peeking."""
 
+import io
 import json
 import subprocess
+import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import respx
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -357,3 +360,153 @@ def test_evaluate_never_runs_a_deleted_test_file(db_session: Session, tmp_path: 
     assert result.selection.mode is Mode.SELECTIVE
     assert result.selection.python_files_run_whole == ("tests/test_keep.py",)
     assert result.selection.command == "pytest tests/test_keep.py"
+
+
+def iso(when: datetime) -> str:
+    return when.isoformat().replace("+00:00", "Z")
+
+
+def zipball(files: dict[str, str], sha: str) -> bytes:
+    """A GitHub-style zipball: every entry under one "<owner>-<repo>-<sha>/" folder."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(f"acme-shop-{sha[:7]}/{name}", content)
+    return buffer.getvalue()
+
+
+@respx.mock(assert_all_mocked=True)
+def test_github_source_gives_graphs_and_file_lists_without_git(
+    respx_mock: respx.MockRouter, tmp_path: Path
+) -> None:
+    sha = "c" * 40
+    route = respx_mock.get(f"https://api.github.com/repos/acme/shop/zipball/{sha}").respond(
+        content=zipball({"shop/cart.py": "import shop.money\n", "shop/money.py": "",
+                         "tests/test_cart.py": "import shop.cart\n"}, sha))  # fmt: skip
+    graphs = ev.GraphProvider(None, "go", tmp_path, ev.GitHubSource("t", "acme/shop"))
+
+    graph = graphs.py_graph_at(sha)
+    assert graph is not None
+    assert graph.affected(["shop/money.py"]) == {"tests/test_cart.py": ["shop/money.py"]}
+    # The file list comes from the same zipball (one download) and is cached.
+    assert graphs.deleted_at(sha, ["shop/cart.py", "shop/gone.py"]) == ("shop/gone.py",)
+    assert route.call_count == 1
+    assert ev.GraphProvider(None, "go", tmp_path).deleted_at(sha, ["shop/gone.py"]) == (
+        "shop/gone.py",
+    )
+
+
+@respx.mock(assert_all_mocked=True)
+def test_merged_pr_targets_cut_history_at_the_head_commit(
+    respx_mock: respx.MockRouter, tmp_path: Path
+) -> None:
+    gh = "https://api.github.com/repos/acme/shop"
+    now = datetime.now(UTC)
+    respx_mock.get(f"{gh}/pulls").respond(json=[
+        {"number": 2, "merged_at": iso(now - timedelta(days=1)), "updated_at": iso(now),
+         "head": {"sha": "b" * 40}, "base": {"sha": "a" * 40}},
+        {"number": 3, "merged_at": None, "updated_at": iso(now),  # closed, not merged
+         "head": {"sha": "d" * 40}, "base": {"sha": "a" * 40}},
+        {"number": 1, "merged_at": iso(now - timedelta(days=200)), "updated_at": iso(now),
+         "head": {"sha": "e" * 40}, "base": {"sha": "a" * 40}},  # outside the window
+    ])  # fmt: skip
+    pushed = now - timedelta(days=2)
+    respx_mock.get(f"{gh}/commits/{'b' * 40}").respond(
+        json={"commit": {"committer": {"date": iso(pushed)}}})  # fmt: skip
+    renamed = {"filename": "src/new.py", "previous_filename": "src/old.py"}
+    respx_mock.get(f"{gh}/compare/{'a' * 40}...{'b' * 40}").respond(json={"files": [renamed]})
+
+    [target] = ev.merged_pr_targets("t", "acme/shop", 90, ev.GitHubCompare("t", tmp_path))
+
+    assert (target.commit_sha, target.branch, target.run_id) == ("b" * 40, "#2", 0)
+    assert abs(target.run_at - pushed) < timedelta(seconds=1)  # head commit, not merge time
+    assert target.changed_files == ("src/new.py", "src/old.py")
+
+
+def zipball_with_links(files: dict[str, str], links: dict[str, str], sha: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(f"acme-shop-{sha[:7]}/{name}", content)
+        for name, target in links.items():
+            info = zipfile.ZipInfo(f"acme-shop-{sha[:7]}/{name}")
+            info.external_attr = 0o120777 << 16  # a symlink, as GitHub's zipballs store them
+            zf.writestr(info, target)
+    return buffer.getvalue()
+
+
+@respx.mock(assert_all_mocked=True)
+def test_zipball_symlinks_become_copies_of_their_targets(
+    respx_mock: respx.MockRouter, tmp_path: Path
+) -> None:
+    sha = "d" * 40
+    respx_mock.get(f"https://api.github.com/repos/acme/shop/zipball/{sha}").respond(
+        content=zipball_with_links(
+            {"real/pkg/a.go": "package pkg", "real/x.txt": "x"},
+            {"cmd/pkg": "../real/pkg",  # a directory link, like substrate's
+             "cmd/x.txt": "../real/x.txt",
+             "chain": "cmd/pkg",  # a link to a link
+             "outside": "../../etc", "dangling": "nope"},
+            sha,
+        )
+    )  # fmt: skip
+    root = tmp_path / "tree"
+
+    files = ev.GitHubSource("t", "acme/shop").extract(sha, root)
+
+    assert files is not None and "cmd/pkg" in files  # listed like git lists a link
+    assert (root / "cmd/pkg/a.go").read_text() == "package pkg"
+    assert (root / "cmd/x.txt").read_text() == "x"
+    assert (root / "chain/a.go").is_file()
+    assert not (root / "outside").exists() and not (root / "dangling").exists()
+
+
+@respx.mock(assert_all_mocked=True)
+def test_providers_unpack_into_private_directories(
+    respx_mock: respx.MockRouter, tmp_path: Path
+) -> None:
+    # Two evals side by side used to share one directory and wipe each other's trees.
+    a, b = "a" * 40, "b" * 40
+    for sha, module in ((a, "first"), (b, "second")):
+        respx_mock.get(f"https://api.github.com/repos/acme/shop/zipball/{sha}").respond(
+            content=zipball({f"{module}.py": "", "tests/test_x.py": f"import {module}\n"}, sha)
+        )
+    one = ev.GraphProvider(None, "go", tmp_path, ev.GitHubSource("t", "acme/shop"))
+    two = ev.GraphProvider(None, "go", tmp_path, ev.GitHubSource("t", "acme/shop"))
+
+    root_one = one._root_at(a)
+    root_two = two._root_at(b)
+    assert root_one is not None and root_two is not None and root_one != root_two
+    assert (root_one / "first.py").exists()  # not wiped by the other provider
+    one.close()
+    two.close()
+    assert not root_one.exists() and not root_two.exists()
+
+
+def test_replay_main_last_n(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    for ci in range(1, 6):
+        ingest(db_session, ci, ci, {"t::a": P}, variant=None, is_main=True)
+    repo_id = db_session.execute(
+        text("SELECT id FROM repos WHERE name = :n"), {"n": REPO}
+    ).scalar_one()
+    compare = ev.GitHubCompare("t", Path("."))
+    monkeypatch.setattr(compare, "files", lambda repo, base, head: ("src/a.py",))
+
+    every = ev.main_replay_targets(db_session, repo_id, REPO, compare)
+    last_two = ev.main_replay_targets(db_session, repo_id, REPO, compare, last=2)
+
+    assert len(every) == 4
+    assert [t.commit_sha for t in last_two] == [t.commit_sha for t in every[-2:]]
+
+
+def test_resume_skips_finished_targets_and_ignores_a_torn_line(tmp_path: Path) -> None:
+    done = ev.TargetRun(0, None, "a" * 40, "#1", T0, changed_files=(), diff_label="PR #1")
+    other = ev.TargetRun(0, None, "b" * 40, "#2", T0, changed_files=(), diff_label="PR #2")
+    log = tmp_path / "results.jsonl"
+    log.write_text(json.dumps({"key": ev.target_key(done)}) + "\n" + '{"key": "PR #2|bbb')  # crash
+
+    keys = ev.resumed_keys(log)
+
+    assert ev.target_key(done) in keys
+    assert ev.target_key(other) not in keys  # its line was cut off: it runs again
+    assert ev.resumed_keys(tmp_path / "missing.jsonl") == set()

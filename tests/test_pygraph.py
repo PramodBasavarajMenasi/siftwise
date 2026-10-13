@@ -144,3 +144,44 @@ def test_json_round_trip(graph: PyGraph) -> None:
 )
 def test_module_of_test_id(test_id: str, expected: str | None) -> None:
     assert module_of_test(test_id) == expected
+
+
+MONOREPO = {
+    # Each package's own directory is its import root (pip install -e cirq-core/ ...).
+    "cirq-core/setup.py": "",
+    "cirq-core/cirq/__init__.py": "from cirq.ops import raw_types\n",
+    "cirq-core/cirq/ops/__init__.py": "",
+    "cirq-core/cirq/ops/raw_types.py": "",
+    "cirq-core/cirq/ops/raw_types_test.py": "import cirq\n",
+    "cirq-google/pyproject.toml": "",
+    "cirq-google/cirq_google/__init__.py": "import cirq\n",
+    "cirq-google/cirq_google/x_test.py": "import cirq_google\n",
+    "libs/b/pyproject.toml": "",
+    "libs/b/src/b/core.py": "",  # src layout inside a package
+    "libs/b/tests/test_core.py": "from b.core import thing\nfrom tests import helpers\n",
+    "libs/b/tests/__init__.py": "",
+    "libs/b/tests/helpers.py": "",
+    "libs/c/pyproject.toml": "",
+    "libs/c/tests/__init__.py": "",
+    "libs/c/tests/helpers.py": "",
+}
+
+
+def test_packages_import_from_their_own_root(tmp_path: Path) -> None:
+    for name, content in MONOREPO.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(content)
+    graph = build_py_graph(tmp_path)
+
+    # cirq-core/cirq/ops/raw_types.py is the module "cirq.ops.raw_types": `import cirq`
+    # reaches it, from its own package and from cirq-google's.
+    assert graph.affected(["cirq-core/cirq/ops/raw_types.py"]) == {
+        "cirq-core/cirq/ops/raw_types_test.py": ["cirq-core/cirq/ops/raw_types.py"],
+        "cirq-google/cirq_google/x_test.py": ["cirq-core/cirq/ops/raw_types.py"],
+    }
+    assert "libs/b/src/b/core.py" in graph.edges["libs/b/tests/test_core.py"]
+    # Two packages both have tests/helpers.py: an ambiguous import links to both (extra
+    # tests are cheap, a missed edge is not).
+    assert {"libs/b/tests/helpers.py", "libs/c/tests/helpers.py"} <= set(
+        graph.edges["libs/b/tests/test_core.py"]
+    )

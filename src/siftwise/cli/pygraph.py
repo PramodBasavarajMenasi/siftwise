@@ -7,6 +7,10 @@ changed module, directly or transitively. The eval also uses it to explain misse
 Edges are file -> files it imports (repo-relative paths). ``import a.b.c`` also loads ``a`` and
 ``a.b``, so those packages' ``__init__.py`` files are edges too. A test file is also treated
 as importing every ``conftest.py`` in its directory and above, since pytest loads them.
+A file's module names are its path from the repo root and from every package root above it
+(a directory with ``pyproject.toml``, ``setup.py`` or ``setup.cfg``, and that root's ``src/``),
+so ``import cirq`` in a monorepo reaches ``cirq-core/cirq/__init__.py``. A name more than one
+file has (two packages' ``tests/helpers.py``) links to all of them.
 Imports are read statically with ``ast``. A string literal that is exactly the dotted name of
 a module in the repo (``"pkg.plugins.json"``) also counts as importing it, since plugin
 registries and ``importlib.import_module`` load modules by name. Other dynamic imports (names
@@ -25,6 +29,9 @@ from pathlib import Path
 from typing import Any
 
 from siftwise.core.selector import is_python_test_file
+
+# A directory holding one of these is a package root: its contents import from there.
+PACKAGE_MANIFESTS = frozenset({"pyproject.toml", "setup.py", "setup.cfg"})
 
 SKIP_DIRS = frozenset(
     {".git", ".venv", "venv", ".tox", ".nox", "build", "dist", "node_modules", ".eggs",
@@ -123,11 +130,19 @@ def build_py_graph(root: Path) -> PyGraph:
         if any(part in SKIP_DIRS for part in rel.parts):
             continue
         files.append(rel.as_posix())
+    package_roots = sorted(
+        {
+            rel.parent.as_posix()
+            for name in PACKAGE_MANIFESTS
+            for rel in (p.relative_to(root) for p in root.rglob(name))
+            if rel.parent.parts and not any(part in SKIP_DIRS for part in rel.parts)
+        }
+    )
 
-    modules: dict[str, str] = {}  # dotted module name -> file
+    modules: dict[str, set[str]] = defaultdict(set)  # dotted module name -> files
     for file in files:
-        for name in _module_names(file):
-            modules.setdefault(name, file)
+        for name in _module_names(file, package_roots):
+            modules[name].add(file)
 
     edges: dict[str, frozenset[str]] = {}
     for file in files:
@@ -159,13 +174,15 @@ def build_py_graph(root: Path) -> PyGraph:
             ):
                 # A dotted module name in a string: a plugin registry or importlib call
                 # loads it at runtime (rdflib registers its parsers/serializers this way).
-                targets.add(modules[node.value])
+                targets.update(modules[node.value])
         targets.discard(file)
         edges[file] = frozenset(targets)
     return PyGraph(edges)
 
 
-def _module_names(file: str) -> Iterable[str]:
+def _module_names(file: str, package_roots: Iterable[str] = ()) -> Iterable[str]:
+    """The dotted names ``file`` can be imported as: from the repo root (and its ``src/`` or
+    ``lib/``), and from each package root above it (and that root's ``src/``)."""
     parts = file[: -len(".py")].split("/")
     if parts[-1] == "__init__":
         parts = parts[:-1]
@@ -174,6 +191,14 @@ def _module_names(file: str) -> Iterable[str]:
     names = [".".join(parts)]
     if parts[0] in ("src", "lib") and len(parts) > 1:  # src layout
         names.append(".".join(parts[1:]))
+    for package_root in package_roots:
+        prefix = package_root.split("/")
+        if parts[: len(prefix)] != prefix or len(parts) == len(prefix):
+            continue
+        inside = parts[len(prefix) :]
+        names.append(".".join(inside))
+        if inside[0] == "src" and len(inside) > 1:
+            names.append(".".join(inside[1:]))
     return names
 
 
@@ -197,14 +222,14 @@ def _absolute(module: str | None, level: int, package: str) -> str | None:
     return ".".join(base)
 
 
-def _resolve(name: str, modules: Mapping[str, str], ancestors: bool = True) -> set[str]:
+def _resolve(name: str, modules: Mapping[str, set[str]], ancestors: bool = True) -> set[str]:
     """Files loaded by importing ``name``: the module and (optionally) its parent packages."""
     found: set[str] = set()
     parts = name.split(".")
     for i in range(len(parts), 0, -1):
-        file = modules.get(".".join(parts[:i]))
-        if file:
-            found.add(file)
+        files = modules.get(".".join(parts[:i]))
+        if files:
+            found.update(files)
             if not ancestors:
                 break
         elif not ancestors and i == len(parts):

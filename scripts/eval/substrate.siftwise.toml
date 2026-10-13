@@ -1,0 +1,9 @@
+# .siftwise.toml for agent-substrate/substrate, used by the eval (substrate itself has none).
+#
+# internal/e2e/suites/* deploy the whole system (ateapi, atelet, atenet, ...) and test it from
+# outside, like kubo's test/cli: no Go import edge connects them to the code they exercise.
+# Approximated as "any non-test Go file". Coarse, and it makes most code changes run them.
+
+[[depends]]
+tests = "internal/e2e/**"
+on = ["**/*.go", "!**/*_test.go", "!internal/e2e/**"]

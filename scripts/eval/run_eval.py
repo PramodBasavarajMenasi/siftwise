@@ -6,6 +6,10 @@ Two modes:
   diffs. ``--failing`` adds every PR run that had failures.
 * ``--replay-main``: treat each main run as a PR whose diff is the previous main run's
   commit ... this commit (fetched from the GitHub compare API and cached).
+* ``--replay-prs``: every PR merged in the last ``--days``, from the GitHub API, whether or not
+  CI recorded results for it: the diff is the PR's base...head (as ``siftwise select`` sends),
+  and history is cut at the PR head commit's time. For repos whose JUnit comes only from main
+  (no PR runs), so it measures selection and savings; with no PR results, not recall.
 
 A target is one CI run attempt: its matrix variants are grouped, and a failure in any variant
 counts. For each target R:
@@ -14,9 +18,11 @@ counts. For each target R:
    earlier than R by ``COALESCE(started_at, created_at)``. ``test_stats`` is not used for
    selection; broken-on-main is recomputed per variant from raw results. The repo's raw
    results are read once into memory (``HistoryIndex``), so each target is cheap.
-2. With ``--checkout``, compute the import graph at R's commit (cached per commit) and pass it
+2. With ``--checkout`` (a git clone) or ``--source github`` (each commit's zipball from the
+   GitHub API, no git), compute the import graph at R's commit (cached per commit) and pass it
    to the selector, as ``siftwise select`` does: for Go ``go list -deps -test -json ./...``
-   (needs ``--go``), for Python the static graph from ``siftwise.cli.pygraph``.
+   (needs ``--go``; listed for ``--goos``, the platform CI tests on), for Python the static
+   graph from ``siftwise.cli.pygraph``.
 3. Run ``select_tests`` with the repo config from ``--siftwise-toml``.
 4. Compare with the tests that actually failed in R. A failure is caught if the selection's
    commands would run it (including new tests in a Python file or Go package run whole).
@@ -35,20 +41,25 @@ Reads SIFTWISE_DATABASE_URL (or .env), and GITHUB_TOKEN for --replay-main. Read-
 from __future__ import annotations
 
 import bisect
+import io
 import itertools
 import json
 import math
 import os
 import posixpath
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import httpx
 import typer
@@ -426,11 +437,14 @@ def pr_targets(session: Session, repo_id: int, limit: int, failing: bool) -> lis
 
 
 def main_replay_targets(
-    session: Session, repo_id: int, repo: str, compare: GitHubCompare
+    session: Session, repo_id: int, repo: str, compare: GitHubCompare, last: int | None = None
 ) -> list[TargetRun]:
-    """Every main run but the first, as a PR from the previous main run's commit."""
+    """Every main run but the first (or the ``last`` most recent), as a PR from the previous
+    main run's commit."""
     query = _CI_RUNS.format(where="r.is_main", having="")
     rows = session.execute(text(f"{query} ORDER BY run_at, id"), {"repo_id": repo_id}).all()
+    if last:
+        rows = rows[-(last + 1) :]  # each target diffs against the run before it
     targets = []
     for prev, (run_id, ci_run_id, sha, branch, run_at, run_ids) in itertools.pairwise(rows):
         prev_sha = prev[2]
@@ -451,6 +465,47 @@ def main_replay_targets(
             )
         )
     return targets
+
+
+def merged_pr_targets(token: str, repo: str, days: int, compare: GitHubCompare) -> list[TargetRun]:
+    """Every PR merged in the last ``days``, oldest first, as a target: the PR's base...head
+    diff, history cut at its head commit's time (when CI would have selected for it)."""
+    gh = httpx.Client(
+        base_url="https://api.github.com",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=60,
+    )
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    prs: list[dict[str, Any]] = []
+    for page in range(1, 50):
+        batch = gh.get(f"/repos/{repo}/pulls", params={"state": "closed", "sort": "updated",
+                       "direction": "desc", "per_page": 100, "page": page}).json()  # fmt: skip
+        prs += [p for p in batch if p.get("merged_at") and _iso(p["merged_at"]) >= cutoff]
+        if len(batch) < 100 or _iso(batch[-1]["updated_at"]) < cutoff:
+            break
+    targets = []
+    for pr in sorted(prs, key=lambda p: p["merged_at"]):
+        head, base = pr["head"]["sha"], pr["base"]["sha"]
+        commit = gh.get(f"/repos/{repo}/commits/{head}")
+        # The time CI last ran on the PR; merged_at if the commit can't be read.
+        when = (commit.json()["commit"]["committer"]["date"] if commit.is_success
+                else pr["merged_at"])  # fmt: skip
+        targets.append(
+            TargetRun(
+                0,  # no stored run: history is everything strictly before `when`
+                None,
+                head,
+                f"#{pr['number']}",
+                _iso(when),
+                changed_files=compare.files(repo, base, head),
+                diff_label=f"PR #{pr['number']} {base[:7]}...{head[:7]}",
+            )
+        )
+    return targets
+
+
+def _iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 class GitHubCompare:
@@ -485,17 +540,136 @@ class GitHubCompare:
         return tuple(sorted(set(paths)))
 
 
+class GitHubSource:
+    """A repo's source at any commit, from the GitHub zipball API: no clone, no git."""
+
+    def __init__(self, token: str, repo: str) -> None:
+        self.repo = repo
+        self._http = httpx.Client(
+            base_url="https://api.github.com",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            # codeload sometimes stalls without closing: fail fast, then retry (extract()).
+            timeout=httpx.Timeout(60, connect=10),
+            follow_redirects=True,
+        )
+
+    def extract(self, sha: str, into: Path) -> list[str] | None:
+        """Unpack the tree at ``sha`` into ``into``; its file paths, or None if unavailable."""
+        response = None
+        for wait in (0, 10, 30):  # codeload times out now and then on big archives
+            time.sleep(wait)
+            try:
+                response = self._http.get(f"/repos/{self.repo}/zipball/{sha}")
+                break
+            except httpx.TransportError:
+                continue
+        if response is None or response.status_code != httpx.codes.OK:
+            return None  # this target gets no graph (reported), the rest of the eval goes on
+        files = []
+        links: dict[str, str] = {}  # link path -> its target, relative to the link's directory
+        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+            for info in zf.infolist():
+                # Every entry is under one "<owner>-<repo>-<sha>/" folder.
+                name = info.filename.partition("/")[2]
+                if not name or info.is_dir():
+                    continue
+                files.append(name)
+                if stat.S_ISLNK(info.external_attr >> 16):
+                    links[name] = zf.read(info).decode("utf-8", errors="replace")
+                    continue
+                target = _long_path(into / name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(zf.read(info))
+        _materialize_links(into, links)
+        return sorted(files)
+
+
+def _long_path(path: Path) -> Path:
+    """On Windows, an extended-length path, so deep trees aren't cut at 260 characters."""
+    if os.name != "nt":
+        return path
+    absolute = str(path.resolve())
+    return Path(absolute if absolute.startswith("\\\\?\\") else "\\\\?\\" + absolute)
+
+
+def _materialize_links(root: Path, links: dict[str, str]) -> None:
+    """Replace zipball symlinks with copies of their targets.
+
+    The zipball stores a symlink as a small file holding its target path. Creating real
+    symlinks on Windows needs extra privileges, and ``go list`` must see the directory a link
+    points at, so copy the target (file or directory) instead. Links to links resolve over
+    several passes; links pointing outside the tree, or nowhere, are left out.
+    """
+    pending = dict(links)
+    while pending:
+        progressed = False
+        for name, target in list(pending.items()):
+            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(name), target))
+            if posixpath.isabs(target) or resolved == ".." or resolved.startswith("../"):
+                del pending[name]  # outside the tree: nothing to copy
+                continue
+            if resolved in pending:
+                continue  # a link to a link: copy once that one exists
+            source, dest = _long_path(root / resolved), _long_path(root / name)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, dest, dirs_exist_ok=True)
+            elif source.is_file():
+                shutil.copyfile(source, dest)
+            del pending[name]
+            progressed = True
+        if not progressed:
+            break  # cycles or dangling links
+
+
 class GraphProvider:
-    """Import graphs at a commit, from a checkout, cached per commit.
+    """Import graphs at a commit, from a checkout or GitHub zipballs, cached per commit.
 
     Go: ``go list``. Python: ``pygraph``. Both are fed to the selector, as ``siftwise select``
     does; the Python graph also explains misses. The commit's file list gives the deleted files.
     """
 
-    def __init__(self, checkout: Path | None, go: str, cache_dir: Path) -> None:
+    def __init__(
+        self,
+        checkout: Path | None,
+        go: str,
+        cache_dir: Path,
+        github: GitHubSource | None = None,
+        goos: str | None = None,
+    ) -> None:
         self.checkout = checkout
         self.go = go
         self.cache_dir = cache_dir
+        self.github = github
+        self.goos = goos
+        # The one commit unpacked from GitHub at a time: (sha, directory). The directory is
+        # private to this provider: evals running side by side each wipe their own tree.
+        self._unpacked: tuple[str, Path] | None = None
+        self._src: Path | None = None
+
+    @property
+    def has_source(self) -> bool:
+        return self.checkout is not None or self.github is not None
+
+    def _root_at(self, sha: str) -> Path | None:
+        """A directory holding the tree at ``sha``: the checkout, or an unpacked zipball."""
+        if self.checkout is not None:
+            return self.checkout if self._checkout(sha) else None
+        if self.github is None:
+            return None
+        if self._unpacked and self._unpacked[0] == sha:
+            return self._unpacked[1]
+        if self._src is None:
+            self._src = Path(tempfile.mkdtemp(prefix="src-", dir=self.cache_dir))
+        self._unpacked = None
+        root = self._src / "tree"
+        shutil.rmtree(_long_path(root), ignore_errors=True)
+        files = self.github.extract(sha, root)
+        if files is None:
+            return None
+        (self.cache_dir / f"files-{sha}.json").write_text(json.dumps(files))
+        self._unpacked = (sha, root)
+        return root
 
     def go_graph_at(self, sha: str) -> tuple[GoGraph | None, str]:
         cache = self.cache_dir / f"gograph-{sha}.json"
@@ -504,24 +678,34 @@ class GraphProvider:
             if "error" in data:
                 return None, f"go list failed at {sha[:7]}: {data['error']}"
             return GoGraph.from_json(data), f"import graph at {sha[:7]}"
-        if self.checkout is None:
-            return None, "no import graph (no --checkout)"
-        if not self._checkout(sha):
-            return None, f"could not check out {sha[:7]}"
+        if not self.has_source:
+            return None, "no import graph (no --checkout or --source)"
+        root = self._root_at(sha)
+        if root is None:
+            return None, f"no source for {sha[:7]}"
+        # go list evaluates build tags for the host: list for the platform CI tests on.
+        env = {**os.environ, **({"GOOS": self.goos} if self.goos else {})}
         proc = subprocess.run(
             [self.go, "list", "-deps", "-test", "-json", "./..."],
-            cwd=self.checkout,
+            cwd=root,
             capture_output=True,
             timeout=1800,
             check=False,
+            env=env,
         )
         if proc.returncode != 0:
             error = proc.stderr.decode(errors="replace").strip().splitlines()[-1:] or ["?"]
             cache.write_text(json.dumps({"error": error[0][:300]}))
             return None, f"go list failed at {sha[:7]}: {error[0][:120]}"
-        graph = build_graph(parse_go_list(proc.stdout.decode(errors="replace")), self.checkout)
+        graph = build_graph(parse_go_list(proc.stdout.decode(errors="replace")), root)
         cache.write_text(json.dumps(graph.to_json()))
         return graph, f"import graph at {sha[:7]}"
+
+    def close(self) -> None:
+        """Remove this provider's unpack directory."""
+        if self._src is not None:
+            shutil.rmtree(_long_path(self._src), ignore_errors=True)
+            self._src = None
 
     def has_py_graph(self, sha: str) -> bool:
         return (self.cache_dir / f"pygraph-{sha}.json").exists()
@@ -530,9 +714,10 @@ class GraphProvider:
         cache = self.cache_dir / f"pygraph-{sha}.json"
         if cache.exists():
             return PyGraph.from_json(json.loads(cache.read_text()))
-        if self.checkout is None or not self._checkout(sha):
+        root = self._root_at(sha)
+        if root is None:
             return None
-        graph = build_py_graph(self.checkout)
+        graph = build_py_graph(root)
         cache.write_text(json.dumps(graph.to_json()))
         return graph
 
@@ -548,7 +733,12 @@ class GraphProvider:
         cache = self.cache_dir / f"files-{sha}.json"
         if cache.exists():
             return frozenset(json.loads(cache.read_text()))
-        if self.checkout is None or not self._fetch(sha):
+        if self.checkout is None:
+            # Unpacking the zipball writes the file list (cached above).
+            if self._root_at(sha) is None or not cache.exists():
+                return None
+            return frozenset(json.loads(cache.read_text()))
+        if not self._fetch(sha):
             return None
         proc = self._run_git("ls-tree", "-r", "--name-only", "-z", sha)
         if proc.returncode != 0:
@@ -736,7 +926,7 @@ def evaluate(
         graph_note = "diff unknown"
     elif go:
         graph, graph_note = graphs.go_graph_at(run.commit_sha)
-    elif graphs.checkout is None and not graphs.has_py_graph(run.commit_sha):
+    elif not graphs.has_source and not graphs.has_py_graph(run.commit_sha):
         graph_note = "python: no --checkout, no import graph"
     elif not any(p.endswith(".py") for p in changed):
         graph_note = "python: no Python file changed"
@@ -776,6 +966,54 @@ def evaluate(
         run, changed, selection, failures, caught, missed, graph_note,
         tests_pct, time_pct, cf, dict(signals),
     )  # fmt: skip
+
+
+def target_key(run: TargetRun) -> str:
+    """Identifies a target across eval runs (for --resume)."""
+    runs = ",".join(map(str, run.run_ids or (run.run_id,)))
+    return f"{run.diff_label}|{run.commit_sha}|{runs}"
+
+
+def resumed_keys(path: Path) -> set[str]:
+    """Keys of the targets already in a --resume file. A line torn by a crash is ignored, so
+    that target runs again."""
+    if not path.exists():
+        return set()
+    keys = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            keys.add(json.loads(line)["key"])
+        except (ValueError, KeyError, TypeError):
+            continue
+    return keys
+
+
+def result_json(r: Result) -> dict[str, Any]:
+    """One target's result, for --json-out and --resume."""
+    cf = r.counterfactual
+    return {
+        "key": target_key(r.run),
+        "target": r.run.diff_label,
+        "branch": r.run.branch,
+        "commit": r.run.commit_sha,
+        "run_ids": list(r.run.run_ids),
+        "changed_files": r.changed_files,
+        "mode": r.selection.mode.value,
+        "reason": r.selection.reason,
+        "selected": r.selection.selected_count,
+        "total_known": r.selection.total_known,
+        "tests_skipped_pct": round(r.tests_skipped_pct, 2),
+        "time_skipped_pct": round(r.time_skipped_pct, 2),
+        "signals": r.signal_counts,
+        "graph": r.graph_note,
+        "failures": len(r.failures),
+        "caught": len(r.caught),
+        "missed": [{"test": m.test_id, "signal": m.signal} for m in r.missed],
+        "without_fallbacks": None if cf is None else {
+            "mapped": bool(cf.selection), "caught": len(cf.caught),
+            "missed": [{"test": m.test_id, "signal": m.signal} for m in cf.missed],
+        },
+    }  # fmt: skip
 
 
 def _signal(reason: str) -> str:
@@ -951,6 +1189,28 @@ def main(
     replay_main: Annotated[
         bool, typer.Option("--replay-main", help="Treat each main run as a PR.")
     ] = False,
+    replay_prs: Annotated[
+        bool, typer.Option("--replay-prs", help="Every PR merged in the last --days.")
+    ] = False,
+    days: Annotated[int, typer.Option(help="Window for --replay-prs.")] = 90,
+    source: Annotated[
+        str, typer.Option(help="'checkout' (--checkout) or 'github' (zipballs, no git).")
+    ] = "checkout",
+    goos: Annotated[str | None, typer.Option(help="GOOS for go list (e.g. linux).")] = None,
+    json_out: Annotated[Path | None, typer.Option(help="Write per-target results here.")] = None,
+    last: Annotated[
+        int | None, typer.Option(help="--replay-main: only the most recent N main runs.")
+    ] = None,
+    commits: Annotated[
+        str | None, typer.Option(help="Only targets at these commits (comma-separated prefixes).")
+    ] = None,
+    resume: Annotated[
+        Path | None,
+        typer.Option(
+            help="JSONL of per-target results: appended as each target finishes, and targets "
+            "already in it are skipped, so an interrupted eval continues where it stopped."
+        ),
+    ] = None,
     language: Annotated[
         str, typer.Option(help="auto, go or python (auto: go if the checkout has go.mod).")
     ] = "auto",
@@ -979,7 +1239,14 @@ def main(
         depends=repo_config.depends if repo_config else (),
         always_run=repo_config.always_run if repo_config else (),
     )
-    graphs = GraphProvider(checkout, go, cache_dir)
+    github_source = None
+    if source == "github":
+        token = _github_token()
+        if not token:
+            typer.echo("error: --source github needs GITHUB_TOKEN", err=True)
+            raise typer.Exit(2)
+        github_source = GitHubSource(token, repo)
+    graphs = GraphProvider(checkout, go, cache_dir, github_source, goos)
     with get_sessionmaker()() as session:
         repo_id = session.execute(
             text("SELECT id FROM repos WHERE name = :name"), {"name": repo}
@@ -990,29 +1257,52 @@ def main(
         durations = top_level_durations(session, repo_id, go=is_go)
         rules = f"{len(config.depends)} declared rule(s)" if config.depends else "no declared rules"
         graph = "go list" if is_go else "python imports"
-        if not checkout:
-            graph += " (cached only, no --checkout)"
+        if not graphs.has_source:
+            graph += " (cached only, no --checkout or --source)"
         typer.echo(f"# {repo} ({'go' if is_go else 'python'}): {rules}; import graph: {graph}")
         started = time.perf_counter()
         index = HistoryIndex(session, repo_id)
         typer.echo(f"history index: {index} in {time.perf_counter() - started:.0f}s", err=True)
 
+        everything: list[Result] = []  # for --json-out
+
+        wanted = tuple(c.strip() for c in commits.split(",") if c.strip()) if commits else ()
+        done = resumed_keys(resume) if resume else set()
+        if done:
+            typer.echo(f"resuming: {len(done)} targets already in {resume}", err=True)
+
         def run_all(title: str, targets: list[TargetRun]) -> list[Result]:
             typer.echo(f"\n# {title}")
             results = []
             for target in targets:
+                if wanted and not target.commit_sha.startswith(wanted):
+                    continue
+                if target_key(target) in done:
+                    continue
                 result = evaluate(session, index, target, config, graphs, durations, is_go)
                 print_result(result, verbose)
                 results.append(result)
+                if resume:  # one line per target as soon as it's done: a crash loses nothing
+                    with resume.open("a", encoding="utf-8") as out:
+                        out.write(json.dumps(result_json(result)) + "\n")
+            everything.extend(results)
             return results
 
-        if replay_main:
+        if replay_prs:
+            token = _github_token()
+            if not token:
+                typer.echo("error: --replay-prs needs GITHUB_TOKEN", err=True)
+                raise typer.Exit(2)
+            compare = GitHubCompare(token, cache_dir)
+            targets = merged_pr_targets(token, repo, days, compare)
+            print_summary(f"PRs merged in the last {days} days", run_all("merged PRs", targets))
+        elif replay_main:
             token = _github_token()
             if not token:
                 typer.echo("error: --replay-main needs GITHUB_TOKEN", err=True)
                 raise typer.Exit(2)
             compare = GitHubCompare(token, cache_dir)
-            targets = main_replay_targets(session, repo_id, repo, compare)
+            targets = main_replay_targets(session, repo_id, repo, compare, last)
             print_summary("main runs replayed as PRs", run_all("main replay", targets))
         else:
             recent = run_all("most recent PR runs", pr_targets(session, repo_id, runs, False))
@@ -1027,6 +1317,9 @@ def main(
                 )
             print_summary("most recent PR runs", recent)
             print_summary("PR runs with failures", failing_results)
+        if json_out:
+            json_out.write_text(json.dumps([result_json(r) for r in everything], indent=1))
+    graphs.close()
 
 
 if __name__ == "__main__":
