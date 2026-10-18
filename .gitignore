@@ -13,3 +13,7 @@ htmlcov/
 .env
 CLAUDE.md
 .eval-cache/
+.mcp.json
+junit*.xml
+.coverage
+coverage.xml
