@@ -1,7 +1,9 @@
-# Selector evaluation
+# Selector and triage evaluation
 
 Replays of siftwise's test selector against real CI history, to find out how much test time
-selection saves and whether it would have missed real failures:
+selection saves and whether it would have missed real failures. The rdflib, Cirq and
+substrate numbers are from the current code (re-run on 2026-10-18); kubo's were measured with
+the week-2 code (its history isn't in the current database):
 
 - [ipfs/kubo](#ipfskubo): a Go project with about 4,100 known tests.
 - [RDFLib/rdflib](#rdflibrdflib): a Python project with about 18,000 known tests. Each CI run
@@ -12,7 +14,12 @@ selection saves and whether it would have missed real failures:
 - [agent-substrate/substrate](#agent-substratesubstrate): a busy Go repo (one module, ~2,000
   packages) with real failures: recall, with and without a declared rule for its e2e suites.
 
+And of triage's verdicts, on rdflib and substrate: [Triage eval](#triage-eval).
+
 ## ipfs/kubo
+
+Measured with the week-2 code: kubo's history isn't in the current database, so these numbers
+weren't re-run.
 
 ### Summary
 
@@ -453,6 +460,10 @@ uv run python -m scripts.eval.run_eval --repo RDFLib/rdflib --replay-main --chec
   93 went selective and the estimated time skipped was **37.3%** (full runs count as 0%).
   PRs that changed only `cirq-google` skipped 80% of test time; PRs in `cirq-core`, which every
   other package imports, skipped 19%.
+- **Re-run with the current code (2026-10-18):** the first run's window extended past the end
+  of the recorded history; this re-run uses the 132 PRs merged by 7 October (the 90 days from
+  2026-07-09 to 2026-10-07): **37.9%** skipped, 91 selective; 79.8% for `cirq-google`-only PRs
+  (21), 20.2% for `cirq-core`-only PRs (46).
 - **Recall can't be measured here.** Cirq uploads JUnit only from a push-to-main monitoring
   workflow: there are no PR test results, and main had no failing run in the window. These
   numbers measure selection and savings, not safety.
@@ -532,7 +543,9 @@ would have claimed.
   the whole system and reach it through no Go import. With one declared rule (as for kubo),
   selective runs catch **36 of 39**, and savings drop: **5.8%** of test time on PR runs and 15.1%
   on main commits, against 19.5% and 31.7% without it. A second rule for `functionaltest`
-  suites brings it to **38 of 39** (5.1% of PR test time skipped; main replay not re-run).
+  suites brings it to **38 of 39** (5.1% of PR test time skipped). With both rules, the 40
+  main commits replayed as PRs: 1,308 of 1,308 caught (33 of 33 in selective runs), **13.9%**
+  of test time skipped.
 - **Not an independent-packages monorepo:** one Go module with about 2,000 packages, and PRs
   often touch several. Savings come from narrow changes, not from package boundaries.
 - **Only 8 days of history.** Its artifacts expire after about two weeks; the backfill got
@@ -637,3 +650,185 @@ uv run python -m scripts.eval.run_eval --repo agent-substrate/substrate --langua
     --siftwise-toml scripts/eval/substrate.siftwise.toml --failing --resume substrate-pr.jsonl
 uv run python -m scripts.eval.run_eval ... --replay-main --last 40 --resume substrate-main.jsonl
 ```
+
+## Triage eval
+
+How accurate are triage's verdicts (`new_regression`, `pre_existing`, `flaky`, `unknown`) on
+real history? Every recorded run with failures was triaged as of just before it, then scored
+against proxy labels taken from what happened afterwards.
+
+### Summary
+
+- **When triage says `new_regression`, it held up.** On rdflib, **10 of 11 fix episodes with a
+  known diff** got `new_regression`; the 11th is a known-flaky remote test where triage said
+  `unknown` and the label is probably wrong. On substrate, all 319 `new_regression` verdicts on
+  labelled failures were regressions.
+- **`pre_existing` is the strongest result:** 2,092 of 2,092 on substrate, including 759 called
+  at medium confidence after a *single* failing main run and confirmed by the main runs after it.
+- **Flaky detection mostly re-reads re-runs.** 678 of substrate's 683 `flaky` verdicts come
+  from a pass of the same commit before the failure, the same fact the flaky label uses, so
+  that agreement isn't an independent test. Only 8 `flaky` verdicts came from history alone; the
+  5 that could be labelled were labelled regressions.
+- **Regressions called flaky (the worst error): 0 on rdflib, 5 on substrate**, and the 5 look
+  like label noise: each test had same-commit flakes on record, and the 4 on branches were
+  "fixed" by diffs of 100+ files that had merged `main` (see the substrate section).
+- **Unknown when unsure:** 12.6% of substrate's failures and 14% of rdflib's got `unknown`,
+  mostly runs whose diff was never recorded (rule 3), as designed.
+- **Blind spot:** on a repo where every change links to every test (rdflib), flaky tests look
+  like regressions unless CI re-runs them. rdflib's `test_service*` tests, which call a remote
+  SPARQL service, were called `new_regression` 12 times out of 13.
+
+### Method
+
+Code: `scripts/eval/run_eval.py --triage`, labels in `scripts/eval/triage_labels.py`.
+
+- **No peeking.** Verdicts come from the production engine (`core.triage.triage_run`), cut off
+  at each run exactly as `POST /repos/{repo}/triage` is: only runs before it, never another leg
+  of the same CI run attempt.
+- **Change links as a live recording would have stored them.** Backfilled runs have no
+  `runs.affected`, so the eval computes each run's links from its stored changed files and the
+  import graphs at its commit (Go `go list`, Python's static graph), through `triage_run`'s
+  `run_links` argument: one optional callback, used for runs stored without links, `None` in
+  production. A graph that can't be built leaves the change unknown, as `record` would.
+- **Unit:** one failing test at one commit (Go subtests folded into a failing parent).
+- **Labels** (the first that applies wins):
+  1. **flaky:** the same commit and variant also passed, in another run;
+  2. **pre_existing:** main (same variant) was failing the test at its latest run before, in a
+     streak of at least 2 main commits;
+  3. **regression:** (a) on a branch, main passed the test before, no run of the commit passed
+     it, and a later commit on the branch passed it after a diff touching a file linked to the
+     test (a GitHub compare, the selector's links); or (b) on main, the previous main run passed
+     and the test then failed on at least 2 main commits in a row, starting here.
+- **Excluded, never guessed:** a failure that never passed again on its branch, no main
+  history of the test, a later pass after a change unrelated to the test, a one-off failure on
+  main (calling it flaky would reuse the engine's own fail-then-pass rule), an unknown fix diff.
+
+### RDFLib/rdflib (regression checks only)
+
+**10 of 11 fix episodes with a known diff got `new_regression`.** An episode is a branch and
+the commit that fixed its failures; the 11th, and a 12th whose diff was never recorded, are
+below. rdflib has no re-runs of a commit and almost nothing failing on main, so every label is
+a regression: this section measures regressions only, with no flaky or pre-existing precision.
+
+| Distinct (commit, test) failures | |
+|---|---|
+| Failures | 2,315 (41 commits, 1,105 tests) |
+| Labelled (all regression) | 1,312 (57%), in 12 fix episodes |
+| → `new_regression` | 1,048 (80%): 656 high confidence, 392 medium |
+| → `unknown` | 264 (20%): one PR (`undef-enum`) whose diff was never recorded (rule 3) |
+| → `flaky` (regressions called flaky) | **0** |
+| `unknown` over all failures | 323 of 2,315 (14%): 264 unknown diff, 58 new tests with no history |
+
+Per matrix leg (about 15 per commit), the same run counts 13,329 failures: 10,568 labelled,
+6,977 `new_regression`, 3,591 `unknown`, 0 `flaky`; 2,761 excluded (never passed again on its
+branch 2,190, no main history 546, later pass after an unrelated change 24, one-off main
+failure 1). Verdicts agree across legs for 2,312 of the 2,315 failures.
+
+Three caveats make the regression numbers weaker evidence than they look:
+
+1. **The label barely separates fixes from other changes on rdflib.** The "fixed by a linked
+   change" check said linked 10,568 times and unrelated 24 times: rdflib's `__init__.py` and
+   plugin registry link nearly every module to nearly every test (why selection saves ~1%
+   there). On rdflib the label effectively means "failed, then passed later on its branch".
+2. **12 fix episodes, not 1,048 data points.** Two PRs hold 75% of the labelled regressions:
+   `upgrade-mypy-v3` (666 tests) and `fix/dataset-length-count` (311).
+3. **A known flaky test was called a regression.** The `test_service*` tests call a remote
+   SPARQL service; triage said `new_regression` for 12 of their 13 failures and the label said
+   regression for 6. Neither can see flakiness: there are no same-commit re-runs, and the
+   fail-then-pass rule needs a change that doesn't link to the test, which almost never
+   happens on rdflib.
+
+### agent-substrate/substrate
+
+The headline repo for flaky and pre-existing: 202 re-runs of a commit and 50 failing main runs.
+3,620 failures in 153 runs (140 commits; 419 tests; one (commit, test) failed in two legs), 8
+days of history; 3,176 labelled (87.7%).
+
+| Label ↓ / verdict → | `new_regression` | `flaky` | `pre_existing` | `unknown` |
+|---|---|---|---|---|
+| regression (406) | **319** | **5** | 0 | 82 |
+| flaky (678) | 0 | **678** | 0 | 0 |
+| pre_existing (2,092) | 0 | 0 | **2,092** | 0 |
+
+| | |
+|---|---|
+| Precision of `new_regression` | 319 / 319 (high 177/177, medium 141/141) |
+| Precision of `pre_existing` | 2,092 / 2,092 (high 1,333/1,333, **medium 759/759**) |
+| Precision of `flaky` | 678 / 683, but see below |
+| Regressions called flaky | **5** (below) |
+| Regressions found (recall) | 319 / 406 (78.6%): 62 `unknown` not linked to the change, 20 `unknown` linked but known flaky ("re-run to tell"), 5 `flaky` |
+| `unknown` over all failures | 456 / 3,620 (12.6%): 347 in 22 runs with an unknown diff |
+| Fix check | linked 402, unrelated 11 (rdflib: 24 of 10,592) |
+| Excluded | 444: never passed again 360, no main history 68, unrelated fix 11, one-off main failure 4, fix diff unknown 1 |
+
+- **`flaky` precision is mostly by construction.** 678 of the 683 `flaky` verdicts are rule 1
+  (the same commit and variant passed before), and all 678 flaky labels are that same earlier
+  pass: no flaky label needed a pass the engine couldn't see. Only 8 `flaky` verdicts came from
+  history alone (past same-commit flakes, or an unrelated fail-then-pass); 3 were unlabelable
+  and the other 5 are the regressions called flaky.
+- **`pre_existing` at medium confidence is the real test of prediction:** the verdict was made
+  after one failing main run, and the label needed the streak to continue on later main runs.
+- **Regressions as `unknown` are triage refusing to guess.** The 62 "not linked" include
+  `atepg::TestAcquireLease_*`, broken by a PR that no import edge or declared rule connects to
+  them (the selection eval's no-fallback counterfactual misses them too).
+- **The 5 regressions called flaky are probably label noise.** 9 of the 34 fix diffs have 100+
+  files, because the branch merged `main` before the fix: the diff then carries `main`'s
+  changes, and they can touch the test's own package. 38 labels rest on such diffs, including
+  all 4 branch-side regressions called flaky; each of those tests had same-commit flakes on
+  record before the run. The 5th is on main (`combinedvolumes::TestCombinedVolumes`, failing on
+  2 main commits), with 2 same-commit flakes before it. rdflib's 17 fix diffs all have 20 files
+  or fewer. Only 1 label anywhere rests on a low-strength link alone (a root build or CI file).
+
+### Examples
+
+1. **A regression, called correctly.** rdflib `fix/dataset-length-count` changed
+   `rdflib/graph.py`; 311 tests failed. Triage: `new_regression`, "imports changed module
+   rdflib/graph.py". A later commit on the branch (`ecf2e75`) fixed them.
+2. **Pre-existing, predicted from one main run.** substrate run 5046 (main, `e2e-agentgateway`):
+   the `TestActorEgress*` e2e tests had failed on main once, at `ac41c06`. Triage:
+   `pre_existing`, medium. They kept failing on main for 9 commits.
+3. **Unknown instead of a guess.** substrate `aramase/c/objectstore_proto_rename`: 332 labelled
+   regressions; 272 `new_regression`, and 60 `unknown` "not linked to this change" for tests
+   (`atepg::TestAcquireLease_*`) the diff reaches through no signal.
+4. **A "regression called flaky" that probably isn't.** substrate
+   `atelet::TestSandboxAssetPrewarmDownloads` failed on three unrelated PRs (`pmem-dax`,
+   `atunnel-egress-h2`, `atunnel-strip-stale-header`). Triage: `flaky`, high, "flaky 5 times in
+   90 days (3 same-commit, 2 unrelated fail-then-pass)". Each PR's later passing commit came
+   after merging `main`: diffs of 220–266 files, including `cmd/atelet` itself, the test's own
+   package. So the label called each a regression fixed by a linked change. Counted as errors
+   here; the test's history says flaky.
+5. **The blind spot.** rdflib `test_service_with_bound_solutions` calls a remote SPARQL
+   service. On a PR that only bumped the pre-commit config, triage said `unknown` (not linked)
+   and the label said regression: this is the 11th episode above. Elsewhere its `test_service*`
+   siblings got `new_regression`, because rdflib's changes link to everything and it never
+   re-runs a commit (a Known issue: a `known_flaky` list or re-run detection would fix it).
+
+### Limits
+
+- **The labels are proxies.** Label (a) uses the selector's links on a later diff, the same
+  mapping verdict rule 6 uses, so `new_regression` precision is partly measured with the
+  engine's own links; on rdflib that check is nearly always "linked".
+- **Fix diffs that merged `main` carry `main`'s changes,** so label (a) can credit a fix to
+  them (9 of substrate's 34 fix diffs; none of rdflib's).
+- **Flaky and pre-existing labels share evidence with rules 1 and 2;** only the parts noted
+  above (medium-confidence `pre_existing`, history-only `flaky`) test prediction.
+- **substrate has 8 days of history:** little for the week-4 fail-then-pass rule to find.
+- **Episodes are few:** 12 on rdflib, 34 on substrate (one of them is 332 of the 406
+  substrate regressions).
+
+### Reproducing
+
+Needs the history backfilled, `GITHUB_TOKEN` (from the environment or `.env`), and Go for
+substrate. A network outage stops the eval (it never records "unavailable" for one);
+`--resume` continues.
+
+```sh
+uv run python -m scripts.eval.run_eval --repo RDFLib/rdflib --language python \
+    --source github --triage --resume rdflib-triage.jsonl
+uv run python -m scripts.eval.run_eval --repo agent-substrate/substrate --language go \
+    --go-module github.com/agent-substrate/substrate --source github --goos linux \
+    --siftwise-toml scripts/eval/substrate.siftwise.toml --triage --resume substrate-triage.jsonl
+```
+
+rdflib took 47 minutes; substrate about 3½ hours, mostly building Go import graphs (about 3
+minutes per commit on Windows).

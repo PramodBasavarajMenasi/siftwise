@@ -6,7 +6,8 @@ Two modes:
   diffs. ``--failing`` adds every PR run that had failures.
 * ``--replay-main``: treat each main run as a PR whose diff is the previous main run's
   commit ... this commit (fetched from the GitHub compare API and cached).
-* ``--replay-prs``: every PR merged in the last ``--days``, from the GitHub API, whether or not
+* ``--replay-prs``: every PR merged in the ``--days`` before the end of the repo's recorded
+  history (its newest run, never today), from the GitHub API, whether or not
   CI recorded results for it: the diff is the PR's base...head (as ``siftwise select`` sends),
   and history is cut at the PR head commit's time. For repos whose JUnit comes only from main
   (no PR runs), so it measures selection and savings; with no PR results, not recall.
@@ -54,10 +55,10 @@ import sys
 import tempfile
 import time
 import zipfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -69,9 +70,11 @@ from sqlalchemy.orm import Session
 if not __package__:  # run as a file path: make the repo root importable
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.eval import triage_labels as tl
 from siftwise.cli.gograph import GoGraph, build_graph, parse_go_list
 from siftwise.cli.pygraph import PyGraph, build_py_graph, module_of_test
 from siftwise.cli.repoconfig import load_repo_config, read_go_module
+from siftwise.config import get_settings
 from siftwise.core.junit import Status
 from siftwise.core.models import FAILED_CODES_SQL, PASSED_CODE, STATUS_CODES
 from siftwise.core.selector import (
@@ -87,6 +90,7 @@ from siftwise.core.selector import (
     is_ignorable,
     select_tests,
 )
+from siftwise.core.triage import Change, Failure, Target, recorded_failures, triage_run
 from siftwise.db import get_sessionmaker
 
 FAILED_CODES = (STATUS_CODES[Status.FAILED], STATUS_CODES[Status.ERROR])
@@ -467,20 +471,37 @@ def main_replay_targets(
     return targets
 
 
-def merged_pr_targets(token: str, repo: str, days: int, compare: GitHubCompare) -> list[TargetRun]:
-    """Every PR merged in the last ``days``, oldest first, as a target: the PR's base...head
-    diff, history cut at its head commit's time (when CI would have selected for it)."""
+def history_end(session: Session, repo_id: int) -> datetime | None:
+    """The repo's newest recorded run time: where its history ends."""
+    end: datetime | None = session.execute(
+        text("SELECT max(COALESCE(started_at, created_at)) FROM runs WHERE repo_id = :repo_id"),
+        {"repo_id": repo_id},
+    ).scalar_one()
+    return end
+
+
+def merged_pr_targets(
+    token: str, repo: str, days: int, compare: GitHubCompare, until: datetime
+) -> list[TargetRun]:
+    """Every PR merged in the ``days`` up to ``until`` (the end of the recorded history),
+    oldest first, as a target: the PR's base...head diff, history cut at its head commit's time
+    (when CI would have selected for it).
+
+    Counted back from the history's end, never from today: a PR merged after it would be
+    selected against history that stops before it, and a re-run months later would replay a
+    different set of PRs."""
     gh = httpx.Client(
         base_url="https://api.github.com",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
         timeout=60,
     )
-    cutoff = datetime.now(UTC) - timedelta(days=days)
+    cutoff = until - timedelta(days=days)
     prs: list[dict[str, Any]] = []
     for page in range(1, 50):
         batch = gh.get(f"/repos/{repo}/pulls", params={"state": "closed", "sort": "updated",
                        "direction": "desc", "per_page": 100, "page": page}).json()  # fmt: skip
-        prs += [p for p in batch if p.get("merged_at") and _iso(p["merged_at"]) >= cutoff]
+        prs += [p for p in batch
+                if p.get("merged_at") and cutoff <= _iso(p["merged_at"]) <= until]  # fmt: skip
         if len(batch) < 100 or _iso(batch[-1]["updated_at"]) < cutoff:
             break
     targets = []
@@ -508,6 +529,34 @@ def _iso(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+# Waits (seconds) between attempts of a GitHub request that failed at the network level.
+NETWORK_RETRY_WAITS = (0, 10, 30, 60)
+
+
+def get_with_retries(http: httpx.Client, url: str) -> httpx.Response:
+    """GET, retrying network errors (DNS, connect, timeouts). If the network stays down, the
+    last error is raised: the eval stops, and ``--resume`` continues later. Never turn an
+    outage into "unavailable": that would be written into the results as a real answer (no
+    import graph, unknown fix diff) and skew them. HTTP errors are returned, not retried."""
+    error: httpx.TransportError | None = None
+    attempts = len(NETWORK_RETRY_WAITS)
+    for attempt, wait in enumerate(NETWORK_RETRY_WAITS, start=1):
+        time.sleep(wait)
+        try:
+            return http.get(url)
+        except httpx.TransportError as exc:
+            error = exc
+            # One line per failed attempt, on stderr: the error class and the request path
+            # only. The token is in the client's headers and is never logged; neither is the
+            # error's message, which could quote a request.
+            then = (f"retrying in {NETWORK_RETRY_WAITS[attempt]}s" if attempt < attempts
+                    else "giving up")  # fmt: skip
+            typer.echo(f"github: attempt {attempt}/{attempts} failed "
+                       f"({type(exc).__name__}) on GET {url}; {then}", err=True)  # fmt: skip
+    assert error is not None
+    raise error
+
+
 class GitHubCompare:
     """Changed files between two commits, from the GitHub compare API, cached on disk."""
 
@@ -524,7 +573,7 @@ class GitHubCompare:
         if cache.exists():
             data = json.loads(cache.read_text())
         else:
-            response = self._http.get(f"/repos/{repo}/compare/{base}...{head}")
+            response = get_with_retries(self._http, f"/repos/{repo}/compare/{base}...{head}")
             if response.status_code != httpx.codes.OK:
                 return None  # not cached: a later run may succeed
             data = response.json()
@@ -554,16 +603,11 @@ class GitHubSource:
         )
 
     def extract(self, sha: str, into: Path) -> list[str] | None:
-        """Unpack the tree at ``sha`` into ``into``; its file paths, or None if unavailable."""
-        response = None
-        for wait in (0, 10, 30):  # codeload times out now and then on big archives
-            time.sleep(wait)
-            try:
-                response = self._http.get(f"/repos/{self.repo}/zipball/{sha}")
-                break
-            except httpx.TransportError:
-                continue
-        if response is None or response.status_code != httpx.codes.OK:
+        """Unpack the tree at ``sha`` into ``into``; its file paths, or None if GitHub says
+        it's unavailable. Network errors are retried, then raised (``get_with_retries``)."""
+        # codeload times out now and then on big archives: retried like any network error
+        response = get_with_retries(self._http, f"/repos/{self.repo}/zipball/{sha}")
+        if response.status_code != httpx.codes.OK:
             return None  # this target gets no graph (reported), the rest of the eval goes on
         files = []
         links: dict[str, str] = {}  # link path -> its target, relative to the link's directory
@@ -1031,6 +1075,289 @@ def _signal(reason: str) -> str:
     return "path mapping"
 
 
+# --- triage eval (--triage) -----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RunMeta:
+    run: tl.Run
+    ci_run_id: str | None
+    run_attempt: int
+    changed_files_known: bool
+
+
+def load_run_meta(session: Session, repo_id: int) -> dict[int, RunMeta]:
+    rows = session.execute(
+        text(
+            "SELECT id, COALESCE(started_at, created_at), commit_sha, branch, is_main,"
+            " COALESCE(variant, ''), ci_run_id, run_attempt, changed_files_known"
+            " FROM runs WHERE repo_id = :repo_id"
+        ),
+        {"repo_id": repo_id},
+    )
+    return {row[0]: RunMeta(tl.Run(*row[:6]), row[6], row[7], row[8]) for row in rows}
+
+
+class RunChanges:
+    """Each run's change as ``siftwise record`` would have stored it, had it recorded live: the
+    run's changed files and the import graphs at its commit. ``links`` is None when the diff is
+    unknown or a graph that applies can't be built (record then stores ``affected`` NULL, and
+    triage treats the change as unknown)."""
+
+    def __init__(
+        self,
+        graphs: GraphProvider,
+        config: SelectorConfig,
+        go: bool,
+        meta: dict[int, RunMeta],
+        changed: dict[int, set[str]],
+    ) -> None:
+        self.graphs, self.config, self.go = graphs, config, go
+        self.meta, self.changed = meta, changed
+        self._links: dict[int, dict[str, Any] | None] = {}
+
+    def links(self, run_id: int) -> dict[str, Any] | None:
+        """``runs.affected`` for the run (the engine's ``run_links`` callback)."""
+        if run_id not in self._links:
+            meta = self.meta.get(run_id)
+            if meta is None or not meta.changed_files_known:
+                self._links[run_id] = None
+            else:
+                files = sorted(self.changed.get(run_id, ()))
+                self._links[run_id] = self.graph_links(meta.run.commit, files)
+        return self._links[run_id]
+
+    def change(self, run_id: int) -> Change:
+        links = self.links(run_id)
+        if links is None:
+            return Change((), False)
+        return Change.from_graph(sorted(self.changed.get(run_id, ())), links)
+
+    def graph_links(self, commit: str, files: list[str]) -> dict[str, Any] | None:
+        """``ChangeGraph`` fields for ``files`` changed at ``commit``, as ``local_change``
+        builds them: Go for any change (a go.mod repo), Python when a .py file changed."""
+        packages: dict[str, list[str]] = {}
+        py_files: dict[str, list[str]] = {}
+        if self.go and files:
+            graph, _ = self.graphs.go_graph_at(commit)
+            if graph is None:
+                return None
+            packages = graph.affected(files)
+        if not self.go and any(f.endswith(".py") for f in files):
+            py_graph = self.graphs.py_graph_at(commit)
+            if py_graph is None:
+                return None
+            py_files = py_graph.affected(files)
+        return {
+            "affected_packages": packages,
+            "affected_files": py_files,
+            "depends": [{"tests": r.tests, "on": list(r.on)} for r in self.config.depends],
+            "go_module": self.config.go_module,
+            "generated": list(self.config.generated),
+        }
+
+
+class FixLinks:
+    """``triage_labels.LinkedFix``: does the diff from the failing commit to the passing one
+    touch a file linked to the test? The selector's change links (as triage's), over a GitHub
+    compare, with the import graphs at the passing commit."""
+
+    def __init__(
+        self, repo: str, compare: GitHubCompare, changes: RunChanges, paths: dict[str, str | None]
+    ) -> None:
+        self.repo, self.compare, self.changes, self.paths = repo, compare, changes, paths
+
+    def __call__(self, test: str, failed: tl.Run, passed: tl.Run) -> bool | None:
+        files = self.compare.files(self.repo, failed.commit, passed.commit)
+        if files is None:
+            return None
+        links = self.changes.graph_links(passed.commit, list(files))
+        if links is None:
+            return None
+        change = Change.from_graph(files, links)
+        return bool(change.links([KnownTest(test, self.paths.get(test))]).get(test))
+
+
+def label_timelines(
+    session: Session, repo_id: int, test_ids: list[str], meta: dict[int, RunMeta]
+) -> dict[tuple[str, str], list[tuple[tl.Run, str]]]:
+    """Every final outcome of these tests, per (test, variant), oldest first. Labels read the
+    future on purpose; verdicts never see this."""
+    status = {PASSED_CODE: tl.PASS, **{code: tl.FAIL for code in FAILED_CODES}}
+    timelines: dict[tuple[str, str], list[tuple[tl.Run, str]]] = defaultdict(list)
+    rows = session.execute(
+        text(
+            """
+            SELECT DISTINCT ON (tr.run_id, tr.test_key) tr.run_id, t.test_id, tr.status
+            FROM tests t JOIN test_results tr ON tr.test_key = t.id
+            WHERE t.repo_id = :repo_id AND t.test_id = ANY(:ids)
+            ORDER BY tr.run_id, tr.test_key, tr.attempt DESC
+            """
+        ),
+        {"repo_id": repo_id, "ids": test_ids},
+    )
+    for run_id, test_id, code in rows:
+        run = meta[run_id].run
+        timelines[(test_id, run.variant)].append((run, status.get(code, tl.SKIP)))
+    for timeline in timelines.values():
+        timeline.sort(key=lambda item: item[0].order)
+    return timelines
+
+
+def triage_targets(session: Session, repo_id: int) -> dict[int, list[Failure]]:
+    """Every recorded run with failures: its failing tests (final attempt), Go subtests folded
+    into a failing parent."""
+    run_ids = list(
+        session.scalars(
+            text(
+                f"""
+                SELECT DISTINCT tr.run_id FROM test_results tr JOIN runs r ON r.id = tr.run_id
+                WHERE r.repo_id = :repo_id AND tr.status IN {FAILED_CODES_SQL}
+                """
+            ),
+            {"repo_id": repo_id},
+        )
+    )
+    targets = {}
+    for run_id, failures in recorded_failures(session, run_ids).items():
+        kept = set(tl.fold_subtests(f.test_id for f in failures))
+        if kept:
+            targets[run_id] = [f for f in failures if f.test_id in kept]
+    return targets
+
+
+def triage_eval(
+    session: Session,
+    repo: str,
+    repo_id: int,
+    changes: RunChanges,
+    fixes: FixLinks,
+    window_days: int,
+    resume: Path | None,
+    wanted: tuple[str, ...],
+    verbose: bool,
+) -> list[tl.Scored]:
+    """Triage every run with failures, oldest first, as of just before it (the production
+    engine, cut off at the run: no peeking), and label each failure from what came after."""
+    targets = triage_targets(session, repo_id)
+    meta = changes.meta
+    order = sorted(targets, key=lambda run_id: meta[run_id].run.order)
+    test_ids = sorted({f.test_id for failures in targets.values() for f in failures})
+    timelines = label_timelines(session, repo_id, test_ids, meta)
+    session.rollback()
+    typer.echo(f"# triage: {len(order)} runs with failures, {len(test_ids)} failing tests")
+    done = resumed_triage(resume) if resume else {}
+    scored = [s for records in done.values() for s in records]
+    for run_id in order:
+        info = meta[run_id]
+        run = info.run
+        if f"triage|{run_id}" in done or (wanted and not run.commit.startswith(wanted)):
+            continue
+        change = changes.change(run_id)
+        target = Target(repo, run.commit, run.variant or None, info.ci_run_id, info.run_attempt)
+        report = triage_run(session, target, targets[run_id], change, window_days, changes.links)
+        assert report is not None
+        records = [
+            tl.Scored(
+                r.test_id, run_id, r.verdict.value, r.confidence.value,
+                tl.label(r.test_id, run, timelines[(r.test_id, run.variant)], fixes),
+            )
+            for r in report.results
+        ]  # fmt: skip
+        session.rollback()  # read-only: don't hold a snapshot across targets
+        scored += records
+        line = {
+            "key": f"triage|{run_id}",
+            "run_id": run_id,
+            "commit": run.commit,
+            "branch": run.branch,
+            "variant": run.variant,
+            "is_main": run.is_main,
+            "change": "known" if change.changed_files_known else "unknown",
+            "reasons": {r.test_id: r.reasons[0] if r.reasons else "" for r in report.results},
+            "failures": [_scored_json(s) for s in records],
+        }
+        if resume:
+            with resume.open("a", encoding="utf-8") as out:
+                out.write(json.dumps(line) + "\n")
+        counts = Counter(f"{s.verdict}/{s.label.kind or '-'}" for s in records)
+        summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
+        typer.echo(
+            f"run {run_id} {run.commit[:7]} {run.branch[:30]} [{run.variant or '-'}] "
+            f"{line['change']}: {summary}"
+        )
+        if verbose:
+            for s in records:
+                typer.echo(f"    {s.verdict:<15} {s.confidence:<6} {s.label.kind or '-':<12} "
+                           f"{s.test}  ({s.label.reason})")  # fmt: skip
+    return scored
+
+
+def _scored_json(s: tl.Scored) -> dict[str, Any]:
+    return {
+        "test": s.test,
+        "verdict": s.verdict,
+        "confidence": s.confidence,
+        "label": s.label.kind,
+        "label_reason": s.label.reason,
+        "when": s.label.when,
+    }
+
+
+def resumed_triage(path: Path) -> dict[str, list[tl.Scored]]:
+    """Targets already in a --triage --resume file, by key."""
+    done: dict[str, list[tl.Scored]] = {}
+    if not path.exists():
+        return done
+    for text_line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            line = json.loads(text_line)
+            done[line["key"]] = [
+                tl.Scored(f["test"], line["run_id"], f["verdict"], f["confidence"],
+                          tl.Label(f["label"], f["label_reason"], f.get("when", "")))
+                for f in line["failures"]
+            ]  # fmt: skip
+        except (ValueError, KeyError, TypeError):
+            continue  # a line torn by a crash: that target runs again
+    return done
+
+
+def print_triage_summary(title: str, scored: list[tl.Scored]) -> None:
+    m = tl.metrics(scored)
+    typer.echo(f"\n=== triage: {title} ===")
+    typer.echo(f"  failures: {m.failures}; labelled {m.labelled} ({_pct(m.labelled, m.failures)})")
+    for reason, n in m.excluded.items():
+        typer.echo(f"    excluded, {reason}: {n}")
+    typer.echo("  label \\ verdict   " + "".join(f"{v:>16}" for v in tl.VERDICTS))
+    for lab in tl.LABELS:
+        cells = "".join(f"{m.confusion.get((lab, v), 0):>16}" for v in tl.VERDICTS)
+        typer.echo(f"  {lab:<18}{cells}")
+    for verdict, lab in (("new_regression", tl.REGRESSION), ("flaky", tl.FLAKY),
+                         ("pre_existing", tl.PRE_EXISTING)):  # fmt: skip
+        parts = [f"all {_ratio(*m.precision(verdict, lab))}"]
+        parts += [f"{c} {_ratio(*m.precision(verdict, lab, c))}" for c in ("high", "medium")]
+        typer.echo(f"  precision of {verdict}: " + ", ".join(parts))
+    for lab, verdict in ((tl.REGRESSION, "new_regression"), (tl.FLAKY, "flaky"),
+                         (tl.PRE_EXISTING, "pre_existing")):  # fmt: skip
+        typer.echo(f"  recall of {lab} as {verdict}: {_ratio(*m.recall(lab, verdict))}")
+    typer.echo(f"  regressions called flaky: {len(m.regressions_called_flaky)}")
+    for s in m.regressions_called_flaky:
+        typer.echo(f"    run {s.run_id}: {s.test} ({s.label.reason})")
+    typer.echo(f"  unknown: {_ratio(m.unknown_all, m.failures)} of all failures, "
+               f"{_ratio(m.unknown_labelled, m.labelled)} of labelled ones")  # fmt: skip
+    if m.flaky_when:
+        typer.echo("  flaky labels, same-commit pass seen: "
+                   + ", ".join(f"{k} {v}" for k, v in sorted(m.flaky_when.items())))  # fmt: skip
+
+
+def _pct(n: int, total: int) -> str:
+    return f"{100 * n / total:.1f}%" if total else "-"
+
+
+def _ratio(n: int, total: int) -> str:
+    return f"{n}/{total} ({_pct(n, total)})" if total else "0/0"
+
+
 # --- report -------------------------------------------------------------------------------
 
 
@@ -1168,15 +1495,35 @@ def _print_miss_signals(label: str, missed: list[Missed]) -> None:
 
 
 def _github_token() -> str | None:
+    """GITHUB_TOKEN from the environment, else from .env (the working directory's, then the
+    repo root's). The environment always wins. Never printed or logged."""
     token = os.environ.get("GITHUB_TOKEN")
     if token:
         return token
-    env = Path(".env")
-    if env.exists():
-        for line in env.read_text(encoding="utf-8-sig").splitlines():
-            key, _, value = line.partition("=")
-            if key.strip() == "GITHUB_TOKEN":
-                return value.strip().strip("\"'")
+    for env in (Path(".env"), Path(__file__).resolve().parents[2] / ".env"):
+        value = _dotenv_value(env, "GITHUB_TOKEN")
+        if value:
+            return value
+    return None
+
+
+def _dotenv_value(path: Path, name: str) -> str | None:
+    """``name``'s value in a .env file: ``NAME=value`` lines, with optional ``export``,
+    quotes and comments."""
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.removeprefix("export ").partition("=")
+        if sep and key.strip() == name:
+            value = value.strip()
+            if value[:1] in "\"'" and value[-1:] == value[:1] and len(value) > 1:
+                return value[1:-1]
+            return value.split(" #", 1)[0].strip()
     return None
 
 
@@ -1190,9 +1537,12 @@ def main(
         bool, typer.Option("--replay-main", help="Treat each main run as a PR.")
     ] = False,
     replay_prs: Annotated[
-        bool, typer.Option("--replay-prs", help="Every PR merged in the last --days.")
+        bool,
+        typer.Option("--replay-prs", help="Every PR merged in the --days before the history ends."),
     ] = False,
-    days: Annotated[int, typer.Option(help="Window for --replay-prs.")] = 90,
+    days: Annotated[
+        int, typer.Option(help="--replay-prs: days back from the newest recorded run.")
+    ] = 90,
     source: Annotated[
         str, typer.Option(help="'checkout' (--checkout) or 'github' (zipballs, no git).")
     ] = "checkout",
@@ -1228,6 +1578,14 @@ def main(
         ".eval-cache"
     ),
     verbose: Annotated[bool, typer.Option("--verbose", help="Details for every run.")] = False,
+    triage: Annotated[
+        bool,
+        typer.Option(
+            "--triage",
+            help="Triage every recorded run with failures as of just before it, and score the "
+            "verdicts against proxy labels from what happened after (see triage_labels.py).",
+        ),
+    ] = False,
 ) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     if checkout and not go_module:
@@ -1255,6 +1613,30 @@ def main(
         if repo_id is None:
             typer.echo(f"error: unknown repo {repo!r}", err=True)
             raise typer.Exit(2)
+        wanted = tuple(c.strip() for c in commits.split(",") if c.strip()) if commits else ()
+        if triage:
+            token = _github_token()
+            if not token:
+                typer.echo("error: --triage needs GITHUB_TOKEN (fix diffs)", err=True)
+                raise typer.Exit(2)
+            meta = load_run_meta(session, repo_id)
+            changes = RunChanges(graphs, config, is_go, meta,
+                                 changed_files_of(session, list(meta)))  # fmt: skip
+            paths: dict[str, str | None] = {
+                test_id: path
+                for test_id, path in session.execute(
+                    text("SELECT test_id, file_path FROM tests WHERE repo_id = :repo_id"),
+                    {"repo_id": repo_id},
+                )
+            }
+            fixes = FixLinks(repo, GitHubCompare(token, cache_dir), changes, paths)
+            window = get_settings().stats_window_days
+            scored = triage_eval(
+                session, repo, repo_id, changes, fixes, window, resume, wanted, verbose
+            )
+            print_triage_summary(repo, scored)
+            graphs.close()
+            return
         durations = top_level_durations(session, repo_id, go=is_go)
         rules = f"{len(config.depends)} declared rule(s)" if config.depends else "no declared rules"
         graph = "go list" if is_go else "python imports"
@@ -1267,7 +1649,6 @@ def main(
 
         everything: list[Result] = []  # for --json-out
 
-        wanted = tuple(c.strip() for c in commits.split(",") if c.strip()) if commits else ()
         done = resumed_keys(resume) if resume else set()
         if done:
             typer.echo(f"resuming: {len(done)} targets already in {resume}", err=True)
@@ -1294,9 +1675,16 @@ def main(
             if not token:
                 typer.echo("error: --replay-prs needs GITHUB_TOKEN", err=True)
                 raise typer.Exit(2)
+            until = history_end(session, repo_id)
+            if until is None:
+                typer.echo(f"error: no recorded runs for {repo!r}", err=True)
+                raise typer.Exit(2)
+            pr_window = f"{until - timedelta(days=days):%Y-%m-%d %H:%M} to {until:%Y-%m-%d %H:%M}"
+            typer.echo(f"merged PRs window: {pr_window} UTC ({days} days up to the end of the "
+                       "recorded history)")  # fmt: skip
             compare = GitHubCompare(token, cache_dir)
-            targets = merged_pr_targets(token, repo, days, compare)
-            print_summary(f"PRs merged in the last {days} days", run_all("merged PRs", targets))
+            targets = merged_pr_targets(token, repo, days, compare, until)
+            print_summary(f"PRs merged {pr_window}", run_all("merged PRs", targets))
         elif replay_main:
             token = _github_token()
             if not token:

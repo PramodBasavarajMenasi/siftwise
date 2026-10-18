@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -91,6 +91,11 @@ MAX_FLAKY_EVENTS = 10
 
 # 0 means "no window": a span longer than any repo's history (as in core/history.py).
 _ALL_HISTORY_DAYS = 365 * 100
+
+# For runs stored without change links (runs.affected NULL): a run id -> its links (as
+# runs.affected would hold them), or None if unknown. Only the eval passes one, to give
+# backfilled history the links a live recording would have stored; production never does.
+RunLinks = Callable[[int], Mapping[str, Any] | None]
 
 
 @dataclass(frozen=True)
@@ -540,6 +545,7 @@ def load_histories(
     target: Target,
     test_ids: Sequence[str],
     window_days: int = 90,
+    run_links: RunLinks | None = None,
 ) -> Histories | None:
     """Each test's history before the cut-off, or None if the repo is unknown.
 
@@ -633,7 +639,7 @@ def load_histories(
             )
         )
 
-    builder = _Builder(session, target, runs, params, window_start)
+    builder = _Builder(session, target, runs, params, window_start, run_links)
     histories = builder.build(seen, keys, paths)
     return Histories(cut_at, run_id, histories)
 
@@ -648,8 +654,10 @@ class _Builder:
         runs: dict[int, _Run],
         params: dict[str, Any],
         window_start: datetime,
+        run_links: RunLinks | None = None,
     ) -> None:
         self.session = session
+        self.run_links = run_links
         self.target = target
         self.runs = runs
         self.params = params
@@ -851,7 +859,16 @@ class _Builder:
             ),
             {"ids": sorted(run_ids)},
         )
-        return {run_id: Change.from_graph(changed, graph) for run_id, graph, changed in rows}
+        changes = {}
+        for run_id, graph, changed in rows:
+            if graph is None and self.run_links is not None:
+                graph = self.run_links(run_id)  # only runs _has_links let through
+            changes[run_id] = Change.from_graph(changed, graph)
+        return changes
+
+    def _has_links(self, run: _Run) -> bool:
+        """Stored links, or (eval only) links ``run_links`` can supply."""
+        return run.has_links or (self.run_links is not None and self.run_links(run.id) is not None)
 
     # -- flaky evidence --
 
@@ -905,7 +922,7 @@ class _Builder:
                 nxt is not None
                 and _final_failed(outcomes, run_id, key)
                 and outcomes.get((nxt.id, key), _NONE).outcome == PASSED_CODE
-                and all(r.changed_files_known and r.has_links for r in (run, nxt))
+                and all(r.changed_files_known and self._has_links(r) for r in (run, nxt))
             ):
                 candidates.append((run, nxt, key))
         if not candidates:
@@ -997,9 +1014,13 @@ def triage_run(
     failures: Sequence[Failure],
     change: Change,
     window_days: int = 90,
+    run_links: RunLinks | None = None,
 ) -> TriageReport | None:
-    """Load the failing tests' histories and triage them; None if the repo is unknown."""
-    histories = load_histories(session, target, [f.test_id for f in failures], window_days)
+    """Load the failing tests' histories and triage them; None if the repo is unknown.
+    ``run_links``: see ``RunLinks`` (the eval only)."""
+    histories = load_histories(
+        session, target, [f.test_id for f in failures], window_days, run_links
+    )
     if histories is None:
         return None
     return TriageReport(
@@ -1067,6 +1088,27 @@ def triage_ci_run(
         {"ids": run_ids},
     ):
         changed[run_id].append(path)
+    failures = recorded_failures(session, run_ids)
+
+    results = []
+    for run in runs:
+        links_known = run.changed_files_known and run.affected is not None
+        change = (
+            Change.from_graph(changed[run.id], run.affected) if links_known else Change((), False)
+        )
+        report = None
+        if failures[run.id]:
+            target = Target(repo, run.commit_sha, run.variant, ci_run_id, run_attempt)
+            report = triage_run(session, target, failures[run.id], change, window_days)
+        results.append(VariantTriage(
+            run.id, run.variant, run.commit_sha, run.changed_files_known, links_known, report,
+        ))  # fmt: skip
+    return results
+
+
+def recorded_failures(session: Session, run_ids: Sequence[int]) -> dict[int, list[Failure]]:
+    """Each run's failing tests as recorded: tests whose final attempt failed or errored, with
+    that attempt's message and the test's file path as of the run."""
     failures: dict[int, list[Failure]] = defaultdict(list)
     # Failed rows through the partial index, then each one's final attempt by primary key: a
     # test that failed and then passed on a retry is not a failure. A path counts only if it
@@ -1094,21 +1136,7 @@ def triage_ci_run(
             ORDER BY f.run_id, t.test_id
             """
         ),
-        {"ids": run_ids},
+        {"ids": list(run_ids)},
     ):
         failures[run_id].append(Failure(test_id, message, file_path))
-
-    results = []
-    for run in runs:
-        links_known = run.changed_files_known and run.affected is not None
-        change = (
-            Change.from_graph(changed[run.id], run.affected) if links_known else Change((), False)
-        )
-        report = None
-        if failures[run.id]:
-            target = Target(repo, run.commit_sha, run.variant, ci_run_id, run_attempt)
-            report = triage_run(session, target, failures[run.id], change, window_days)
-        results.append(VariantTriage(
-            run.id, run.variant, run.commit_sha, run.changed_files_known, links_known, report,
-        ))  # fmt: skip
-    return results
+    return failures

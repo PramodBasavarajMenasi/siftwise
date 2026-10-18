@@ -17,6 +17,7 @@ from siftwise.core.triage import (
     UNRELATED_FAIL_THEN_PASS,
     Change,
     Failure,
+    RunLinks,
     Target,
     TriageReport,
     TriageResult,
@@ -96,6 +97,7 @@ def run_triage(
     change: Change | None = None,
     message: str | None = None,
     window_days: int = 90,
+    run_links: RunLinks | None = None,
     **kwargs: Any,
 ) -> TriageReport:
     report = triage_run(
@@ -104,6 +106,7 @@ def run_triage(
         [Failure(t, message) for t in test_ids or (TEST,)],
         change or Change(("docs/unrelated.txt",), True),
         window_days,
+        run_links,
     )
     assert report is not None
     return report
@@ -280,6 +283,53 @@ def test_fail_then_pass_needs_both_runs_known_and_unrelated(
 
     assert found.history.flaky == ()
     assert found.verdict is Verdict.UNKNOWN
+
+
+def test_run_links_fill_in_only_runs_stored_without_links(db_session: Session) -> None:
+    # Backfilled history (runs.affected NULL): no fail-then-pass evidence on its own. The
+    # eval's callback supplies the links a live recording would have stored.
+    record(db_session, commit=1, hour=0, tests={TEST: P})
+    fail_then_pass(db_session, 10, 10, failed_graph=None, passed_graph=None)
+    asked: list[int] = []
+
+    def no_links(run_id: int) -> dict[str, Any] | None:
+        asked.append(run_id)
+        return ChangeGraph().model_dump()
+
+    without = result(db_session)
+    with_links = result(db_session, run_links=no_links)
+
+    assert without.history.flaky == ()
+    [event] = with_links.history.flaky
+    assert event.kind == UNRELATED_FAIL_THEN_PASS
+    assert asked  # asked only about runs without stored links, every one of them is NULL
+    stored = {r.id: r.affected for r in db_session.query(Run).filter(Run.id.in_(asked))}
+    assert set(stored.values()) == {None}
+
+
+def test_stored_links_win_over_run_links(db_session: Session) -> None:
+    # The passing run's stored graph links the test: that's a fix, not a flake, whatever the
+    # callback would say; and the callback is never asked about a run with stored links.
+    record(db_session, commit=1, hour=0, tests={TEST: P})
+    linked = ChangeGraph(affected_files={"tests/test_cart.py": ["src/more.py"]})
+    fail_then_pass(db_session, 10, 10, failed_graph=None, passed_graph=linked)
+    asked: list[int] = []
+
+    def no_links(run_id: int) -> dict[str, Any] | None:
+        asked.append(run_id)
+        return ChangeGraph().model_dump()
+
+    found = result(db_session, run_links=no_links)
+
+    assert found.history.flaky == ()
+    stored = {r.id: r.affected for r in db_session.query(Run).filter(Run.id.in_(asked))}
+    assert asked and set(stored.values()) == {None}
+
+
+def test_run_links_returning_none_is_no_evidence(db_session: Session) -> None:
+    record(db_session, commit=1, hour=0, tests={TEST: P})
+    fail_then_pass(db_session, 10, 10, failed_graph=None, passed_graph=None)
+    assert result(db_session, run_links=lambda run_id: None).history.flaky == ()
 
 
 def test_linked_and_flaky_is_unknown_and_linked_alone_a_regression(db_session: Session) -> None:
