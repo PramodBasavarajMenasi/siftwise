@@ -1,7 +1,8 @@
 name: siftwise record
 description: >-
-  Upload the run's JUnit reports to siftwise (use with if: always()). Never fails the job:
-  problems are warnings.
+  Upload the run's JUnit reports to siftwise (use with if: always()). In a single job, also
+  triage the run's failures into the PR comment and job summary. Never fails the job unless
+  fail-on is set: problems are warnings.
 inputs:
   server-url:
     description: siftwise server URL (e.g. secrets.SIFTWISE_URL).
@@ -42,9 +43,41 @@ inputs:
     required: false
     default: auto
   github-token:
-    description: Reads the run's start time from the Actions API (needs actions read).
+    description: >-
+      Reads the run's start time from the Actions API (needs actions read) and writes the
+      PR comment's failures section (needs pull-requests write).
     required: false
     default: ${{ github.token }}
+  triage:
+    description: >-
+      'auto' (triage unless the rollup is deferred, i.e. in a single job), 'true' or 'false'.
+      After a matrix, actions/rollup triages every leg at once.
+    required: false
+    default: auto
+  comment:
+    description: Add the failures to the sticky PR comment when triaging.
+    required: false
+    default: "true"
+  fail-on:
+    description: >-
+      Comma-separated verdicts that fail this step, e.g. "new_regression,unknown". Off by
+      default: siftwise then never fails anything. When set, unavailable verdicts (server
+      down or erroring, nothing recorded) also fail the step; without a siftwise token (fork
+      PRs) it only warns: that run is not gated.
+    required: false
+    default: ""
+outputs:
+  verdicts-available:
+    description: "'true' if the run's failures were triaged, else 'false'."
+    value: ${{ steps.record.outputs.verdicts-available }}
+  counts:
+    description: >-
+      JSON object of failing tests per verdict (new_regression, unknown, flaky,
+      pre_existing); each test counts once, under its worst verdict over the variants.
+    value: ${{ steps.record.outputs.counts }}
+  report:
+    description: Path of the Markdown failures report (what went to the job summary).
+    value: ${{ steps.record.outputs.report }}
 runs:
   using: composite
   steps:
@@ -54,7 +87,8 @@ runs:
     - name: Install siftwise
       shell: bash
       run: uv tool install --quiet --force --python 3.12 "$GITHUB_ACTION_PATH/../.."
-    - name: Record results
+    - id: record
+      name: Record results
       shell: bash
       env:
         SIFTWISE_SERVER: ${{ inputs.server-url }}
@@ -67,4 +101,7 @@ runs:
         SIFTWISE_VARIANT: ${{ inputs.variant }}
         SIFTWISE_DEFER_ROLLUP: ${{ inputs.defer-rollup }}
         SIFTWISE_GITHUB_TOKEN: ${{ inputs.github-token }}
+        SIFTWISE_TRIAGE: ${{ inputs.triage }}
+        SIFTWISE_COMMENT: ${{ inputs.comment }}
+        SIFTWISE_FAIL_ON: ${{ inputs.fail-on }}
       run: '"$(uv tool dir --bin)/siftwise" gha record'
