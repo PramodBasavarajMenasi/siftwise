@@ -531,7 +531,8 @@ would have claimed.
 - **The misses are binary-level e2e suites and flaky tests.** `internal/e2e/suites/*` deploy
   the whole system and reach it through no Go import. With one declared rule (as for kubo),
   selective runs catch **36 of 39**, and savings drop: **5.8%** of test time on PR runs and 15.1%
-  on main commits, against 19.5% and 31.7% without it.
+  on main commits, against 19.5% and 31.7% without it. A second rule for `functionaltest`
+  suites brings it to **38 of 39** (5.1% of PR test time skipped; main replay not re-run).
 - **Not an independent-packages monorepo:** one Go module with about 2,000 packages, and PRs
   often touch several. Savings come from narrow changes, not from package boundaries.
 - **Only 8 days of history.** Its artifacts expire after about two weeks; the backfill got
@@ -577,8 +578,25 @@ for an unmapped file, 24 for build or CI files.
 | `e2e/suites/egressmitm::TestActorEgressMITMTrust` (3 runs) | `internal/atunnel`, `internal/ateomnet/dns`, benchmarking fakes | missed; failed in earlier unrelated runs too, calls external hosts: flaky | caught (runs on every Go change) |
 | `e2e/suites/egresscredinject::TestActorEgressCredentialInjection` (2 runs) | `internal/atunnel`, `cmd/atecontroller` | missed; recurring, calls `httpbin.org`: flaky | caught |
 | `e2e/suites/demo::TestMultipleDurableDirLifecycle` | `cmd/atenet/...`, `internal/atunnel` | missed: the suite drives the deployed system | caught |
-| `controlapi/functionaltest::TestResumeActor_AteletTransport...` (2) | `cmd/atecontroller` | missed: drives ateapi and atelet, no import edge | **missed** |
+| `controlapi/functionaltest::TestResumeActor_AteletTransport...` (2) | `cmd/atecontroller` | missed: drives ateapi and atelet, no import edge | **missed**; caught by the `functionaltest` rule (below) |
 | `internal/credbundle::TestLoaderConcurrentHandshakes` | `internal/ateomnet` | missed: imports nothing changed; a concurrency test, probably flaky | **missed** |
+
+**Adding a `functionaltest` rule** (a second `[[depends]]`: `**/functionaltest/**` on every
+non-test Go file, now in the same config), re-run on the same 80 PR targets with today's code:
+
+| | e2e rule only | e2e + functionaltest rules |
+|---|---|---|
+| Caught in selective runs | 36 / 39 | **38 / 39** |
+| Failures caught | 2,041 / 2,044 | **2,043 / 2,044** |
+| Estimated time skipped, all runs | 6.4% | 5.1% |
+| Time skipped in selective runs (average) | 23.2% | 18.7% |
+| Full / selective | 60 / 20 | 60 / 20 |
+
+It catches both `TestResumeActor_AteletTransportErrorLeavesActorResuming` failures (the test
+and its `caller_deadline` subtest) at `79a94f1`, a change to `cmd/atecontroller/main.go` and
+`workersync`. The one miss left is `internal/credbundle::TestLoaderConcurrentHandshakes`
+(`dd7d5a3`), a concurrency test with no link to the change. The e2e-only figure is 6.4% here
+against 5.8% in the first run: the selector changed in between, the targets didn't.
 
 ### Findings
 
@@ -594,7 +612,8 @@ for an unmapped file, 24 for build or CI files.
 ### Limits
 
 - 8 days of history: co-change and recently-failed signals see little.
-- The e2e rule is coarse (any non-test Go file), and `functionaltest` needs its own rule.
+- Both rules are coarse (any non-test Go file): they run e2e and functional suites on almost
+  every Go change.
 - The eval's Go graphs come from zipballs on Windows with `GOOS=linux`. The first attempt
   shared one unpack directory between two evals and corrupted 22 graphs; all were rebuilt. The
   7 targets that had run without a graph gave the same result with one (all were full-suite

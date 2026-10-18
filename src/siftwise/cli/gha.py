@@ -27,7 +27,7 @@ import os
 import re
 import subprocess
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -390,7 +390,8 @@ def fail_open_result(problem: str) -> dict[str, Any]:
 
 
 def selection_markdown(result: dict[str, Any], head_sha: str) -> str:
-    """The selection as a small Markdown table (step summary and PR comment)."""
+    """The selection as a short Markdown list (step summary and PR comment). A list, not a
+    two-column table: a table needs a header row, and this one had nothing to put in it."""
     mode, total_known = result["mode"], result["total_known"]
     if mode == "full":
         tests = f"all ({total_known:,} known)" if total_known else "all"
@@ -398,7 +399,7 @@ def selection_markdown(result: dict[str, Any], head_sha: str) -> str:
         tests = f"{result['selected_count']:,} of {total_known:,} known tests"
     else:
         tests = f"none of {total_known:,} known tests are affected"
-    rows = [("Mode", f"**{mode}**"), ("Tests", tests)]
+    rows = [("Mode", mode), ("Tests", tests)]
     estimated = result.get("estimated_ms") or {}
     total, would_run = estimated.get("total") or 0.0, estimated.get("would_run") or 0.0
     if total > 0:
@@ -407,9 +408,9 @@ def selection_markdown(result: dict[str, Any], head_sha: str) -> str:
                      f"({100 * saved / total:.0f}% saved)"))  # fmt: skip
     if mode == "full":
         rows.append(("Why the full suite", _cell(result["reason"])))
-    table = "\n".join(f"| {k} | {v} |" for k, v in rows)
+    items = "\n".join(f"- **{k}:** {v}" for k, v in rows)
     commit = f" for `{head_sha[:7]}`" if head_sha else ""
-    return f"### siftwise test selection{commit}\n\n| | |\n|---|---|\n{table}\n"
+    return f"### siftwise test selection{commit}\n\n{items}\n"
 
 
 def split_comment(body: str) -> tuple[str | None, str | None]:
@@ -764,16 +765,48 @@ def run_started_at(ctx: Context, github_token: str, env: Env) -> str:
 
 
 def find_junit(patterns: str, junit_dir: str) -> list[Path]:
-    """Files matching any of the (whitespace-separated) globs, plus ``junit_dir/*.xml``."""
+    """Files matching any of the (whitespace-separated) globs, plus ``junit_dir/*.xml``. Never
+    looks inside SKIP_DIRS (node_modules, virtualenvs, .git...)."""
     found: set[Path] = set()
     for pattern in patterns.split():
-        for name in glob.glob(pattern, recursive=True):
-            path = Path(name)
-            if path.is_file() and not SKIP_DIRS.intersection(path.parts):
-                found.add(path)
+        found.update(path for path in _glob_pruned(pattern)
+                     if path.is_file() and not SKIP_DIRS.intersection(path.parts))  # fmt: skip
     if junit_dir and Path(junit_dir).is_dir():
         found.update(p for p in Path(junit_dir).glob("*.xml") if p.is_file())
     return sorted(found)
+
+
+_GLOB_CHARS = re.compile(r"[*?\[]")
+
+
+def _glob_pruned(pattern: str) -> Iterator[Path]:
+    """``glob.glob(pattern, recursive=True)``, except that ``**`` never descends into SKIP_DIRS.
+
+    glob walks a whole ``node_modules`` or ``.venv`` before a filter can drop its matches: on a
+    big checkout that's most of the step's time. Like glob, ``**`` and ``*`` skip hidden
+    directories and files (unless the pattern's own segment starts with a dot).
+    """
+    from siftwise.core.selector import glob_match
+
+    segments = pattern.replace("\\", "/").split("/")
+    first = next((i for i, s in enumerate(segments) if _GLOB_CHARS.search(s)), len(segments))
+    rest = "/".join(segments[first:])
+    if "**" not in rest:  # no recursion: glob only reads the directories the pattern names
+        yield from (Path(name) for name in glob.glob(pattern))
+        return
+    base = "/".join(segments[:first]) or "."
+    if segments[:first] == [""]:  # an absolute pattern: "/**/x.xml"
+        base = "/"
+    hidden_ok = segments[-1].startswith(".")
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        rel_dir = os.path.relpath(dirpath, base).replace(os.sep, "/")
+        for name in filenames:
+            if name.startswith(".") and not hidden_ok:
+                continue
+            rel = name if rel_dir == "." else f"{rel_dir}/{name}"
+            if glob_match(rel, rest):
+                yield Path(name) if dirpath == "." else Path(dirpath) / name
 
 
 def git_is_shallow() -> bool:

@@ -73,7 +73,7 @@ Replays of real CI history with no peeking at the future. Full details: [docs/ev
 | [ipfs/kubo](https://github.com/ipfs/kubo) (Go, ~4,100 tests) | 19 of 19 in failing PRs | 30.7% over 20 main commits replayed as PRs; 0% on recent PRs (all dependency/CI bumps) |
 | [RDFLib/rdflib](https://github.com/RDFLib/rdflib) (Python, ~18,000 tests) | 2,049 of 2,050 in 39 failing PRs; 140 of 141 in selective runs. The miss is a flaky remote-service test (see below) | 10.4% on the 10 most recent PRs (was 0.4% before lint-only configs stopped forcing the full suite); 0.6% over 19 main commits |
 | [quantumlib/Cirq](https://github.com/quantumlib/Cirq) (Python monorepo, 9 packages, ~40,000 tests) | not measurable: JUnit only from main, which never failed | 37.3% over 134 merged PRs; 80% for `cirq-google`-only PRs, 19% for `cirq-core` |
-| [agent-substrate/substrate](https://github.com/agent-substrate/substrate) (Go, ~9,000 tests, 8 days of history) | 2,041 of 2,044 in 72 failing PRs; 36 of 39 in selective runs, with a declared rule for its e2e suites (26 of 38 without) | 5.8% on PR runs and 15.1% over 40 main commits with the rule (19.5% / 31.7% without) |
+| [agent-substrate/substrate](https://github.com/agent-substrate/substrate) (Go, ~9,000 tests, 8 days of history) | 2,043 of 2,044 in 72 failing PRs; 38 of 39 in selective runs, with declared rules for its e2e and functional suites (26 of 38 without) | 5.1% on PR runs with both rules; 15.1% over 40 main commits with the e2e rule (19.5% / 31.7% without rules) |
 
 In the Cirq monorepo, savings follow package boundaries: a change to one integration package
 skips most of the suite, a change to the core package that everything imports skips little.
@@ -526,15 +526,21 @@ runs. siftwise uses no instrumentation; when its graphs can't see a dependency, 
 
 ```toml
 always_run = ["tests/smoke/**", "tests.test_health::*"]  # test file paths or test IDs
+generated = ["build/reports/**"]          # more files your test runs write (see below)
 
 [[depends]]                               # dependencies no import graph can see
 tests = "test/cli/**"                     # test file paths, or <Go package dir>/<TestName>
 on = ["**/*.go", "!**/*_test.go"]         # ! excludes
 ```
 
-Both use the same globs: `**` spans directories, while `*` and `?` stay within one path
+All use the same globs: `**` spans directories, while `*` and `?` stay within one path
 segment (`tests/*` matches `tests/test_a.py`, not `tests/unit/test_b.py`). Go test IDs contain
 their package's import path, so match them with `**::TestName` or `<import path>::*`.
+
+Files that test runs write never count as changed code, even untracked or committed by
+mistake: `junit*.xml`, `coverage.xml`, `.coverage`, `.coverage.*`, `htmlcov/`, `*.log`,
+`.pytest_cache/` and `__pycache__/`, at any depth. Like docs, they never select a test or force
+the full suite. `generated` adds to that list.
 
 | Variable | Used by | Default |
 |---|---|---|
@@ -543,6 +549,25 @@ their package's import path, so match them with `**::TestName` or `<import path>
 | `SIFTWISE_STATS_WINDOW_DAYS` | server: per-test stats window (0 = all history) | `90` |
 | `SIFTWISE_MAX_UPLOAD_BYTES` | server: request body limit | 50 MB |
 | `GITHUB_TOKEN` | `scripts/backfill.py` | none |
+
+## Security and limits
+
+- **One token per server, with full access.** `SIFTWISE_API_TOKEN` is a single shared secret.
+  Every client (CI, the CLI, the MCP server) uses the same token, and it can read and write the
+  history of **every repo** on the server. There are no per-repo, read-only or per-user
+  tokens. Run a separate server (or database) for repos whose owners shouldn't see each
+  other's test history, and rotate the token by changing it on the server and in each secret.
+- **Keep the token out of fork PRs.** Use `pull_request`, never `pull_request_target` (see
+  [GitHub Action](#github-action)): a fork's code must never run with the token.
+- **What the server stores:** test IDs, outcomes, durations, failure messages (truncated to 4
+  KB), changed file paths, branch names and commit SHAs. Failure messages can contain whatever
+  your tests print, so treat the database as you treat CI logs.
+- **Public PR comments** show test IDs, verdicts and siftwise's own reasons, never raw failure
+  messages.
+- **Stats cover the window only.** Per-test stats use the last `SIFTWISE_STATS_WINDOW_DAYS`
+  (90) days before the repo's newest run. A test not seen within the window loses its stats row
+  on the next rollup; its raw results stay, and `GET /tests/{id}/history` shows them with
+  `stats: null`.
 
 ## Supported languages
 

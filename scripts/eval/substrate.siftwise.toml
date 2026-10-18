@@ -7,3 +7,10 @@
 [[depends]]
 tests = "internal/e2e/**"
 on = ["**/*.go", "!**/*_test.go", "!internal/e2e/**"]
+
+# Functional tests (e.g. cmd/ateapi/internal/controlapi/functionaltest) start ateapi and
+# atelet and talk to them over their APIs: the same kind of binary-level dependency. A change
+# to cmd/atecontroller broke them twice with no import edge between the two.
+[[depends]]
+tests = "**/functionaltest/**"
+on = ["**/*.go", "!**/*_test.go", "!**/functionaltest/**"]

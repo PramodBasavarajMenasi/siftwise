@@ -26,16 +26,17 @@ def get_test_history(
     session: Annotated[Session, Depends(get_session)],
 ) -> TestHistoryResponse:
     test = get_test(session, repo, test_id)
-    stats = get_test_stats(session, repo, test_id) if test else None
-    if test is None or stats is None:
+    if test is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, f"no history for test {test_id!r} in repo {repo!r}"
         )
+    stats = get_test_stats(session, repo, test_id)
     rows = get_recent_results(session, test.id, HISTORY_LIMIT)
     return TestHistoryResponse(
         repo=repo,
         test_id=test_id,
-        stats=TestStatsOut.model_validate(stats),
+        # No row: the test hasn't run within the stats window (the rollup drops those rows).
+        stats=TestStatsOut.model_validate(stats) if stats else None,
         results=[
             TestResultOut(
                 run_id=run.id,

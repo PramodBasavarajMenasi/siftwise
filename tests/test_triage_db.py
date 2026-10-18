@@ -120,8 +120,26 @@ def test_affected_is_stored_with_the_run(db_session: Session) -> None:
     no_graph = record(db_session, commit=2, hour=2, tests={TEST: P}, graph=None)
 
     assert run.affected == {"affected_packages": {}, "affected_files": {
-        "tests/test_cart.py": ["src/cart.py"]}, "depends": [], "go_module": None}  # fmt: skip
+        "tests/test_cart.py": ["src/cart.py"]}, "depends": [], "go_module": None,
+        "generated": []}  # fmt: skip
     assert no_graph.affected is None
+
+
+def test_stored_generated_globs_are_ignored_by_ci_run_triage(db_session: Session) -> None:
+    # The run's .siftwise.toml declared build/reports/** generated: it's stored with the links,
+    # so the CI-run triage ignores those files as /triage would.
+    graph = ChangeGraph(generated=["build/reports/**"])
+    assert Change.from_graph(["build/reports/x.html"], graph.model_dump()).config.generated == (
+        "build/reports/**",)  # fmt: skip
+    record(db_session, commit=1, hour=1, tests={TEST: P})
+    record(db_session, commit=2, hour=5, branch="pr", ci_run_id="gen", tests={TEST: F},
+           changed=("build/reports/x.html", "src/cart.py"), graph=graph)  # fmt: skip
+
+    [linux] = ci_triage(db_session, "gen")
+
+    assert linux.report is not None
+    [result] = linux.report.results
+    assert [link.changed for link in result.links] == ["src/cart.py"]
 
 
 def test_unknown_repo(db_session: Session) -> None:

@@ -132,6 +132,7 @@ class Change:
             depends=tuple(
                 DependsRule(rule["tests"], tuple(rule["on"])) for rule in graph.get("depends", ())
             ),
+            generated=tuple(graph.get("generated") or ()),
         )
         return cls(
             tuple(changed_files),

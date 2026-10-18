@@ -65,7 +65,7 @@ def test_record_uploads_junit_with_metadata(checkout: str, api: respx.MockRouter
         "changed_files": ["b.py"], "changed_files_known": True,
         # b.py is imported by no test file: an empty but complete graph
         "affected": {"affected_packages": {}, "affected_files": {}, "depends": [],
-                     "go_module": None},
+                     "go_module": None, "generated": []},
     }  # fmt: skip
 
 

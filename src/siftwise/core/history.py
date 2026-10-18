@@ -43,6 +43,9 @@ Batch ingest (``POST /runs?defer_rollup=true``) skips the rollup; ``recompute_re
 (``POST /repos/{repo}/rollup``) then recomputes every test in the window. Until it runs,
 ``test_stats`` is stale.
 
+Every rollup also drops the rows of tests not seen within the window (``drop_stale_stats``):
+``test_stats`` only describes tests with results in the window.
+
 Tests are rolled up in batches of test keys sized so a batch has at most ``BATCH_ROWS``
 (test, run) rows: each statement's working set fits in memory (no temp files), and the cost
 grows linearly with the window. Within a batch there are no sorts of the window's rows:
@@ -277,8 +280,37 @@ def _batches(
         yield keys[start : start + size]
 
 
+# Rows of tests not seen within the window. A recomputed row always has last_seen_at in the
+# window (the test has results there), so these are exactly the rows no rollup can update
+# any more: a deleted or renamed test, or one that stopped running. NULL: from before 0005.
+_DROP_STALE_SQL = text(
+    """
+    DELETE FROM test_stats
+    WHERE repo_id = :repo_id
+      AND (last_seen_at IS NULL OR last_seen_at < (
+          SELECT max(COALESCE(started_at, created_at)) - make_interval(days => :window_days)
+          FROM runs WHERE repo_id = :repo_id))
+    """
+)
+
+
+def drop_stale_stats(session: Session, repo_id: int, window_days: int) -> int:
+    """Delete the stats of tests not seen within the window; returns how many.
+
+    Dropped rather than left for readers to ignore: every reader would need the window, and
+    the selector's broken-on-main query reads ``test_stats`` without one, so a stale row kept
+    a long-gone test "broken on main" forever. Raw results stay: a test that runs again gets
+    its row back from the next rollup. Does not commit.
+    """
+    result = session.execute(
+        _DROP_STALE_SQL, {"repo_id": repo_id, "window_days": _window_days(window_days)}
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
 def recompute_test_stats(session: Session, repo_id: int, run_id: int, window_days: int) -> None:
-    """Recompute ``test_stats`` for the tests in ``run_id`` over the window. Does not commit."""
+    """Recompute ``test_stats`` for the tests in ``run_id`` over the window, and drop the rows
+    of tests not seen within it. Does not commit."""
     _lock(session, repo_id)
     days = _window_days(window_days)
     keys = list(
@@ -298,10 +330,13 @@ def recompute_test_stats(session: Session, repo_id: int, run_id: int, window_day
                 "keys": list(batch),
             },
         )
+    # Single-job repos never call the repo rollup, so this path drops stale rows too.
+    drop_stale_stats(session, repo_id, window_days)
 
 
 def recompute_repo_stats(session: Session, repo_id: int, window_days: int) -> int:
-    """Recompute ``test_stats`` for every test with results in the window. Does not commit.
+    """Recompute ``test_stats`` for every test with results in the window, and drop the rows
+    of tests not seen within it. Does not commit.
 
     Returns the number of tests updated. Used after a batch (``defer_rollup``) ingest.
     """
@@ -320,6 +355,7 @@ def recompute_repo_stats(session: Session, repo_id: int, window_days: int) -> in
             },
         )
         updated += int(getattr(result, "rowcount", 0) or 0)
+    drop_stale_stats(session, repo_id, window_days)
     return updated
 
 

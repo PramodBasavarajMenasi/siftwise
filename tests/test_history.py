@@ -20,6 +20,7 @@ from siftwise.core.ingest import create_run
 from siftwise.core.junit import ParsedTestResult, Status
 from siftwise.core.models import Run, Test, TestResult, TestStats
 from siftwise.core.schemas import RunMetadata
+from siftwise.core.selector import load_history
 from siftwise.db import get_session
 
 REPO = "acme/shop"
@@ -48,6 +49,7 @@ def ingest(
     repo: str = REPO,
     duration_ms: int | None = 10,
     window_days: int = 90,
+    rollup: bool = True,
 ) -> Run:
     """Ingest one run. A sequence of statuses means successive attempts of that test."""
     results = []
@@ -75,7 +77,7 @@ def ingest(
         variant=variant,
         started_at=None if hour is None else at(hour),
     )
-    run, created = create_run(session, meta, results, window_days=window_days)
+    run, created = create_run(session, meta, results, window_days=window_days, rollup=rollup)
     assert created
     return run
 
@@ -286,6 +288,53 @@ def test_window_is_anchored_on_the_newest_run_not_today(db_session: Session) -> 
     # T0 is 2026-01-01; a "now"-anchored 90-day window would see none of this.
     ingest(db_session, commit=1, hour=0, tests={"t::a": F})
     assert stats(db_session).runs == 1
+
+
+def test_rollup_drops_stats_of_tests_not_seen_within_the_window(db_session: Session) -> None:
+    # t::gone fails on main, then is deleted from the suite; t::a keeps running.
+    ingest(db_session, commit=1, hour=0, tests={"t::a": P, "t::gone": F})
+    assert stats(db_session, "t::gone").broken_on_main_since_sha == sha(1)
+    ingest(db_session, commit=2, hour=50 * DAY, tests={"t::a": P})
+    assert get_test_stats(db_session, REPO, "t::gone") is not None  # day 0 is still in the window
+
+    ingest(db_session, commit=3, hour=100 * DAY, tests={"t::a": P})  # window: day 10..100
+
+    assert get_test_stats(db_session, REPO, "t::gone") is None
+    assert stats(db_session).runs == 2
+    # The stale row kept a long-gone test "broken on main" for the selector.
+    history_ = load_history(db_session, REPO)
+    assert history_ is not None and "t::gone" not in history_.broken_on_main
+
+
+def test_repo_rollup_drops_stale_stats(db_session: Session) -> None:
+    run = ingest(db_session, commit=1, hour=0, tests={"t::a": P, "t::gone": P})
+    ingest(db_session, commit=2, hour=100 * DAY, tests={"t::a": P}, rollup=False)  # deferred
+    assert get_test_stats(db_session, REPO, "t::gone") is not None
+
+    history.recompute_repo_stats(db_session, run.repo_id, 90)
+
+    assert get_test_stats(db_session, REPO, "t::gone") is None
+    assert stats(db_session).runs == 1
+
+
+def test_a_window_of_zero_drops_nothing(db_session: Session) -> None:
+    ingest(db_session, commit=1, hour=0, tests={"t::a": P, "t::old": P}, window_days=0)
+    ingest(db_session, commit=2, hour=1000 * DAY, tests={"t::a": P}, window_days=0)
+    assert stats(db_session, "t::old").runs == 1
+
+
+def test_history_api_without_stats_still_shows_results(
+    client: TestClient, db_session: Session
+) -> None:
+    ingest(db_session, commit=1, hour=0, tests={"t::a": P, "t::gone": F})
+    ingest(db_session, commit=2, hour=100 * DAY, tests={"t::a": P})
+
+    response = client.get(history_url("t::gone"), params={"repo": REPO}, headers=AUTH)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["stats"] is None
+    assert [r["commit_sha"] for r in body["results"]] == [sha(1)]
 
 
 def test_broken_on_main_streak_start_is_found_before_the_window(db_session: Session) -> None:

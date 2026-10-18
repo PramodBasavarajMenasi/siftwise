@@ -881,7 +881,7 @@ def counterfactual(
         p
         for p in changed
         if (not is_build_file(p) or build_file_scope(p) is not None)
-        and not is_ignorable(p)
+        and not is_ignorable(p, config.generated)
         and select([p]).mode is Mode.SELECTIVE
     ]
     if not mapped:
@@ -1238,6 +1238,7 @@ def main(
         go_module=go_module,
         depends=repo_config.depends if repo_config else (),
         always_run=repo_config.always_run if repo_config else (),
+        generated=repo_config.generated if repo_config else (),
     )
     github_source = None
     if source == "github":

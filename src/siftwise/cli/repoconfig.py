@@ -1,6 +1,7 @@
 """The repo's ``.siftwise.toml``: selection settings the CLI sends with each request.
 
 always_run = ["tests/smoke/**"]
+generated = ["build/reports/**"]    # more generated files (siftwise ignores reports by default)
 
 [[depends]]                         # binary-level suites with no import edge to the code
 tests = "test/cli/**"
@@ -27,6 +28,8 @@ class RepoConfigError(ValueError):
 class RepoConfig:
     depends: tuple[DependsRule, ...] = ()
     always_run: tuple[str, ...] = ()
+    # Globs of generated files, on top of selector.GENERATED_GLOBS: never changed source.
+    generated: tuple[str, ...] = ()
 
 
 def load_repo_config(path: Path) -> RepoConfig:
@@ -38,13 +41,16 @@ def load_repo_config(path: Path) -> RepoConfig:
 
 
 def parse_repo_config(data: dict[str, Any], source: str = FILE_NAME) -> RepoConfig:
-    unknown = set(data) - {"depends", "always_run"}
+    unknown = set(data) - {"depends", "always_run", "generated"}
     if unknown:
         raise RepoConfigError(f"{source}: unknown key(s): {', '.join(sorted(unknown))}")
 
     always_run = data.get("always_run", [])
     if not _is_str_list(always_run):
         raise RepoConfigError(f"{source}: always_run must be a list of strings")
+    generated = data.get("generated", [])
+    if not _is_str_list(generated):
+        raise RepoConfigError(f"{source}: generated must be a list of strings")
 
     rules = data.get("depends", [])
     if not isinstance(rules, list):
@@ -64,7 +70,7 @@ def parse_repo_config(data: dict[str, Any], source: str = FILE_NAME) -> RepoConf
         if not _is_str_list(on) or not on or all(p.startswith("!") for p in on):
             raise RepoConfigError(f"{where}: 'on' needs at least one non-'!' glob")
         depends.append(DependsRule(tests, tuple(on)))
-    return RepoConfig(tuple(depends), tuple(always_run))
+    return RepoConfig(tuple(depends), tuple(always_run), tuple(generated))
 
 
 def _is_str_list(value: object) -> bool:
