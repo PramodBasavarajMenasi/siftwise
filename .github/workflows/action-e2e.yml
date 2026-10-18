@@ -62,7 +62,10 @@ jobs:
       - name: Start a siftwise server
         run: |
           uv run alembic upgrade head
-          nohup uv run uvicorn siftwise.api.main:app --port 8000 > "$RUNNER_TEMP/server.log" 2>&1 &
+          # The venv's uvicorn, not `uv run`: a uv process left running holds the uv cache lock,
+          # and setup-uv's post-job `uv cache prune` then times out waiting for it.
+          nohup .venv/bin/uvicorn siftwise.api.main:app --port 8000 > "$RUNNER_TEMP/server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/server.pid"
           for _ in $(seq 60); do curl -sf "$SERVER/healthz" && exit 0; sleep 1; done
           cat "$RUNNER_TEMP/server.log"
           exit 1
@@ -176,6 +179,12 @@ jobs:
         if: failure()
         run: |
           cat "$RUNNER_TEMP/server.log" 2>/dev/null || echo "no server log: the server never started"
+
+      # Before the post-job steps (setup-uv prunes its cache there): nothing left running.
+      - name: Stop the siftwise server
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/server.pid" ]; then kill "$(cat "$RUNNER_TEMP/server.pid")" || true; fi
 
   shallow:
     # select can't diff a shallow clone: the one deliberate failure, with a clear message.
