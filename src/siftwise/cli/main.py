@@ -3,6 +3,8 @@
 import json
 import os
 import subprocess
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -20,6 +22,7 @@ from siftwise.cli.repoconfig import (
     load_repo_config,
     read_go_module,
 )
+from siftwise.core.junit import JUnitParseError, Status, parse_junit
 
 app = typer.Typer(help="Siftwise: test impact analysis for CI.", no_args_is_help=True)
 app.add_typer(gha.app, name="gha")
@@ -28,6 +31,10 @@ app.add_typer(gha.app, name="gha")
 EXIT_API_ERROR = 1
 EXIT_USAGE = 2
 EXIT_FULL_SUITE_NO_COMMAND = 3
+# `siftwise triage --fail-on`: a failure got one of the given verdicts.
+EXIT_FAIL_ON = 4
+
+VERDICTS = ("new_regression", "pre_existing", "flaky", "unknown")
 
 
 class SiftwiseError(Exception):
@@ -125,14 +132,23 @@ def record_command(
         bool, typer.Option(help="Skip the stats rollup; run `siftwise rollup` after all legs.")
     ] = False,
     server: Annotated[str, typer.Option(help="siftwise server URL.")] = "http://localhost:8000",
+    go_list: Annotated[
+        bool, typer.Option(help="Record Go import links (`go list`), for triage.")
+    ] = True,
+    py_imports: Annotated[bool, typer.Option(help="Record Python import links, for triage.")] = (
+        True
+    ),
 ) -> None:
-    """Upload a CI run's JUnit XML. Exit codes: 0 ok, 1 API error, 2 usage error."""
+    """Upload a CI run's JUnit XML. Exit codes: 0 ok, 1 API error, 2 usage error.
+
+    With --base, the change and its import graphs are recorded too, so triage can later tell
+    whether this run's failures were related to its change.
+    """
     token = _token()
     missing = [str(path) for path in junit if not path.is_file()]
     if missing:
         _err(f"error: not a file: {', '.join(missing)}")
         raise typer.Exit(EXIT_USAGE)
-    diff = git_diff(base, head) if base else None
     metadata: dict[str, Any] = {
         "repo": repo,
         "commit_sha": commit or git_rev_parse("HEAD"),
@@ -142,8 +158,7 @@ def record_command(
         "run_attempt": run_attempt,
         "variant": variant,
         "started_at": started_at,
-        "changed_files": diff[0] if diff else [],
-        "changed_files_known": diff is not None,
+        **recorded_change(base, head, go_list=go_list, py_imports=py_imports),
     }
     try:
         result = upload_run(server, token, junit, metadata, defer_rollup=defer_rollup)
@@ -168,7 +183,162 @@ def rollup_command(
     _err(f"siftwise: {result['tests_updated']} tests updated in {result['seconds']}s")
 
 
+@app.command("triage")
+def triage_command(
+    junit: Annotated[list[Path], typer.Argument(help="JUnit XML files of the run.")],
+    repo: Annotated[str, typer.Option(help="Repository name in siftwise, e.g. acme/shop.")],
+    base: Annotated[str, typer.Option(help="Base ref the change is diffed against.")] = "main",
+    head: Annotated[str, typer.Option(help="Head ref: the commit that was tested.")] = "HEAD",
+    commit: Annotated[str | None, typer.Option(help="Full commit SHA (default: HEAD's).")] = None,
+    variant: Annotated[
+        str | None, typer.Option(help="Matrix leg: compare with this variant's history.")
+    ] = None,
+    ci_run_id: Annotated[
+        str | None, typer.Option(help="CI run ID: its uploads are left out of the history.")
+    ] = None,
+    run_attempt: Annotated[int, typer.Option(min=1, help="CI run attempt.")] = 1,
+    fail_on: Annotated[
+        str,
+        typer.Option(
+            help="Comma-separated verdicts that fail the command (exit 4), e.g. new_regression."
+        ),
+    ] = "",
+    server: Annotated[str, typer.Option(help="siftwise server URL.")] = "http://localhost:8000",
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the full API response as JSON.")
+    ] = False,
+    go_list: Annotated[bool, typer.Option(help="For Go repos, link tests through `go list`.")] = (
+        True
+    ),
+    py_imports: Annotated[
+        bool, typer.Option(help="Link Python tests through a static import graph.")
+    ] = True,
+) -> None:
+    """Triage a run's failing tests: new regression, pre-existing on main, flaky or unknown.
+
+    The failing tests come from the JUnit files, the change from BASE...HEAD (as in `select`).
+    One line per failure on stdout (verdict, confidence, test) with its main reason; counts on
+    stderr. Needs SIFTWISE_API_TOKEN. Exit codes: 0 ok, 1 API error, 2 usage error, 4 a
+    failure got a --fail-on verdict.
+    """
+    token = _token()
+    gate = {v.strip() for v in fail_on.split(",") if v.strip()}
+    if gate - set(VERDICTS):
+        _err(f"error: unknown --fail-on verdict(s): {', '.join(sorted(gate - set(VERDICTS)))}"
+             f" (choose from {', '.join(VERDICTS)})")  # fmt: skip
+        raise typer.Exit(EXIT_USAGE)
+    missing = [str(path) for path in junit if not path.is_file()]
+    if missing:
+        _err(f"error: not a file: {', '.join(missing)}")
+        raise typer.Exit(EXIT_USAGE)
+    try:
+        failures = junit_failures(junit)
+    except (JUnitParseError, OSError) as exc:
+        _err(f"error: {exc}")
+        raise typer.Exit(EXIT_USAGE) from exc
+    if not failures:
+        _err("siftwise: no failing tests in the JUnit report(s)")
+        if json_output:
+            typer.echo(json.dumps({"repo": repo, "counts": {}, "results": []}, indent=2))
+        return
+    try:
+        change = local_change(base, head, go_list=go_list, py_imports=py_imports)
+    except RepoConfigError as exc:
+        _err(f"error: {exc}")
+        raise typer.Exit(EXIT_USAGE) from exc
+    body: dict[str, Any] = {
+        "repo": repo,
+        **change.fields,
+        "commit_sha": commit or git_rev_parse(head),
+        "variant": variant,
+        "ci_run_id": ci_run_id,
+        "run_attempt": run_attempt,
+        "failures": failures,
+    }
+    try:
+        result = post_json(server, token, "/triage", body)
+    except SiftwiseError as exc:
+        _err(f"error: {exc}")
+        raise typer.Exit(EXIT_API_ERROR) from exc
+
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for item in result["results"]:
+            typer.echo(f"{item['verdict']:<15} {item['confidence']:<6} {item['test_id']}")
+            if item["reasons"]:
+                typer.echo(f"    {item['reasons'][0]}")
+    counts = result.get("counts", {})
+    summary = ", ".join(f"{counts.get(v, 0)} {v.replace('_', ' ')}" for v in VERDICTS)
+    _err(f"siftwise: {len(result['results'])} failing test(s): {summary}")
+    hit = sorted({item["verdict"] for item in result["results"]} & gate)
+    if hit:
+        _err(f"siftwise: --fail-on matched: {', '.join(hit)}")
+        raise typer.Exit(EXIT_FAIL_ON)
+
+
 # --- reusable steps (also used by siftwise.cli.gha) ----------------------------------------
+
+
+@dataclass(frozen=True)
+class LocalChange:
+    """BASE...HEAD in the current checkout, as /select and /triage describe a change."""
+
+    # changed_files, changed_files_known, deleted_files, depends, go_module, affected_*
+    fields: dict[str, Any]
+    config: RepoConfig
+    # Every import graph that applies was built: none failed or was turned off.
+    graph_complete: bool
+
+    def graph(self) -> dict[str, Any] | None:
+        """``runs.affected`` (schemas.ChangeGraph) to record, or None if the change's links are
+        unknown: the diff is, or a graph failed or was skipped."""
+        if not (self.fields["changed_files_known"] and self.graph_complete):
+            return None
+        return {
+            "affected_packages": self.fields.get("affected_packages", {}),
+            "affected_files": self.fields.get("affected_files", {}),
+            "depends": self.fields["depends"],
+            "go_module": self.fields.get("go_module"),
+        }
+
+
+def local_change(
+    base: str | None, head: str, *, go_list: bool = True, py_imports: bool = True
+) -> LocalChange:
+    """The change BASE...HEAD with its import graphs and .siftwise.toml. ``base`` None (or a
+    failing git diff) means the changed files are unknown.
+
+    Raises RepoConfigError for an invalid .siftwise.toml.
+    """
+    root = git_toplevel() or Path.cwd()
+    config_path = root / FILE_NAME
+    config = load_repo_config(config_path) if config_path.is_file() else RepoConfig()
+
+    diff = git_diff(base, head) if base else None
+    changed = diff[0] if diff else None
+    fields: dict[str, Any] = {
+        "changed_files": changed or [],
+        "changed_files_known": changed is not None,
+        "depends": [{"tests": r.tests, "on": list(r.on)} for r in config.depends],
+    }
+    complete = True
+    if diff and diff[1]:
+        fields["deleted_files"] = diff[1]
+    go_module = read_go_module(root)
+    if go_module:
+        fields["go_module"] = go_module
+        if changed:
+            packages = go_dependents(root, changed) if go_list else None
+            complete = packages is not None
+            if go_list:
+                fields["affected_packages"] = packages or {}
+    if changed and any(p.endswith(".py") for p in changed):
+        files = python_dependents(root, changed) if py_imports else None
+        complete = complete and files is not None
+        if py_imports:
+            fields["affected_files"] = files or {}
+    return LocalChange(fields, config, complete)
 
 
 def selection_request(
@@ -185,31 +355,58 @@ def selection_request(
 
     Raises RepoConfigError for an invalid .siftwise.toml.
     """
-    root = git_toplevel() or Path.cwd()
-    config_path = root / FILE_NAME
-    config = load_repo_config(config_path) if config_path.is_file() else RepoConfig()
-
-    diff = git_diff(base, head) if base else None
-    changed = diff[0] if diff else None
+    change = local_change(base, head, go_list=go_list, py_imports=py_imports)
     body: dict[str, Any] = {
         "repo": repo,
-        "changed_files": changed or [],
-        "changed_files_known": changed is not None,
-        "depends": [{"tests": r.tests, "on": list(r.on)} for r in config.depends],
-        "always_run": list(config.always_run),
+        **change.fields,
+        "always_run": list(change.config.always_run),
     }
     if junit_dir:
         body["junit_dir"] = junit_dir
-    if diff and diff[1]:
-        body["deleted_files"] = diff[1]
-    go_module = read_go_module(root)
-    if go_module:
-        body["go_module"] = go_module
-        if go_list and changed:
-            body["affected_packages"] = go_dependents(root, changed)
-    if py_imports and changed and any(p.endswith(".py") for p in changed):
-        body["affected_files"] = python_dependents(root, changed)
     return body
+
+
+def recorded_change(
+    base: str | None, head: str, *, go_list: bool = True, py_imports: bool = True
+) -> dict[str, Any]:
+    """``changed_files``, ``changed_files_known`` and ``affected`` for ``POST /runs``.
+
+    An invalid .siftwise.toml never blocks an upload: the run is recorded without links.
+    """
+    if not base:
+        return {"changed_files": [], "changed_files_known": False, "affected": None}
+    try:
+        change = local_change(base, head, go_list=go_list, py_imports=py_imports)
+    except RepoConfigError as exc:
+        _err(f"warning: {exc}; recording the run without its change links")
+        diff = git_diff(base, head)
+        return {
+            "changed_files": diff[0] if diff else [],
+            "changed_files_known": diff is not None,
+            "affected": None,
+        }
+    return {
+        "changed_files": change.fields["changed_files"],
+        "changed_files_known": change.fields["changed_files_known"],
+        "affected": change.graph(),
+    }
+
+
+def junit_failures(paths: Sequence[Path]) -> list[dict[str, Any]]:
+    """Failing tests in JUnit reports: tests whose final attempt (the last one reported, files
+    in order) failed or errored, with that attempt's message and file.
+
+    Raises JUnitParseError or OSError.
+    """
+    final: dict[str, Any] = {}
+    for path in paths:
+        for result in parse_junit(path.read_bytes()):
+            final[result.test_id] = result
+    return [
+        {"test_id": r.test_id, "message": r.message, "file_path": r.file_path}
+        for r in final.values()
+        if r.status in (Status.FAILED, Status.ERROR)
+    ]
 
 
 def post_json(
@@ -300,25 +497,25 @@ def git_toplevel() -> Path | None:
     return Path(proc.stdout.decode(errors="replace").strip())
 
 
-def go_dependents(root: Path, changed: list[str]) -> dict[str, list[str]]:
-    """Packages whose tests import a changed package; empty (fallbacks apply) if go list fails."""
+def go_dependents(root: Path, changed: list[str]) -> dict[str, list[str]] | None:
+    """Packages whose tests import a changed package; None (fallbacks apply) if go list fails."""
     packages = run_go_list(root)
     if packages is None:
         _err("warning: `go list -deps -test -json ./...` failed; not selecting dependents")
-        return {}
+        return None
     affected = build_graph(packages, root).affected(changed)
     if affected:
         _err(f"siftwise: go list: {len(affected)} package(s) depend on changed Go code")
     return affected
 
 
-def python_dependents(root: Path, changed: list[str]) -> dict[str, list[str]]:
-    """Test files that import a changed module; empty (fallbacks apply) if the graph fails."""
+def python_dependents(root: Path, changed: list[str]) -> dict[str, list[str]] | None:
+    """Test files that import a changed module; None (fallbacks apply) if the graph fails."""
     try:
         graph = build_py_graph(root)
     except (OSError, ValueError, RecursionError) as exc:
         _err(f"warning: could not build the Python import graph ({exc}); not selecting importers")
-        return {}
+        return None
     affected = graph.affected(changed)
     if affected:
         _err(f"siftwise: python imports: {len(affected)} test file(s) import changed modules")

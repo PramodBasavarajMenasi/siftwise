@@ -1267,6 +1267,10 @@ def test_command_quotes_every_test_id(tmp_path: Path) -> None:
         pytest.skip("no bash to eval the command with")
     # Eval it with pytest stubbed to print its arguments: every node ID arrives as one
     # argument, and nothing in them runs.
+    if Path(bash).parent.name.lower() in ("system32", "windowsapps"):
+        # WSL's bash.exe (what `bash` is from PowerShell) passes neither the environment nor
+        # the arguments after -c's script into WSL.
+        pytest.skip("bash is WSL's launcher; run from Git Bash to eval the command")
     script = 'pytest() { printf "%s\\n" "$@"; }; eval "$CMD"'
     proc = subprocess.run([bash, "-c", script], env={**os.environ, "CMD": selection.command},
                           cwd=tmp_path, capture_output=True, text=True, check=True)  # fmt: skip

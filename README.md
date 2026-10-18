@@ -31,8 +31,8 @@
 <p align="center"><sub>If siftwise looks useful, a ⭐ helps others find it.</sub></p>
 
 > **Alpha, early development.** The server, CLI, test selection and GitHub Action work, and
-> selection has been evaluated on two real repos. The MCP server and failure triage don't
-> exist yet. APIs and the database schema may change.
+> selection has been evaluated on real repos. Failure triage is new and not evaluated yet; the
+> MCP server doesn't exist yet. APIs and the database schema may change.
 
 ## The problem
 
@@ -86,7 +86,7 @@ every module to nearly every test file, so safe file-level selection still runs 
 suite. The 10.4% comes from PRs that only touch lint configs. Bigger savings need codebases with
 independent parts (monorepos), or per-test coverage. The one miss, `test_service_with_bound_solutions`,
 calls a remote SPARQL service and also failed in 2 earlier unrelated runs: it's flaky, and
-flaky-test detection (planned) should label it rather than count it as a miss.
+[triage](#triage) should label it rather than count it as a miss (not evaluated yet).
 
 ## Quickstart
 
@@ -141,7 +141,66 @@ siftwise record junit.xml --repo acme/shop --branch feature-x --ci-run-id 1234 \
 
 Uploads are idempotent per `(repo, ci_run_id, run_attempt, variant)`: a re-upload returns 200
 and stores nothing new. For a matrix, give each leg a `--variant` (e.g. `ubuntu-py3.12`) and
-`--defer-rollup`, then run `siftwise rollup --repo acme/shop` once after all legs.
+`--defer-rollup`, then run `siftwise rollup --repo acme/shop` once after all legs. With
+`--base`, `record` also stores what the change links to (its import graphs and declared rules),
+which [triage](#triage) uses to tell whether a later failure was related to this run's change.
+
+## Triage
+
+`siftwise triage` reads a run's JUnit reports and its diff, and says for each failing test
+whether the change broke it:
+
+```sh
+siftwise triage junit.xml --repo acme/shop --base origin/main --variant ubuntu-py3.12 \
+    --ci-run-id 1234 --fail-on new_regression
+```
+
+```text
+new_regression  high   tests.test_cart::test_total
+    tests/test_cart.py tests changed src/cart.py
+pre_existing    high   tests.test_db::test_query
+    failing on main on ubuntu-py3.12 since 4f2a9c1 (3 main runs)
+flaky           medium tests.test_net::test_fetch
+    flaky 1 time in 90 days (1 unrelated fail-then-pass)
+siftwise: 3 failing test(s): 1 new regression, 1 pre existing, 1 flaky, 0 unknown
+```
+
+The first rule that applies decides:
+
+| # | Situation | Verdict | Confidence |
+|---|---|---|---|
+| 1 | The same commit and variant passed before (a re-run or a retry) | **flaky** | high |
+| 2 | Failing on main for this variant, at the last main run before this one | **pre-existing** | high for a streak of 2+ main runs or a matching message, else medium; at most medium if the change also touches the test |
+| 3 | The diff is unknown | **unknown** | low |
+| 4 | No history before this run | **new regression** if the test's own file changed (medium), else **unknown** | |
+| 5 | Linked to the change, but known flaky | **unknown**: re-run to tell | low |
+| 6 | Linked to the change | **new regression** | high: the test's file or path mapping; medium: an import, a `[[depends]]` rule or a nested build file; low: a root build/CI file. One level lower without a passing main run to compare with |
+| 7 | Not linked, with flaky evidence | **flaky** | high with 2+ events or a matching message, else medium |
+| 8 | Not linked, no flaky evidence | **unknown** (infrastructure, environment, or a dependency no signal sees) | low |
+
+- **Linked** means the selector's change-based signals: the test's file, path mapping, Go and
+  Python imports, `[[depends]]` rules, build files. History signals (co-change, recently failed,
+  always-run) don't link a failure to *this* change.
+- **No peeking:** only runs before the triaged one count (by run time; with `--ci-run-id`, the
+  recorded run sets the cut-off and none of that CI run's uploads count). Triaging an old run
+  gives the answer it would have got live.
+- **Per variant:** a failure is compared with its own matrix leg; other legs failing on main are
+  only noted.
+- **Flaky evidence**, in the stats window, comes in two kinds, counted apart: a fail and a pass on
+  one commit and variant; or a failure on a run whose change didn't link to the test, then a
+  pass on the branch's next run, whose change didn't either. The second kind needs both runs
+  recorded with a known diff and change links (`siftwise record --base`, or the Action): runs
+  without them (e.g. backfilled ones) never count as evidence.
+- **Failure messages** are evidence only. Normalised (numbers, addresses, temp paths and
+  timestamps removed), a match raises confidence; a mismatch is noted, never decisive.
+
+`--json` prints the full response: per test, the verdict, confidence, reasons and evidence
+(links, the main streak, flaky events by kind, history). The API is `POST /triage`, with
+`/select`'s change fields plus `commit_sha`, `variant`, `ci_run_id` and
+`failures: [{test_id, message, file_path}]` (up to 5,000). Exit codes: 0 ok, 1 API error,
+2 usage error, 4 a failure got a `--fail-on` verdict (off by default). 500 failures on rdflib
+take about 0.25 s, or 1 s with a cold cache (`scripts/bench_triage.py`). The GitHub Action
+doesn't triage yet.
 
 ## GitHub Action
 
@@ -281,8 +340,9 @@ and PR of this repo.
 - ✅ Safe full-suite fallbacks, `.siftwise.toml` for dependencies no graph can see
 - ✅ Self-hosted: one FastAPI service and Postgres, stateless workers
 - ✅ GitHub Action (select, record, rollup) with a sticky PR comment; fails open
+- ✅ Failure triage (`siftwise triage`, `POST /triage`): new regression vs pre-existing on main
+  vs flaky, with evidence
 - 🔜 MCP server, so coding agents can ask which tests to run and why a test failed
-- 🔜 Failure triage: new regression vs pre-existing on main vs flaky
 
 ## How it compares
 
@@ -350,13 +410,15 @@ SIFTWISE_TEST_DATABASE_URL=postgresql+psycopg://siftwise:siftwise@localhost:5432
 Database tests are skipped when `SIFTWISE_TEST_DATABASE_URL` is unset. After upgrading an existing
 database past migration 0005, run `POST /repos/{repo}/rollup` once per repo. Migration 0006
 rewrites `test_results` in place (it needs free disk for a second, smaller copy while it runs);
-run `VACUUM ANALYZE test_results` afterwards. Replay the selector
+run `VACUUM ANALYZE test_results` afterwards. Migration 0007 builds a small index on failed
+results (seconds; it blocks writes to `test_results` meanwhile). Replay the selector
 on a backfilled repo with `uv run python -m scripts.eval.run_eval --repo owner/name --checkout <clone>`.
 
 ## Roadmap
 
-- **Next:** a monorepo eval and a `v0` tag for the GitHub Action.
-- **Then:** flaky and pre-existing failure triage, and an MCP server for coding agents.
+- **Next:** a `v0` tag for the GitHub Action.
+- **Then:** an MCP server for coding agents, verdicts in the Action's PR comment, and a triage
+  eval on real history.
 - **Later:** a recall harness, docs and launch.
 
 ## Contributing

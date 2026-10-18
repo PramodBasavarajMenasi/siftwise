@@ -13,6 +13,7 @@ from pydantic import (
 )
 
 from siftwise.core.junit import Status, normalize_path
+from siftwise.core.models import MESSAGE_MAX_BYTES, truncate_utf8
 
 NonEmpty255 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
 
@@ -23,6 +24,40 @@ def _blank_to_none(value: object) -> object:
 
 # Matrix variant of a CI run, e.g. "ubuntu-py3.12". Blank means "no variant" (None).
 Variant = Annotated[NonEmpty255 | None, BeforeValidator(_blank_to_none)]
+
+
+Glob = Annotated[str, StringConstraints(min_length=1, max_length=1024)]
+Path4K = Annotated[str, StringConstraints(max_length=4096)]
+
+
+class DependsRuleIn(BaseModel):
+    """A ``[[depends]]`` rule from the repo's .siftwise.toml."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tests: Glob
+    on: list[Glob] = Field(min_length=1, max_length=100)
+
+
+class ChangeGraph(BaseModel):
+    """What a change links to beyond path mapping: the CLI's import graphs and the repo's
+    declared rules. Sent with ``/select`` and ``/triage`` (as top-level fields) and stored per
+    run (``runs.affected``) so triage can tell later whether a failure was related to it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    affected_packages: dict[str, list[str]] = Field(
+        default_factory=dict,
+        max_length=20_000,
+        description="Go package -> changed packages it imports, from `go list -deps -test`",
+    )
+    affected_files: dict[str, list[str]] = Field(
+        default_factory=dict,
+        max_length=50_000,
+        description="Python test file -> changed modules it imports, from a static import graph",
+    )
+    depends: list[DependsRuleIn] = Field(default_factory=list, max_length=100)
+    go_module: NonEmpty255 | None = None
 
 
 class RunMetadata(BaseModel):
@@ -51,6 +86,12 @@ class RunMetadata(BaseModel):
         default=True,
         description="False if the uploader could not determine the diff; forces full-suite "
         "selection for this run.",
+    )
+    affected: ChangeGraph | None = Field(
+        default=None,
+        description="The change's import graphs and declared rules, as sent to /select. Omit "
+        "if they weren't computed (or failed): triage then treats this run's relatedness to "
+        "its failures as unknown.",
     )
 
     @field_validator("changed_files")
@@ -106,49 +147,26 @@ class RunLookupResponse(BaseModel):
     commit_sha: str
 
 
-Glob = Annotated[str, StringConstraints(min_length=1, max_length=1024)]
-
-
-class DependsRuleIn(BaseModel):
-    """A ``[[depends]]`` rule from the repo's .siftwise.toml."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    tests: Glob
-    on: list[Glob] = Field(min_length=1, max_length=100)
-
-
-class SelectRequest(BaseModel):
-    """Body of ``POST /select``."""
-
-    model_config = ConfigDict(extra="forbid")
+class ChangeRequest(ChangeGraph):
+    """A change as the CLI describes it: the diff plus its ``ChangeGraph``."""
 
     repo: NonEmpty255
-    changed_files: list[Annotated[str, StringConstraints(max_length=4096)]] = Field(
-        default_factory=list, max_length=50_000
-    )
+    changed_files: list[Path4K] = Field(default_factory=list, max_length=50_000)
     changed_files_known: bool = Field(
         default=True,
         description="False if the caller could not determine the diff; forces the full suite.",
     )
-    affected_packages: dict[str, list[str]] = Field(
-        default_factory=dict,
-        max_length=20_000,
-        description="Go package -> changed packages it imports, from `go list -deps -test`",
-    )
-    affected_files: dict[str, list[str]] = Field(
-        default_factory=dict,
-        max_length=50_000,
-        description="Python test file -> changed modules it imports, from a static import graph",
-    )
-    deleted_files: list[Annotated[str, StringConstraints(max_length=4096)]] = Field(
+    deleted_files: list[Path4K] = Field(
         default_factory=list,
         max_length=50_000,
         description="Changed files that no longer exist at head; never named in a command",
     )
-    depends: list[DependsRuleIn] = Field(default_factory=list, max_length=100)
+
+
+class SelectRequest(ChangeRequest):
+    """Body of ``POST /select``."""
+
     always_run: list[Glob] = Field(default_factory=list, max_length=1000)
-    go_module: NonEmpty255 | None = None
     junit_dir: Annotated[str, StringConstraints(min_length=1, max_length=1024)] | None = Field(
         default=None,
         description="Directory for pytest JUnit reports: each pytest command gets "
@@ -247,3 +265,129 @@ class TestHistoryResponse(BaseModel):
     test_id: str
     stats: TestStatsOut
     results: list[TestResultOut] = Field(description="Latest result rows, newest run first")
+
+
+# --- triage -------------------------------------------------------------------------------
+
+
+def _truncate_message(value: object) -> object:
+    return truncate_utf8(value, MESSAGE_MAX_BYTES) if isinstance(value, str) else value
+
+
+class FailureIn(BaseModel):
+    """A failing test of the run being triaged (its final attempt failed or errored)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    test_id: Annotated[str, StringConstraints(min_length=1, max_length=4096)]
+    message: Annotated[str | None, BeforeValidator(_truncate_message)] = Field(
+        default=None, description="Failure message; evidence only, never decides a verdict"
+    )
+    file_path: Path4K | None = Field(default=None, description="The test's file, if reported")
+
+
+class TriageRequest(ChangeRequest):
+    """Body of ``POST /triage``: a run's change and its failing tests."""
+
+    commit_sha: Annotated[
+        str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^[0-9a-fA-F]{40}$")
+    ]
+    variant: Variant = Field(
+        default=None, description="Matrix leg: failures are compared with this variant's history"
+    )
+    ci_run_id: NonEmpty255 | None = Field(
+        default=None,
+        description="The run's CI run ID. Every upload of this CI run attempt is left out of "
+        "the history, and a recorded run of this variant sets the cut-off time.",
+    )
+    run_attempt: int = Field(default=1, ge=1)
+    as_of: datetime | None = Field(
+        default=None,
+        description="Only history strictly before this time counts (default: the recorded "
+        "run's time, else now)",
+    )
+    failures: list[FailureIn] = Field(min_length=1, max_length=5000)
+
+
+class LinkOut(BaseModel):
+    signal: str = Field(description="Which selector signal links the test to the change")
+    changed: str = Field(description="The changed file (or module/package) it goes through")
+    reason: str
+    strength: str = Field(description="'high', 'medium' or 'low'")
+
+
+class RunRefOut(BaseModel):
+    run_id: int
+    commit_sha: str
+    branch: str
+    variant: str | None
+    occurred_at: datetime
+    ci_run_id: str | None
+
+
+class PreExistingOut(BaseModel):
+    variant: str | None
+    since_sha: str = Field(description="Commit of the first failing main run of the streak")
+    since_run: RunRefOut
+    main_runs_failing: int = Field(description="Main runs of this variant failing in the streak")
+    last_main_pass_sha: str | None = Field(description="Latest main commit where it passed")
+    message_matches: bool | None = Field(
+        description="The failure message matches main's latest failure (null: nothing to compare)"
+    )
+
+
+class OtherVariantOut(BaseModel):
+    variant: str | None
+    run: RunRefOut = Field(description="That variant's latest main run, where the test failed")
+
+
+class FlakyEventOut(BaseModel):
+    kind: str = Field(
+        description="'same_commit': failed and passed on one commit and variant; "
+        "'unrelated_fail_then_pass': failed on a run whose change wasn't linked to it, then "
+        "passed on the branch's next run (also unlinked)"
+    )
+    commit_sha: str = Field(description="The commit it failed on")
+    variant: str | None
+    failed: list[RunRefOut]
+    passed: list[RunRefOut]
+    message_matches: bool | None
+
+
+class HistoryOut(BaseModel):
+    seen_before: bool = Field(description="The test has results from before the cut-off")
+    failures_in_window: int = Field(description="Runs it failed in (any variant), in the window")
+    last_failed_at: datetime | None
+    last_main_pass: RunRefOut | None = Field(
+        description="Latest main run of this variant it passed"
+    )
+    flaky_counts: dict[str, int] = Field(description="Flaky events by kind, in the window")
+
+
+class EvidenceOut(BaseModel):
+    links: list[LinkOut] = Field(description="How this change reaches the test (empty: unrelated)")
+    pre_existing: PreExistingOut | None
+    other_variants: list[OtherVariantOut] = Field(
+        description="Other variants failing on main in their latest main run"
+    )
+    flaky: list[FlakyEventOut] = Field(description="Flaky events, newest first (at most 10)")
+    history: HistoryOut
+
+
+class TriageResultOut(BaseModel):
+    test_id: str
+    verdict: str = Field(description="'new_regression', 'pre_existing', 'flaky' or 'unknown'")
+    confidence: str = Field(description="'high', 'medium' or 'low'")
+    reasons: list[str]
+    evidence: EvidenceOut
+
+
+class TriageResponse(BaseModel):
+    repo: str
+    commit_sha: str
+    variant: str | None
+    as_of: datetime = Field(description="Cut-off: only history strictly before it was used")
+    run_id: int | None = Field(description="The recorded run being triaged, if found")
+    window_days: int = Field(description="Flaky evidence window (0 = all history)")
+    counts: dict[str, int] = Field(description="Results per verdict")
+    results: list[TriageResultOut]

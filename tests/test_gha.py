@@ -357,7 +357,10 @@ def test_record_uploads_with_run_metadata(
         "started_at": "2026-10-11T10:00:00Z",
         "changed_files": ["src/cart.py"],
         "changed_files_known": True,
-    }
+        # For triage: what the change links to (here, no test file imports src/cart.py).
+        "affected": {"affected_packages": {}, "affected_files": {}, "depends": [],
+                     "go_module": None},
+    }  # fmt: skip
     assert sorted(names) == ["junit.xml", "siftwise-1.xml"]
     assert url.params["defer_rollup"] == "true"  # a variant: one rollup job after the matrix
     assert "stats update deferred" in gh.summary.read_text()

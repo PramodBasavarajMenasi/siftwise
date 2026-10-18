@@ -617,6 +617,122 @@ def _with_estimate(selection: Selection, history: RepoHistory | None) -> Selecti
     )
 
 
+# --- change links (triage) ----------------------------------------------------------------
+
+
+class Strength(StrEnum):
+    """How directly a change reaches a test."""
+
+    HIGH = "high"  # the test's own file, or path mapping (its module, its Go package)
+    MEDIUM = "medium"  # through an import, a declared rule or a nested build file
+    LOW = "low"  # a root build/config file changed: every test depends on it
+
+    @property
+    def rank(self) -> int:
+        return {Strength.LOW: 0, Strength.MEDIUM: 1, Strength.HIGH: 2}[self]
+
+
+# ChangeLink.signal values.
+LINK_TEST_FILE = "test file changed"
+LINK_PATH = "path mapping"
+LINK_PY_IMPORT = "imports changed module"
+LINK_GO_IMPORT = "imports changed package"
+LINK_DECLARED = "declared dependency"
+LINK_NESTED_BUILD = "nested build file"
+LINK_ROOT_BUILD = "root build/config file"
+
+
+@dataclass(frozen=True)
+class ChangeLink:
+    signal: str
+    changed: str  # the changed file, module or package it goes through
+    reason: str  # worded as in the selector's reasons
+    strength: Strength
+
+
+def change_links(
+    tests: Iterable[KnownTest],
+    changed_files: Iterable[str],
+    config: SelectorConfig | None = None,
+    affected_packages: Mapping[str, Sequence[str]] | None = None,
+    affected_files: Mapping[str, Sequence[str]] | None = None,
+    deleted_files: Iterable[str] = (),
+) -> dict[str, tuple[ChangeLink, ...]]:
+    """How a (known) change reaches each test: test_id -> links, empty if it doesn't.
+
+    The selector's change-based signals only, matched exactly as ``select_tests`` matches them:
+    the test's file, path mapping, Python and Go imports, ``[[depends]]`` rules and nested
+    build files. History signals (co-change, recently failed, always-run) say nothing about
+    *this* change, so they never link. A root build or CI file, for which the selector runs
+    the full suite, links every test with ``Strength.LOW``. Ignorable files link nothing.
+    """
+    config = config or SelectorConfig()
+    tests_by_id = _index(tests)
+    found: dict[str, list[ChangeLink]] = {test_id: [] for test_id in tests_by_id}
+    deleted = frozenset(p for p in (normalize_path(f) for f in deleted_files) if p)
+    by_file = {
+        path: modules
+        for file, modules in (affected_files or {}).items()
+        if (path := normalize_path(file))
+    }
+    packages = affected_packages or {}
+    paths = sorted({p for p in (normalize_path(f) for f in changed_files) if p})
+    scoped_build = {p: d for p in paths if (d := build_file_scope(p)) is not None}
+    build = [p for p in paths if is_build_file(p) and p not in scoped_build]
+    relevant = [p for p in paths if not is_ignorable(p) and p not in scoped_build]
+    py_test_files = {
+        t.py_path
+        for t in tests_by_id.values()
+        if t.runner is Runner.PYTEST
+        and not t.doctest
+        and t.classname != PYTEST_COLLECTION_CLASSNAME
+    }
+
+    for path in relevant:
+        if (
+            path in deleted
+            and path.endswith(".py")
+            and (is_python_test_file(path) or path in py_test_files)
+        ):
+            continue  # a deleted test file: its tests are gone (as in select_tests)
+        for test_id, reason in _map_path(path, tests_by_id, config).items():
+            test = tests_by_id[test_id]
+            signal = LINK_TEST_FILE if path in (test.file_path, test.py_path) else LINK_PATH
+            found[test_id].append(ChangeLink(signal, path, reason, Strength.HIGH))
+
+    for test in tests_by_id.values():
+        links = found[test.test_id]
+        imported: Sequence[str] | None = None
+        signal = ""
+        if (
+            test.runner is Runner.PYTEST
+            and test.py_path
+            and not test.doctest
+            and test.classname != PYTEST_COLLECTION_CLASSNAME
+            and test.py_path not in deleted
+        ):
+            imported, signal = by_file.get(test.py_path), LINK_PY_IMPORT
+        elif test.runner is Runner.GO:
+            imported, signal = packages.get(test.classname), LINK_GO_IMPORT
+        if imported:
+            first = sorted(imported)[0]
+            more = f" (+{len(imported) - 1} more)" if len(imported) > 1 else ""
+            links.append(ChangeLink(signal, first, f"{signal} {first}{more}", Strength.MEDIUM))
+        for path, directory in sorted(scoped_build.items()):
+            if _test_under_dir(test, directory):
+                reason = f"build file {path} changed (tests under {directory}/)"
+                links.append(ChangeLink(LINK_NESTED_BUILD, path, reason, Strength.MEDIUM))
+        for rule in config.depends:
+            triggers = [p for p in relevant if rule.matches_file(p)]
+            if triggers and _test_matches_glob(test, rule.tests, config):
+                reason = f"declared dependency: {rule.tests} on {_list(triggers, 1)}"
+                links.append(ChangeLink(LINK_DECLARED, triggers[0], reason, Strength.MEDIUM))
+        if build:
+            reason = f"build/config file changed: {_list(build)}; every test depends on it"
+            links.append(ChangeLink(LINK_ROOT_BUILD, build[0], reason, Strength.LOW))
+    return {test_id: tuple(links) for test_id, links in found.items()}
+
+
 def _is_go_subtest(test_id: str) -> bool:
     classname, _, name = test_id.partition("::")
     return "/" in name and _looks_like_go(classname, name)

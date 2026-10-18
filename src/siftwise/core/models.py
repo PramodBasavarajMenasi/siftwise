@@ -7,6 +7,7 @@ at any time.
 """
 
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -145,6 +146,10 @@ class Run(Base):
     # False when the uploader could not determine the diff (so changed_files is incomplete or
     # empty). Selection must then fall back to the full suite.
     changed_files_known: Mapped[bool] = mapped_column(Boolean, server_default=true())
+    # What the uploader linked the change to (``schemas.ChangeGraph``: import graphs, declared
+    # rules), for triage's "was this failure related to the run's change". NULL = not sent
+    # (backfill, older uploads, a failed graph): relatedness unknown.
+    affected: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
 
     # When the run happened. Use this (never created_at alone) wherever "latest" matters:
     # backfill ingests old runs late, so created_at is ingest time, not run time.
@@ -186,6 +191,13 @@ class TestResult(Base):
             "ix_test_results_failed",
             "run_id",
             "test_key",
+            postgresql_where=text(f"status IN {FAILED_CODES_SQL}"),
+        ),
+        # The same, by test: triage looks up a few hundred tests' failures at once.
+        Index(
+            "ix_test_results_failed_by_test",
+            "test_key",
+            "run_id",
             postgresql_where=text(f"status IN {FAILED_CODES_SQL}"),
         ),
     )

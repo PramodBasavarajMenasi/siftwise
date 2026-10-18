@@ -227,8 +227,8 @@ def record_step(
         _annotate("warning", f"siftwise: no JUnit files match {junit!r}"
                   f"{f' or {junit_dir}/*.xml' if junit_dir else ''}; nothing recorded")  # fmt: skip
         return
-    # Same diff as the select step, so a recorded run's changed files are what was selected on.
-    diff = cli.git_diff(ctx.base, ctx.head_sha or "HEAD") if ctx.base else None
+    # Same diff as the select step, so a recorded run's changed files are what was selected on,
+    # and its import graphs, so triage can later tell if a failure was related to the change.
     metadata = {
         "repo": repo,
         "commit_sha": ctx.head_sha,
@@ -238,8 +238,7 @@ def record_step(
         "run_attempt": ctx.run_attempt,
         "variant": variant or None,
         "started_at": run_started_at(ctx, github_token, env),
-        "changed_files": diff[0] if diff else [],
-        "changed_files_known": diff is not None,
+        **cli.recorded_change(ctx.base, ctx.head_sha or "HEAD"),
     }
     # A matrix leg defers the rollup to one `actions/rollup` job: the per-upload rollup costs
     # about as much as the whole-repo one on a big repo (~75 s on rdflib), once per leg.

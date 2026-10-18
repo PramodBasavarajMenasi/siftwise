@@ -81,6 +81,7 @@ def create_run(
             variant=meta.variant,
             started_at=meta.started_at,
             changed_files_known=meta.changed_files_known,
+            affected=meta.affected.model_dump() if meta.affected is not None else None,
         )
         session.add(run)
         session.flush()

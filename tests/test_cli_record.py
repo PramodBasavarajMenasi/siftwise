@@ -63,7 +63,43 @@ def test_record_uploads_junit_with_metadata(checkout: str, api: respx.MockRouter
         "repo": "acme/shop", "commit_sha": checkout, "branch": "main", "is_main": True,
         "ci_run_id": "77", "run_attempt": 1, "variant": "linux", "started_at": None,
         "changed_files": ["b.py"], "changed_files_known": True,
+        # b.py is imported by no test file: an empty but complete graph
+        "affected": {"affected_packages": {}, "affected_files": {}, "depends": [],
+                     "go_module": None},
     }  # fmt: skip
+
+
+def test_record_without_a_complete_graph_sends_no_links(
+    checkout: str, api: respx.MockRouter
+) -> None:
+    upload = api.post(f"{SERVER}/runs").respond(
+        201, json={"run_id": 4, "created": True, "counts": {"total": 0}})  # fmt: skip
+    args = ["record", "junit.xml", "--repo", "acme/shop", "--branch", "b", "--server", SERVER,
+            "--base", "HEAD~1", "--no-py-imports"]  # fmt: skip
+
+    assert CliRunner().invoke(app, args).exit_code == 0
+
+    content = upload.calls.last.request.content
+    meta = json.loads(content.split(b'name="metadata"\r\n\r\n')[1].split(b"\r\n--")[0])
+    # Python changed but its graph was skipped: the run's relatedness is unknown.
+    assert (meta["changed_files"], meta["affected"]) == (["b.py"], None)
+
+
+def test_record_with_an_invalid_repo_config_still_uploads(
+    checkout: str, api: respx.MockRouter
+) -> None:
+    Path(".siftwise.toml").write_text("[[depends]]\ntests = 1\n")
+    upload = api.post(f"{SERVER}/runs").respond(
+        201, json={"run_id": 4, "created": True, "counts": {"total": 0}})  # fmt: skip
+    args = ["record", "junit.xml", "--repo", "acme/shop", "--branch", "b", "--server", SERVER,
+            "--base", "HEAD~1"]  # fmt: skip
+
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    assert "recording the run without its change links" in result.output
+    assert b'"affected": null' in upload.calls.last.request.content
+    assert b'"changed_files": ["b.py"]' in upload.calls.last.request.content
 
 
 def test_record_without_base_has_unknown_changed_files(
@@ -77,6 +113,7 @@ def test_record_without_base_has_unknown_changed_files(
 
     request = upload.calls.last.request
     assert b'"changed_files_known": false' in request.content
+    assert b'"affected": null' in request.content
     assert "defer_rollup" not in request.url.params
 
 
