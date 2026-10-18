@@ -1,4 +1,5 @@
-"""POST /triage: is each failing test a new regression, pre-existing on main, or flaky?"""
+"""POST /triage: is each failing test a new regression, pre-existing on main, or flaky?
+POST /repos/{repo}/triage: the same for every variant of a recorded CI run attempt."""
 
 from collections import Counter
 from typing import Annotated
@@ -16,9 +17,13 @@ from siftwise.core.schemas import (
     OtherVariantOut,
     PreExistingOut,
     RunRefOut,
+    RunTriageRequest,
+    RunTriageResponse,
+    RunTriageResultOut,
     TriageRequest,
     TriageResponse,
     TriageResultOut,
+    VariantTriageOut,
 )
 from siftwise.core.selector import ChangeLink, DependsRule, SelectorConfig
 from siftwise.core.triage import (
@@ -29,7 +34,9 @@ from siftwise.core.triage import (
     RunRef,
     Target,
     TriageResult,
+    VariantTriage,
     Verdict,
+    triage_ci_run,
     triage_run,
 )
 from siftwise.db import get_session
@@ -78,6 +85,86 @@ def post_triage(
         window_days=settings.stats_window_days,
         counts={verdict.value: counts[verdict] for verdict in Verdict},
         results=[_result(result) for result in report.results],
+    )
+
+
+# Worst first: what a reader must act on, then what can't be told, then what isn't theirs.
+VERDICT_ORDER = (Verdict.NEW_REGRESSION, Verdict.UNKNOWN, Verdict.FLAKY, Verdict.PRE_EXISTING)
+_VERDICT_RANK = {verdict.value: rank for rank, verdict in enumerate(VERDICT_ORDER)}
+_CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+# Repo names contain "/", hence the path converter.
+@router.post("/repos/{repo:path}/triage", responses={404: {"description": "Unknown repo or run"}})
+def post_run_triage(
+    repo: str,
+    body: RunTriageRequest,
+    session: Annotated[Session, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> RunTriageResponse:
+    """Triage every recorded variant of a CI run attempt from what its uploads stored: the
+    failing tests, the changed files and the change links (``runs.affected``). A run without
+    stored links is triaged as an unknown change. For the GitHub Action, after all legs."""
+    variants = triage_ci_run(
+        session, repo, body.ci_run_id, body.run_attempt, settings.stats_window_days
+    )
+    if variants is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown repo {repo!r}")
+    if not variants:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"no runs recorded for CI run {body.ci_run_id} attempt {body.run_attempt}",
+        )
+    rows = [
+        (v.variant, result) for v in variants for result in (v.report.results if v.report else ())
+    ]
+    by_test: dict[str, list[RunTriageResultOut]] = {}
+    for variant, result in rows:
+        by_test.setdefault(result.test_id, []).append(
+            RunTriageResultOut(variant=variant, **_result(result).model_dump())
+        )
+    for results in by_test.values():
+        results.sort(key=lambda r: (*_rank(r), r.variant or ""))
+    tests = sorted(by_test.items(), key=lambda item: (_rank(item[1][0]), item[0]))
+
+    counts = Counter(results[0].verdict for _, results in tests)
+    kept: list[RunTriageResultOut] = []
+    for _, results in tests:
+        if len(kept) + len(results) > body.limit:
+            # Whole tests only, so a reader never sees half of a test's variants; a single
+            # test with more variants than the limit is the one exception.
+            kept = kept or results[: body.limit]
+            break
+        kept.extend(results)
+    return RunTriageResponse(
+        repo=repo,
+        ci_run_id=body.ci_run_id,
+        run_attempt=body.run_attempt,
+        window_days=settings.stats_window_days,
+        variants=[_variant_out(v) for v in variants],
+        failing_tests=len(tests),
+        counts={verdict.value: counts[verdict.value] for verdict in VERDICT_ORDER},
+        results=kept,
+        truncated=len(kept) < len(rows),
+    )
+
+
+def _rank(result: TriageResultOut) -> tuple[int, int]:
+    return _VERDICT_RANK[result.verdict], _CONFIDENCE_RANK[result.confidence]
+
+
+def _variant_out(v: VariantTriage) -> VariantTriageOut:
+    results = v.report.results if v.report else []
+    counts = Counter(result.verdict for result in results)
+    return VariantTriageOut(
+        variant=v.variant,
+        run_id=v.run_id,
+        commit_sha=v.commit_sha,
+        as_of=v.report.cut_at if v.report else None,
+        changed_files_known=v.changed_files_known,
+        links_known=v.links_known,
+        failing=len(results),
+        counts={verdict.value: counts[verdict] for verdict in VERDICT_ORDER},
     )
 
 

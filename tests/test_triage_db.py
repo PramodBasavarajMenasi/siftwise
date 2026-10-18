@@ -20,8 +20,10 @@ from siftwise.core.triage import (
     Target,
     TriageReport,
     TriageResult,
+    VariantTriage,
     Verdict,
     load_histories,
+    triage_ci_run,
     triage_run,
 )
 
@@ -54,6 +56,7 @@ def record(
     changed: Sequence[str] | None = ("docs/notes.txt",),
     graph: ChangeGraph | None = NO_LINKS,
     message: str | None = "AssertionError: assert 2 == 3",
+    file_path: str | None = None,
 ) -> Run:
     """One run. ``changed`` None = unknown diff; ``graph`` None = no stored change links."""
     results = []
@@ -62,7 +65,7 @@ def record(
         for attempt, status in enumerate(attempts, start=1):
             classname, _, name = test_id.partition("::")
             results.append(ParsedTestResult(
-                test_id, classname, name, None, status, 5, attempt,
+                test_id, classname, name, file_path, status, 5, attempt,
                 message if status is F else None,
             ))  # fmt: skip
     meta = RunMetadata(
@@ -404,3 +407,104 @@ def test_other_legs_of_the_triaged_ci_run_are_left_out(db_session: Session) -> N
     assert triaged.history.other_variants_failing == ()
     # Without the CI run ID, an earlier upload is just history.
     assert [r.variant for r in unidentified.history.other_variants_failing] == ["macos"]
+
+
+# --- a recorded CI run attempt ------------------------------------------------------------
+
+
+def ci_triage(session: Session, ci_run_id: str, run_attempt: int = 1) -> list[VariantTriage]:
+    variants = triage_ci_run(session, REPO, ci_run_id, run_attempt)
+    assert variants is not None
+    return variants
+
+
+def verdicts(variant: VariantTriage) -> dict[str, Verdict]:
+    assert variant.report is not None
+    return {r.test_id: r.verdict for r in variant.report.results}
+
+
+def test_ci_run_failures_are_final_attempts_of_each_variant(db_session: Session) -> None:
+    record(db_session, commit=1, hour=1, tests={TEST: P, OTHER: P})
+    record(db_session, commit=2, hour=5, branch="pr", ci_run_id="7",
+           tests={TEST: F, OTHER: [F, P], "t::late": [P, F]})  # fmt: skip
+    record(db_session, commit=2, hour=5, branch="pr", ci_run_id="7", variant="macos",
+           tests={TEST: P, OTHER: P})  # fmt: skip
+
+    linux, macos = ci_triage(db_session, "7")
+
+    assert (linux.variant, macos.variant) == ("linux", "macos")
+    # Failed then passed on a retry: not a failure. Passed then failed: one.
+    assert set(verdicts(linux)) == {TEST, "t::late"}
+    assert macos.report is None  # nothing failed: nothing to triage
+    assert linux.report is not None and linux.report.run_id == linux.run_id
+
+
+def test_ci_run_uses_the_stored_change_links(db_session: Session) -> None:
+    record(db_session, commit=1, hour=1, tests={TEST: P})
+    graph = ChangeGraph(affected_files={"tests/test_cart.py": ["src/money.py"]})
+    record(db_session, commit=2, hour=5, branch="pr", ci_run_id="8", tests={TEST: F},
+           changed=("src/money.py",), graph=graph)  # fmt: skip
+
+    [linux] = ci_triage(db_session, "8")
+
+    assert linux.links_known
+    assert linux.report is not None
+    [regression] = linux.report.results
+    assert regression.verdict == Verdict.NEW_REGRESSION
+    assert [link.changed for link in regression.links] == ["src/money.py"]
+
+
+def test_ci_run_without_stored_links_is_an_unknown_change(db_session: Session) -> None:
+    # A graph failed at record time (runs.affected NULL): an import-only link can't be seen,
+    # so the change must not look unrelated (that would make a real regression look flaky).
+    record(db_session, commit=1, hour=1, tests={TEST: P, "t::broken": P})
+    record(db_session, commit=2, hour=2, tests={TEST: P, "t::broken": F})
+    fail_then_pass(db_session, 10, 10)  # TEST has flaky evidence
+    record(db_session, commit=20, hour=20, branch="pr", ci_run_id="9",
+           tests={TEST: F, "t::broken": F}, changed=("src/money.py",), graph=None)  # fmt: skip
+
+    [linux] = ci_triage(db_session, "9")
+
+    assert (linux.changed_files_known, linux.links_known) == (True, False)
+    # Rule 3, not rule 7 (flaky); rule 2 still applies: it was failing on main already.
+    assert verdicts(linux) == {TEST: Verdict.UNKNOWN, "t::broken": Verdict.PRE_EXISTING}
+
+
+def test_ci_run_never_uses_its_own_attempt_as_history(db_session: Session) -> None:
+    # The macOS leg of the same attempt ran the new test earlier. It isn't history, so the
+    # Linux failure has none; a re-run (attempt 2) does see attempt 1's results.
+    record(db_session, commit=1, hour=1, tests={TEST: P})
+    record(db_session, commit=2, hour=4, branch="pr", ci_run_id="10", variant="macos",
+           tests={"t::new": P})  # fmt: skip
+    record(db_session, commit=2, hour=5, branch="pr", ci_run_id="10", tests={"t::new": F})
+    record(db_session, commit=2, hour=6, branch="pr", ci_run_id="10", run_attempt=2,
+           tests={"t::new": F})  # fmt: skip
+
+    first = ci_triage(db_session, "10")[0]
+    rerun = ci_triage(db_session, "10", run_attempt=2)[0]
+
+    assert first.report is not None and rerun.report is not None
+    assert not first.report.results[0].history.seen
+    assert rerun.report.results[0].history.seen
+
+
+def test_ci_run_file_paths_from_later_runs_are_not_used(db_session: Session) -> None:
+    # Rule 4: a new test whose own file changed is a regression. The path must be the run's
+    # own (or older): a later run's path would be peeking.
+    record(db_session, commit=1, hour=1, tests={TEST: P})
+    record(db_session, commit=2, hour=5, branch="pr", ci_run_id="11", tests={"web::adds": F},
+           changed=("web/cart.test.js",), file_path="web/cart.test.js")  # fmt: skip
+
+    assert verdicts(ci_triage(db_session, "11")[0]) == {"web::adds": Verdict.NEW_REGRESSION}
+
+    record(db_session, commit=3, hour=9, tests={"web::adds": P}, file_path="web/moved.test.js")
+
+    assert verdicts(ci_triage(db_session, "11")[0]) == {"web::adds": Verdict.UNKNOWN}
+
+
+def test_ci_run_unknown_repo_or_attempt(db_session: Session) -> None:
+    record(db_session, commit=1, hour=1, tests={TEST: P}, ci_run_id="12")
+
+    assert triage_ci_run(db_session, "nobody/nothing", "12") is None
+    assert ci_triage(db_session, "12", run_attempt=2) == []
+    assert ci_triage(db_session, "nope") == []

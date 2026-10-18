@@ -400,6 +400,56 @@ class TriageResponse(BaseModel):
     results: list[TriageResultOut]
 
 
+class RunTriageRequest(BaseModel):
+    """Body of ``POST /repos/{repo}/triage``: a recorded CI run attempt to triage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ci_run_id: NonEmpty255
+    run_attempt: int = Field(default=1, ge=1)
+    limit: int = Field(
+        default=500,
+        ge=1,
+        le=2000,
+        description="Most results returned (one per failing test and variant), worst verdicts "
+        "first and never splitting a test's variants; counts always cover every failure",
+    )
+
+
+class VariantTriageOut(BaseModel):
+    variant: str | None
+    run_id: int
+    commit_sha: str
+    as_of: datetime | None = Field(description="Cut-off; null when nothing failed")
+    changed_files_known: bool
+    links_known: bool = Field(
+        description="The run's change links were stored. If not, the change counts as unknown"
+    )
+    failing: int = Field(description="Failing tests in this variant")
+    counts: dict[str, int] = Field(description="This variant's failing tests per verdict")
+
+
+class RunTriageResultOut(TriageResultOut):
+    variant: str | None
+
+
+class RunTriageResponse(BaseModel):
+    repo: str
+    ci_run_id: str
+    run_attempt: int
+    window_days: int = Field(description="Flaky evidence window (0 = all history)")
+    variants: list[VariantTriageOut] = Field(description="Every recorded variant of the attempt")
+    failing_tests: int = Field(description="Distinct failing tests over all variants")
+    counts: dict[str, int] = Field(
+        description="Distinct failing tests per verdict, each counted once under its worst "
+        "verdict over the variants (new_regression, unknown, flaky, pre_existing)"
+    )
+    results: list[RunTriageResultOut] = Field(
+        description="Worst first: tests by their worst verdict and confidence, then test ID"
+    )
+    truncated: bool = Field(description="Results were cut at the limit (the counts weren't)")
+
+
 # --- explain ------------------------------------------------------------------------------
 
 

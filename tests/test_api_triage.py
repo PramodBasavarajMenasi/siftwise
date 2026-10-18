@@ -126,3 +126,99 @@ def test_unknown_repo_and_auth(client: TestClient) -> None:
 def test_long_messages_are_truncated_not_rejected(client: TestClient) -> None:
     response = post_triage(client, failures=[{"test_id": TEST, "message": "x" * 100_000}])
     assert response.status_code == 200, response.text
+
+
+# --- POST /repos/{repo}/triage ------------------------------------------------------------
+
+
+def post_run_triage(client: TestClient, ci_run_id: str, **body: Any) -> httpx2.Response:
+    response: httpx2.Response = client.post(
+        f"/repos/{REPO}/triage", json={"ci_run_id": ci_run_id, **body}, headers=AUTH
+    )
+    return response
+
+
+def record_matrix(session: Session) -> None:
+    """Main history for two variants, then CI run "77": TEST fails on both legs (its source
+    file changed), OTHER on Linux only (unrelated), t::broken on Linux (already broken on
+    main there)."""
+    for variant in ("linux", "macos"):
+        record(session, commit=1, hour=1, variant=variant,
+               tests={TEST: P, OTHER: P, "t::broken": P})  # fmt: skip
+        record(session, commit=2, hour=2, variant=variant,
+               tests={TEST: P, OTHER: P, "t::broken": F if variant == "linux" else P})  # fmt: skip
+    record(session, commit=50, hour=5, branch="pr", ci_run_id="77", changed=["src/cart.py"],
+           tests={TEST: F, OTHER: F, "t::broken": F})  # fmt: skip
+    record(session, commit=50, hour=5, branch="pr", ci_run_id="77", changed=["src/cart.py"],
+           variant="macos", tests={TEST: F, OTHER: P, "t::broken": P})  # fmt: skip
+
+
+def test_run_triage_covers_every_variant(client: TestClient, db_session: Session) -> None:
+    record_matrix(db_session)
+
+    response = post_run_triage(client, "77")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert (body["ci_run_id"], body["run_attempt"], body["window_days"]) == ("77", 1, 30)
+    assert [(v["variant"], v["failing"], v["links_known"]) for v in body["variants"]] == [
+        ("linux", 3, True), ("macos", 1, True)]  # fmt: skip
+    assert body["variants"][0]["counts"] == {
+        "new_regression": 1, "unknown": 1, "flaky": 0, "pre_existing": 1}  # fmt: skip
+    # Distinct tests, each under its worst verdict; worst first, a test's variants together.
+    assert (body["failing_tests"], body["truncated"]) == (3, False)
+    assert body["counts"] == {"new_regression": 1, "unknown": 1, "flaky": 0, "pre_existing": 1}
+    assert [(r["test_id"], r["variant"], r["verdict"]) for r in body["results"]] == [
+        (TEST, "linux", "new_regression"),
+        (TEST, "macos", "new_regression"),
+        (OTHER, "linux", "unknown"),
+        ("t::broken", "linux", "pre_existing"),
+    ]
+    assert body["results"][0]["evidence"]["links"][0]["changed"] == "src/cart.py"
+
+
+def test_run_triage_limit_cuts_whole_tests_and_keeps_true_counts(
+    client: TestClient, db_session: Session
+) -> None:
+    record_matrix(db_session)
+
+    cut = post_run_triage(client, "77", limit=3).json()
+    tiny = post_run_triage(client, "77", limit=1).json()
+
+    # TEST (2 rows) and OTHER (1) fit; t::broken would be a 4th row.
+    assert [(r["test_id"], r["variant"]) for r in cut["results"]] == [
+        (TEST, "linux"), (TEST, "macos"), (OTHER, "linux")]  # fmt: skip
+    assert cut["truncated"] is True
+    assert (cut["failing_tests"], cut["counts"]["pre_existing"]) == (3, 1)
+    # A test with more variants than the limit: its first rows, never nothing.
+    assert [(r["test_id"], r["variant"]) for r in tiny["results"]] == [(TEST, "linux")]
+    assert tiny["counts"] == cut["counts"]
+
+
+def test_run_triage_without_failures(client: TestClient, db_session: Session) -> None:
+    record(db_session, commit=1, hour=1, ci_run_id="80", tests={TEST: P})
+
+    body = post_run_triage(client, "80").json()
+
+    assert (body["failing_tests"], body["results"], body["truncated"]) == (0, [], False)
+    [variant] = body["variants"]
+    assert (variant["failing"], variant["as_of"]) == (0, None)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"limit": 0}, {"limit": 2001}, {"run_attempt": 0}, {"ci_run_id": ""}, {"surprise": 1}],
+)
+def test_run_triage_invalid_requests(client: TestClient, body: dict[str, Any]) -> None:
+    assert post_run_triage(client, **{"ci_run_id": "77", **body}).status_code == 422
+
+
+def test_run_triage_unknown_repo_run_and_auth(client: TestClient, db_session: Session) -> None:
+    assert post_run_triage(client, "77").json()["detail"] == f"unknown repo {REPO!r}"
+    record(db_session, commit=1, hour=1, ci_run_id="77", tests={TEST: P})
+
+    missing = post_run_triage(client, "77", run_attempt=2)
+
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "no runs recorded for CI run 77 attempt 2"
+    assert client.post(f"/repos/{REPO}/triage", json={"ci_run_id": "77"}).status_code == 401

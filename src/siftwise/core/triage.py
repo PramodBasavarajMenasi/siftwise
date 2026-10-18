@@ -1006,3 +1006,108 @@ def triage_run(
         histories.run_id,
         triage(failures, histories.tests, change, window_days),
     )
+
+
+# --- a recorded CI run attempt --------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VariantTriage:
+    """One recorded variant (upload) of a CI run attempt, triaged."""
+
+    run_id: int
+    variant: str | None
+    commit_sha: str
+    changed_files_known: bool
+    # The run's change links are stored (``runs.affected``): without them the change is
+    # treated as unknown (rule 3), so a test linked only through an import graph can never
+    # look unrelated and be called flaky.
+    links_known: bool
+    report: TriageReport | None  # None: no failing tests
+
+
+def triage_ci_run(
+    session: Session,
+    repo: str,
+    ci_run_id: str,
+    run_attempt: int = 1,
+    window_days: int = 90,
+) -> list[VariantTriage] | None:
+    """Triage every recorded variant of a CI run attempt, from what was stored: the failing
+    tests (final attempt failed or errored), the changed files and the change links the
+    uploader computed (``runs.affected``). None if the repo is unknown; an empty list if the
+    attempt has no recorded runs.
+
+    Each variant is triaged as ``/triage`` would with the same change: the cut-off is that
+    variant's run, and no upload of this CI run attempt is ever history.
+    """
+    repo_id = session.execute(
+        text("SELECT id FROM repos WHERE name = :name"), {"name": repo}
+    ).scalar_one_or_none()
+    if repo_id is None:
+        return None
+    runs = session.execute(
+        text(
+            """
+            SELECT id, variant, commit_sha, changed_files_known, affected
+            FROM runs
+            WHERE repo_id = :repo_id AND ci_run_id = :ci AND run_attempt = :attempt
+            ORDER BY COALESCE(variant, ''), id
+            """
+        ),
+        {"repo_id": repo_id, "ci": ci_run_id, "attempt": run_attempt},
+    ).all()
+    if not runs:
+        return []
+    run_ids = [run.id for run in runs]
+    changed: dict[int, list[str]] = defaultdict(list)
+    for run_id, path in session.execute(
+        text("SELECT run_id, path FROM changed_files WHERE run_id = ANY(:ids) ORDER BY path"),
+        {"ids": run_ids},
+    ):
+        changed[run_id].append(path)
+    failures: dict[int, list[Failure]] = defaultdict(list)
+    # Failed rows through the partial index, then each one's final attempt by primary key: a
+    # test that failed and then passed on a retry is not a failure. A path counts only if it
+    # was reported by this run or an earlier one (a later run's path would be peeking).
+    for run_id, test_id, file_path, message in session.execute(
+        text(
+            f"""
+            WITH failed AS (
+                SELECT DISTINCT run_id, test_key FROM test_results
+                WHERE run_id = ANY(:ids) AND status IN {FAILED_CODES_SQL}
+            )
+            SELECT f.run_id, t.test_id,
+                   CASE WHEN t.file_path_at <= COALESCE(r.started_at, r.created_at)
+                        THEN t.file_path END,
+                   final.message
+            FROM failed f
+            JOIN tests t ON t.id = f.test_key
+            JOIN runs r ON r.id = f.run_id
+            CROSS JOIN LATERAL (
+                SELECT tr.status, tr.message FROM test_results tr
+                WHERE tr.run_id = f.run_id AND tr.test_key = f.test_key
+                ORDER BY tr.attempt DESC LIMIT 1
+            ) final
+            WHERE final.status IN {FAILED_CODES_SQL}
+            ORDER BY f.run_id, t.test_id
+            """
+        ),
+        {"ids": run_ids},
+    ):
+        failures[run_id].append(Failure(test_id, message, file_path))
+
+    results = []
+    for run in runs:
+        links_known = run.changed_files_known and run.affected is not None
+        change = (
+            Change.from_graph(changed[run.id], run.affected) if links_known else Change((), False)
+        )
+        report = None
+        if failures[run.id]:
+            target = Target(repo, run.commit_sha, run.variant, ci_run_id, run_attempt)
+            report = triage_run(session, target, failures[run.id], change, window_days)
+        results.append(VariantTriage(
+            run.id, run.variant, run.commit_sha, run.changed_files_known, links_known, report,
+        ))  # fmt: skip
+    return results
