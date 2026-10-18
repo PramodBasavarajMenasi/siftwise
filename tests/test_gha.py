@@ -1,6 +1,7 @@
 """`siftwise gha select|record|rollup`: context, outputs, comment, fail-open (no real GitHub)."""
 
 import json
+import os
 import re
 import subprocess
 from collections.abc import Iterator
@@ -264,7 +265,8 @@ def test_select_sets_outputs_summary_and_comment(
     exported = gh.outputs(gh.github_env)
     assert exported["SIFTWISE_JUNIT_DIR"] == str(gh.dir / "siftwise-junit")
     summary = gh.summary.read_text()
-    assert "**selective**" in summary and "2 of 10 known tests" in summary
+    assert "- **Mode:** selective" in summary and "- **Tests:** 2 of 10 known tests" in summary
+    assert "|" not in summary  # a list: no table, so no empty header row
     assert "1m 00s of 10m 00s (90% saved)" in summary
     comment = json.loads(created.calls.last.request.content)["body"]
     assert comment.startswith(gha.COMMENT_MARKER)
@@ -411,7 +413,7 @@ def test_record_uploads_with_run_metadata(
         "changed_files_known": True,
         # For triage: what the change links to (here, no test file imports src/cart.py).
         "affected": {"affected_packages": {}, "affected_files": {}, "depends": [],
-                     "go_module": None},
+                     "go_module": None, "generated": []},
     }  # fmt: skip
     assert sorted(names) == ["junit.xml", "siftwise-1.xml"]
     assert url.params["defer_rollup"] == "true"  # a variant: one rollup job after the matrix
@@ -480,6 +482,53 @@ def test_find_junit_skips_tool_directories(tmp_path: Path, monkeypatch: pytest.M
     assert gha.find_junit("**/junit*.xml", "") == [Path("junit.xml"), Path("reports/junit-a.xml")]
 
 
+def test_find_junit_never_walks_into_skipped_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    for path in ("junit.xml", "pkg/sub/junit-b.xml", "node_modules/a/b/junit.xml",
+                 ".venv/lib/junit.xml", "venv/lib/junit.xml", ".tox/py/junit.xml",
+                 ".git/hooks/junit.xml", ".github/junit.xml"):  # fmt: skip
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text("<testsuite/>")
+    walked: list[str] = []
+    real_walk = os.walk
+
+    def recording_walk(top: str) -> Iterator[tuple[str, list[str], list[str]]]:
+        for entry in real_walk(top):
+            walked.append(entry[0].replace(os.sep, "/"))
+            yield entry
+
+    monkeypatch.setattr(os, "walk", recording_walk)
+
+    found = gha.find_junit("**/junit*.xml", "")
+
+    assert found == [Path("junit.xml"), Path("pkg/sub/junit-b.xml")]
+    skipped = ("node_modules", ".venv", "venv", ".tox", ".git")
+    assert walked and not [d for d in walked if any(s in d.split("/") for s in skipped)]
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected"),
+    [
+        ("**/junit*.xml", ["junit.xml", "a/junit-1.xml", "a/b/junit-2.xml"]),
+        ("a/**/*.xml", ["a/junit-1.xml", "a/b/junit-2.xml", "a/b/other.xml"]),
+        ("a/*.xml", ["a/junit-1.xml"]),  # no **: plain glob, one level
+        ("junit.xml", ["junit.xml"]),
+        ("**/.hidden.xml", ["a/.hidden.xml"]),  # a dot in the pattern matches dot files
+    ],
+)
+def test_find_junit_matches_like_glob(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pattern: str, expected: list[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    for path in ("junit.xml", "a/junit-1.xml", "a/.hidden.xml", "a/b/junit-2.xml",
+                 "a/b/other.xml", ".cache/junit.xml"):  # fmt: skip
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text("<testsuite/>")
+    assert gha.find_junit(pattern, "") == sorted(Path(p) for p in expected)
+
+
 # --- rollup -------------------------------------------------------------------------------
 
 
@@ -508,7 +557,7 @@ def test_full_mode_markdown_shows_the_reason_escaped() -> None:
 
     assert "for `abcdef1`" in markdown
     assert "all (10 known)" in markdown
-    assert "build/config file changed: a\\|b" in markdown  # a pipe would end the table cell
+    assert "- **Why the full suite:** build/config file changed: a\\|b" in markdown
 
 
 def test_markdown_when_nothing_is_affected_or_siftwise_is_down() -> None:
@@ -516,7 +565,7 @@ def test_markdown_when_nothing_is_affected_or_siftwise_is_down() -> None:
     assert "none of 10 known tests are affected" in nothing
 
     down = gha.selection_markdown(gha.fail_open_result("timed out"), "")
-    assert "| Tests | all |" in down
+    assert "- **Tests:** all\n" in down
     assert "siftwise unavailable: timed out" in down
 
 

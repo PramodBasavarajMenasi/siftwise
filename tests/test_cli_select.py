@@ -116,6 +116,7 @@ def test_prints_command_for_branch_diff(api: respx.MockRouter) -> None:
         "changed_files_known": True,
         # No .siftwise.toml and no go.mod: empty rules, no go_module or affected_packages.
         "depends": [],
+        "generated": [],
         "always_run": [],
         # The deleted file and the old side of the rename: never named in a command.
         "deleted_files": ["src/gone.py", "src/old_name.py"],
@@ -263,6 +264,7 @@ def test_missing_token_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
 
 SIFTWISE_TOML = """
 always_run = ["smoke/**"]
+generated = ["build/reports/**"]
 
 [[depends]]
 tests = "e2e/**"
@@ -316,6 +318,7 @@ def test_go_dependents_and_repo_config_are_sent(
     }
     assert body["depends"] == [{"tests": "e2e/**", "on": ["**/*.go", "!**/*_test.go"]}]
     assert body["always_run"] == ["smoke/**"]
+    assert body["generated"] == ["build/reports/**"]  # the server ignores these files too
     assert "4 package(s) depend on changed Go code" in result.stderr
 
 

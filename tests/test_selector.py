@@ -558,6 +558,49 @@ def test_lint_and_format_configs_never_force_the_full_suite(path: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "path",
+    [
+        "junit.xml",  # the untracked report that once forced a full run
+        "reports/junit-unit.xml",
+        "coverage.xml",
+        ".coverage",
+        ".coverage.runner-1.12345",
+        "htmlcov/index.html",
+        "web/htmlcov/app_js.html",
+        "ci.log",
+        "logs/server/run.log",
+        ".pytest_cache/v/cache/nodeids",
+        "src/shop/__pycache__/cart.cpython-312.pyc",
+    ],
+)
+def test_generated_files_never_count_as_changed_source(path: str) -> None:
+    # Ignorable, not dropped: a change of only generated files selects nothing, not the full
+    # suite that an empty (unsure) diff would get.
+    alone = select(PY, path)
+    assert (alone.mode, alone.tests, alone.reason) == (Mode.SELECTIVE, (), "no tests affected")
+
+    with_code = select(PY, path, "src/shop/cart.py")
+    assert with_code.mode is Mode.SELECTIVE
+    assert set(ids(with_code)) == set(ids(select(PY, "src/shop/cart.py")))
+
+
+def test_generated_globs_extend_from_the_repo_config() -> None:
+    assert select(PY, "build/reports/index.html").mode is Mode.FULL  # unmapped: unsure
+    extended = select(PY, "build/reports/index.html", generated=("build/reports/**",))
+    assert (extended.mode, extended.tests) == (Mode.SELECTIVE, ())
+
+
+def test_generated_files_are_not_co_change_evidence() -> None:
+    # A past failing run that also committed a junit.xml: a later junit.xml says nothing.
+    past = FailedRun(1, "a" * 40, frozenset({"junit.xml"}), frozenset({"tests.test_io::test_read"}))
+    hist = history(*PY.tests.values(), failed_runs=(past,))
+    selection = select(hist, "junit.xml", "src/shop/cart.py")
+    assert selection.mode is Mode.SELECTIVE
+    assert "tests.test_io::test_read" not in ids(selection)
+    assert set(ids(selection)) == set(ids(select(hist, "src/shop/cart.py")))
+
+
+@pytest.mark.parametrize(
     "path", [".flake8", "ruff.toml", ".pylintrc", "mypy.ini", ".eslintrc.json", "eslint.config.js"]
 )
 def test_code_linter_configs_are_still_test_inputs(path: str) -> None:

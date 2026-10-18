@@ -13,6 +13,7 @@ from siftwise.core.selector import DependsRule
 
 KUBO_CONFIG = """
 always_run = ["test/cli/smoke/**"]
+generated = ["build/reports/**", "**/*.trace"]
 
 [[depends]]
 tests = "test/cli/**"
@@ -34,6 +35,7 @@ def test_load_repo_config(tmp_path: Path) -> None:
             DependsRule("tests/integration/**", ("src/**",)),  # a single string is allowed
         ),
         always_run=("test/cli/smoke/**",),
+        generated=("build/reports/**", "**/*.trace"),
     )
 
 
@@ -46,6 +48,8 @@ def test_empty_config() -> None:
     [
         ({"depend": []}, "unknown key(s): depend"),
         ({"always_run": "x"}, "always_run must be a list of strings"),
+        ({"generated": "*.log"}, "generated must be a list of strings"),
+        ({"generated": [""]}, "generated must be a list of strings"),
         ({"depends": {"tests": "x"}}, "depends must be an array of tables"),
         ({"depends": ["x"]}, "#1 must be a table"),
         ({"depends": [{"tests": "x", "on": ["a"], "when": 1}]}, "only 'tests' and 'on'"),

@@ -58,6 +58,12 @@ class ChangeGraph(BaseModel):
     )
     depends: list[DependsRuleIn] = Field(default_factory=list, max_length=100)
     go_module: NonEmpty255 | None = None
+    generated: list[Glob] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Globs of generated files (reports, caches) from .siftwise.toml, on top of "
+        "the built-in list: never counted as changed source",
+    )
 
 
 class RunMetadata(BaseModel):
@@ -263,7 +269,9 @@ class TestHistoryResponse(BaseModel):
 
     repo: str
     test_id: str
-    stats: TestStatsOut
+    stats: TestStatsOut | None = Field(
+        description="Rolled-up stats; null when the test has no results in the stats window"
+    )
     results: list[TestResultOut] = Field(description="Latest result rows, newest run first")
 
 

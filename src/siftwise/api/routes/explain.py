@@ -55,6 +55,7 @@ def post_explain(
         always_run=tuple(body.always_run),
         depends=tuple(DependsRule(rule.tests, tuple(rule.on)) for rule in body.depends),
         go_module=body.go_module,
+        generated=tuple(body.generated),
     )
     history = load_history(session, body.repo, config)
     if history is None:

@@ -155,6 +155,13 @@ _IGNORABLE_GLOBS = (
     ".cspell.config.*",
 )  # fmt: skip
 _IGNORABLE_DIRS = ("docs/",)
+# Files that test and coverage runs write: reports, caches, logs. Never a change to the code,
+# even when untracked or committed by mistake (an untracked junit.xml once made the MCP server
+# ask for the full suite). Ignorable like docs; .siftwise.toml's `generated` adds globs.
+GENERATED_GLOBS = (
+    "**/junit*.xml", "**/coverage.xml", "**/.coverage", "**/.coverage.*", "**/htmlcov/**",
+    "**/*.log", "**/.pytest_cache/**", "**/__pycache__/**",
+)  # fmt: skip
 
 _PY_IDENTIFIER = re.compile(r"[A-Za-z_]\w*\Z")
 # A directory in a pytest classname: pytest run from a monorepo's root reports
@@ -180,6 +187,8 @@ class SelectorConfig:
     go_module: str | None = None
     # Declared dependencies from the repo's .siftwise.toml.
     depends: tuple[DependsRule, ...] = ()
+    # Generated-file globs from .siftwise.toml, on top of GENERATED_GLOBS.
+    generated: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -395,7 +404,7 @@ def _select(
             py_test_files.setdefault(test.py_path, []).append(test)
 
     # Path mapping. Every changed source file must map to at least one test.
-    relevant = [p for p in paths if not is_ignorable(p) and p not in scoped_build]
+    relevant = [p for p in paths if not is_ignorable(p, config.generated) and p not in scoped_build]
     unmapped = []
     whole_packages: set[str] = set()
     py_whole_files: set[str] = set()
@@ -679,7 +688,7 @@ def change_links(
     paths = sorted({p for p in (normalize_path(f) for f in changed_files) if p})
     scoped_build = {p: d for p in paths if (d := build_file_scope(p)) is not None}
     build = [p for p in paths if is_build_file(p) and p not in scoped_build]
-    relevant = [p for p in paths if not is_ignorable(p) and p not in scoped_build]
+    relevant = [p for p in paths if not is_ignorable(p, config.generated) and p not in scoped_build]
     py_test_files = {
         t.py_path
         for t in tests_by_id.values()
@@ -761,7 +770,9 @@ def build_file_scope(path: str) -> str | None:
     return None
 
 
-def is_ignorable(path: str) -> bool:
+def is_ignorable(path: str, generated: Sequence[str] = ()) -> bool:
+    """Docs, lint-only configs and generated files: never a reason to run a test.
+    ``generated`` adds globs to GENERATED_GLOBS."""
     base = posixpath.basename(path)
     stem, ext = posixpath.splitext(base)
     return (
@@ -770,7 +781,13 @@ def is_ignorable(path: str) -> bool:
         or stem in _IGNORABLE_BASENAMES  # LICENSE.txt, CHANGELOG.txt
         or any(fnmatch.fnmatchcase(base, glob) for glob in _IGNORABLE_GLOBS)
         or path.startswith(_IGNORABLE_DIRS)
+        or is_generated(path, generated)
     )
+
+
+def is_generated(path: str, extra: Sequence[str] = ()) -> bool:
+    """A report, cache or log a test run writes (GENERATED_GLOBS, plus ``extra``)."""
+    return any(glob_match(path, glob) for glob in (*GENERATED_GLOBS, *extra))
 
 
 def _list(items: Sequence[str], limit: int = 3) -> str:

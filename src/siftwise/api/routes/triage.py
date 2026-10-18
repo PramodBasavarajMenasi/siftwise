@@ -58,6 +58,7 @@ def post_triage(
         config=SelectorConfig(
             depends=tuple(DependsRule(rule.tests, tuple(rule.on)) for rule in body.depends),
             go_module=body.go_module,
+            generated=tuple(body.generated),
         ),
         affected_packages=body.affected_packages,
         affected_files=body.affected_files,

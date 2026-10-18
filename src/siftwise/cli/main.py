@@ -303,7 +303,7 @@ def mcp_command() -> None:
 class LocalChange:
     """BASE...HEAD in the current checkout, as /select and /triage describe a change."""
 
-    # changed_files, changed_files_known, deleted_files, depends, go_module, affected_*
+    # changed_files, changed_files_known, deleted_files, depends, generated, go_module, affected_*
     fields: dict[str, Any]
     config: RepoConfig
     # Every import graph that applies was built: none failed or was turned off.
@@ -319,6 +319,7 @@ class LocalChange:
             "affected_files": self.fields.get("affected_files", {}),
             "depends": self.fields["depends"],
             "go_module": self.fields.get("go_module"),
+            "generated": self.fields["generated"],
         }
 
 
@@ -350,6 +351,9 @@ def local_change(
         "changed_files": changed or [],
         "changed_files_known": changed is not None,
         "depends": [{"tests": r.tests, "on": list(r.on)} for r in config.depends],
+        # Reports and caches a test run leaves behind (untracked or not) never count as
+        # changed source: the server ignores the built-in list plus these.
+        "generated": list(config.generated),
     }
     complete = True
     if diff and diff[1]:
