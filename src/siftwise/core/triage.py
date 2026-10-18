@@ -15,6 +15,7 @@ doesn't make a macOS failure pre-existing. Other variants failing on main are on
 Rules, in order; the first that applies decides:
 
 1. The same commit and variant passed before (a re-run or a retry) -> **flaky**, high.
+   Never for uncommitted code (``Target.commit_sha`` None): no earlier run tested it.
 2. Failing on main for this variant, at the latest main run before the cut-off ->
    **pre-existing**: high if the streak is 2+ main runs or the message matches main's, else
    medium; medium at most if this change also links to the test.
@@ -471,7 +472,9 @@ class Target:
     """The run being triaged."""
 
     repo: str
-    commit_sha: str
+    # None: uncommitted code (a dirty working tree), so no earlier run tested the same code
+    # and rule 1 can't apply.
+    commit_sha: str | None
     variant: str | None = None
     ci_run_id: str | None = None
     run_attempt: int = 1
@@ -668,7 +671,8 @@ class _Builder:
         if not seen:
             return histories
         failures = self._failures(seen)  # (run, key) with any failed attempt, in the window
-        same_commit = self.by_pair.get((self.target.commit_sha, self.target.variant), [])
+        commit = self.target.commit_sha
+        same_commit = self.by_pair.get((commit, self.target.variant), []) if commit else []
         next_runs = {run_id: nxt for run_id, _ in failures if (nxt := self._next_on_branch(run_id))}
         pairs = {(r.id, k) for k in seen for r in same_commit}
         for run_id, key in failures:

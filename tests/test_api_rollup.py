@@ -4,7 +4,7 @@ import json
 from collections.abc import Iterator
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
@@ -38,7 +38,7 @@ def xml(**tests: str) -> bytes:
     return f"<testsuite>{cases}</testsuite>".encode()
 
 
-def upload(client: TestClient, n: int, defer: bool, **tests: str) -> httpx.Response:
+def upload(client: TestClient, n: int, defer: bool, **tests: str) -> httpx2.Response:
     meta = {
         "repo": REPO,
         "commit_sha": f"{n:040x}",
@@ -47,7 +47,7 @@ def upload(client: TestClient, n: int, defer: bool, **tests: str) -> httpx.Respo
         "ci_run_id": str(n),
         "started_at": f"2026-09-0{n}T00:00:00Z",
     }
-    response: httpx.Response = client.post(
+    response: httpx2.Response = client.post(
         "/runs",
         params={"defer_rollup": "true"} if defer else None,
         files={"files": ("r.xml", xml(**tests))},

@@ -185,3 +185,25 @@ def test_packages_import_from_their_own_root(tmp_path: Path) -> None:
     assert {"libs/b/tests/helpers.py", "libs/c/tests/helpers.py"} <= set(
         graph.edges["libs/b/tests/test_core.py"]
     )
+
+
+def test_directories_pytest_never_collects_are_not_walked(tmp_path: Path) -> None:
+    files = {
+        "pkg/__init__.py": "",
+        "tests/test_a.py": "import pkg\n",
+        ".eval-cache/tools/x.py": "",  # dot-dirs (pytest norecursedirs '.*')
+        "node_modules/m/y.py": "",
+        "env/pyvenv.cfg": "home = /usr\n",  # a virtualenv with any name
+        "env/lib/site.py": "",
+        "thing.egg/z.py": "",
+        "sub/pyproject.toml": "",
+        ".hidden/setup.py": "",
+    }
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+
+    graph = build_py_graph(tmp_path)
+
+    assert sorted(graph.edges) == ["pkg/__init__.py", "tests/test_a.py"]
+    assert graph.affected(["pkg/__init__.py"]) == {"tests/test_a.py": ["pkg/__init__.py"]}

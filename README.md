@@ -30,9 +30,9 @@
 
 <p align="center"><sub>If siftwise looks useful, a ⭐ helps others find it.</sub></p>
 
-> **Alpha, early development.** The server, CLI, test selection and GitHub Action work, and
-> selection has been evaluated on real repos. Failure triage is new and not evaluated yet; the
-> MCP server doesn't exist yet. APIs and the database schema may change.
+> **Alpha, early development.** The server, CLI, test selection, GitHub Action and MCP server
+> work, and selection has been evaluated on real repos. Failure triage is new and not evaluated
+> yet. APIs and the database schema may change.
 
 ## The problem
 
@@ -202,6 +202,111 @@ The first rule that applies decides:
 take about 0.25 s, or 1 s with a cold cache (`scripts/bench_triage.py`). The GitHub Action
 doesn't triage yet.
 
+## Coding agents (MCP)
+
+`siftwise mcp` is an MCP server (stdio) that gives a coding agent three tools. It keeps no
+state: each call computes the change in the agent's checkout, with the same code as
+`siftwise select`, and asks the siftwise server. It never records runs.
+
+| Tool | The agent calls it | Returns |
+|---|---|---|
+| `select_tests` | before running tests after a change | `mode`, the command to run, the selected tests with a reason each |
+| `triage_failure` | when tests fail, before trying to fix them | a verdict per failure (from JUnit paths or test IDs), with reasons and evidence |
+| `explain` | when a selection or verdict surprises it | one test's recent results, flaky evidence, broken-on-main status, and why it would (not) be selected |
+
+- **Uncommitted work counts.** The diff runs from the merge base of the base branch and HEAD
+  to the working tree, untracked files included (`include_uncommitted`, on by default). When
+  the tree is dirty, triage sends no commit, so "passed on this commit before" can't apply.
+- **Fails open.** If the server is down, errors or no token is set, `select_tests` says to run
+  the full suite and `triage_failure` says verdicts are unavailable.
+- **Compact output.** Each result stays under 8,000 characters (long lists end with a
+  `more_*` count). The API token never appears in a result.
+
+**Install** the CLI with the `mcp` extra, from a siftwise checkout:
+
+```sh
+uv tool install ".[mcp]"     # siftwise lands in ~/.local/bin (Windows: %USERPROFILE%\.local\bin)
+uv tool update-shell         # once, if that directory isn't on your PATH; then restart the agent
+uv tool dir --bin            # prints the directory, for a full path in the configs below
+```
+
+`siftwise mcp` without the extra exits 2 with this install command. The agent starts the
+server in its working directory: open the agent in the repository (any directory inside the
+checkout works). It reads `SIFTWISE_SERVER` and `SIFTWISE_API_TOKEN`, and optionally
+`SIFTWISE_REPO` (default: `owner/name` from the `origin` remote) and `SIFTWISE_BASE_REF`
+(default: the branch `origin/HEAD` points to, else `main`). Keep the token out of files you
+commit: use your user-level config, or environment-variable expansion where the client has it.
+
+**Claude Code:**
+
+```sh
+claude mcp add siftwise --env SIFTWISE_SERVER=https://siftwise.example.com \
+    --env SIFTWISE_API_TOKEN=your-token -- siftwise mcp
+```
+
+or a project `.mcp.json`, which expands `${VAR}` from your environment:
+
+```json
+{
+  "mcpServers": {
+    "siftwise": {
+      "command": "siftwise",
+      "args": ["mcp"],
+      "env": {
+        "SIFTWISE_SERVER": "https://siftwise.example.com",
+        "SIFTWISE_API_TOKEN": "${SIFTWISE_API_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+**Codex** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.siftwise]
+command = "siftwise"
+args = ["mcp"]
+env = { SIFTWISE_SERVER = "https://siftwise.example.com", SIFTWISE_API_TOKEN = "your-token" }
+```
+
+**Cursor** (`~/.cursor/mcp.json` for every project, or `.cursor/mcp.json` in one):
+
+```json
+{
+  "mcpServers": {
+    "siftwise": {
+      "command": "siftwise",
+      "args": ["mcp"],
+      "env": {
+        "SIFTWISE_SERVER": "https://siftwise.example.com",
+        "SIFTWISE_API_TOKEN": "your-token"
+      }
+    }
+  }
+}
+```
+
+**If the agent can't find `siftwise`** (it doesn't see your shell's PATH, common on Windows),
+give the full path from `uv tool dir --bin` as the command. In JSON, double the backslashes;
+in TOML, use a single-quoted string:
+
+```json
+"command": "C:\\Users\\you\\.local\\bin\\siftwise.exe"
+```
+
+```toml
+command = 'C:\Users\you\.local\bin\siftwise.exe'
+```
+
+Then tell the agent when to use it, e.g. in `AGENTS.md` or `CLAUDE.md`:
+
+```markdown
+Before running tests, call the siftwise `select_tests` tool and run the command it returns.
+When tests fail, call `triage_failure` before fixing anything: fix `new_regression` failures,
+re-run `flaky` ones, and leave `pre_existing` ones (already failing on main).
+```
+
 ## GitHub Action
 
 Three composite actions in this repo. They install the CLI from the action's own checkout
@@ -342,7 +447,7 @@ and PR of this repo.
 - ✅ GitHub Action (select, record, rollup) with a sticky PR comment; fails open
 - ✅ Failure triage (`siftwise triage`, `POST /triage`): new regression vs pre-existing on main
   vs flaky, with evidence
-- 🔜 MCP server, so coding agents can ask which tests to run and why a test failed
+- ✅ MCP server for coding agents (`siftwise mcp`): `select_tests`, `triage_failure`, `explain`
 
 ## How it compares
 
@@ -350,7 +455,7 @@ From each project's public docs as of October 2026; corrections welcome.
 
 | | Open source | Self-hosted | Languages | How it selects | Agent/MCP support |
 |---|---|---|---|---|---|
-| **siftwise** | Yes (Apache-2.0) | Yes | Python, Go, JS/TS | file mapping, Go/Python import graphs, failure history | Planned |
+| **siftwise** | Yes (Apache-2.0) | Yes | Python, Go, JS/TS | file mapping, Go/Python import graphs, failure history | MCP server (select, triage, explain) |
 | [CloudBees Smart Tests](https://docs.cloudbees.com/docs/cloudbees-smart-tests/latest/features/predictive-test-selection) | No | Not stated | Many (runner integrations incl. Python, Go, Java, JS) | LLM analysis of changes + test history | Not documented |
 | [Datadog Test Impact Analysis](https://docs.datadoghq.com/tests/test_impact_analysis/) | No | No (Datadog SaaS) | JS/TS, Java, Python, Go, Swift and more | per-test code coverage | Not documented |
 | [Develocity Predictive Test Selection](https://docs.develocity.ai/current/using-develocity/predictive-test-selection/) | No | Yes (Develocity server) | Gradle and Maven builds | predictive model from past builds | Not documented |
@@ -417,8 +522,7 @@ on a backfilled repo with `uv run python -m scripts.eval.run_eval --repo owner/n
 ## Roadmap
 
 - **Next:** a `v0` tag for the GitHub Action.
-- **Then:** an MCP server for coding agents, verdicts in the Action's PR comment, and a triage
-  eval on real history.
+- **Then:** verdicts in the Action's PR comment, and a triage eval on real history.
 - **Later:** a recall harness, docs and launch.
 
 ## Contributing

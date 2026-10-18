@@ -19,6 +19,10 @@ dependencies = [
     "defusedxml>=0.7.1",
 ]
 
+[project.optional-dependencies]
+# `siftwise mcp`: the MCP server for coding agents (uv tool install ".[mcp]").
+mcp = ["mcp>=2.3,<3"]
+
 [project.scripts]
 siftwise = "siftwise.cli.main:app"
 
@@ -30,6 +34,8 @@ dev = [
     "mypy>=1.11",
     "types-defusedxml>=0.7.0.20260504",
     "respx>=0.23.1",
+    "mcp>=2.3,<3",
+    "httpx2>=2.10",  # what starlette's TestClient uses (and is typed with)
 ]
 
 [build-system]

@@ -2,7 +2,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -63,8 +63,8 @@ def seeded(db_session: Session) -> None:
 
 def post_select(
     client: TestClient, headers: dict[str, str] | None = None, **body: Any
-) -> httpx.Response:
-    response: httpx.Response = client.post(
+) -> httpx2.Response:
+    response: httpx2.Response = client.post(
         "/select", json={"repo": REPO, **body}, headers=AUTH if headers is None else headers
     )
     return response

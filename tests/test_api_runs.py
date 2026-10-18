@@ -3,7 +3,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -57,8 +57,8 @@ def post_run(
     files: list[tuple[str, bytes]],
     meta: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
-) -> httpx.Response:
-    response: httpx.Response = client.post(
+) -> httpx2.Response:
+    response: httpx2.Response = client.post(
         "/runs",
         files=[("files", (name, content, "application/xml")) for name, content in files],
         data={"metadata": json.dumps(meta if meta is not None else metadata())},
@@ -277,8 +277,8 @@ def test_changed_files_known_is_stored(
 # --- GET /runs/lookup ---------------------------------------------------------------------
 
 
-def lookup(client: TestClient, **params: Any) -> httpx.Response:
-    response: httpx.Response = client.get(
+def lookup(client: TestClient, **params: Any) -> httpx2.Response:
+    response: httpx2.Response = client.get(
         "/runs/lookup",
         params={"repo": "acme/shop", "ci_run_id": "9001", **params},
         headers=AUTH,

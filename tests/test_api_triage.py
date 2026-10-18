@@ -1,7 +1,7 @@
 from collections.abc import Iterator
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -32,8 +32,8 @@ def seeded(db_session: Session) -> None:
     fail_then_pass(db_session, 10, 10)
 
 
-def post_triage(client: TestClient, **body: Any) -> httpx.Response:
-    response: httpx.Response = client.post(
+def post_triage(client: TestClient, **body: Any) -> httpx2.Response:
+    response: httpx2.Response = client.post(
         "/triage",
         json={"repo": REPO, "commit_sha": sha(99).upper(), "variant": "linux", **body},
         headers=AUTH,

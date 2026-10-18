@@ -20,11 +20,12 @@ from siftwise.core.schemas import (
     TriageResponse,
     TriageResultOut,
 )
-from siftwise.core.selector import DependsRule, SelectorConfig
+from siftwise.core.selector import ChangeLink, DependsRule, SelectorConfig
 from siftwise.core.triage import (
     MAX_FLAKY_EVENTS,
     Change,
     Failure,
+    FlakyEvent,
     RunRef,
     Target,
     TriageResult,
@@ -80,7 +81,7 @@ def post_triage(
     )
 
 
-def _ref(run: RunRef) -> RunRefOut:
+def run_ref_out(run: RunRef) -> RunRefOut:
     return RunRefOut(
         run_id=run.run_id,
         commit_sha=run.commit_sha,
@@ -100,19 +101,11 @@ def _result(result: TriageResult) -> TriageResultOut:
         confidence=result.confidence.value,
         reasons=list(result.reasons),
         evidence=EvidenceOut(
-            links=[
-                LinkOut(
-                    signal=link.signal,
-                    changed=link.changed,
-                    reason=link.reason,
-                    strength=link.strength.value,
-                )
-                for link in result.links
-            ],
+            links=[link_out(link) for link in result.links],
             pre_existing=PreExistingOut(
                 variant=streak.variant,
                 since_sha=streak.since.commit_sha,
-                since_run=_ref(streak.since),
+                since_run=run_ref_out(streak.since),
                 main_runs_failing=streak.main_runs_failing,
                 last_main_pass_sha=streak.last_main_pass.commit_sha
                 if streak.last_main_pass
@@ -122,26 +115,36 @@ def _result(result: TriageResult) -> TriageResultOut:
             if streak
             else None,
             other_variants=[
-                OtherVariantOut(variant=run.variant, run=_ref(run))
+                OtherVariantOut(variant=run.variant, run=run_ref_out(run))
                 for run in h.other_variants_failing
             ],
             flaky=[
-                FlakyEventOut(
-                    kind=event.kind,
-                    commit_sha=event.commit_sha,
-                    variant=event.variant,
-                    failed=[_ref(r) for r in event.failed],
-                    passed=[_ref(r) for r in event.passed],
-                    message_matches=matches,
-                )
+                flaky_event_out(event, matches)
                 for event, matches in result.flaky[:MAX_FLAKY_EVENTS]
             ],
             history=HistoryOut(
                 seen_before=h.seen,
                 failures_in_window=h.failures_in_window,
                 last_failed_at=h.last_failed_at,
-                last_main_pass=_ref(h.last_main_pass) if h.last_main_pass else None,
+                last_main_pass=run_ref_out(h.last_main_pass) if h.last_main_pass else None,
                 flaky_counts=result.flaky_counts,
             ),
         ),
+    )
+
+
+def link_out(link: ChangeLink) -> LinkOut:
+    return LinkOut(
+        signal=link.signal, changed=link.changed, reason=link.reason, strength=link.strength.value
+    )
+
+
+def flaky_event_out(event: FlakyEvent, message_matches: bool | None = None) -> FlakyEventOut:
+    return FlakyEventOut(
+        kind=event.kind,
+        commit_sha=event.commit_sha,
+        variant=event.variant,
+        failed=[run_ref_out(r) for r in event.failed],
+        passed=[run_ref_out(r) for r in event.passed],
+        message_matches=message_matches,
     )

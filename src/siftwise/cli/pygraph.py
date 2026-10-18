@@ -21,6 +21,7 @@ still apply.
 from __future__ import annotations
 
 import ast
+import os
 import posixpath
 from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
@@ -123,21 +124,35 @@ def module_of_test(test_id: str) -> str | None:
     return "/".join(parts[: modules[-1] + 1]) + ".py"
 
 
-def build_py_graph(root: Path) -> PyGraph:
-    files: list[str] = []
-    for path in root.rglob("*.py"):
-        rel = path.relative_to(root)
-        if any(part in SKIP_DIRS for part in rel.parts):
-            continue
-        files.append(rel.as_posix())
-    package_roots = sorted(
-        {
-            rel.parent.as_posix()
-            for name in PACKAGE_MANIFESTS
-            for rel in (p.relative_to(root) for p in root.rglob(name))
-            if rel.parent.parts and not any(part in SKIP_DIRS for part in rel.parts)
-        }
+def _skipped_dir(path: Path) -> bool:
+    """Directories pytest never collects from (its default ``norecursedirs``: dot-dirs,
+    ``*.egg``, virtualenvs), plus build and tool output. Pruned while walking: descending into
+    a ``.venv`` or a cache first and filtering after took 14 s on one checkout."""
+    name = path.name
+    return (
+        name in SKIP_DIRS
+        or name.startswith(".")
+        or name.endswith(".egg")
+        or (path / "pyvenv.cfg").is_file()
     )
+
+
+def _python_files(root: Path) -> tuple[list[str], list[str]]:
+    """``(.py files, package roots)`` under ``root``, as sorted repo-relative paths."""
+    files: list[str] = []
+    package_roots: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        directory = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if not _skipped_dir(directory / d)]
+        rel = directory.relative_to(root)
+        files.extend((rel / name).as_posix() for name in filenames if name.endswith(".py"))
+        if rel.parts and PACKAGE_MANIFESTS.intersection(filenames):
+            package_roots.add(rel.as_posix())
+    return sorted(files), sorted(package_roots)
+
+
+def build_py_graph(root: Path) -> PyGraph:
+    files, package_roots = _python_files(root)
 
     modules: dict[str, set[str]] = defaultdict(set)  # dotted module name -> files
     for file in files:

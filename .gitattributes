@@ -1,0 +1,18 @@
+# Text files are stored and checked out with LF on every OS (Windows editors and scripts
+# otherwise leave CRLF behind).
+* text=auto eol=lf
+
+# SVGs are text: diffable, normalized to LF like the rest.
+*.svg text eol=lf
+
+# Binary: never normalized or diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.whl binary

@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -277,6 +278,24 @@ def triage_command(
         raise typer.Exit(EXIT_FAIL_ON)
 
 
+@app.command("mcp")
+def mcp_command() -> None:
+    """Serve siftwise's tools to coding agents over MCP (stdio): select_tests, triage_failure,
+    explain. Reads SIFTWISE_SERVER and SIFTWISE_API_TOKEN (optional: SIFTWISE_REPO,
+    SIFTWISE_BASE_REF). Needs the mcp extra; exit 2 without it."""
+    try:
+        from siftwise.mcp.server import main as serve
+    except ImportError as exc:
+        if not (exc.name or "").startswith("mcp"):
+            raise
+        _err(
+            "error: `siftwise mcp` needs the mcp extra. From a siftwise checkout: "
+            'uv tool install ".[mcp]"'
+        )
+        raise typer.Exit(EXIT_USAGE) from exc
+    serve()
+
+
 # --- reusable steps (also used by siftwise.cli.gha) ----------------------------------------
 
 
@@ -304,10 +323,17 @@ class LocalChange:
 
 
 def local_change(
-    base: str | None, head: str, *, go_list: bool = True, py_imports: bool = True
+    base: str | None,
+    head: str,
+    *,
+    go_list: bool = True,
+    py_imports: bool = True,
+    working_tree: bool = False,
 ) -> LocalChange:
     """The change BASE...HEAD with its import graphs and .siftwise.toml. ``base`` None (or a
-    failing git diff) means the changed files are unknown.
+    failing git diff) means the changed files are unknown. ``working_tree``: the change from
+    the merge base of BASE and HEAD to the working tree instead, so uncommitted (staged,
+    unstaged and untracked) changes count too; ``head`` is then unused.
 
     Raises RepoConfigError for an invalid .siftwise.toml.
     """
@@ -315,7 +341,10 @@ def local_change(
     config_path = root / FILE_NAME
     config = load_repo_config(config_path) if config_path.is_file() else RepoConfig()
 
-    diff = git_diff(base, head) if base else None
+    if not base:
+        diff = None
+    else:
+        diff = git_worktree_diff(base, root) if working_tree else git_diff(base, head)
     changed = diff[0] if diff else None
     fields: dict[str, Any] = {
         "changed_files": changed or [],
@@ -520,6 +549,66 @@ def python_dependents(root: Path, changed: list[str]) -> dict[str, list[str]] | 
     if affected:
         _err(f"siftwise: python imports: {len(affected)} test file(s) import changed modules")
     return affected
+
+
+def git_output(*args: str, cwd: Path | None = None, timeout: float = 30) -> bytes | None:
+    """A git command's stdout, or None if it fails or git can't run."""
+    try:
+        proc = subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def git_worktree_diff(base: str, root: Path) -> tuple[list[str], list[str]] | None:
+    """``(changed, deleted)`` from the merge base of ``base`` and HEAD to the working tree:
+    committed, staged, unstaged and untracked changes. None if git fails."""
+    merge_base = git_output("merge-base", base, "HEAD", cwd=root)
+    if merge_base is None:
+        _err(f"warning: no merge base of {base} and HEAD; asking for the full suite")
+        return None
+    diff = git_output(
+        "diff", "--name-status", "-z", "-M", merge_base.decode().strip(), cwd=root, timeout=120
+    )
+    untracked = git_output(
+        "ls-files", "--others", "--exclude-standard", "--full-name", "-z", cwd=root, timeout=120
+    )
+    if diff is None or untracked is None:
+        _err("warning: git diff of the working tree failed; asking for the full suite")
+        return None
+    added = [path for path in untracked.decode("utf-8", errors="replace").split("\0") if path]
+    return list(dict.fromkeys([*parse_name_status(diff), *added])), parse_deleted(diff)
+
+
+def git_is_dirty() -> bool | None:
+    """Whether the working tree differs from HEAD (untracked files included); None if git
+    fails."""
+    status = git_output("status", "--porcelain", "-z", "--untracked-files=normal")
+    return None if status is None else bool(status.strip(b"\0"))
+
+
+def git_head() -> str | None:
+    """HEAD's full SHA, or None."""
+    out = git_output("rev-parse", "--verify", "HEAD^{commit}")
+    return out.decode().strip() if out else None
+
+
+_REMOTE_REPO = re.compile(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/*$")
+
+
+def origin_repo() -> str | None:
+    """``owner/name`` from the ``origin`` remote's URL (https or ssh), or None."""
+    out = git_output("remote", "get-url", "origin")
+    match = _REMOTE_REPO.search(out.decode().strip()) if out else None
+    return match.group(1) if match else None
+
+
+def default_base() -> str:
+    """The branch ``origin/HEAD`` points to (e.g. ``origin/main``), else ``main``."""
+    out = git_output("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    return out.decode().strip() if out and out.strip() else "main"
 
 
 def git_diff(base: str, head: str) -> tuple[list[str], list[str]] | None:

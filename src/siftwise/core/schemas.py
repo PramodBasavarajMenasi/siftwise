@@ -289,9 +289,16 @@ class FailureIn(BaseModel):
 class TriageRequest(ChangeRequest):
     """Body of ``POST /triage``: a run's change and its failing tests."""
 
-    commit_sha: Annotated[
-        str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^[0-9a-fA-F]{40}$")
-    ]
+    commit_sha: (
+        Annotated[
+            str,
+            StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^[0-9a-fA-F]{40}$"),
+        ]
+        | None
+    ) = Field(
+        description="The tested commit; null for uncommitted code (a dirty working tree): then "
+        "no earlier run tested the same code, and a pass on HEAD never makes a failure flaky",
+    )
     variant: Variant = Field(
         default=None, description="Matrix leg: failures are compared with this variant's history"
     )
@@ -384,10 +391,53 @@ class TriageResultOut(BaseModel):
 
 class TriageResponse(BaseModel):
     repo: str
-    commit_sha: str
+    commit_sha: str | None
     variant: str | None
     as_of: datetime = Field(description="Cut-off: only history strictly before it was used")
     run_id: int | None = Field(description="The recorded run being triaged, if found")
     window_days: int = Field(description="Flaky evidence window (0 = all history)")
     counts: dict[str, int] = Field(description="Results per verdict")
     results: list[TriageResultOut]
+
+
+# --- explain ------------------------------------------------------------------------------
+
+
+class ExplainRequest(ChangeRequest):
+    """Body of ``POST /explain``: one test, and the change to explain its selection for."""
+
+    test_id: Annotated[str, StringConstraints(min_length=1, max_length=4096)]
+    variant: Variant = Field(default=None, description="Matrix leg for the main-streak evidence")
+    always_run: list[Glob] = Field(default_factory=list, max_length=1000)
+
+
+class OutcomeOut(BaseModel):
+    run_id: int
+    commit_sha: str
+    branch: str
+    is_main: bool
+    variant: str | None
+    occurred_at: datetime
+    status: Status = Field(description="The final attempt's status")
+    attempts: int
+
+
+class ExplainSelectionOut(BaseModel):
+    mode: str = Field(description="The selection's mode for this change: 'full' or 'selective'")
+    selected: bool = Field(description="Whether the selection's commands would run this test")
+    reasons: list[str] = Field(description="Why it runs (empty when it doesn't)")
+    summary: str = Field(description="The selection's reason (why the full suite, or a summary)")
+    links: list[LinkOut] = Field(description="How this change reaches the test (empty: it doesn't)")
+
+
+class ExplainResponse(BaseModel):
+    repo: str
+    test_id: str
+    known: bool = Field(description="The test has recorded results")
+    file_path: str | None
+    stats: TestStatsOut | None = Field(description="Rolled-up stats over the window (current)")
+    recent: list[OutcomeOut] = Field(description="Latest runs it appeared in, newest first")
+    flaky: list[FlakyEventOut] = Field(description="Flaky events in the window, newest first")
+    flaky_counts: dict[str, int]
+    window_days: int
+    selection: ExplainSelectionOut
