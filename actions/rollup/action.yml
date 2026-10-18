@@ -1,7 +1,9 @@
 name: siftwise rollup
 description: >-
-  Update siftwise's test stats once after a matrix whose legs recorded with a variant (deferred
-  rollup). Run it in a job with needs: on every leg and if: always(). Never fails the job.
+  After a matrix whose legs recorded with a variant: triage the run's failures over every leg
+  (PR comment and job summary), then update siftwise's test stats once (deferred rollup). Run
+  it in a job with needs: on every leg and if: always(). No checkout needed. Never fails the
+  job unless fail-on is set.
 inputs:
   server-url:
     description: siftwise server URL (e.g. secrets.SIFTWISE_URL).
@@ -14,6 +16,38 @@ inputs:
     description: Repository name in siftwise.
     required: false
     default: ${{ github.repository }}
+  triage:
+    description: Triage the run's failures ('true' or 'false').
+    required: false
+    default: "true"
+  comment:
+    description: Add the failures to the sticky PR comment (needs pull-requests write).
+    required: false
+    default: "true"
+  fail-on:
+    description: >-
+      Comma-separated verdicts that fail this step, e.g. "new_regression,unknown". Off by
+      default: siftwise then never fails anything. When set, unavailable verdicts (server
+      down or erroring, nothing recorded) also fail the step; without a siftwise token (fork
+      PRs) it only warns: that run is not gated.
+    required: false
+    default: ""
+  github-token:
+    description: Token for the PR comment (needs pull-requests write).
+    required: false
+    default: ${{ github.token }}
+outputs:
+  verdicts-available:
+    description: "'true' if the run's failures were triaged, else 'false'."
+    value: ${{ steps.rollup.outputs.verdicts-available }}
+  counts:
+    description: >-
+      JSON object of failing tests per verdict (new_regression, unknown, flaky,
+      pre_existing); each test counts once, under its worst verdict over the variants.
+    value: ${{ steps.rollup.outputs.counts }}
+  report:
+    description: Path of the Markdown failures report (what went to the job summary).
+    value: ${{ steps.rollup.outputs.report }}
 runs:
   using: composite
   steps:
@@ -23,10 +57,15 @@ runs:
     - name: Install siftwise
       shell: bash
       run: uv tool install --quiet --force --python 3.12 "$GITHUB_ACTION_PATH/../.."
-    - name: Update test stats
+    - id: rollup
+      name: Triage failures and update test stats
       shell: bash
       env:
         SIFTWISE_SERVER: ${{ inputs.server-url }}
         SIFTWISE_API_TOKEN: ${{ inputs.token }}
         SIFTWISE_REPO: ${{ inputs.repo }}
+        SIFTWISE_TRIAGE: ${{ inputs.triage }}
+        SIFTWISE_COMMENT: ${{ inputs.comment }}
+        SIFTWISE_FAIL_ON: ${{ inputs.fail-on }}
+        SIFTWISE_GITHUB_TOKEN: ${{ inputs.github-token }}
       run: '"$(uv tool dir --bin)/siftwise" gha rollup'

@@ -311,13 +311,14 @@ re-run `flaky` ones, and leave `pre_existing` ones (already failing on main).
 
 Three composite actions in this repo. They install the CLI from the action's own checkout
 (siftwise isn't on PyPI yet), and they never block CI: if the server is unreachable, times out
-or returns an error, `select` outputs `mode: full` and `record`/`rollup` log a warning.
+or returns an error, `select` outputs `mode: full` and `record`/`rollup` log a warning. The
+only exception is [`fail-on`](#fail-on), which you opt into.
 
 | Action | When | What |
 |---|---|---|
 | `actions/select` | before tests | picks tests; outputs `mode`, `command`, `selected`, `total`, `reason`, `junit-dir`; posts one sticky PR comment and a job summary |
-| `actions/record` | after tests, `if: always()` | uploads JUnit with the run ID and attempt, the PR head commit (not the merge commit), branch, variant, start time and changed files |
-| `actions/rollup` | once after a matrix | updates test stats once for all legs (`POST /repos/{repo}/rollup`) |
+| `actions/record` | after tests, `if: always()` | uploads JUnit with the run ID and attempt, the PR head commit (not the merge commit), branch, variant, start time and changed files; in a single job, then [triages the failures](#failure-verdicts) |
+| `actions/rollup` | once after a matrix | [triages the failures](#failure-verdicts) of every leg, then updates test stats once for all legs (`POST /repos/{repo}/rollup`) |
 
 **Setup:**
 - **Secrets:** add `SIFTWISE_URL` (your server) and `SIFTWISE_TOKEN` (its `SIFTWISE_API_TOKEN`).
@@ -331,7 +332,7 @@ The examples use `@main` until a `v0` tag exists.
 **Never use this action with `pull_request_target`.** That event runs with secrets on code
 from the PR, so a fork could read your siftwise token. Use `pull_request`: on fork PRs, secrets
 are empty, so `select` runs the full suite and skips the comment (the job summary says why),
-and `record` skips the upload.
+`record` skips the upload, and there are no failure verdicts.
 
 ### Single job
 
@@ -431,8 +432,62 @@ jobs:
           token: ${{ secrets.SIFTWISE_TOKEN }}
 ```
 
+The rollup job needs no checkout: the server already has what each leg recorded.
+
+### Failure verdicts
+
+After the run's last upload, siftwise triages its failing tests
+([verdicts](#triage)): in `actions/rollup` after a matrix, in `actions/record` in a single job
+(its `triage` input: `auto`, `true` or `false`). The server works from what the uploads stored,
+including the change links `record` computed, so the verdicts match `siftwise triage`.
+
+The sticky PR comment gets a **Failures** section under the selection:
+
+- a summary line, e.g. "2 new regressions, 1 unknown, 1 flaky, 1 pre-existing", counting each
+  test once, under its worst verdict over the legs;
+- a table of test, verdict, confidence, the legs and one reason: new regressions first, then
+  unknown; flaky and pre-existing collapsed below. `all` means the test got that verdict on
+  every leg recorded; a test that failed on some legs lists only those;
+- at most 20 rows per table, then "+N more" with a link to the job summary, which has the full
+  list (up to 500).
+
+The comment is left alone if the PR got new commits since the run started (that run owns it),
+and a new push's selection drops the old commit's failures. Fork PRs get the verdicts nowhere:
+they have no siftwise token (the job summary says so). Outputs: `verdicts-available`, `counts`
+(JSON, per verdict) and `report` (the summary's Markdown, as a file).
+
+### fail-on
+
+`fail-on` (on `rollup`, or `record` in a single job) fails the step when a failure gets one of
+the listed verdicts, on any leg:
+
+```yaml
+      - uses: PramodBasavarajMenasi/siftwise/actions/rollup@main
+        with:
+          server-url: ${{ secrets.SIFTWISE_URL }}
+          token: ${{ secrets.SIFTWISE_TOKEN }}
+          fail-on: new_regression,unknown
+```
+
+- **It can only add a failure.** A leg whose tests failed is already red. To let siftwise
+  decide, give the test steps `continue-on-error: true` and make the rollup job the required
+  check.
+- **`new_regression` alone lets `unknown` through,** and `unknown` is common (a new test, an
+  unknown diff, an unrelated failure with no flaky history). Gate on `new_regression,unknown`.
+- **With `fail-on` set, unavailable verdicts fail the step too** (fail closed):
+  `siftwise verdicts unavailable (<reason>); failing because fail-on is set`. That covers a
+  server that's down or erroring, a timeout, and nothing recorded for the attempt (a 404), so
+  a real failure can't pass while siftwise is unreachable.
+- **Except without a siftwise token:** fork PRs get no secrets, so the step warns
+  `fail-on skipped: no siftwise token (fork PR?); this run is not gated` and passes. Keep
+  another required check on fork PRs (the test legs themselves, without `continue-on-error`
+  there). A missing `SIFTWISE_TOKEN` secret on your own repo looks the same: watch for that
+  warning.
+
+Without `fail-on` (the default), siftwise never fails anything.
+
 `.github/workflows/action-e2e.yml` runs all three actions against a real server on every push
-and PR of this repo.
+and PR of this repo, including a deliberately failing test's verdict and `fail-on`.
 
 
 ## Features

@@ -1,8 +1,9 @@
 name: Action e2e
 
 # Dogfoods actions/select, record and rollup on siftwise itself, against a real server: an
-# empty history (full suite), recording this run's JUnit, the rollup, a second selection that
-# sees the history, and the fail-open paths (server down, no token, shallow clone).
+# empty history (full suite), recording this run's JUnit (plus one deliberately failing test),
+# the rollup's failure verdicts in the job summary and PR comment, fail-on, a second selection
+# that sees the history, and the fail-open paths (server down, no token, shallow clone).
 
 on:
   push:
@@ -12,7 +13,7 @@ on:
 permissions:
   contents: read
   actions: read          # record reads the run's start time
-  pull-requests: write   # select's sticky PR comment
+  pull-requests: write   # the sticky PR comment: select's selection, rollup's failures
 
 concurrency:
   group: action-e2e-${{ github.ref }}
@@ -91,9 +92,28 @@ jobs:
           JUNIT_DIR: ${{ steps.first.outputs.junit-dir }}
         run: uv run pytest --junitxml="$JUNIT_DIR/full.xml"
 
+      # A test that always fails, written outside the checkout, so triage has a failure to give
+      # a verdict. Its own rootdir makes its ID test_e2e_failing::test_e2e_always_fails. It's
+      # new (no history before this run) and its file isn't in the diff, so the verdict is
+      # `unknown` (rule 4).
+      - name: A deliberately failing test (for triage)
+        env:
+          JUNIT_DIR: ${{ steps.first.outputs.junit-dir }}
+        run: |
+          dir="$RUNNER_TEMP/e2e_failing"
+          mkdir -p "$dir"
+          printf 'def test_e2e_always_fails():\n    assert 1 == 2\n' > "$dir/test_e2e_failing.py"
+          if uv run pytest "$dir/test_e2e_failing.py" --rootdir "$dir" -p no:cacheprovider \
+              --junitxml="$JUNIT_DIR/e2e-failing.xml"; then
+            echo "the deliberately failing test passed"; exit 1
+          fi
+          # Nothing the e2e run creates may show up in the checkout.
+          git status --porcelain
+          test -z "$(git status --porcelain)"
+
       # Even when the tests fail (that's when results matter), but only with a checkout: the
       # actions live in it.
-      - name: "Record (a matrix-style leg: deferred rollup)"
+      - name: "Record (a matrix-style leg: deferred rollup, no triage)"
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: ./actions/record
         with:
@@ -101,12 +121,26 @@ jobs:
           token: ${{ env.TOKEN }}
           variant: e2e
 
-      - name: Rollup
+      - name: Rollup (triages the run's failures; comments on the PR)
+        id: rollup
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: ./actions/rollup
         with:
           server-url: ${{ env.SERVER }}
           token: ${{ env.TOKEN }}
+
+      - name: Check the failure verdict in the job summary
+        env:
+          AVAILABLE: ${{ steps.rollup.outputs.verdicts-available }}
+          COUNTS: ${{ steps.rollup.outputs.counts }}
+          REPORT: ${{ steps.rollup.outputs.report }}
+        run: |
+          cat "$REPORT"
+          test "$AVAILABLE" = true
+          echo "$COUNTS" | jq -e '.unknown == 1 and .new_regression == 0'
+          # The report is what went to the job summary; Markdown-escaped, one variant.
+          grep -F '<code>test\_e2e\_failing::test\_e2e\_always\_fails</code> | unknown | low |' "$REPORT"
+          grep -F '### Failures: 1 unknown' "$REPORT"
 
       - name: Check the recorded run
         run: |
@@ -138,6 +172,43 @@ jobs:
             *) exit 1 ;;
           esac
 
+      # Same-repo PRs only: a fork's token can't comment. After the second select, so this also
+      # checks that select kept the failures section of the same commit.
+      - name: Check the failure verdict in the PR comment
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          body=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            --jq '.[] | select(.body | contains("<!-- siftwise -->")) | .body')
+          echo "$body"
+          test "$(grep -c -F '<!-- siftwise -->' <<< "$body")" = 1
+          grep -F '<!-- siftwise:selection -->' <<< "$body"
+          grep -F "<!-- siftwise:failures sha=$HEAD_SHA attempt=$GITHUB_RUN_ATTEMPT -->" <<< "$body"
+          grep -F '<code>test\_e2e\_failing::test\_e2e\_always\_fails</code> | unknown | low |' <<< "$body"
+
+      # fail-on: the opt-in way the actions fail a step on purpose (comment: false keeps the
+      # real failures section in the PR comment).
+      - name: fail-on - a matching verdict fails the step
+        id: failon_hit
+        continue-on-error: true
+        uses: ./actions/rollup
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          comment: false
+          fail-on: unknown
+
+      - name: fail-on - no matching verdict passes
+        id: failon_miss
+        uses: ./actions/rollup
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          comment: false
+          fail-on: new_regression
+
       - name: Fail open - select with the server down
         id: down
         uses: ./actions/select
@@ -154,26 +225,54 @@ jobs:
           token: ""
           comment: false
 
+      # comment: false on these: "verdicts unavailable" must not replace the real section.
       - name: Fail open - record and rollup with the server down
+        id: down_record
         uses: ./actions/record
         with:
           server-url: ${{ env.DOWN }}
           token: ${{ env.TOKEN }}
+          comment: false
 
-      - uses: ./actions/rollup
+      - id: down_rollup
+        uses: ./actions/rollup
         with:
           server-url: ${{ env.DOWN }}
           token: ${{ env.TOKEN }}
+          comment: false
 
-      - name: Check the fail-open selections
+      - name: Fail closed - rollup with the server down and fail-on set
+        id: down_failon
+        continue-on-error: true
+        uses: ./actions/rollup
+        with:
+          server-url: ${{ env.DOWN }}
+          token: ${{ env.TOKEN }}
+          comment: false
+          fail-on: new_regression
+
+      - name: Check the fail-open selections and verdicts, and fail-on
         env:
           DOWN_MODE: ${{ steps.down.outputs.mode }}
           DOWN_COMMAND: ${{ steps.down.outputs.command }}
           NOTOKEN_MODE: ${{ steps.notoken.outputs.mode }}
+          DOWN_RECORD_AVAILABLE: ${{ steps.down_record.outputs.verdicts-available }}
+          DOWN_AVAILABLE: ${{ steps.down_rollup.outputs.verdicts-available }}
+          DOWN_REPORT: ${{ steps.down_rollup.outputs.report }}
+          FAILON_HIT: ${{ steps.failon_hit.outcome }}
+          FAILON_MISS: ${{ steps.failon_miss.outcome }}
+          DOWN_FAILON: ${{ steps.down_failon.outcome }}
         run: |
           test "$DOWN_MODE" = full
           test -z "$DOWN_COMMAND"  # the workflow runs its own full-suite command
           test "$NOTOKEN_MODE" = full
+          test "$DOWN_RECORD_AVAILABLE" = false  # single-job record triages: nothing recorded
+          test "$DOWN_AVAILABLE" = false
+          grep -F 'Failure verdicts unavailable: could not reach siftwise' "$DOWN_REPORT"
+          echo "fail-on: hit=$FAILON_HIT miss=$FAILON_MISS down=$DOWN_FAILON"
+          test "$FAILON_HIT" = failure
+          test "$FAILON_MISS" = success
+          test "$DOWN_FAILON" = failure   # fail closed: fail-on is set
 
       - name: Server log
         if: failure()
@@ -187,7 +286,7 @@ jobs:
           if [ -f "$RUNNER_TEMP/server.pid" ]; then kill "$(cat "$RUNNER_TEMP/server.pid")" || true; fi
 
   shallow:
-    # select can't diff a shallow clone: the one deliberate failure, with a clear message.
+    # select can't diff a shallow clone: its one deliberate failure, with a clear message.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4  # fetch-depth 1
