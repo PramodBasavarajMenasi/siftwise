@@ -3,17 +3,22 @@
 import io
 import json
 import subprocess
+import time
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 import respx
+import typer
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from typer.testing import CliRunner
 
 from scripts.eval import run_eval as ev
-from siftwise.cli.pygraph import PyGraph
+from scripts.eval import triage_labels as tl
+from siftwise.cli.pygraph import PyGraph, build_py_graph
 from siftwise.core.ingest import create_run
 from siftwise.core.junit import ParsedTestResult, Status
 from siftwise.core.schemas import RunMetadata
@@ -215,14 +220,14 @@ T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def ingest(session: Session, ci: int, hour: int, tests: dict[str, Status], *, variant: str | None,
-           is_main: bool = False) -> int:  # fmt: skip
+           is_main: bool = False, run_attempt: int = 1) -> int:  # fmt: skip
     results = [
         ParsedTestResult(t, t.split("::")[0], t.split("::")[1], None, s, 1, 1)
         for t, s in tests.items()
     ]
     meta = RunMetadata(
         repo=REPO, commit_sha=f"{ci:040x}", branch="main" if is_main else "feature",
-        is_main=is_main, ci_run_id=str(ci), variant=variant,
+        is_main=is_main, ci_run_id=str(ci), run_attempt=run_attempt, variant=variant,
         started_at=T0 + timedelta(hours=hour), changed_files=["src/a.py"],
     )  # fmt: skip
     run, _ = create_run(session, meta, results)
@@ -416,7 +421,7 @@ def test_merged_pr_targets_cut_history_at_the_head_commit(
     renamed = {"filename": "src/new.py", "previous_filename": "src/old.py"}
     respx_mock.get(f"{gh}/compare/{'a' * 40}...{'b' * 40}").respond(json={"files": [renamed]})
 
-    [target] = ev.merged_pr_targets("t", "acme/shop", 90, ev.GitHubCompare("t", tmp_path))
+    [target] = ev.merged_pr_targets("t", "acme/shop", 90, ev.GitHubCompare("t", tmp_path), now)
 
     assert (target.commit_sha, target.branch, target.run_id) == ("b" * 40, "#2", 0)
     assert abs(target.run_at - pushed) < timedelta(seconds=1)  # head commit, not merge time
@@ -510,3 +515,302 @@ def test_resume_skips_finished_targets_and_ignores_a_torn_line(tmp_path: Path) -
     assert ev.target_key(done) in keys
     assert ev.target_key(other) not in keys  # its line was cut off: it runs again
     assert ev.resumed_keys(tmp_path / "missing.jsonl") == set()
+
+
+# --- --triage --------------------------------------------------------------------------------
+
+
+def triage_setup(db_session: Session, tmp_path: Path) -> tuple[int, ev.RunChanges]:
+    repo_id = db_session.execute(
+        text("SELECT id FROM repos WHERE name = :n"), {"n": REPO}
+    ).scalar_one()
+    meta = ev.load_run_meta(db_session, repo_id)
+    graphs = ev.GraphProvider(None, "go", tmp_path)
+    changes = ev.RunChanges(graphs, SelectorConfig(), False, meta,
+                            ev.changed_files_of(db_session, list(meta)))  # fmt: skip
+    # No import graph needed: the stored change (src/a.py) links by path mapping alone.
+    changes.graph_links = lambda commit, files: {  # type: ignore[method-assign]
+        "affected_packages": {}, "affected_files": {}, "depends": [], "go_module": None,
+        "generated": [],
+    }  # fmt: skip
+    return repo_id, changes
+
+
+def run_triage_eval(
+    db_session: Session, tmp_path: Path, resume: Path | None = None
+) -> dict[tuple[int, str], tl.Scored]:
+    repo_id, changes = triage_setup(db_session, tmp_path)
+    fixes = lambda test, failed, passed: True  # noqa: E731  (every fix diff is linked)
+    scored = ev.triage_eval(db_session, REPO, repo_id, changes, fixes, 90, resume, (), False)  # type: ignore[arg-type]
+    return {(s.run_id, s.test): s for s in scored}
+
+
+def test_triage_eval_verdicts_never_see_later_runs(db_session: Session, tmp_path: Path) -> None:
+    ingest(db_session, 1, 1, {"tests.test_a::t": P, "tests.test_b::t": P}, variant=None,
+           is_main=True)  # fmt: skip
+    pr = ingest(db_session, 2, 2, {"tests.test_a::t": F, "tests.test_b::t": F}, variant=None)
+    before = run_triage_eval(db_session, tmp_path)
+
+    # Later: the same commit passes test_b (a re-run), a new commit fixes test_a.
+    ingest(db_session, 2, 3, {"tests.test_a::t": F, "tests.test_b::t": P}, variant=None,
+           run_attempt=2)  # fmt: skip
+    ingest(db_session, 3, 4, {"tests.test_a::t": P, "tests.test_b::t": P}, variant=None)
+    after = run_triage_eval(db_session, tmp_path)
+
+    for key in ((pr, "tests.test_a::t"), (pr, "tests.test_b::t")):
+        assert (after[key].verdict, after[key].confidence) == (
+            before[key].verdict, before[key].confidence)  # fmt: skip
+    # Labels may use the future: test_b turned out flaky, test_a a regression.
+    assert after[(pr, "tests.test_b::t")].label.kind == tl.FLAKY
+    assert after[(pr, "tests.test_b::t")].label.when == "after"
+    assert after[(pr, "tests.test_a::t")].label.kind == tl.REGRESSION
+    assert before[(pr, "tests.test_a::t")].label.kind is None  # nothing after it yet
+
+
+def test_triage_eval_resume_skips_done_runs(db_session: Session, tmp_path: Path) -> None:
+    ingest(db_session, 1, 1, {"tests.test_a::t": P}, variant=None, is_main=True)
+    pr = ingest(db_session, 2, 2, {"tests.test_a::t": F}, variant=None)
+    log = tmp_path / "triage.jsonl"
+
+    first = run_triage_eval(db_session, tmp_path, log)
+    lines = log.read_text().splitlines()
+    second = run_triage_eval(db_session, tmp_path, log)
+
+    assert [json.loads(line)["key"] for line in lines] == [f"triage|{pr}"]
+    assert log.read_text().splitlines() == lines  # nothing triaged again
+    assert second == first  # read back from the log
+    # src/a.py changed: path mapping links tests/test_a.py, main passed before -> regression.
+    assert first[(pr, "tests.test_a::t")].verdict == "new_regression"
+
+
+def test_triage_eval_unknown_diff_is_an_unknown_change(db_session: Session, tmp_path: Path) -> None:
+    ingest(db_session, 1, 1, {"tests.test_a::t": P}, variant=None, is_main=True)
+    run_id = ingest(db_session, 2, 2, {"tests.test_a::t": F}, variant=None)
+    db_session.execute(text("UPDATE runs SET changed_files_known = false WHERE id = :id"),
+                       {"id": run_id})  # fmt: skip
+    _, changes = triage_setup(db_session, tmp_path)
+
+    assert changes.links(run_id) is None
+    assert changes.change(run_id).changed_files_known is False
+    assert run_triage_eval(db_session, tmp_path)[(run_id, "tests.test_a::t")].verdict == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("GITHUB_TOKEN=abc\n", "abc"),
+        ("# comment\nexport GITHUB_TOKEN='a b'\n", "a b"),
+        ('GITHUB_TOKEN="x"\nOTHER=1\n', "x"),
+        ("GITHUB_TOKEN=abc # note\n", "abc"),
+        ("OTHER=1\n", None),
+    ],
+)
+def test_dotenv_value(tmp_path: Path, content: str, expected: str | None) -> None:
+    env = tmp_path / ".env"
+    env.write_text(content)
+    assert ev._dotenv_value(env, "GITHUB_TOKEN") == expected
+
+
+def test_github_token_prefers_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("GITHUB_TOKEN=from-file\n")
+    monkeypatch.setenv("GITHUB_TOKEN", "from-env")
+    assert ev._github_token() == "from-env"
+    monkeypatch.delenv("GITHUB_TOKEN")
+    assert ev._github_token() == "from-file"
+
+
+def test_triage_cli_startup_path(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``run_eval --triage`` through ``main``: run metadata, the change and path maps, the
+    triage, the resume log and the summary. The unit tests above call ``triage_eval`` directly
+    and missed a crash in main's own setup."""
+    ingest(db_session, 1, 1, {"tests.test_a::t": P}, variant=None, is_main=True)
+    pr = ingest(db_session, 2, 2, {"tests.test_a::t": F}, variant=None)
+    ingest(db_session, 3, 3, {"tests.test_a::t": F}, variant=None)  # filtered out by --commits
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (tmp_path / "empty").mkdir()
+    # src/a.py changed: the commit's Python graph is needed. Cached, so nothing is downloaded.
+    graph = build_py_graph(tmp_path / "empty").to_json()
+    (cache / f"pygraph-{2:040x}.json").write_text(json.dumps(graph))
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")  # never the real one from .env
+    connection = db_session.connection()
+    monkeypatch.setattr(ev, "get_sessionmaker", lambda: lambda: Session(
+        bind=connection, join_transaction_mode="create_savepoint"))  # fmt: skip
+    app = typer.Typer()
+    app.command()(ev.main)
+    log = tmp_path / "triage.jsonl"
+
+    with respx.mock(assert_all_called=False):  # no routes: any GitHub call fails the test
+        result = CliRunner().invoke(app, [
+            "--repo", REPO, "--language", "python", "--source", "github", "--triage",
+            "--commits", f"{2:040x}", "--cache-dir", str(cache), "--resume", str(log),
+        ])  # fmt: skip
+
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    assert "# triage: 2 runs with failures, 1 failing tests" in result.output
+    assert "=== triage: acme/shop ===" in result.output
+    assert "failures: 1; labelled 0 (0.0%)" in result.output
+    assert "excluded, never passed again on its branch: 1" in result.output
+    [line] = [json.loads(text_line) for text_line in log.read_text().splitlines()]
+    assert (line["key"], line["change"]) == (f"triage|{pr}", "known")
+    assert line["failures"][0]["verdict"] == "new_regression"
+
+
+# --- --replay-prs window ----------------------------------------------------------------------
+
+
+def pr(number: int, merged: str | None, updated: str = "2026-10-20T00:00:00Z") -> dict[str, object]:
+    return {"number": number, "merged_at": merged, "updated_at": updated,
+            "head": {"sha": f"{number:040x}"}, "base": {"sha": "b" * 40}}  # fmt: skip
+
+
+def test_merged_prs_window_ends_with_the_recorded_history(
+    respx_mock: respx.MockRouter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    until = datetime(2026, 10, 7, 21, 0, tzinfo=UTC)
+    respx_mock.get("https://api.github.com/repos/acme/shop/pulls").respond(json=[
+        pr(1, "2026-07-01T00:00:00Z"),  # before the window (90 days before until)
+        pr(2, "2026-07-10T00:00:00Z"),  # first day inside it
+        pr(3, "2026-10-07T20:59:00Z"),  # just before the history ends
+        pr(4, "2026-10-07T21:01:00Z"),  # after it: its history would be stale
+        pr(5, None),  # closed without merging
+    ])  # fmt: skip
+    respx_mock.get(url__regex=r".*/commits/.*").respond(
+        json={"commit": {"committer": {"date": "2026-10-01T00:00:00Z"}}}
+    )
+    compare = ev.GitHubCompare("t", tmp_path)
+    monkeypatch.setattr(compare, "files", lambda repo, base, head: ("src/a.py",))
+
+    targets = ev.merged_pr_targets("t", "acme/shop", 90, compare, until)
+
+    assert [t.branch for t in targets] == ["#2", "#3"]
+
+
+def test_history_end_is_the_newest_run(db_session: Session) -> None:
+    ingest(db_session, 1, 1, {"t::a": P}, variant=None)
+    ingest(db_session, 2, 30, {"t::a": P}, variant=None)
+    repo_id = db_session.execute(
+        text("SELECT id FROM repos WHERE name = :n"), {"n": REPO}
+    ).scalar_one()
+    assert ev.history_end(db_session, repo_id) == T0 + timedelta(hours=30)
+    assert ev.history_end(db_session, -1) is None
+
+
+def test_replay_prs_prints_the_window_it_used(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ingest(db_session, 1, 1, {"t::a": P}, variant=None, is_main=True)
+    ingest(db_session, 2, 48, {"t::a": P}, variant=None, is_main=True)  # history ends Jan 3
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    connection = db_session.connection()
+    monkeypatch.setattr(ev, "get_sessionmaker", lambda: lambda: Session(
+        bind=connection, join_transaction_mode="create_savepoint"))  # fmt: skip
+    app = typer.Typer()
+    app.command()(ev.main)
+
+    with respx.mock() as github:
+        pulls = github.get("https://api.github.com/repos/acme/shop/pulls").respond(json=[])
+        args = ["--repo", REPO, "--language", "python", "--replay-prs", "--days", "10"]
+        result = CliRunner().invoke(app, [*args, "--cache-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    assert ("merged PRs window: 2025-12-24 00:00 to 2026-01-03 00:00 UTC (10 days up to the "
+            "end of the recorded history)") in result.output  # fmt: skip
+    assert pulls.called
+
+
+# --- network errors -------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    waits: list[float] = []
+    monkeypatch.setattr(time, "sleep", waits.append)
+    return waits
+
+
+def test_github_calls_retry_network_errors(
+    respx_mock: respx.MockRouter, tmp_path: Path, no_waits: list[float]
+) -> None:
+    gh = "https://api.github.com/repos/acme/shop"
+    respx_mock.get(f"{gh}/compare/{'a' * 40}...{'b' * 40}").mock(side_effect=[
+        httpx.ConnectError("getaddrinfo failed"),  # the DNS blip that stopped the substrate eval
+        httpx.ReadTimeout("timed out"),
+        httpx.Response(200, json={"files": [{"filename": "src/a.py"}]}),
+    ])  # fmt: skip
+    sha = "c" * 40
+    respx_mock.get(f"{gh}/zipball/{sha}").mock(side_effect=[
+        httpx.ConnectError("getaddrinfo failed"),
+        httpx.Response(200, content=zipball({"a.py": ""}, sha)),
+    ])  # fmt: skip
+
+    files = ev.GitHubCompare("t", tmp_path).files("acme/shop", "a" * 40, "b" * 40)
+    tree = ev.GitHubSource("t", "acme/shop").extract(sha, tmp_path / "tree")
+
+    assert files == ("src/a.py",)
+    assert tree == ["a.py"]
+    assert no_waits == [0, 10, 30, 0, 10]
+
+
+def test_a_network_outage_stops_the_eval_instead_of_skewing_it(
+    respx_mock: respx.MockRouter, tmp_path: Path, no_waits: list[float]
+) -> None:
+    # "Unavailable" (None) would be recorded as a real answer: no graph, an unknown fix diff.
+    gh = "https://api.github.com/repos/acme/shop"
+    respx_mock.get(url__startswith=gh).mock(side_effect=httpx.ConnectError("getaddrinfo failed"))
+
+    with pytest.raises(httpx.ConnectError):
+        ev.GitHubCompare("t", tmp_path).files("acme/shop", "a" * 40, "b" * 40)
+    with pytest.raises(httpx.ConnectError):
+        ev.GitHubSource("t", "acme/shop").extract("c" * 40, tmp_path / "tree")
+    assert no_waits == [*ev.NETWORK_RETRY_WAITS, *ev.NETWORK_RETRY_WAITS]
+    assert not list(tmp_path.glob("compare-*"))  # nothing cached
+
+
+def test_http_errors_still_mean_unavailable(
+    respx_mock: respx.MockRouter, tmp_path: Path, no_waits: list[float]
+) -> None:
+    gh = "https://api.github.com/repos/acme/shop"
+    respx_mock.get(url__startswith=gh).respond(404)
+
+    assert ev.GitHubCompare("t", tmp_path).files("acme/shop", "a" * 40, "b" * 40) is None
+    assert ev.GitHubSource("t", "acme/shop").extract("c" * 40, tmp_path / "tree") is None
+    assert no_waits == [0, 0]  # answered: not retried
+
+
+def test_each_retry_is_logged_without_the_token(
+    respx_mock: respx.MockRouter,
+    tmp_path: Path,
+    no_waits: list[float],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    token = "ghp_secret-token-never-logged"
+    gh = "https://api.github.com/repos/acme/shop"
+    respx_mock.get(f"{gh}/compare/{'a' * 40}...{'b' * 40}").mock(side_effect=[
+        httpx.ConnectError(f"getaddrinfo failed (Bearer {token})"),  # even if a message quotes it
+        httpx.ReadTimeout("timed out"),
+        httpx.Response(200, json={"files": []}),
+    ])  # fmt: skip
+    respx_mock.get(url__startswith=f"{gh}/zipball/").mock(side_effect=httpx.ConnectError("down"))
+
+    ev.GitHubCompare(token, tmp_path).files("acme/shop", "a" * 40, "b" * 40)
+    with pytest.raises(httpx.ConnectError):
+        ev.GitHubSource(token, "acme/shop").extract("c" * 40, tmp_path / "tree")
+
+    err = capsys.readouterr().err
+    compare = f"/repos/acme/shop/compare/{'a' * 40}...{'b' * 40}"
+    zipball = f"/repos/acme/shop/zipball/{'c' * 40}"
+    assert err.splitlines() == [
+        f"github: attempt 1/4 failed (ConnectError) on GET {compare}; retrying in 10s",
+        f"github: attempt 2/4 failed (ReadTimeout) on GET {compare}; retrying in 30s",
+        f"github: attempt 1/4 failed (ConnectError) on GET {zipball}; retrying in 10s",
+        f"github: attempt 2/4 failed (ConnectError) on GET {zipball}; retrying in 30s",
+        f"github: attempt 3/4 failed (ConnectError) on GET {zipball}; retrying in 60s",
+        f"github: attempt 4/4 failed (ConnectError) on GET {zipball}; giving up",
+    ]
+    assert token not in err and "Bearer" not in err

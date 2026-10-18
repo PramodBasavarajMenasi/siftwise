@@ -66,14 +66,15 @@ flowchart LR
 
 ## Results on real repos
 
-Replays of real CI history with no peeking at the future. Full details: [docs/eval-results.md](docs/eval-results.md).
+Replays of real CI history with no peeking at the future, with the current code except where
+noted. Full details: [docs/eval-results.md](docs/eval-results.md).
 
 | Repo | Failures caught | Test time skipped |
 |---|---|---|
-| [ipfs/kubo](https://github.com/ipfs/kubo) (Go, ~4,100 tests) | 19 of 19 in failing PRs | 30.7% over 20 main commits replayed as PRs; 0% on recent PRs (all dependency/CI bumps) |
+| [ipfs/kubo](https://github.com/ipfs/kubo) (Go, ~4,100 tests), measured with the week-2 code | 19 of 19 in failing PRs | 30.7% over 20 main commits replayed as PRs; 0% on recent PRs (all dependency/CI bumps) |
 | [RDFLib/rdflib](https://github.com/RDFLib/rdflib) (Python, ~18,000 tests) | 2,049 of 2,050 in 39 failing PRs; 140 of 141 in selective runs. The miss is a flaky remote-service test (see below) | 10.4% on the 10 most recent PRs (was 0.4% before lint-only configs stopped forcing the full suite); 0.6% over 19 main commits |
-| [quantumlib/Cirq](https://github.com/quantumlib/Cirq) (Python monorepo, 9 packages, ~40,000 tests) | not measurable: JUnit only from main, which never failed | 37.3% over 134 merged PRs; 80% for `cirq-google`-only PRs, 19% for `cirq-core` |
-| [agent-substrate/substrate](https://github.com/agent-substrate/substrate) (Go, ~9,000 tests, 8 days of history) | 2,043 of 2,044 in 72 failing PRs; 38 of 39 in selective runs, with declared rules for its e2e and functional suites (26 of 38 without) | 5.1% on PR runs with both rules; 15.1% over 40 main commits with the e2e rule (19.5% / 31.7% without rules) |
+| [quantumlib/Cirq](https://github.com/quantumlib/Cirq) (Python monorepo, 9 packages, ~40,000 tests) | not measurable: JUnit only from main, which never failed | 37.9% over 132 merged PRs; 79.8% for `cirq-google`-only PRs, 20.2% for `cirq-core` |
+| [agent-substrate/substrate](https://github.com/agent-substrate/substrate) (Go, ~9,000 tests, 8 days of history) | 2,043 of 2,044 in 72 failing PRs; 38 of 39 in selective runs, with declared rules for its e2e and functional suites (26 of 38 without them, week-3 code) | 5.1% on PR runs and 13.9% over 40 main commits, with both rules (19.5% / 31.7% without rules, week-3 code) |
 
 In the Cirq monorepo, savings follow package boundaries: a change to one integration package
 skips most of the suite, a change to the core package that everything imports skips little.
@@ -86,7 +87,22 @@ every module to nearly every test file, so safe file-level selection still runs 
 suite. The 10.4% comes from PRs that only touch lint configs. Bigger savings need codebases with
 independent parts (monorepos), or per-test coverage. The one miss, `test_service_with_bound_solutions`,
 calls a remote SPARQL service and also failed in 2 earlier unrelated runs: it's flaky, and
-[triage](#triage) should label it rather than count it as a miss (not evaluated yet).
+[triage](#triage) should label it rather than count it as a miss. It doesn't yet: see triage
+below.
+
+**Triage** (a verdict per failure, scored against what happened next; details in
+[the triage eval](docs/eval-results.md#triage-eval)):
+
+- **The worst error, a regression called flaky:** 0 on rdflib. On substrate, 5 of 406
+  labelled regressions were called flaky, all on tests with earlier same-commit flakes; 4 are
+  likely label noise from merge diffs.
+- **The real prediction tests held up:** `new_regression` 319 of 319 labelled substrate
+  failures (and 10 of 11 rdflib fix episodes with a known diff), and medium-confidence
+  `pre_existing` 759 of 759, each called after a single failing main run.
+- **Flaky precision is mostly by construction:** almost every `flaky` verdict is rule 1, a
+  pass of the same commit seen before the failure, which is also the flaky label's evidence.
+  Without re-runs, on a repo where every change links to every test, flaky tests look like
+  regressions (rdflib's remote-service tests).
 
 ## Quickstart
 
