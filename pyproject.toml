@@ -59,7 +59,7 @@ only-include = ["src/siftwise", "README.md", "LICENSE", "pyproject.toml"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "tests"]
+src = ["src", "tests", "examples/quickstart"]
 
 [tool.ruff.lint]
 select = [

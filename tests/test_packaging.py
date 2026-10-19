@@ -158,6 +158,32 @@ def test_the_version_has_one_source() -> None:
     assert result.output.strip() == siftwise.__version__
 
 
+def test_version_flag_prints_the_version() -> None:
+    flag = CliRunner().invoke(app, ["--version"])
+    command = CliRunner().invoke(app, ["version"])
+
+    assert flag.exit_code == 0, flag.output
+    assert flag.output == command.output == f"{siftwise.__version__}\n"
+
+
+def test_version_flag_in_the_light_install() -> None:
+    result = without_extras(
+        f"""
+        from typer.testing import CliRunner
+        from siftwise.cli.main import app
+
+        outcome = CliRunner().invoke(app, ["--version"])
+        assert outcome.exit_code == 0, (outcome.output, outcome.exception)
+        loaded = {{m.split(".")[0] for m, module in sys.modules.items() if module is not None}}
+        assert not loaded & set({NOT_IN_THE_LIGHT_INSTALL!r}), loaded
+        print(outcome.output, end="")
+        """
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{siftwise.__version__}\n"
+
+
 def test_the_light_dependencies_are_only_the_cli_ones() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     names = {dep.split(">")[0].split("[")[0] for dep in project["dependencies"]}

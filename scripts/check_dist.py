@@ -6,9 +6,10 @@ release.yml).
 - ``twine check --strict`` on the sdist and wheel;
 - the sdist holds only ``src/siftwise``, README.md, LICENSE and pyproject.toml; the wheel holds
   the migrations;
-- the wheel in fresh venvs: light (``siftwise --help`` and ``version``, none of the extras'
-  modules importable, ``siftwise server start`` exits 2 with the install command), ``[server]``
-  (the API imports, the migrations resolve) and ``[mcp]``; prints each install's size.
+- the wheel in fresh venvs: light (``siftwise --help``, ``version`` and ``--version``, none of
+  the extras' modules importable, ``siftwise server start`` exits 2 with the install command),
+  ``[server]`` (the API imports, the migrations resolve) and ``[mcp]``; prints each install's
+  size.
 
 Needs only the standard library and ``uv`` on PATH. Exit 1 on the first failed check.
 """
@@ -101,8 +102,9 @@ def main() -> None:
         bin_dir, size = venv(base, "light", str(wheel.resolve()))
         siftwise = bin_dir / "siftwise"
         run(siftwise, "--help")
-        if run(siftwise, "version").strip() != version:
-            fail(f"`siftwise version` doesn't print {version}")
+        for args in (["version"], ["--version"]):
+            if run(siftwise, *args).strip() != version:
+                fail(f"`siftwise {args[0]}` doesn't print {version}")
         importable = run(
             bin_dir / "python", "-c",
             "import importlib.util as u; "

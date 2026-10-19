@@ -1,0 +1,48 @@
+name: Quickstart
+
+# Runs the README Quickstart exactly as written (scripts/run_quickstart.py): the compose stack
+# from scratch, the light CLI, the example project's first run and selection.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - README.md
+      - examples/**
+      - src/**
+      - Dockerfile
+      - .dockerignore
+      - docker-compose.yml
+      - pyproject.toml
+      - uv.lock
+      - scripts/run_quickstart.py
+      - .github/workflows/quickstart.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quickstart-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quickstart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Anonymous Docker Hub pulls hit rate limits on shared runners ("toomanyrequests"):
+      # pull python and postgres through Google's Docker Hub mirror. Same images, same digests.
+      - name: Use a Docker Hub mirror
+        run: |
+          echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      # uv only: the quickstart installs the CLI with `uv tool install` itself.
+      - uses: astral-sh/setup-uv@v6
+
+      # Prints the server's logs if it fails; stops the server and deletes its volume either way.
+      - name: Run the README Quickstart
+        run: python3 scripts/run_quickstart.py
