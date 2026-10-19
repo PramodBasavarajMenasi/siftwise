@@ -81,7 +81,9 @@ def store(
     variant: str | None = None,
     commit: int = 50,
 ) -> bool:
-    return store_selection(session, REPO, ShadowTarget(ci, 1, variant, sha(commit)), sel)
+    """Stored (or already stored for this commit)."""
+    target = ShadowTarget(ci, 1, variant, sha(commit))
+    return store_selection(session, REPO, target, sel) is None
 
 
 def shadow_run(
@@ -283,7 +285,8 @@ def test_storing_a_selection(db_session: Session) -> None:
 def test_the_first_leg_to_store_wins(db_session: Session) -> None:
     assert store(db_session, selection(TEST))
     assert store(db_session, selection(OTHER))  # same commit: stored (by the other leg)
-    assert not store(db_session, selection(TEST), commit=51)  # another commit: not ours
+    conflict = ShadowTarget(SHADOW, 1, None, sha(51))  # another commit: not ours
+    assert store_selection(db_session, REPO, conflict, selection(TEST)) == "commit_conflict"
     assert store(db_session, selection(TEST), variant="mac")  # another variant: its own row
 
     rows = db_session.scalars(select(ShadowSelection).order_by(ShadowSelection.id)).all()
@@ -295,9 +298,10 @@ def test_the_first_leg_to_store_wins(db_session: Session) -> None:
 
 @pytest.mark.usefixtures("seeded")
 def test_a_selection_naming_unknown_tests_or_repos_is_not_stored(db_session: Session) -> None:
-    assert not store(db_session, selection("tests.test_ghost::test_x"))
-    assert not store_selection(db_session, "nobody/nothing",
-                               ShadowTarget(SHADOW, 1, None, sha(50)), selection())  # fmt: skip
+    target = ShadowTarget(SHADOW, 1, None, sha(50))
+    ghost = selection("tests.test_ghost::test_x")
+    assert store_selection(db_session, REPO, target, ghost) == "incomplete_selection"
+    assert store_selection(db_session, "nobody/nothing", target, selection()) == "unknown_repo"
     assert db_session.scalars(select(ShadowSelection)).all() == []
 
 

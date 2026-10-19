@@ -242,6 +242,12 @@ class SelectResponse(BaseModel):
         description="Shadow runs only: the selection was stored (false: this run won't be "
         "counted in recall)",
     )
+    shadow_reason: str | None = Field(
+        default=None,
+        description="Why a shadow selection wasn't stored: 'incomplete_selection' (a selected "
+        "test unknown), 'commit_conflict' (the attempt holds another commit's selection) or "
+        "'storage_error'; null when stored",
+    )
 
 
 class BrokenVariant(BaseModel):

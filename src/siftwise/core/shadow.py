@@ -47,6 +47,11 @@ CANCELLED = "cancelled"
 # A recorded variant with no stored selection of its own and none for the whole attempt.
 NO_SELECTION = "no_selection"
 MAX_MISSES = 100
+# Why a shadow selection wasn't stored (``SelectResponse.shadow_reason``).
+UNKNOWN_REPO = "unknown_repo"
+INCOMPLETE_SELECTION = "incomplete_selection"  # a selected test has no key: would under-count
+COMMIT_CONFLICT = "commit_conflict"  # the attempt and variant hold another commit's selection
+STORAGE_ERROR = "storage_error"  # the database failed (set by the /select route)
 
 
 @dataclass(frozen=True)
@@ -61,13 +66,13 @@ class ShadowTarget:
 
 def store_selection(
     session: Session, repo: str, target: ShadowTarget, selection: Selection
-) -> bool:
-    """Store ``selection`` for a shadow run. True if it's stored (by this call, or already
-    for the same commit by another leg); False if the attempt and variant hold a selection of
-    another commit, or the repo is unknown. Commits."""
+) -> str | None:
+    """Store ``selection`` for a shadow run. None if it's stored (by this call, or already for
+    the same commit by another leg), else why not: ``UNKNOWN_REPO``, ``INCOMPLETE_SELECTION``
+    or ``COMMIT_CONFLICT``. Commits."""
     repo_id = session.scalars(select(Repo.id).where(Repo.name == repo)).one_or_none()
     if repo_id is None:
-        return False
+        return UNKNOWN_REPO
     scope = SelectionScope.of(selection)
     keys = _test_keys(session, repo_id, sorted(scope.test_ids))
     # Selected tests come from history, so all have keys; a missing one can't be stored, and
@@ -75,7 +80,7 @@ def store_selection(
     if len(keys) < len(scope.test_ids):
         logger.warning("shadow selection not stored: %d selected tests unknown",
                        len(scope.test_ids) - len(keys))  # fmt: skip
-        return False
+        return INCOMPLETE_SELECTION
     inserted = session.execute(
         pg_insert(ShadowSelection)
         .values(
@@ -108,7 +113,7 @@ def store_selection(
     ).scalar_one_or_none()
     session.commit()
     if inserted is not None:
-        return True
+        return None
     # Another leg stored it first (selections of one commit are the same), or a different
     # commit claims this attempt: that one isn't ours to compare.
     stored = session.scalars(
@@ -119,7 +124,7 @@ def store_selection(
             func.coalesce(ShadowSelection.variant, "") == (target.variant or ""),
         )
     ).one()
-    return stored == target.commit_sha
+    return None if stored == target.commit_sha else COMMIT_CONFLICT
 
 
 # --- counting ---------------------------------------------------------------------------------

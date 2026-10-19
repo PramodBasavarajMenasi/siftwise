@@ -51,6 +51,7 @@ def test_select_stores_a_shadow_selection(client: TestClient, db_session: Sessio
     body = post_select(client, shadow=SHADOW_IN).json()
 
     assert (body["mode"], body["selected_count"], body["shadow_stored"]) == ("selective", 1, True)
+    assert body["shadow_reason"] is None
     stored = db_session.scalars(select(ShadowSelection)).one()
     assert (stored.ci_run_id, stored.variant, stored.commit_sha, stored.mode) == (
         SHADOW, None, sha(50), "selective")  # fmt: skip
@@ -61,7 +62,7 @@ def test_select_stores_a_shadow_selection(client: TestClient, db_session: Sessio
 def test_select_without_shadow_stores_nothing(client: TestClient, db_session: Session) -> None:
     body = post_select(client).json()
 
-    assert body["shadow_stored"] is None
+    assert (body["shadow_stored"], body["shadow_reason"]) == (None, None)
     assert db_session.scalars(select(ShadowSelection)).all() == []
 
 
@@ -76,7 +77,20 @@ def test_a_failed_store_never_fails_select(
     response = post_select(client, shadow=SHADOW_IN)
 
     assert response.status_code == 200
-    assert (response.json()["mode"], response.json()["shadow_stored"]) == ("selective", False)
+    body = response.json()
+    assert (body["mode"], body["shadow_stored"], body["shadow_reason"]) == (
+        "selective", False, "storage_error")  # fmt: skip
+
+
+@pytest.mark.usefixtures("seeded")
+def test_select_says_why_a_shadow_selection_was_not_stored(client: TestClient) -> None:
+    assert post_select(client, shadow=SHADOW_IN).json()["shadow_stored"] is True
+    # Another commit claims the same CI run attempt.
+    other = post_select(client, shadow={**SHADOW_IN, "commit_sha": sha(51)}).json()
+    assert (other["shadow_stored"], other["shadow_reason"]) == (False, "commit_conflict")
+    # Another leg of the same commit: already stored.
+    again = post_select(client, shadow=SHADOW_IN).json()
+    assert (again["shadow_stored"], again["shadow_reason"]) == (True, None)
 
 
 @pytest.mark.parametrize(

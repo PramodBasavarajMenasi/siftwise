@@ -37,6 +37,23 @@ inputs:
     description: Token for the PR comment (needs pull-requests write).
     required: false
     default: ${{ github.token }}
+  shadow:
+    description: >-
+      Shadow mode, to measure recall: 'off' (default), 'always', or a percentage of CI runs
+      such as '10%'. A shadow run outputs mode full and an empty command (run your full suite)
+      while siftwise stores what it would have selected; actions/rollup (or record in a single
+      job) then reports the failures that selection would have caught or missed. Sampled by
+      a hash of the run ID, so every matrix leg agrees. Never fails or shortens a run; an
+      invalid value is a warning and turns it off.
+    required: false
+    default: "off"
+  variant:
+    description: >-
+      Matrix leg, the same value as actions/record's variant. Only matters in shadow runs:
+      each leg's selection is stored for its own variant (legs can differ, e.g. Go graphs per
+      OS). Empty: one selection for every leg of the run.
+    required: false
+    default: ""
 outputs:
   mode:
     description: "'selective' or 'full'. In full mode, run your normal full-suite command."
@@ -58,6 +75,20 @@ outputs:
   junit-dir:
     description: Where the selected pytest commands write their JUnit reports.
     value: ${{ steps.select.outputs.junit-dir }}
+  shadow:
+    description: "'true' if this is a shadow run (mode is then full), else 'false'."
+    value: ${{ steps.select.outputs.shadow }}
+  shadow-mode:
+    description: >-
+      In a shadow run, what siftwise would have done: 'selective' or 'full'. Empty otherwise,
+      or if siftwise couldn't select.
+    value: ${{ steps.select.outputs.shadow-mode }}
+  shadow-selected:
+    description: In a shadow run, the number of known tests siftwise would have selected.
+    value: ${{ steps.select.outputs.shadow-selected }}
+  shadow-total:
+    description: In a shadow run, the number of known tests.
+    value: ${{ steps.select.outputs.shadow-total }}
 runs:
   using: composite
   steps:
@@ -79,4 +110,6 @@ runs:
         SIFTWISE_JUNIT_DIR: ${{ inputs.junit-dir }}
         SIFTWISE_COMMENT: ${{ inputs.comment }}
         SIFTWISE_GITHUB_TOKEN: ${{ inputs.github-token }}
+        SIFTWISE_SHADOW: ${{ inputs.shadow }}
+        SIFTWISE_VARIANT: ${{ inputs.variant }}
       run: '"$(uv tool dir --bin)/siftwise" gha select'

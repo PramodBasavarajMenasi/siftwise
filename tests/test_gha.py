@@ -51,6 +51,9 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
 @pytest.fixture
 def api() -> Iterator[respx.MockRouter]:
     with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
+        # rollup (and record where it triages) ask whether the run was a shadow run: by
+        # default it wasn't. Tests about shadow mode replace this route.
+        router.post(f"{SERVER}/repos/{REPO}/shadow").respond(json={"shadow": False})
         yield router
 
 
@@ -1011,3 +1014,266 @@ def test_record_with_nothing_recorded_fails_only_with_fail_on(
     assert ("::error::siftwise verdicts unavailable (nothing recorded for this attempt "
             "(no JUnit files)); failing because fail-on is set") in result.output  # fmt: skip
     assert "Failure verdicts unavailable: nothing recorded" in sent_body(created)
+
+
+# --- shadow mode --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "rate"),
+    [("", 0.0), ("off", 0.0), (" OFF ", 0.0), ("always", 1.0), ("10%", 0.1), ("0%", 0.0),
+     ("100%", 1.0), ("12.5%", 0.125), ("10", None), ("true", None), ("150%", None),
+     ("-5%", None), ("ten%", None)],
+)  # fmt: skip
+def test_parse_shadow(value: str, rate: float | None) -> None:
+    assert gha.parse_shadow(value) == rate
+
+
+def test_sampling_is_deterministic_per_run_and_near_the_rate() -> None:
+    runs = [str(n) for n in range(10_000)]
+    picked = [r for r in runs if gha.sampled(REPO, r, 0.1)]
+    assert 900 < len(picked) < 1100
+    # Every leg (and every attempt) of a run computes the same answer.
+    assert picked == [r for r in runs if gha.sampled(REPO, r, 0.1)]
+    assert all(gha.sampled(REPO, r, 0.2) for r in picked)  # a higher rate keeps them
+    assert not any(gha.sampled(REPO, r, 0.0) for r in runs[:100])
+    assert all(gha.sampled(REPO, r, 1.0) for r in runs[:100])
+    assert not gha.sampled(REPO, "", 1.0)  # no run ID: nothing to key the selection by
+
+
+def test_shadow_run_forces_the_full_suite_and_stores_the_selection(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        # The full suite was decided before this call: if it failed now, the run is full.
+        early = gh.outputs()
+        assert (early["mode"], early["command"], early["shadow"]) == ("full", "", "true")
+        return httpx.Response(200, json=selection(shadow_stored=True, shadow_reason=None))
+
+    select = api.post(f"{SERVER}/select").mock(side_effect=respond)
+    created = no_comments(api)
+
+    result = gh.run("select", "pull_request", pr_event(repo), SIFTWISE_SHADOW="always",
+                    SIFTWISE_VARIANT="linux")  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    sent = json.loads(select.calls.last.request.content)["shadow"]
+    assert sent == {"ci_run_id": "555", "run_attempt": 2, "variant": "linux",
+                    "commit_sha": repo["head"]}  # fmt: skip
+    outputs = gh.outputs()
+    assert {k: outputs[k] for k in ("mode", "command", "selected", "total", "shadow",
+                                    "shadow-mode", "shadow-selected", "shadow-total")} == {
+        "mode": "full", "command": "", "selected": "10", "total": "10", "shadow": "true",
+        "shadow-mode": "selective", "shadow-selected": "2", "shadow-total": "10",
+    }  # fmt: skip
+    assert outputs["reason"] == gha.SHADOW_REASON
+    summary = gh.summary.read_text()
+    assert "- **Mode:** full (shadow run)" in summary
+    assert "- **Would have run:** 2 of 10 known tests (~90% time saved, estimated)" in summary
+    assert "Recall" not in summary
+    assert "- **Would have run:** 2 of 10" in sent_body(created)
+    assert "::warning::" not in result.output
+
+
+def test_shadow_lines_when_siftwise_would_have_run_everything_or_nothing() -> None:
+    full = selection(mode="full", reason="build/config file changed: a|b", command="")
+    nothing = selection(command="", selected_count=0)
+    forced = gha.shadow_result(full)
+
+    assert "- **Would have run:** all (build/config file changed: a\\|b)" in \
+        gha.selection_markdown(forced, "", shadow=True, would_have=full)  # fmt: skip
+    assert "- **Would have run:** none of 10 known tests (none affected)" in \
+        gha.selection_markdown(forced, "", shadow=True, would_have=nothing)  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "server",
+    [httpx.ConnectError("refused"), httpx.Response(500, json={"detail": "boom"})],
+    ids=["unreachable", "500"],
+)
+def test_a_shadow_run_stays_full_when_siftwise_fails(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, server: Any
+) -> None:
+    api.post(f"{SERVER}/select").mock(side_effect=[server])
+    no_comments(api)
+
+    result = gh.run("select", "pull_request", pr_event(repo), SIFTWISE_SHADOW="always")
+
+    assert result.exit_code == 0, result.output
+    outputs = gh.outputs()
+    assert (outputs["mode"], outputs["command"], outputs["shadow"]) == ("full", "", "true")
+    assert (outputs["shadow-mode"], outputs["shadow-selected"]) == ("", "")
+    assert re.search(r"::warning::siftwise: shadow run not counted: (could not reach|siftwise "
+                     r"returned 500)", result.output)  # fmt: skip
+    assert "this run won't be counted" in gh.summary.read_text()
+
+
+def test_an_unstored_shadow_selection_warns_with_the_reason(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    api.post(f"{SERVER}/select").respond(
+        json=selection(shadow_stored=False, shadow_reason="commit_conflict"))  # fmt: skip
+    no_comments(api)
+
+    result = gh.run("select", "pull_request", pr_event(repo), SIFTWISE_SHADOW="always")
+
+    assert result.exit_code == 0
+    assert ("::warning::siftwise: shadow run not counted: the selection wasn't stored "
+            "(commit_conflict)") in result.output  # fmt: skip
+    assert (gh.outputs()["mode"], gh.outputs()["shadow-mode"]) == ("full", "selective")
+
+
+@pytest.mark.parametrize(
+    ("env", "warning"),
+    [({"SIFTWISE_SHADOW": "sometimes"}, True), ({"SIFTWISE_SHADOW": "off"}, False),
+     ({}, False), ({"SIFTWISE_SHADOW": "always", "GITHUB_RUN_ID": ""}, False)],
+    ids=["invalid", "off", "default", "no-run-id"],
+)  # fmt: skip
+def test_no_shadow_run(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, env: dict[str, str], warning: bool
+) -> None:
+    select = api.post(f"{SERVER}/select").respond(json=selection())
+    no_comments(api)
+
+    result = gh.run("select", "pull_request", pr_event(repo), **env)
+
+    assert result.exit_code == 0, result.output
+    assert "shadow" not in json.loads(select.calls.last.request.content)
+    outputs = gh.outputs()
+    assert (outputs["mode"], outputs["shadow"], outputs["shadow-mode"]) == (
+        "selective", "false", "")  # fmt: skip
+    assert ("::warning::siftwise: invalid shadow value 'sometimes'" in result.output) is warning
+
+
+def test_no_shadow_run_without_a_token(gh: Runner, repo: dict[str, str]) -> None:
+    result = gh.run("select", "pull_request", pr_event(repo, fork=True), SIFTWISE_API_TOKEN="",
+                    SIFTWISE_SHADOW="always")  # fmt: skip
+
+    assert result.exit_code == 0
+    assert (gh.outputs()["mode"], gh.outputs()["shadow"]) == ("full", "false")
+
+
+def compare_response(**overrides: Any) -> dict[str, Any]:
+    """A ``POST /repos/{repo}/shadow`` response: a counted selective shadow run."""
+    return {
+        "repo": REPO, "ci_run_id": "555", "run_attempt": 2, "shadow": True, "counted": True,
+        "mode": "selective",
+        "selections": [{"variant": None, "commit_sha": "a" * 40, "mode": "selective",
+                        "reason": "r", "selected_count": 120, "total_known": 692,
+                        "estimated_ms": {"total": 1.0, "would_run": 0.5}, "status": "compared"}],
+        "variants": [],
+        "failing_tests": 4, "caught": 2, "missed": 1, "flaky_excluded": 1,
+        "missed_by_verdict": {"new_regression": 0, "unknown": 1, "pre_existing": 0},
+        "missed_tests": [{"test_id": "t::new[a|b]_x", "verdict": "unknown", "variants": [None]}],
+        "time": {"total_ms": 1000.0, "would_run_ms": 300.0, "saved": 0.7},
+        **overrides,
+    }  # fmt: skip
+
+
+def test_shadow_markdown() -> None:
+    line = gha.shadow_markdown(compare_response())
+    assert line.splitlines()[0] == (
+        "**Shadow run:** would have run 120 of 692 tests (70% time saved) and caught 2 of 3 "
+        "failures (1 flaky not counted).")  # fmt: skip
+    assert "- <code>t::new\\[a\\|b\\]\\_x</code> (unknown)" in line
+
+    full = gha.shadow_markdown(compare_response(mode="full", caught=3, missed=0, missed_tests=[],
+                                                flaky_excluded=0))  # fmt: skip
+    assert full == ("**Shadow run:** would have run all 692 tests (the full suite) and caught "
+                    "3 of 3 failures.\n")  # fmt: skip
+
+    quiet = gha.shadow_markdown(compare_response(caught=0, missed=0, missed_tests=[],
+                                                 flaky_excluded=0))  # fmt: skip
+    assert quiet.endswith("(70% time saved) and had no failures to catch.\n")
+
+    many = [{"test_id": f"t::m{i}", "verdict": "pre_existing", "variants": [None]}
+            for i in range(25)]  # fmt: skip
+    capped = gha.shadow_markdown(compare_response(missed=25, missed_tests=many))
+    assert capped.count("<code>") == 20 and "- +5 more" in capped
+    assert "(pre-existing)" in capped
+
+    mismatch = compare_response(counted=False, mode=None, selections=[
+        {**compare_response()["selections"][0], "status": "commit_mismatch"}])  # fmt: skip
+    assert gha.shadow_markdown(mismatch) == (
+        "**Shadow run:** not counted: the recorded results are for another commit.\n"
+    )
+
+
+def test_rollup_adds_the_shadow_line_to_the_comment_summary_and_outputs(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    shadow = api.post(f"{SERVER}/repos/{REPO}/shadow").respond(json=compare_response())
+    api.post(f"{SERVER}/repos/{REPO}/triage").respond(json=triage_response(
+        failure("t::cart", "new_regression")))  # fmt: skip
+    api.post(f"{SERVER}/repos/{REPO}/rollup").respond(json={})
+    created = pr_routes(api, repo["head"])
+
+    result = gh.run("rollup", "pull_request", pr_event(repo))
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(shadow.calls.last.request.content) == {"ci_run_id": "555", "run_attempt": 2}
+    line = "**Shadow run:** would have run 120 of 692 tests (70% time saved) and caught 2 of 3"
+    body = sent_body(created)
+    assert line in body and body.index("t::cart") < body.index(line)  # in the failures section
+    assert line in gh.summary.read_text(encoding="utf-8")
+    assert line in Path(gh.outputs()["report"]).read_text(encoding="utf-8")
+    outputs = gh.outputs()
+    assert {k: outputs[k] for k in ("shadow", "shadow-mode", "shadow-caught", "shadow-missed")} \
+        == {"shadow": "true", "shadow-mode": "selective", "shadow-caught": "2",
+            "shadow-missed": "1"}  # fmt: skip
+
+
+def test_rollup_of_a_run_that_was_not_a_shadow_run(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    api.post(f"{SERVER}/repos/{REPO}/triage").respond(json=triage_response())
+    api.post(f"{SERVER}/repos/{REPO}/rollup").respond(json={})
+
+    assert gh.run("rollup", "push", {}).exit_code == 0
+
+    assert "Shadow run" not in gh.summary.read_text(encoding="utf-8")
+    assert (gh.outputs()["shadow"], gh.outputs()["shadow-caught"]) == ("false", "")
+
+
+@pytest.mark.parametrize("fail_on", ["", "new_regression"])
+def test_a_failed_shadow_comparison_only_warns(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, fail_on: str
+) -> None:
+    api.post(f"{SERVER}/repos/{REPO}/shadow").respond(500, json={"detail": "boom"})
+    api.post(f"{SERVER}/repos/{REPO}/triage").respond(json=triage_response())
+    api.post(f"{SERVER}/repos/{REPO}/rollup").respond(json={})
+
+    result = gh.run("rollup", "push", {}, SIFTWISE_FAIL_ON=fail_on)
+
+    assert result.exit_code == 0, result.output  # no verdict matched: the comparison can't fail it
+    assert ("::warning::siftwise: shadow comparison failed: siftwise returned 500: boom; this "
+            "run won't be counted in recall") in result.output  # fmt: skip
+    assert gh.outputs()["shadow"] == "false"
+
+
+def test_rollup_without_triage_puts_the_shadow_line_in_the_summary(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    api.post(f"{SERVER}/repos/{REPO}/shadow").respond(json=compare_response())
+    api.post(f"{SERVER}/repos/{REPO}/rollup").respond(json={})
+
+    assert gh.run("rollup", "push", {}, SIFTWISE_TRIAGE="false").exit_code == 0
+
+    assert "**Shadow run:** would have run 120 of 692" in gh.summary.read_text(encoding="utf-8")
+
+
+def test_record_in_a_single_job_compares_a_shadow_run(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    Path("junit.xml").write_text("<testsuite/>")
+    api.get(f"{GH}/repos/{REPO}/actions/runs/555").respond(404)
+    api.post(f"{SERVER}/runs").respond(201, json={"run_id": 9, "created": True})
+    api.post(f"{SERVER}/repos/{REPO}/triage").respond(json=triage_response(variants=(None,)))
+    api.post(f"{SERVER}/repos/{REPO}/shadow").respond(json=compare_response())
+    created = pr_routes(api, repo["head"])
+
+    result = gh.run("record", "pull_request", pr_event(repo))
+
+    assert result.exit_code == 0, result.output
+    assert "**Shadow run:** would have run 120 of 692" in sent_body(created)
+    assert gh.outputs()["shadow-missed"] == "1"

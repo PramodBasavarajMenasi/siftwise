@@ -1,9 +1,10 @@
 name: siftwise rollup
 description: >-
   After a matrix whose legs recorded with a variant: triage the run's failures over every leg
-  (PR comment and job summary), then update siftwise's test stats once (deferred rollup). Run
-  it in a job with needs: on every leg and if: always(). No checkout needed. Never fails the
-  job unless fail-on is set.
+  (PR comment and job summary), report a shadow run's recall (see actions/select's shadow
+  input), then update siftwise's test stats once (deferred rollup). Run it in a job with
+  needs: on every leg and if: always(). No checkout needed. Never fails the job unless
+  fail-on is set.
 inputs:
   server-url:
     description: siftwise server URL (e.g. secrets.SIFTWISE_URL).
@@ -48,6 +49,20 @@ outputs:
   report:
     description: Path of the Markdown failures report (what went to the job summary).
     value: ${{ steps.rollup.outputs.report }}
+  shadow:
+    description: "'true' if this run was a shadow run that siftwise compared, else 'false'."
+    value: ${{ steps.rollup.outputs.shadow }}
+  shadow-mode:
+    description: "In a shadow run, what siftwise would have done: 'selective' or 'full'."
+    value: ${{ steps.rollup.outputs.shadow-mode }}
+  shadow-caught:
+    description: >-
+      In a counted shadow run, failing tests the selection would have run (flaky ones not
+      counted).
+    value: ${{ steps.rollup.outputs.shadow-caught }}
+  shadow-missed:
+    description: In a counted shadow run, failing tests the selection would have skipped.
+    value: ${{ steps.rollup.outputs.shadow-missed }}
 runs:
   using: composite
   steps:
