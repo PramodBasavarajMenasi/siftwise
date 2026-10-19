@@ -11,7 +11,7 @@ import respx
 from typer.testing import CliRunner, Result
 
 from siftwise.cli.main import EXIT_API_ERROR, EXIT_FAIL_ON, EXIT_USAGE, app
-from tests.test_cli_select import repo  # noqa: F401  (fixture)
+from tests.test_cli_select import git, repo  # noqa: F401  (fixture)
 
 SERVER = "http://siftwise.test"
 TRIAGE_URL = f"{SERVER}/triage"
@@ -93,6 +93,52 @@ def test_sends_final_failures_and_the_change(api: respx.MockRouter) -> None:
         "    why unknown",
     ]
     assert "2 failing test(s): 1 new regression, 0 pre existing, 0 flaky, 1 unknown" in out.stderr
+
+
+def commit_config(repo: Path, branch: str, content: str) -> None:  # noqa: F811
+    git(repo, "checkout", "-q", branch)
+    (repo / ".siftwise.toml").write_text(content)
+    git(repo, "add", ".siftwise.toml")
+    git(repo, "commit", "-q", "-m", "config")
+    git(repo, "checkout", "-q", "feature")
+
+
+@pytest.mark.usefixtures("junit")
+def test_known_flaky_comes_from_the_base_by_default(
+    repo: Path,  # noqa: F811
+    api: respx.MockRouter,
+) -> None:
+    commit_config(repo, "main", 'known_flaky = ["tests.test_db::*"]\n')
+    # The change tries to excuse its own failure: it applies only after merge.
+    (repo / ".siftwise.toml").write_text('known_flaky = ["tests.test_cart::*"]\n')
+    route = api.post(TRIAGE_URL).respond(json=response())
+
+    base = run()
+    head = run("--known-flaky-source", "head")
+
+    assert base.exit_code == head.exit_code == 0, base.output
+    first, second = (json.loads(call.request.content) for call in route.calls)
+    assert first["known_flaky"] == ["tests.test_db::*"]
+    assert "known_flaky changes in this change apply after merge" in base.stderr
+    assert second["known_flaky"] == ["tests.test_cart::*"]
+    assert "apply after merge" not in head.stderr
+
+
+@pytest.mark.usefixtures("junit")
+def test_known_flaky_unchanged_or_unreadable_at_the_base(
+    repo: Path,  # noqa: F811
+    api: respx.MockRouter,
+) -> None:
+    route = api.post(TRIAGE_URL).respond(json=response())
+
+    neither = run()  # no .siftwise.toml anywhere: nothing listed, nothing changed
+    commit_config(repo, "main", "known_flaky = 3\n")
+    invalid = run()
+
+    assert neither.exit_code == invalid.exit_code == 0
+    assert [json.loads(c.request.content)["known_flaky"] for c in route.calls] == [[], []]
+    assert "apply after merge" not in neither.stderr
+    assert "ignoring known_flaky at main" in invalid.stderr
 
 
 @pytest.mark.usefixtures("junit")

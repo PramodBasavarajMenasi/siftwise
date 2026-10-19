@@ -73,7 +73,8 @@ def post_triage(
         as_of=body.as_of,
     )
     failures = [Failure(f.test_id, f.message, f.file_path) for f in body.failures]
-    report = triage_run(session, target, failures, change, settings.stats_window_days)
+    report = triage_run(session, target, failures, change, settings.stats_window_days,
+                        known_flaky=body.known_flaky)  # fmt: skip
     if report is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown repo {body.repo!r}")
     counts = Counter(result.verdict for result in report.results)
@@ -103,18 +104,21 @@ def post_run_triage(
     session: Annotated[Session, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_app_settings)],
 ) -> RunTriageResponse:
-    """Triage every recorded variant of a CI run attempt from what its uploads stored: the
-    failing tests, the changed files and the change links (``runs.affected``). A run without
-    stored links is triaged as an unknown change. For the GitHub Action, after all legs."""
+    """Triage every recorded variant of a CI run attempt (or only ``variants``) from what
+    its uploads stored: the failing tests, the changed files, the change links
+    (``runs.affected``) and ``known_flaky``. A run without stored links is triaged as an
+    unknown change. For the GitHub Action: after all legs, or one leg's own variant (re-runs)."""
     variants = triage_ci_run(
-        session, repo, body.ci_run_id, body.run_attempt, settings.stats_window_days
-    )
+        session, repo, body.ci_run_id, body.run_attempt, settings.stats_window_days,
+        body.variants,
+    )  # fmt: skip
     if variants is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown repo {repo!r}")
     if not variants:
+        only = f" (variants {body.variants})" if body.variants is not None else ""
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
-            f"no runs recorded for CI run {body.ci_run_id} attempt {body.run_attempt}",
+            f"no runs recorded for CI run {body.ci_run_id} attempt {body.run_attempt}{only}",
         )
     rows = [
         (v.variant, result) for v in variants for result in (v.report.results if v.report else ())
@@ -166,6 +170,8 @@ def _variant_out(v: VariantTriage) -> VariantTriageOut:
         links_known=v.links_known,
         failing=len(results),
         counts={verdict.value: counts[verdict] for verdict in VERDICT_ORDER},
+        reruns=v.reruns,
+        known_flaky_changed=v.known_flaky_changed,
     )
 
 
@@ -188,6 +194,7 @@ def _result(result: TriageResult) -> TriageResultOut:
         verdict=result.verdict.value,
         confidence=result.confidence.value,
         reasons=list(result.reasons),
+        known_flaky=result.known_flaky,
         evidence=EvidenceOut(
             links=[link_out(link) for link in result.links],
             pre_existing=PreExistingOut(
@@ -216,6 +223,8 @@ def _result(result: TriageResult) -> TriageResultOut:
                 last_failed_at=h.last_failed_at,
                 last_main_pass=run_ref_out(h.last_main_pass) if h.last_main_pass else None,
                 flaky_counts=result.flaky_counts,
+                rerun_passes=list(h.rerun_passes),
+                rerun_failures=list(h.rerun_failures),
             ),
         ),
     )

@@ -74,7 +74,8 @@ def post_explain(
         settings.stats_window_days,
     )
     assert histories is not None  # the repo exists
-    [as_triaged] = triage([Failure(body.test_id)], histories.tests, Change((), False))
+    [as_triaged] = triage([Failure(body.test_id, file_path=file_path)], histories.tests,
+                          Change((), False), known_flaky=body.known_flaky)  # fmt: skip
 
     selection = select_tests(
         history,
@@ -116,6 +117,7 @@ def post_explain(
         recent=_recent(session, test.id) if test else [],
         flaky=[flaky_event_out(e, m) for e, m in as_triaged.flaky[:MAX_FLAKY_EVENTS]],
         flaky_counts=as_triaged.flaky_counts,
+        known_flaky=as_triaged.known_flaky,
         window_days=settings.stats_window_days,
         selection=ExplainSelectionOut(
             mode=selection.mode.value,

@@ -50,15 +50,18 @@ def lookup_run(
     ci_run_id: Annotated[str, Query(min_length=1)],
     run_attempt: Annotated[int, Query(ge=1)] = 1,
     variant: Annotated[str | None, Query(max_length=255)] = None,
+    rerun: Annotated[int, Query(ge=0, le=10)] = 0,
 ) -> RunLookupResponse:
     """Whether a CI run attempt (and matrix variant) is already ingested, so uploaders can
-    skip the work. Omit ``variant`` for runs uploaded without one."""
+    skip the work. Omit ``variant`` for runs uploaded without one; ``rerun`` > 0 looks up a
+    re-run upload instead of the run itself."""
     variant = (variant.strip() or None) if variant is not None else None
-    run = find_run(session, repo, ci_run_id, run_attempt, variant)
+    run = find_run(session, repo, ci_run_id, run_attempt, variant, rerun)
     if run is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
-            f"no run {ci_run_id} attempt {run_attempt}{_variant(variant)} recorded for {repo!r}",
+            f"no run {ci_run_id} attempt {run_attempt}{_variant(variant)}{_rerun(rerun)} "
+            f"recorded for {repo!r}",
         )
     return RunLookupResponse(
         run_id=run.id,
@@ -67,6 +70,7 @@ def lookup_run(
         run_attempt=run_attempt,
         variant=run.variant,
         commit_sha=run.commit_sha,
+        rerun=run.rerun,
     )
 
 
@@ -112,7 +116,7 @@ def post_run(
         ),
     ] = False,
 ) -> RunResponse:
-    """Record a CI run. Idempotent per ``(repo, ci_run_id, run_attempt, variant)``."""
+    """Record a CI run. Idempotent per ``(repo, ci_run_id, run_attempt, variant, rerun)``."""
     try:
         meta = RunMetadata.model_validate_json(metadata)
     except ValidationError as exc:
@@ -143,9 +147,9 @@ def post_run(
             # Same CI run attempt claiming a different commit is a client bug, not a re-upload.
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"run {meta.ci_run_id} attempt {meta.run_attempt}{_variant(meta.variant)} "
-                f"of {meta.repo} is already recorded for commit {run.commit_sha}, "
-                f"not {meta.commit_sha}",
+                f"run {meta.ci_run_id} attempt {meta.run_attempt}{_variant(meta.variant)}"
+                f"{_rerun(meta.rerun)} of {meta.repo} is already recorded for commit "
+                f"{run.commit_sha}, not {meta.commit_sha}",
             )
         response.status_code = status.HTTP_200_OK
     return RunResponse(
@@ -180,3 +184,7 @@ def _parse_files(files: list[UploadFile]) -> list[ParsedTestResult]:
 
 def _variant(variant: str | None) -> str:
     return f" variant {variant!r}" if variant else ""
+
+
+def _rerun(rerun: int) -> str:
+    return f" re-run {rerun}" if rerun else ""

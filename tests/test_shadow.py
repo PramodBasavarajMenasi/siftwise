@@ -168,6 +168,49 @@ def test_failures_are_caught_missed_or_flaky(db_session: Session) -> None:
 
 
 @pytest.mark.usefixtures("seeded")
+def test_a_known_flaky_failure_is_flaky_not_missed(db_session: Session) -> None:
+    assert store(db_session, selection(TEST))
+    record(db_session, commit=50, hour=6, branch="pr", ci_run_id=SHADOW, changed=CART_CHANGE,
+           tests={TEST: F, OTHER: F}, known_flaky=["tests.test_db::*"])  # fmt: skip
+
+    result = compare(db_session)
+
+    outcomes = {u.test_id: (u.outcome, u.verdict) for u in result.units}
+    assert outcomes == {TEST: (CAUGHT, "new_regression"), OTHER: (FLAKY, "flaky")}
+    assert (result.tally.missed, result.tally.flaky_excluded) == (0, 1)
+
+
+@pytest.mark.usefixtures("seeded")
+def test_a_known_flaky_failure_linked_to_the_change_can_be_missed(db_session: Session) -> None:
+    # Linked + listed: unknown ("re-run to tell"), so a selection that skips it missed it.
+    assert store(db_session, selection(OTHER))
+    record(db_session, commit=50, hour=6, branch="pr", ci_run_id=SHADOW, changed=CART_CHANGE,
+           tests={TEST: F}, known_flaky=["tests.test_cart::*"])  # fmt: skip
+
+    [unit] = compare(db_session).units
+
+    assert (unit.test_id, unit.outcome, unit.verdict) == (TEST, MISSED, "unknown")
+
+
+@pytest.mark.usefixtures("seeded")
+def test_a_failure_passing_on_a_re_run_is_flaky_and_re_runs_are_not_variants(
+    db_session: Session,
+) -> None:
+    assert store(db_session, selection(TEST))
+    shadow_run(db_session, {TEST: F, OTHER: F, PASSING: P})
+    record(db_session, commit=50, hour=6.5, branch="pr", ci_run_id=SHADOW, rerun=1,
+           changed=CART_CHANGE, tests={OTHER: P})  # fmt: skip
+
+    result = compare(db_session)
+
+    outcomes = {u.test_id: (u.outcome, u.verdict) for u in result.units}
+    assert outcomes == {TEST: (CAUGHT, "new_regression"), OTHER: (FLAKY, "flaky")}
+    [variant] = result.variants  # the re-run upload is not compared as a leg
+    # Time is measured on the full-suite run alone: 3 tests, 1 would have run.
+    assert (variant.tests_total, variant.tests_would_run) == (3, 1)
+
+
+@pytest.mark.usefixtures("seeded")
 def test_tests_a_stored_selection_runs_but_does_not_name(db_session: Session) -> None:
     # Go: TestA selected with -run (its new subtest runs, TestC doesn't); a Python file run
     # whole runs a test history has never seen.

@@ -78,6 +78,14 @@ def test_explain_a_selected_test(client: TestClient) -> None:
 
 
 @pytest.mark.usefixtures("seeded")
+def test_explain_says_whether_known_flaky_lists_the_test(client: TestClient) -> None:
+    listed = explain(client, known_flaky=["tests/nope/**", "tests.test_cart::*"]).json()
+    plain = explain(client).json()
+
+    assert (listed["known_flaky"], plain["known_flaky"]) == ("tests.test_cart::*", None)
+
+
+@pytest.mark.usefixtures("seeded")
 def test_explain_not_selected_and_full_suite(client: TestClient) -> None:
     not_selected = explain(client, changed_files=["src/db.py"]).json()["selection"]
     full = explain(client, changed_files=["pyproject.toml"]).json()["selection"]

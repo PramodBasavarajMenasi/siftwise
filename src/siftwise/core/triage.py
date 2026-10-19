@@ -7,19 +7,25 @@ histories from the database, and ``triage_run`` does both.
 **No peeking.** Only history strictly before the triaged run counts: runs earlier by
 ``(Run.occurred_at, id)`` than the cut-off (the recorded run, else ``as_of``, else now), and
 never an upload of the triaged CI run attempt itself (its other matrix legs included).
-Triaging an old run gives the answer it would have got live.
+Triaging an old run gives the answer it would have got live. One exception, for rule 1 only:
+the attempt's own re-runs of this variant (``runs.rerun`` > 0, uploaded by the Action after
+the run), which re-test the same code.
 
 **Variants.** A failure is compared with its own variant's history: Linux failing on main
 doesn't make a macOS failure pre-existing. Other variants failing on main are only noted.
 
 Rules, in order; the first that applies decides:
 
-1. The same commit and variant passed before (a re-run or a retry) -> **flaky**, high.
-   Never for uncommitted code (``Target.commit_sha`` None): no earlier run tested it.
+1. The same commit and variant passed before (a re-run or a retry), or passed on one of
+   this attempt's re-runs -> **flaky**, high. Never for uncommitted code
+   (``Target.commit_sha`` None): no earlier run tested it.
 2. Failing on main for this variant, at the latest main run before the cut-off ->
    **pre-existing**: high if the streak is 2+ main runs or the message matches main's, else
-   medium; medium at most if this change also links to the test.
+   medium; medium at most if this change also links to the test. Listed in ``known_flaky``:
+   a note only.
 3. The diff is unknown -> **unknown** (nothing can be linked).
+3b. Listed in ``known_flaky`` (``.siftwise.toml``) -> linked to this change: **unknown**
+   ("re-run to tell"); else **flaky**, medium (high with flaky evidence rule 7 calls high).
 4. No history before this run -> **new regression** (medium) if the test's own file changed,
    else **unknown**.
 5. Linked to this change and known flaky -> **unknown** ("re-run to tell").
@@ -53,8 +59,8 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
@@ -72,6 +78,7 @@ from siftwise.core.selector import (
     SelectorConfig,
     Strength,
     change_links,
+    glob_match,
 )
 
 
@@ -191,6 +198,9 @@ class TestHistory:
     flaky: tuple[FlakyEvent, ...] = ()  # in the window, newest first
     failures_in_window: int = 0
     last_failed_at: datetime | None = None
+    # This CI run attempt's re-runs of the variant (``runs.rerun`` numbers): passed / failed.
+    rerun_passes: tuple[int, ...] = ()
+    rerun_failures: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -204,6 +214,7 @@ class TriageResult:
     main_message_matches: bool | None = None
     # (event, whether the failure's message matches one of the event's)
     flaky: tuple[tuple[FlakyEvent, bool | None], ...] = ()
+    known_flaky: str | None = None  # the known_flaky glob it matches
 
     @property
     def flaky_counts(self) -> dict[str, int]:
@@ -261,9 +272,11 @@ def triage(
     change: Change,
     window_days: int = 90,
     variant: str | None = None,
+    known_flaky: Sequence[str] = (),
 ) -> list[TriageResult]:
     """A verdict for each failing test (the first of duplicate test IDs counts). ``variant``
-    is the triaged run's, for wording only: ``histories`` already compare within it."""
+    is the triaged run's, for wording only: ``histories`` already compare within it.
+    ``known_flaky``: the repo's globs, matched against test IDs and file paths."""
     unique_by_id: dict[str, Failure] = {}
     for failure in failures:
         unique_by_id.setdefault(failure.test_id, failure)
@@ -282,9 +295,23 @@ def triage(
             change.changed_files_known,
             window_days,
             variant,
+            known_flaky_match(test, known_flaky),
         )
-        for f in unique
+        for f, test in zip(unique, tests, strict=True)
     ]
+
+
+def known_flaky_match(test: KnownTest, patterns: Sequence[str]) -> str | None:
+    """The first ``known_flaky`` glob matching the test's ID or file path (as ``always_run``)."""
+    return next(
+        (
+            pattern
+            for pattern in patterns
+            if glob_match(test.test_id, pattern)
+            or (test.file_path and glob_match(test.file_path, pattern))
+        ),
+        None,
+    )
 
 
 def _verdict(
@@ -294,6 +321,7 @@ def _verdict(
     diff_known: bool,
     window_days: int,
     variant: str | None,
+    listed: str | None = None,
 ) -> TriageResult:
     window = f"in {window_days} days" if window_days else "in the history"
     flaky = tuple((event, _matches_any(failure.message, event.messages)) for event in h.flaky)
@@ -303,6 +331,9 @@ def _verdict(
         f"also failing on main on {_variant(run.variant)} (latest main run {run.commit_sha[:7]})"
         for run in h.other_variants_failing
     ]
+    if h.rerun_failures:
+        notes.append(f"failed again on {_plural(len(h.rerun_failures), 're-run')}")
+    listed_reason = f"listed in known_flaky ({listed!r})" if listed else ""
 
     def done(
         verdict: Verdict, confidence: Strength, reasons: list[str], main_match: bool | None = None
@@ -316,6 +347,7 @@ def _verdict(
             h,
             main_match,
             flaky,
+            listed,
         )
 
     def linked() -> str:
@@ -324,6 +356,15 @@ def _verdict(
         return f"{strongest.reason}{more}"
 
     # 1. Same code, different outcome.
+    if h.rerun_passes:
+        return done(
+            Verdict.FLAKY,
+            Strength.HIGH,
+            [
+                f"passed on re-run {h.rerun_passes[0]} of this commit and variant: same code, "
+                "different outcome",
+            ],
+        )
     if h.same_commit_passes:
         run = h.same_commit_passes[0]
         return done(
@@ -354,11 +395,19 @@ def _verdict(
         if strongest is not None:
             confidence = Strength.MEDIUM if confidence is Strength.HIGH else confidence
             reasons.append(f"this change also touches it: {linked()}")
+        if listed:
+            reasons.append(listed_reason)
         return done(Verdict.PRE_EXISTING, confidence, reasons, match)
 
     flaky_note = _flaky_note(h.flaky, window)
     # 3. Nothing can be linked without the diff.
     if not diff_known:
+        if listed:
+            return done(
+                Verdict.UNKNOWN,
+                Strength.LOW,
+                [f"{listed_reason}, but the diff is unknown: re-run to tell"],
+            )
         if h.flaky:
             return done(
                 Verdict.UNKNOWN,
@@ -374,6 +423,26 @@ def _verdict(
                 "diff unknown: can't tell if this change caused it",
             ],
         )
+
+    # 3b. Declared flaky: the repo's own list, after the evidence rules 1-2.
+    strong_flaky = len(h.flaky) >= 2 or any(match for _, match in flaky)
+    if listed:
+        if strongest is not None:
+            return done(
+                Verdict.UNKNOWN,
+                Strength.LOW,
+                [
+                    "linked to this change but listed in known_flaky: re-run to tell",
+                    linked(),
+                    listed_reason,
+                ],
+            )
+        reasons = [listed_reason, "not linked to this change"]
+        if h.flaky:
+            reasons.append(flaky_note)
+        if any(match for _, match in flaky):
+            reasons.append("same failure message as an earlier flaky failure")
+        return done(Verdict.FLAKY, Strength.HIGH if strong_flaky else Strength.MEDIUM, reasons)
 
     # 4. No history to compare with.
     if not h.seen:
@@ -426,11 +495,10 @@ def _verdict(
 
     # 7-8. Not linked to this change.
     if h.flaky:
-        strong = len(h.flaky) >= 2 or any(match for _, match in flaky)
         reasons = [flaky_note, "not linked to this change"]
         if any(match for _, match in flaky):
             reasons.append("same failure message as an earlier flaky failure")
-        return done(Verdict.FLAKY, Strength.HIGH if strong else Strength.MEDIUM, reasons)
+        return done(Verdict.FLAKY, Strength.HIGH if strong_flaky else Strength.MEDIUM, reasons)
     return done(
         Verdict.UNKNOWN,
         Strength.LOW,
@@ -512,6 +580,7 @@ class _Run:
     ci_run_id: str | None
     changed_files_known: bool
     has_links: bool
+    rerun: int = 0
 
     @property
     def ref(self) -> RunRef:
@@ -566,13 +635,17 @@ def load_histories(
     cut_at = target.as_of or datetime.now(UTC)
     if cut_at.tzinfo is None:
         cut_at = cut_at.replace(tzinfo=UTC)
-    cut_id, run_id = _NO_RUN, None
+    cut_id, run_id, has_reruns = _NO_RUN, None, False
     if target.ci_run_id is not None:
         row = session.execute(
             text(
-                "SELECT id, COALESCE(started_at, created_at) FROM runs WHERE repo_id = :repo_id"
-                " AND ci_run_id = :ci AND run_attempt = :attempt"
-                " AND COALESCE(variant, '') = :variant"
+                "SELECT r.id, COALESCE(r.started_at, r.created_at), EXISTS ("
+                "  SELECT 1 FROM runs x WHERE x.repo_id = r.repo_id AND x.ci_run_id = r.ci_run_id"
+                "  AND x.run_attempt = r.run_attempt AND COALESCE(x.variant, '') = :variant"
+                "  AND x.rerun > 0 AND x.commit_sha = r.commit_sha)"
+                " FROM runs r WHERE r.repo_id = :repo_id"
+                " AND r.ci_run_id = :ci AND r.run_attempt = :attempt"
+                " AND COALESCE(r.variant, '') = :variant AND r.rerun = 0"
             ),
             {
                 "repo_id": repo_id,
@@ -582,7 +655,7 @@ def load_histories(
             },
         ).first()
         if row is not None:
-            run_id, cut_at, cut_id = row[0], row[1], row[0]
+            run_id, cut_at, cut_id, has_reruns = row[0], row[1], row[0], row[2]
     params: dict[str, Any] = {
         "repo_id": repo_id,
         "cut_at": cut_at,
@@ -600,7 +673,7 @@ def load_histories(
                 WITH before AS MATERIALIZED (
                     SELECT r.id, r.commit_sha, r.branch, r.is_main, r.variant,
                            COALESCE(r.started_at, r.created_at) AS run_at, r.ci_run_id,
-                           r.changed_files_known, r.affected IS NOT NULL AS has_links
+                           r.changed_files_known, r.affected IS NOT NULL AS has_links, r.rerun
                     FROM runs r WHERE r.repo_id = :repo_id AND {_BEFORE}
                 )
                 SELECT * FROM before
@@ -641,7 +714,52 @@ def load_histories(
 
     builder = _Builder(session, target, runs, params, window_start, run_links)
     histories = builder.build(seen, keys, paths)
+    if has_reruns and keys:
+        _add_reruns(session, params, target, keys, histories)
     return Histories(cut_at, run_id, histories)
+
+
+def _add_reruns(
+    session: Session,
+    params: Mapping[str, Any],
+    target: Target,
+    keys: Mapping[int, str],
+    histories: dict[str, TestHistory],
+) -> None:
+    """The triaged attempt's own re-runs of its variant: rule 1's "same code, different
+    outcome". Re-runs come after the run, so this is the one read past the cut-off."""
+    passes: dict[str, list[int]] = defaultdict(list)
+    failures: dict[str, list[int]] = defaultdict(list)
+    for rerun, key, outcome in session.execute(
+        text(
+            f"""
+            SELECT r.rerun, tr.test_key, {_OUTCOME}
+            FROM runs r JOIN test_results tr ON tr.run_id = r.id
+            WHERE r.repo_id = :repo_id AND r.ci_run_id = :ci_run_id
+              AND r.run_attempt = :run_attempt AND COALESCE(r.variant, '') = :variant
+              AND r.rerun > 0 AND r.commit_sha = :commit
+              AND tr.test_key = ANY(CAST(:keys AS integer[]))
+            GROUP BY r.id, r.rerun, tr.test_key
+            ORDER BY r.rerun
+            """
+        ),
+        {
+            **params,
+            "variant": target.variant or "",
+            "commit": target.commit_sha,
+            "keys": sorted(keys),
+        },
+    ):
+        if outcome == PASSED_CODE:
+            passes[keys[key]].append(rerun)
+        elif outcome in _FAILED:
+            failures[keys[key]].append(rerun)
+    for test_id in passes.keys() | failures.keys():
+        histories[test_id] = replace(
+            histories[test_id],
+            rerun_passes=tuple(passes[test_id]),
+            rerun_failures=tuple(failures[test_id]),
+        )
 
 
 class _Builder:
@@ -789,8 +907,9 @@ class _Builder:
             reverse=True,
         )
         latest_other: dict[str | None, _Run] = {}
+        # A re-run holds a few tests only: never a variant's "latest main run".
         for run in sorted((r for r in self.runs.values() if r.is_main), key=lambda r: r.order):
-            if run.variant != variant:
+            if run.variant != variant and not run.rerun:
                 latest_other[run.variant] = run
         walks = {key: _MainWalk() for key in keys}
 
@@ -829,7 +948,8 @@ class _Builder:
                 f"""
                 SELECT r.id, r.commit_sha, r.branch, r.is_main, r.variant,
                        COALESCE(r.started_at, r.created_at) AS run_at, r.ci_run_id,
-                       r.changed_files_known, r.affected IS NOT NULL, tr.test_key, {_OUTCOME}
+                       r.changed_files_known, r.affected IS NOT NULL, r.rerun, tr.test_key,
+                       {_OUTCOME}
                 FROM test_results tr JOIN runs r ON r.id = tr.run_id
                 WHERE tr.test_key = ANY(:keys) AND r.repo_id = :repo_id AND r.is_main
                   AND r.variant IS NOT DISTINCT FROM CAST(:variant AS text)
@@ -844,7 +964,7 @@ class _Builder:
                 "window_start": self.window_start,
             },
         ).all()
-        found = [(_Run(*row[:9]), row[9], row[10]) for row in rows]
+        found = [(_Run(*row[:10]), row[10], row[11]) for row in rows]
         found.sort(key=lambda item: item[0].order, reverse=True)
         return found
 
@@ -1015,6 +1135,7 @@ def triage_run(
     change: Change,
     window_days: int = 90,
     run_links: RunLinks | None = None,
+    known_flaky: Sequence[str] = (),
 ) -> TriageReport | None:
     """Load the failing tests' histories and triage them; None if the repo is unknown.
     ``run_links``: see ``RunLinks`` (the eval only)."""
@@ -1026,7 +1147,7 @@ def triage_run(
     return TriageReport(
         histories.cut_at,
         histories.run_id,
-        triage(failures, histories.tests, change, window_days),
+        triage(failures, histories.tests, change, window_days, known_flaky=known_flaky),
     )
 
 
@@ -1046,6 +1167,8 @@ class VariantTriage:
     # look unrelated and be called flaky.
     links_known: bool
     report: TriageReport | None  # None: no failing tests
+    reruns: int = 0  # re-run uploads of this variant in the attempt
+    known_flaky_changed: bool = False  # the PR's own known_flaky differs (applies after merge)
 
 
 def triage_ci_run(
@@ -1054,24 +1177,28 @@ def triage_ci_run(
     ci_run_id: str,
     run_attempt: int = 1,
     window_days: int = 90,
+    variants: Collection[str | None] | None = None,
 ) -> list[VariantTriage] | None:
-    """Triage every recorded variant of a CI run attempt, from what was stored: the failing
-    tests (final attempt failed or errored), the changed files and the change links the
-    uploader computed (``runs.affected``). None if the repo is unknown; an empty list if the
-    attempt has no recorded runs.
+    """Triage every recorded variant of a CI run attempt (or only ``variants``), from what
+    was stored: the failing tests (final attempt failed or errored), the changed files, the
+    change links the uploader computed (``runs.affected``) and the run's ``known_flaky``. None
+    if the repo is unknown; an empty list if the attempt has no recorded runs (of
+    ``variants``).
 
     Each variant is triaged as ``/triage`` would with the same change: the cut-off is that
-    variant's run, and no upload of this CI run attempt is ever history.
+    variant's run, and no upload of this CI run attempt is history, except the variant's own
+    re-runs for rule 1. Re-run uploads (``runs.rerun`` > 0) are never variants themselves.
     """
     repo_id = session.execute(
         text("SELECT id FROM repos WHERE name = :name"), {"name": repo}
     ).scalar_one_or_none()
     if repo_id is None:
         return None
-    runs = session.execute(
+    rows = session.execute(
         text(
             """
-            SELECT id, variant, commit_sha, changed_files_known, affected
+            SELECT id, variant, commit_sha, changed_files_known, affected, known_flaky,
+                   known_flaky_changed, rerun
             FROM runs
             WHERE repo_id = :repo_id AND ci_run_id = :ci AND run_attempt = :attempt
             ORDER BY COALESCE(variant, ''), id
@@ -1079,6 +1206,8 @@ def triage_ci_run(
         ),
         {"repo_id": repo_id, "ci": ci_run_id, "attempt": run_attempt},
     ).all()
+    reruns = Counter(row.variant for row in rows if row.rerun)
+    runs = [row for row in rows if not row.rerun and (variants is None or row.variant in variants)]
     if not runs:
         return []
     run_ids = [run.id for run in runs]
@@ -1099,9 +1228,11 @@ def triage_ci_run(
         report = None
         if failures[run.id]:
             target = Target(repo, run.commit_sha, run.variant, ci_run_id, run_attempt)
-            report = triage_run(session, target, failures[run.id], change, window_days)
+            report = triage_run(session, target, failures[run.id], change, window_days,
+                                known_flaky=run.known_flaky)  # fmt: skip
         results.append(VariantTriage(
             run.id, run.variant, run.commit_sha, run.changed_files_known, links_known, report,
+            reruns[run.variant], run.known_flaky_changed,
         ))  # fmt: skip
     return results
 

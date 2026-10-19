@@ -299,6 +299,7 @@ def test_lookup_finds_ingested_run(client: TestClient) -> None:
         "run_attempt": 2,
         "variant": None,
         "commit_sha": SHA,
+        "rerun": 0,
     }
 
 
@@ -403,6 +404,37 @@ def test_lookup_by_variant(client: TestClient) -> None:
     # Without a variant, only a run uploaded without one matches.
     assert lookup(client).status_code == 404
     assert lookup(client, variant="").status_code == 404
+
+
+def test_a_re_run_upload_is_its_own_run(client: TestClient) -> None:
+    first = post_run(client, [fixture("go.xml")], metadata(variant="linux")).json()
+    rerun_meta = metadata(variant="linux", rerun=1, known_flaky=["pkg::*"])
+
+    rerun = post_run(client, [fixture("go.xml")], rerun_meta)
+    again = post_run(client, [fixture("go.xml")], rerun_meta)
+
+    assert rerun.status_code == 201
+    assert rerun.json()["run_id"] != first["run_id"]
+    assert (again.status_code, again.json()["run_id"]) == (200, rerun.json()["run_id"])
+    # Lookups find the run itself unless asked for a re-run; re-runs are never variants.
+    assert lookup(client, variant="linux").json()["run_id"] == first["run_id"]
+    found = lookup(client, variant="linux", rerun=1).json()
+    assert (found["run_id"], found["rerun"]) == (rerun.json()["run_id"], 1)
+    missing = lookup(client, variant="linux", rerun=2)
+    assert missing.status_code == 404 and "re-run 2" in missing.json()["detail"]
+    response = client.get("/runs/variants", params={"repo": "acme/shop", "ci_run_id": "9001"},
+                          headers=AUTH)  # fmt: skip
+    assert response.json()["variants"] == ["linux"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"rerun": 1, "ci_run_id": None}, {"rerun": 11}, {"rerun": -1}, {"known_flaky": [""]}],
+)
+def test_invalid_re_run_and_known_flaky_metadata(
+    client: TestClient, overrides: dict[str, Any]
+) -> None:
+    assert post_run(client, [fixture("go.xml")], metadata(**overrides)).status_code == 422
 
 
 def test_variant_too_long_returns_422(client: TestClient) -> None:

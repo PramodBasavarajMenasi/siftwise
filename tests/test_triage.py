@@ -284,6 +284,114 @@ def test_duplicate_failures_get_one_result_in_first_seen_order() -> None:
     assert [r.test_id for r in results] == ["b::t", "a::t"]
 
 
+# --- known_flaky (3b) and this attempt's re-runs (1) -------------------------------------
+
+LISTED = ["tests.test_cart::*"]
+
+
+def listed(
+    history: TestHistory | None,
+    change_: Change,
+    known_flaky: list[str] = LISTED,
+    message: str | None = None,
+    file_path: str | None = None,
+) -> TriageResult:
+    histories = {} if history is None else {TEST: history}
+    [result] = triage([Failure(TEST, message, file_path)], histories, change_, 90, "linux",
+                      known_flaky)  # fmt: skip
+    return result
+
+
+def test_a_listed_unlinked_failure_is_flaky_medium() -> None:
+    result = listed(PASSES_ON_MAIN, UNRELATED)
+
+    assert (result.verdict, result.confidence) == (Verdict.FLAKY, M)
+    assert result.reasons == ("listed in known_flaky ('tests.test_cart::*')",
+                              "not linked to this change")  # fmt: skip
+    assert result.known_flaky == "tests.test_cart::*"
+
+
+def test_known_flaky_matches_file_paths_too() -> None:
+    result = listed(PASSES_ON_MAIN, UNRELATED, ["tests/test_*.py"], file_path="tests/test_cart.py")
+
+    assert (result.verdict, result.known_flaky) == (Verdict.FLAKY, "tests/test_*.py")
+
+
+def test_an_unlisted_failure_ignores_known_flaky() -> None:
+    result = listed(PASSES_ON_MAIN, UNRELATED, ["tests.test_other::*"])
+
+    assert (result.verdict, result.known_flaky) == (Verdict.UNKNOWN, None)
+
+
+def test_a_listed_failure_linked_to_the_change_is_unknown() -> None:
+    result = listed(PASSES_ON_MAIN, change("src/cart.py"))
+
+    assert (result.verdict, result.confidence) == (Verdict.UNKNOWN, L)
+    assert result.reasons[0] == "linked to this change but listed in known_flaky: re-run to tell"
+    assert result.reasons[-1] == "listed in known_flaky ('tests.test_cart::*')"
+
+
+def test_a_listed_failure_with_strong_flaky_history_is_high() -> None:
+    history = TestHistory(seen=True, flaky=(flaky_event(3), flaky_event(5)))
+
+    result = listed(history, UNRELATED)
+
+    assert (result.verdict, result.confidence) == (Verdict.FLAKY, H)
+    assert result.reasons[2] == "flaky 2 times in 90 days (2 unrelated fail-then-pass)"
+
+
+def test_a_listed_failure_with_one_flaky_event_stays_medium() -> None:
+    result = listed(TestHistory(seen=True, flaky=(flaky_event(3),)), UNRELATED)
+
+    assert (result.verdict, result.confidence) == (Verdict.FLAKY, M)
+
+
+def test_a_listed_test_without_history_is_flaky() -> None:
+    assert listed(None, UNRELATED).verdict is Verdict.FLAKY
+
+
+def test_a_listed_new_test_whose_file_changed_is_unknown() -> None:
+    # Its own file changed: linked, so "re-run to tell", never flaky.
+    assert listed(None, change("tests/test_cart.py")).verdict is Verdict.UNKNOWN
+
+
+def test_failing_on_main_wins_over_known_flaky_with_a_note() -> None:
+    history = TestHistory(seen=True, broken_on_main=streak(2), last_main_pass=run(9))
+
+    result = listed(history, UNRELATED)
+
+    assert (result.verdict, result.confidence) == (Verdict.PRE_EXISTING, H)
+    assert result.reasons[-1] == "listed in known_flaky ('tests.test_cart::*')"
+
+
+def test_a_listed_failure_with_an_unknown_diff_is_unknown() -> None:
+    result = listed(PASSES_ON_MAIN, change(known=False))
+
+    assert (result.verdict, result.confidence) == (Verdict.UNKNOWN, L)
+    assert result.reasons == (
+        "listed in known_flaky ('tests.test_cart::*'), but the diff is unknown: re-run to tell",
+    )
+
+
+def test_a_pass_on_a_re_run_of_this_attempt_is_flaky_high_even_if_linked() -> None:
+    history = TestHistory(seen=True, rerun_passes=(2,), rerun_failures=(1,))
+
+    result = one(history, change("src/cart.py"))
+
+    assert (result.verdict, result.confidence) == (Verdict.FLAKY, H)
+    assert result.reasons == (
+        "passed on re-run 2 of this commit and variant: same code, different outcome",
+        "failed again on 1 re-run",
+    )
+
+
+def test_failing_again_on_every_re_run_keeps_the_verdict_with_a_note() -> None:
+    result = one(TestHistory(seen=True, rerun_failures=(1, 2)), UNRELATED)
+
+    assert result.verdict is Verdict.UNKNOWN
+    assert result.reasons[-1] == "failed again on 2 re-runs"
+
+
 # --- messages -----------------------------------------------------------------------------
 
 
