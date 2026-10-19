@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.pytest_cache/
+junit.xml
+uv.lock
+selected.sh

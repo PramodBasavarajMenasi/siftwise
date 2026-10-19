@@ -13,8 +13,8 @@ from typing import Annotated, Any
 import httpx
 import typer
 
-from siftwise import __version__
-from siftwise.cli import gha
+from siftwise import __version__, extras
+from siftwise.cli import gha, server
 from siftwise.cli.gograph import build_graph, run_go_list
 from siftwise.cli.pygraph import build_py_graph
 from siftwise.cli.repoconfig import (
@@ -29,6 +29,7 @@ from siftwise.core.junit import JUnitParseError, Status, parse_junit
 
 app = typer.Typer(help="Siftwise: test impact analysis for CI.", no_args_is_help=True)
 app.add_typer(gha.app, name="gha")
+app.add_typer(server.app, name="server")
 
 # `siftwise select` exit codes, besides 0 (success, including "no tests affected").
 EXIT_API_ERROR = 1
@@ -38,6 +39,16 @@ EXIT_FULL_SUITE_NO_COMMAND = 3
 EXIT_FAIL_ON = 4
 
 VERDICTS = ("new_regression", "pre_existing", "flaky", "unknown")
+
+# --server, else SIFTWISE_SERVER (as for MCP and the Action's steps), else localhost.
+DEFAULT_SERVER = "http://localhost:8000"
+ServerOption = Annotated[
+    str,
+    typer.Option(
+        help="siftwise server URL (default: SIFTWISE_SERVER, else http://localhost:8000).",
+        envvar="SIFTWISE_SERVER",
+    ),
+]
 
 
 class KnownFlakySource(StrEnum):
@@ -53,8 +64,24 @@ class SiftwiseError(Exception):
         self.status = status  # the HTTP status, if the server answered
 
 
+def _print_version(value: bool) -> None:
+    if value:
+        typer.echo(__version__)
+        raise typer.Exit()
+
+
 @app.callback()
-def main() -> None:
+def main(
+    show_version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_print_version,
+            is_eager=True,
+            help="Print the siftwise version and exit (same as `siftwise version`).",
+        ),
+    ] = False,
+) -> None:
     """Siftwise: test impact analysis for CI."""
 
 
@@ -69,7 +96,7 @@ def select_command(
     repo: Annotated[str, typer.Option(help="Repository name in siftwise, e.g. acme/shop.")],
     base: Annotated[str, typer.Option(help="Base ref to diff against.")] = "main",
     head: Annotated[str, typer.Option(help="Head ref.")] = "HEAD",
-    server: Annotated[str, typer.Option(help="siftwise server URL.")] = "http://localhost:8000",
+    server: ServerOption = DEFAULT_SERVER,
     json_output: Annotated[
         bool, typer.Option("--json", help="Print the full API response as JSON.")
     ] = False,
@@ -139,7 +166,7 @@ def record_command(
     defer_rollup: Annotated[
         bool, typer.Option(help="Skip the stats rollup; run `siftwise rollup` after all legs.")
     ] = False,
-    server: Annotated[str, typer.Option(help="siftwise server URL.")] = "http://localhost:8000",
+    server: ServerOption = DEFAULT_SERVER,
     go_list: Annotated[
         bool, typer.Option(help="Record Go import links (`go list`), for triage.")
     ] = True,
@@ -180,7 +207,7 @@ def record_command(
 @app.command("rollup")
 def rollup_command(
     repo: Annotated[str, typer.Option(help="Repository name in siftwise, e.g. acme/shop.")],
-    server: Annotated[str, typer.Option(help="siftwise server URL.")] = "http://localhost:8000",
+    server: ServerOption = DEFAULT_SERVER,
 ) -> None:
     """Recompute a repo's test stats, after uploads with --defer-rollup."""
     try:
@@ -211,7 +238,7 @@ def triage_command(
             help="Comma-separated verdicts that fail the command (exit 4), e.g. new_regression."
         ),
     ] = "",
-    server: Annotated[str, typer.Option(help="siftwise server URL.")] = "http://localhost:8000",
+    server: ServerOption = DEFAULT_SERVER,
     json_output: Annotated[
         bool, typer.Option("--json", help="Print the full API response as JSON.")
     ] = False,
@@ -300,7 +327,7 @@ def triage_command(
 def report_command(
     repo: Annotated[str, typer.Option(help="Repository name in siftwise, e.g. acme/shop.")],
     days: Annotated[int, typer.Option(min=1, max=365, help="Shadow runs of the last N days.")] = 30,
-    server: Annotated[str, typer.Option(help="siftwise server URL.")] = "http://localhost:8000",
+    server: ServerOption = DEFAULT_SERVER,
     json_output: Annotated[
         bool, typer.Option("--json", help="Print the full API response as JSON.")
     ] = False,
@@ -454,10 +481,7 @@ def mcp_command() -> None:
     except ImportError as exc:
         if not (exc.name or "").startswith("mcp"):
             raise
-        _err(
-            "error: `siftwise mcp` needs the mcp extra. From a siftwise checkout: "
-            'uv tool install ".[mcp]"'
-        )
+        _err(f"error: `siftwise mcp` needs the mcp extra: {extras.install_hint('mcp')}")
         raise typer.Exit(EXIT_USAGE) from exc
     serve()
 

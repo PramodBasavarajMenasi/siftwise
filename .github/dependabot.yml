@@ -1,0 +1,32 @@
+# Weekly updates for the digest-pinned images and the workflows' actions.
+version: 2
+updates:
+  # Dockerfile: the python and uv base images. Python stays on 3.12 (digest and patch updates
+  # only); moving to a new minor is a deliberate change.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # docker-compose.yml: the Postgres image. Digest updates only within 16: a new major can't
+  # open the existing data volume (it needs pg_upgrade).
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]
+
+  # .github/workflows/*.yml and the composite actions' own steps.
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /actions/select
+      - /actions/record
+      - /actions/rollup
+    schedule:
+      interval: weekly

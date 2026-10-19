@@ -1,36 +1,43 @@
+# The quickstart: the siftwise server plus Postgres, `docker compose up -d --build --wait`.
+# Reads SIFTWISE_API_TOKEN (required) from .env next to this file; see the README Quickstart.
+# Only the API is published, on 127.0.0.1 (SIFTWISE_PORT, default 8000); Postgres stays inside.
+# Development adds docker-compose.dev.yml (Postgres on 5432 and the test database).
+# TODO(after the first release): use ghcr.io/pramodbasavarajmenasi/siftwise:<version> instead
+# of building locally.
 name: siftwise
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     environment:
       POSTGRES_USER: siftwise
-      POSTGRES_PASSWORD: siftwise
+      # Used when the volume is first created; changing it later doesn't change the password.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-siftwise}
       POSTGRES_DB: siftwise
-    ports:
-      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U siftwise -d siftwise"]
       interval: 2s
       timeout: 3s
       retries: 15
+    restart: unless-stopped
 
   api:
     build: .
     environment:
-      SIFTWISE_DATABASE_URL: postgresql+psycopg://siftwise:siftwise@postgres:5432/siftwise
-      SIFTWISE_API_TOKEN: ${SIFTWISE_API_TOKEN:-dev-token}
+      SIFTWISE_DATABASE_URL: postgresql+psycopg://siftwise:${POSTGRES_PASSWORD:-siftwise}@postgres:5432/siftwise
+      SIFTWISE_API_TOKEN: ${SIFTWISE_API_TOKEN:?set SIFTWISE_API_TOKEN in .env (see the README Quickstart)}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:${SIFTWISE_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:
-    # Docker volumes can't be renamed: an install from before the sieve → siftwise rename sets
+    # Unchanged across the quickstart/dev split, so existing data stays. Docker volumes can't be
+    # renamed: an install from before the sieve → siftwise rename sets
     # SIFTWISE_PG_VOLUME=sieve_pgdata in .env to keep its data.
     name: ${SIFTWISE_PG_VOLUME:-siftwise_pgdata}

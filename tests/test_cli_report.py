@@ -237,3 +237,25 @@ def test_report_errors(api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch) -
     assert by_month.exit_code == EXIT_USAGE and "--by must be 'week'" in by_month.output
     monkeypatch.delenv("SIFTWISE_API_TOKEN")
     assert CliRunner().invoke(app, ARGS).exit_code == EXIT_USAGE
+
+
+def test_server_comes_from_siftwise_server(
+    api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Like the MCP server and the Action's steps: --server, else SIFTWISE_SERVER, else
+    # http://localhost:8000.
+    args = ["report", "--repo", "acme/shop"]
+    default = api.get("http://localhost:8000/repos/acme/shop/recall").respond(json=recall())
+    from_env = api.get("http://siftwise.internal:9000/repos/acme/shop/recall").respond(
+        json=recall()
+    )
+    flag = api.get(URL).respond(json=recall())
+
+    assert CliRunner().invoke(app, args).exit_code == 0
+    monkeypatch.setenv("SIFTWISE_SERVER", "http://siftwise.internal:9000")
+    assert CliRunner().invoke(app, args).exit_code == 0
+    assert CliRunner().invoke(app, [*args, "--server", SERVER]).exit_code == 0
+
+    assert default.call_count == 1
+    assert from_env.call_count == 1
+    assert flag.call_count == 1  # the flag wins over SIFTWISE_SERVER

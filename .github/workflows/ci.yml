@@ -58,3 +58,22 @@ jobs:
 
       - name: pytest
         run: uv run pytest
+
+  package:
+    name: package (build, twine check, light/server/mcp installs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      # `uv build` builds the wheel from the sdist, so a file missing from the sdist fails here.
+      - name: Build the sdist and wheel
+        run: uv build
+
+      # twine check, the sdist's file list, and the wheel in fresh venvs: the light install has
+      # none of the server's modules, and `siftwise server start` there names the extra.
+      - name: Check the distributions
+        run: uv run --no-project python scripts/check_dist.py dist

@@ -1,8 +1,8 @@
-.git
-.venv
+# An allowlist: the image needs only these (a denylist once sent .eval-cache and .env along).
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src
 **/__pycache__
-.pytest_cache
-.mypy_cache
-.ruff_cache
-.env
-tests

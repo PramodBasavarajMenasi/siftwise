@@ -118,44 +118,118 @@ before and after, checked on real data; details in
 
 ## Quickstart
 
-Start the server with Postgres. The API token is a shared secret you choose:
+From zero to a first selection in about 5 minutes, on a small example project. You need
+Docker, git and [uv](https://docs.astral.sh/uv/). The commands are bash: on Windows, use Git
+Bash or WSL. CI runs the blocks below exactly as written
+([quickstart.yml](.github/workflows/quickstart.yml)).
 
 ```sh
 git clone https://github.com/PramodBasavarajMenasi/siftwise.git
 cd siftwise
-export SIFTWISE_API_TOKEN=$(openssl rand -hex 32)
-docker compose up -d --build
-curl http://localhost:8000/healthz        # {"status":"ok"}
 ```
 
-Seed history from a repo's past GitHub Actions runs (here rdflib, which uploads one JUnit
-artifact per matrix leg). `GITHUB_TOKEN` needs `actions:read` and `contents:read`:
+**1. Start the server** with Postgres. The API token is a shared secret you choose; it goes in
+`.env`, which `docker compose` reads:
+
+```sh quickstart
+[ -f .env ] || echo "SIFTWISE_API_TOKEN=$(openssl rand -hex 32)" > .env
+docker compose up -d --build --wait     # builds the image, waits until both services are healthy
+curl -fsS http://localhost:8000/healthz # {"status":"ok"}
+```
+
+**2. Install the CLI** (the light install, without the server's dependencies) and give it the
+token:
+
+```sh quickstart
+uv tool install .                       # later: pip install siftwise
+export SIFTWISE_API_TOKEN=$(sed -n 's/^SIFTWISE_API_TOKEN=//p' .env)
+```
+
+If `siftwise` isn't found afterwards, run `uv tool update-shell` once and open a new shell.
+
+**3. Record a first run.** Copy [the example project](examples/quickstart) into a git repo of
+its own, run its tests with a JUnit report, and upload the report:
+
+```sh quickstart
+demo="$(mktemp -d)/shop" && cp -r examples/quickstart "$demo" && cd "$demo"
+git init -q && git add -A && git commit -qm "A shop"
+uv run pytest -q --junitxml=junit.xml
+siftwise record junit.xml --repo demo/shop --branch main --main
+```
+
+**4. Change a file and ask what to run.** `shop/cart.py` changes; only the cart's tests import
+it:
+
+```sh quickstart
+echo "# reviewed the bulk discount" >> shop/cart.py && git commit -qam "Touch the cart"
+siftwise select --repo demo/shop --base HEAD~1 > selected.sh
+cat selected.sh                         # pytest tests/test_cart.py
+uv run sh selected.sh
+```
+
+The command goes to stdout (so `eval "$(siftwise select ...)"` works, or a file as here) and a
+summary to stderr:
+
+```text
+siftwise: python imports: 1 test file(s) import changed modules
+siftwise: selective (2 of 4 known tests): 2 of 4 known tests selected
+```
+
+A change to `shop/prices.py` selects both test files instead (the cart imports prices).
+`--json` prints the full response with a reason per test. Exit codes: 0 ok, 1 API error, 2
+usage error, 3 full suite needed but no command known. `docker compose down` stops the server
+(`down -v` also deletes its data).
+
+**On your own project:** record each CI run's JUnit report (the [GitHub Action](#github-action)
+does it for you, or `siftwise record` below), then call `siftwise select` (or the Action's
+select step) on a change. In CI, check out with `fetch-depth: 0` so the `base...head` diff works;
+if it fails, the full suite runs.
+
+### Install
+
+| Install | What you get | Size |
+|---|---|---|
+| `pip install siftwise` | the CLI: `select`, `record`, `triage`, `report`, `rollup`, and the GitHub Action's steps | 9 MB |
+| `pip install 'siftwise[server]'` | plus the API server: `siftwise server start` and `migrate` (FastAPI, SQLAlchemy, Postgres driver) | 50 MB |
+| `pip install 'siftwise[mcp]'` | plus `siftwise mcp`, for [coding agents](#coding-agents-mcp) | 49 MB |
+
+siftwise isn't on PyPI yet: from a checkout, `uv tool install .` (or `".[server]"`,
+`".[mcp]"`). A command whose extra is missing exits 2 and prints the install command.
+
+### Run the server
+
+With Docker, from a checkout (the image isn't published yet):
+
+```sh
+docker build -t siftwise .
+docker run -d -p 8000:8000 -e SIFTWISE_API_TOKEN=...     -e SIFTWISE_DATABASE_URL=postgresql+psycopg://user:password@db-host:5432/siftwise siftwise
+```
+
+The image (about 80 MB to pull, 350 MB unpacked) runs `siftwise server start` as a non-root
+user: it applies the database migrations, then serves on port 8000. Migrations take a Postgres
+lock, so several replicas can start at once. A Docker health check calls `/healthz`. Without
+Docker: `pip install 'siftwise[server]'`, then `siftwise server start --host 0.0.0.0`
+(`siftwise server migrate` applies the migrations alone).
+
+The quickstart's `docker-compose.yml` publishes the API on `127.0.0.1` only (port
+`SIFTWISE_PORT`, default 8000) and keeps Postgres inside Docker. For CI to reach the server,
+put it behind a reverse proxy with TLS: the token travels in a request header.
+
+**After pulling a new siftwise version, rebuild the image:** `docker compose up -d --build`.
+Compose otherwise keeps the old image. Once the database has a newer migration than that image
+knows, its `siftwise server start` fails with `Can't locate revision ...`, and the container
+restarts in a loop.
+
+### Seed history from past CI runs
+
+Backfill a repo's past GitHub Actions runs (here rdflib, which uploads one JUnit artifact per
+matrix leg) instead of waiting for new ones. `GITHUB_TOKEN` needs `actions:read` and
+`contents:read`:
 
 ```sh
 export GITHUB_TOKEN=...
-uv run python scripts/backfill.py --repo RDFLib/rdflib --workflow validate.yaml \
-    --artifact-pattern '*-pytest-junit-xml' --max-runs 20 --batch
+uv run python scripts/backfill.py --repo RDFLib/rdflib --workflow validate.yaml     --artifact-pattern '*-pytest-junit-xml' --max-runs 20 --batch
 ```
-
-Install the CLI and ask for a test command in a checkout of that repo:
-
-```sh
-uv tool install .                          # puts `siftwise` on your PATH
-cd .. && git clone https://github.com/RDFLib/rdflib.git && cd rdflib
-siftwise select --repo RDFLib/rdflib --base HEAD~1
-```
-
-The command goes to stdout (so `eval "$(siftwise select ...)"` works) and a summary to stderr:
-
-```text
-siftwise: python imports: 325 test file(s) import changed modules
-siftwise: selective (11448 of 11516 known tests): 11448 of 11516 known tests selected
-pytest test/data/suites/trix/test_trix.py test/jsonld/test_api.py ...
-```
-
-`--json` prints the full response with per-test reasons. Exit codes: 0 ok, 1 API error, 2 usage
-error, 3 full suite needed but no command known. In CI, check out with `fetch-depth: 0` so the
-`base...head` diff works; if it fails, the full suite runs.
 
 ### Record results from CI
 
@@ -255,7 +329,8 @@ state: each call computes the change in the agent's checkout, with the same code
 - **Compact output.** Each result stays under 8,000 characters (long lists end with a
   `more_*` count). The API token never appears in a result.
 
-**Install** the CLI with the `mcp` extra, from a siftwise checkout:
+**Install** the CLI with the `mcp` extra (`pip install 'siftwise[mcp]'` once it's on PyPI;
+until then from a siftwise checkout, see [Install](#install)):
 
 ```sh
 uv tool install ".[mcp]"     # siftwise lands in ~/.local/bin (Windows: %USERPROFILE%\.local\bin)
@@ -263,7 +338,7 @@ uv tool update-shell         # once, if that directory isn't on your PATH; then 
 uv tool dir --bin            # prints the directory, for a full path in the configs below
 ```
 
-`siftwise mcp` without the extra exits 2 with this install command. The agent starts the
+`siftwise mcp` without the extra exits 2 with the install command. The agent starts the
 server in its working directory: open the agent in the repository (any directory inside the
 checkout works). It reads `SIFTWISE_SERVER` and `SIFTWISE_API_TOKEN`, and optionally
 `SIFTWISE_REPO` (default: `owner/name` from the `origin` remote) and `SIFTWISE_BASE_REF`
@@ -342,10 +417,11 @@ re-run `flaky` ones, and leave `pre_existing` ones (already failing on main).
 
 ## GitHub Action
 
-Three composite actions in this repo. They install the CLI from the action's own checkout
-(siftwise isn't on PyPI yet), and they never block CI: if the server is unreachable, times out
-or returns an error, `select` outputs `mode: full` and `record`/`rollup` log a warning. The
-only exception is [`fail-on`](#fail-on), which you opt into.
+Three composite actions in this repo. They install the light CLI from the action's own
+checkout (siftwise isn't on PyPI yet; without the server's dependencies), and they never
+block CI: if the server is unreachable, times out or returns an error, `select` outputs
+`mode: full` and `record`/`rollup` log a warning. The only exception is [`fail-on`](#fail-on),
+which you opt into.
 
 | Action | When | What |
 |---|---|---|
@@ -727,6 +803,7 @@ list ([Flaky tests](#flaky-tests)).
 | Variable | Used by | Default |
 |---|---|---|
 | `SIFTWISE_API_TOKEN` | server (required: if unset, every endpoint but `/healthz` returns 503) and clients | none |
+| `SIFTWISE_SERVER` | clients: the CLI's `--server`, MCP, the Action's steps | `http://localhost:8000` |
 | `SIFTWISE_DATABASE_URL` | server | `postgresql+psycopg://siftwise:siftwise@localhost:5432/siftwise` |
 | `SIFTWISE_STATS_WINDOW_DAYS` | server: per-test stats window (0 = all history) | `90` |
 | `SIFTWISE_MAX_UPLOAD_BYTES` | server: request body limit | 50 MB |
@@ -766,16 +843,23 @@ list ([Flaky tests](#flaky-tests)).
 ## Development
 
 ```sh
-uv sync                                   # install deps, incl. the dev group
-docker compose up -d postgres             # Postgres on :5432, plus a siftwise_test database
-cp .env.example .env
+uv sync                                   # deps, the dev group and every extra
+cp .env.example .env                      # set SIFTWISE_API_TOKEN
+# Postgres on :5432 plus a siftwise_test database (the quickstart file + dev additions):
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
 uv run alembic upgrade head
 uv run uvicorn siftwise.api.main:app --reload
 
 uv run ruff check && uv run ruff format --check
 uv run mypy src tests scripts
 SIFTWISE_TEST_DATABASE_URL=postgresql+psycopg://siftwise:siftwise@localhost:5432/siftwise_test uv run pytest
+uv build && uv run --no-project python scripts/check_dist.py   # the package checks CI runs
 ```
+
+After pulling a new siftwise version, rebuild the compose stack's API image too:
+`docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build`. Once
+`uv run alembic upgrade head` has applied a migration the old image doesn't have, that image
+fails at start with `Can't locate revision ...` and restarts in a loop.
 
 Database tests are skipped when `SIFTWISE_TEST_DATABASE_URL` is unset. After upgrading an existing
 database past migration 0005, run `POST /repos/{repo}/rollup` once per repo. Migration 0006
@@ -791,10 +875,11 @@ on a backfilled repo with `uv run python -m scripts.eval.run_eval --repo owner/n
 - **Done:** recording and history, test selection with import graphs and safe fallbacks, the
   GitHub Action, failure triage with verdicts in the PR comment and `fail-on`, the MCP server,
   the triage eval, [shadow mode](#shadow-mode) with `siftwise report` (by week too), miss
-  causes, and [flaky handling](#flaky-tests) (`known_flaky`, `rerun-unknown`).
-- **Next:** performance (batched triage and rollup queries), packaging (a light CLI, a Docker
-  image) and dogfooding: shadow mode on siftwise and another repo, for real recall data.
-- **Then:** a `v0.1.0` release on PyPI, docs and launch.
+  causes, [flaky handling](#flaky-tests) (`known_flaky`, `rerun-unknown`), performance
+  (batched triage, faster select and ingest) and packaging (a light CLI, a server image, the
+  quickstart).
+- **Next:** dogfooding: shadow mode on siftwise and another repo, for real recall data.
+- **Then:** a `v0.1.0` release on PyPI and GHCR, docs and launch; an arm64 server image.
 
 ## Contributing
 

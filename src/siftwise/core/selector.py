@@ -62,12 +62,14 @@ import shlex
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
-from sqlalchemy import text
-from sqlalchemy.orm import Session
-
+from siftwise.core.codes import FAILED_CODES_SQL
 from siftwise.core.junit import normalize_path
-from siftwise.core.models import FAILED_CODES_SQL
+
+if TYPE_CHECKING:
+    # The light CLI (no server extra) imports this module: SQLAlchemy only where it's used.
+    from sqlalchemy.orm import Session
 
 
 class Mode(StrEnum):
@@ -1241,6 +1243,8 @@ def load_history(
     tests are therefore as fresh as the rollup (stale between a deferred batch ingest and
     ``POST /repos/{repo}/rollup``).
     """
+    from sqlalchemy import text
+
     config = config or SelectorConfig()
     repo_id = session.execute(
         text("SELECT id FROM repos WHERE name = :name"), {"name": repo}

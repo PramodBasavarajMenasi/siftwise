@@ -1,13 +1,16 @@
 """Data migrations, run on their own scratch database (the shared test database stays at head)."""
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
 import pytest
 from alembic import command
+from alembic.script import ScriptDirectory
 from sqlalchemy import Engine, create_engine, make_url, text
 from sqlalchemy.orm import Session
 
+from siftwise import migrate
 from siftwise.core.history import recompute_repo_stats
 from tests.conftest import alembic_config
 
@@ -131,3 +134,50 @@ def test_0006_converts_results_in_place_and_back(scratch_engine: tuple[Engine, s
         ("t::b", None),
     ]
     assert next_id == len(before) + 1  # the id sequence continues after the restored rows
+
+
+# --- siftwise server migrate ---------------------------------------------------------------
+
+
+HEAD = ScriptDirectory.from_config(migrate.alembic_config()).get_current_head()
+
+
+def revision(engine: Engine) -> str | None:
+    with engine.connect() as connection:
+        if not connection.scalar(text("SELECT to_regclass('alembic_version') IS NOT NULL")):
+            return None
+        version: str | None = connection.scalar(text("SELECT version_num FROM alembic_version"))
+        return version
+
+
+def test_migrate_upgrades_a_fresh_database_from_the_package(
+    scratch_engine: tuple[Engine, str],
+) -> None:
+    engine, url = scratch_engine
+
+    migrate.upgrade(url)
+    migrate.upgrade(url)  # nothing left to do
+
+    assert HEAD is not None and revision(engine) == HEAD
+
+
+def test_migrate_waits_for_another_replica_holding_the_lock(
+    scratch_engine: tuple[Engine, str],
+) -> None:
+    engine, url = scratch_engine
+    lock = dict(zip(("ns", "key"), migrate.MIGRATION_LOCK, strict=True))
+
+    with engine.connect() as other, ThreadPoolExecutor(max_workers=1) as pool:
+        other.execute(text("SELECT pg_advisory_lock(:ns, :key)"), lock)
+        other.commit()
+        replica = pool.submit(migrate.upgrade, url)
+        try:
+            with pytest.raises(TimeoutError):
+                replica.result(timeout=1.5)  # blocked on the lock...
+            assert revision(engine) is None  # ...having migrated nothing
+        finally:
+            other.execute(text("SELECT pg_advisory_unlock(:ns, :key)"), lock)
+            other.commit()
+        replica.result(timeout=120)  # then runs, and raises if it failed
+
+    assert revision(engine) == HEAD
