@@ -29,7 +29,7 @@ jobs:
       SIFTWISE_TEST_DATABASE_URL: postgresql+psycopg://siftwise:siftwise@localhost:5432/siftwise_test
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Start PostgreSQL
         run: |
@@ -40,7 +40,7 @@ jobs:
             -c "CREATE ROLE siftwise LOGIN SUPERUSER PASSWORD 'siftwise'"
           sudo -u postgres createdb -O siftwise siftwise_test
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
@@ -63,9 +63,9 @@ jobs:
     name: package (build, twine check, light/server/mcp installs)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
 

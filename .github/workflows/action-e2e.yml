@@ -40,7 +40,7 @@ jobs:
       HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         id: checkout
         with:
           fetch-depth: 0  # select diffs against the PR base
@@ -54,7 +54,7 @@ jobs:
           sudo -u postgres createdb -O siftwise siftwise
           sudo -u postgres createdb -O siftwise siftwise_test
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
           enable-cache: true
@@ -545,7 +545,7 @@ jobs:
     # select can't diff a shallow clone: its one deliberate failure, with a clear message.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4  # fetch-depth 1
+      - uses: actions/checkout@v7  # fetch-depth 1
       - name: Select on a shallow clone
         id: select
         continue-on-error: true
