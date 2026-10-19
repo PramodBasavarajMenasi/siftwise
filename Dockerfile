@@ -3,7 +3,7 @@
 # non-root user. Bases are pinned by digest; Dependabot proposes updates weekly. The build and
 # runtime stages must use the same python image (the venv links to its interpreter).
 
-FROM ghcr.io/astral-sh/uv:0.11.3@sha256:90bbb3c16635e9627f49eec6539f956d70746c409209041800a0280b93152823 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.1@sha256:4a1f3666816dafadd20ceb71eac9a7d56d7ef30279f7d64048519ab901ada336 AS uv
 
 # --- build: the server extra into /app/.venv, siftwise installed as a wheel (no source tree) ---
 FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258 AS build
