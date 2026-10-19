@@ -878,8 +878,9 @@ on a backfilled repo with `uv run python -m scripts.eval.run_eval --repo owner/n
   causes, [flaky handling](#flaky-tests) (`known_flaky`, `rerun-unknown`), performance
   (batched triage, faster select and ingest) and packaging (a light CLI, a server image, the
   quickstart).
-- **Next:** dogfooding: shadow mode on siftwise and another repo, for real recall data.
-- **Then:** a `v0.1.0` release on PyPI and GHCR, docs and launch; an arm64 server image.
+- **Next:** a `v0.1.0` release on PyPI and GHCR, docs and launch; an arm64 server image.
+- **After launch:** live dogfooding: shadow mode on siftwise's own CI with a hosted server,
+  with published live recall numbers.
 
 ## Contributing
 
