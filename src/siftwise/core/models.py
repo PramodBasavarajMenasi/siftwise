@@ -28,7 +28,7 @@ from sqlalchemy import (
     text,
     true,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, column_property, mapped_column
 
@@ -240,3 +240,106 @@ class TestStats(Base):
     last_seen_run_id: Mapped[int | None] = mapped_column(BigInteger)
     # Test file as reported in the window (latest non-null), for the selector's commands.
     file_path: Mapped[str | None] = mapped_column(Text)
+
+
+# --- shadow mode ----------------------------------------------------------------------------
+
+# Why a stored shadow selection was or wasn't compared (``shadow_selections.status``).
+SHADOW_PENDING = "pending"  # no compare yet (in progress, or it never ran: see core/shadow.py)
+SHADOW_COMPARED = "compared"
+SHADOW_NO_UPLOAD = "no_upload"  # compared, but nothing was recorded for its variant
+SHADOW_COMMIT_MISMATCH = "commit_mismatch"  # the recorded run tested another commit
+SHADOW_COMPARE_ERROR = "compare_error"  # the server failed while comparing
+SHADOW_STATUSES = (
+    SHADOW_PENDING,
+    SHADOW_COMPARED,
+    SHADOW_NO_UPLOAD,
+    SHADOW_COMMIT_MISMATCH,
+    SHADOW_COMPARE_ERROR,
+)
+SHADOW_UNIQUE_INDEX = "uq_shadow_selections_repo_ci_run_attempt_variant"
+
+
+class ShadowSelection(Base):
+    """What siftwise would have selected for a shadow run (one that ran the full suite), as
+    ``selector.SelectionScope``: enough for ``WouldRun`` to tell whether a test would have run.
+    One per CI run attempt and variant; a NULL variant applies to every leg."""
+
+    __tablename__ = "shadow_selections"
+    __table_args__ = (
+        Index(
+            SHADOW_UNIQUE_INDEX,
+            "repo_id",
+            "ci_run_id",
+            "run_attempt",
+            text("COALESCE(variant, '')"),
+            unique=True,
+        ),
+        Index(None, "repo_id", "created_at"),
+        CheckConstraint("mode IN ('full', 'selective')", name="mode"),
+        CheckConstraint(
+            "status IN (" + ", ".join(f"'{s}'" for s in SHADOW_STATUSES) + ")", name="status"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    repo_id: Mapped[int] = mapped_column(ForeignKey("repos.id", ondelete="CASCADE"))
+    ci_run_id: Mapped[str] = mapped_column(String(255))
+    run_attempt: Mapped[int] = mapped_column(Integer)
+    variant: Mapped[str | None] = mapped_column(String(255))
+    commit_sha: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    mode: Mapped[str] = mapped_column(String(16))
+    reason: Mapped[str] = mapped_column(Text)
+    # tests.id of the selected tests (all come from history), and the Go-runner subset of them.
+    selected_keys: Mapped[list[int]] = mapped_column(ARRAY(Integer))
+    go_selected_keys: Mapped[list[int]] = mapped_column(ARRAY(Integer))
+    go_packages: Mapped[list[str]] = mapped_column(ARRAY(Text))
+    python_files: Mapped[list[str]] = mapped_column(ARRAY(Text))
+    selected_count: Mapped[int] = mapped_column(Integer)
+    total_known: Mapped[int] = mapped_column(Integer)
+    estimated_ms_total: Mapped[float] = mapped_column(Float)
+    estimated_ms_would_run: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(32), server_default=SHADOW_PENDING)
+    compared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ShadowResult(Base):
+    """One recorded run (variant) of a shadow CI run attempt, compared with its selection.
+    Flaky failures are counted apart: neither caught nor missed."""
+
+    __tablename__ = "shadow_results"
+
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    selection_id: Mapped[int] = mapped_column(
+        ForeignKey("shadow_selections.id", ondelete="CASCADE"), index=True
+    )
+    compared_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    failing: Mapped[int] = mapped_column(Integer)
+    caught: Mapped[int] = mapped_column(Integer)
+    missed: Mapped[int] = mapped_column(Integer)
+    flaky: Mapped[int] = mapped_column(Integer)
+    # Measured in this (full-suite) run: final attempts' durations, Go subtests left out.
+    tests_total: Mapped[int] = mapped_column(Integer)
+    tests_would_run: Mapped[int] = mapped_column(Integer)
+    ms_total: Mapped[float] = mapped_column(Float)
+    ms_would_run: Mapped[float] = mapped_column(Float)
+
+
+class ShadowFailure(Base):
+    """Every failing test of a compared shadow run: whether the selection would have run it,
+    and triage's verdict (flaky ones are not misses)."""
+
+    __tablename__ = "shadow_failures"
+
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("shadow_results.run_id", ondelete="CASCADE"), primary_key=True
+    )
+    test_key: Mapped[int] = mapped_column(
+        ForeignKey("tests.id", ondelete="CASCADE"), primary_key=True
+    )
+    would_run: Mapped[bool] = mapped_column(Boolean)
+    verdict: Mapped[str] = mapped_column(String(32))
+    confidence: Mapped[str] = mapped_column(String(16))

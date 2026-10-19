@@ -580,22 +580,44 @@ def _select(
     )
 
 
+@dataclass(frozen=True)
+class SelectionScope:
+    """Everything ``WouldRun`` reads from a selection: what shadow mode stores, so a stored
+    selection answers "would this test have run?" with the same matching."""
+
+    full: bool
+    test_ids: frozenset[str] = frozenset()
+    # The selected tests with the Go runner: their command is `go test -run '^(TestX)$'`.
+    go_test_ids: frozenset[str] = frozenset()
+    go_packages: frozenset[str] = frozenset()
+    python_files: frozenset[str] = frozenset()
+
+    @classmethod
+    def of(cls, selection: Selection) -> SelectionScope:
+        return cls(
+            full=selection.mode is Mode.FULL,
+            test_ids=frozenset(t.test_id for t in selection.tests),
+            go_test_ids=frozenset(t.test_id for t in selection.tests if t.runner is Runner.GO),
+            go_packages=frozenset(selection.go_packages_run_whole),
+            python_files=frozenset(selection.python_files_run_whole),
+        )
+
+
 class WouldRun:
     """Whether a selection's commands would execute a test, including tests that history
     doesn't name: everything in a Python file or Go package run whole, and the subtests of a
     Go test selected with ``-run``. Precomputed, for many lookups."""
 
-    def __init__(self, selection: Selection) -> None:
-        self.full = selection.mode is Mode.FULL
-        self.selected = {t.test_id for t in selection.tests}
-        self.go_packages = set(selection.go_packages_run_whole)
-        self.py_files = set(selection.python_files_run_whole)
+    def __init__(self, selection: Selection | SelectionScope) -> None:
+        scope = selection if isinstance(selection, SelectionScope) else SelectionScope.of(selection)
+        self.full = scope.full
+        self.selected = scope.test_ids
+        self.go_packages = scope.go_packages
+        self.py_files = scope.python_files
         # go test -run '^(TestX)$' runs TestX with all of its subtests.
         self.go_top_level = {
             (package, name.split("/", 1)[0])
-            for t in selection.tests
-            if t.runner is Runner.GO
-            for package, _, name in [t.test_id.partition("::")]
+            for package, _, name in (test_id.partition("::") for test_id in scope.go_test_ids)
         }
 
     def __call__(self, test_id: str) -> bool:
@@ -616,7 +638,7 @@ def _with_estimate(selection: Selection, history: RepoHistory | None) -> Selecti
     runs = WouldRun(selection)
     total = would_run = 0.0
     for test in history.tests.values():
-        if not test.avg_duration_ms or _is_go_subtest(test.test_id):
+        if not test.avg_duration_ms or is_go_subtest(test.test_id):
             continue
         total += test.avg_duration_ms
         if runs(test.test_id):
@@ -742,7 +764,7 @@ def change_links(
     return {test_id: tuple(links) for test_id, links in found.items()}
 
 
-def _is_go_subtest(test_id: str) -> bool:
+def is_go_subtest(test_id: str) -> bool:
     classname, _, name = test_id.partition("::")
     return "/" in name and _looks_like_go(classname, name)
 

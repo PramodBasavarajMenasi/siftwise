@@ -278,6 +278,93 @@ def triage_command(
         raise typer.Exit(EXIT_FAIL_ON)
 
 
+@app.command("report")
+def report_command(
+    repo: Annotated[str, typer.Option(help="Repository name in siftwise, e.g. acme/shop.")],
+    days: Annotated[int, typer.Option(min=1, max=365, help="Shadow runs of the last N days.")] = 30,
+    server: Annotated[str, typer.Option(help="siftwise server URL.")] = "http://localhost:8000",
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the full API response as JSON.")
+    ] = False,
+) -> None:
+    """Live recall from shadow runs: how many failures the selection would have caught or
+    missed, over every shadow run and over selective ones only, and the time it would have
+    saved. Needs SIFTWISE_API_TOKEN. Exit codes: 0 ok, 1 API error, 2 usage error."""
+    token = _token()
+    try:
+        result = get_json(server, token, f"/repos/{repo}/recall", {"days": days})
+    except SiftwiseError as exc:
+        _err(f"error: {exc}")
+        raise typer.Exit(EXIT_API_ERROR) from exc
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    for line in recall_lines(result):
+        typer.echo(line)
+
+
+def recall_lines(result: dict[str, Any]) -> list[str]:
+    """``siftwise report``'s text. The all-runs recall never appears without the selective
+    one: full-suite fallbacks catch everything and flatter it."""
+    every, selective = result["all"], result["selective"]
+    lines = [
+        f"Recall {_recall(every)} over {_plural(every['runs'], 'shadow run')}; "
+        f"selective runs only: {_recall(selective)} over {selective['runs']}",
+    ]
+    if every["flaky_excluded"]:
+        lines.append(f"Flaky failures not counted: {every['flaky_excluded']} (all runs), "
+                     f"{selective['flaky_excluded']} (selective)")  # fmt: skip
+    if every["missed"]:
+        lines.append(f"Missed by verdict: {_verdicts(every['missed_by_verdict'])} (all runs); "
+                     f"{_verdicts(selective['missed_by_verdict'])} (selective)")  # fmt: skip
+    time = result["time"]
+    if time["saved"] is not None:
+        lines.append(f"Time saved (measured on the shadow runs): {time['saved']:.1%} of "
+                     f"{_minutes(time['total_ms'])}")  # fmt: skip
+    lines.append(f"Full-suite shadow runs (siftwise would have run everything): "
+                 f"{result['full_runs']}")  # fmt: skip
+    not_counted = {reason: n for reason, n in result["not_counted"].items() if n}
+    if not_counted or result["in_progress"]:
+        parts = [f"{n} {reason.replace('_', ' ')}" for reason, n in not_counted.items()]
+        if result["in_progress"]:
+            parts.append(f"{result['in_progress']} in progress")
+        lines.append(f"Not counted: {', '.join(parts)}")
+    if result["misses"]:
+        lines.append("")
+        lines.append("Misses, newest first:")
+        for miss in result["misses"]:
+            variants = ", ".join(v or "-" for v in miss["variants"])
+            lines.append(f"  {miss['at'][:10]}  {miss['verdict']:<14} {miss['test_id']}  "
+                         f"(run {miss['ci_run_id']} attempt {miss['run_attempt']}, "
+                         f"{miss['commit_sha'][:7]}, {variants})")  # fmt: skip
+        if result["misses_truncated"]:
+            lines.append("  ... more not shown (--json has the first 100)")
+    return lines
+
+
+def _recall(stats: dict[str, Any]) -> str:
+    counted = stats["caught"] + stats["missed"]
+    if not counted:
+        return "n/a (no failures)"
+    return f"{stats['recall']:.1%} ({stats['caught']} of {counted})"
+
+
+def _verdicts(counts: dict[str, int]) -> str:
+    words = {"pre_existing": "pre-existing"}
+    return ", ".join(
+        f"{n} {words.get(verdict, verdict.replace('_', ' '))}" for verdict, n in counts.items()
+    )
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def _minutes(ms: float) -> str:
+    minutes = ms / 60_000
+    return f"{minutes:.1f} min" if minutes < 120 else f"{minutes / 60:.1f} h"
+
+
 @app.command("mcp")
 def mcp_command() -> None:
     """Serve siftwise's tools to coding agents over MCP (stdio): select_tests, triage_failure,
@@ -450,6 +537,22 @@ def post_json(
         response = httpx.post(
             f"{server.rstrip('/')}{path}",
             json=body,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=timeout,
+        )
+    except httpx.HTTPError as exc:
+        raise SiftwiseError(f"could not reach siftwise at {server}: {exc}") from exc
+    return _ok(response)
+
+
+def get_json(
+    server: str, token: str, path: str, params: dict[str, Any] | None = None, timeout: float = 60
+) -> dict[str, Any]:
+    """GET from the siftwise API. Raises SiftwiseError on any transport or HTTP error."""
+    try:
+        response = httpx.get(
+            f"{server.rstrip('/')}{path}",
+            params=params,
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout,
         )
