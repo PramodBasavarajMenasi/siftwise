@@ -616,230 +616,314 @@ def load_histories(
     window_days: int = 90,
     run_links: RunLinks | None = None,
 ) -> Histories | None:
-    """Each test's history before the cut-off, or None if the repo is unknown.
+    """Each test's history before the cut-off, or None if the repo is unknown: the one-target
+    case of ``load_histories_many``."""
+    loaded = load_histories_many(session, [(target, test_ids)], window_days, run_links)
+    return None if loaded is None else loaded[0]
 
-    A fixed number of batched queries, whatever the number of tests: the cut-off, the window's
-    runs (metadata only), test keys, which tests have any earlier result, their failures (a
-    partial index by test), the outcomes those failures need for flaky evidence (primary-key
-    probes), main outcomes of this variant newest first (in at most three rounds, plus one
-    look before the window for streaks older than it) and the changes of the runs that flaky
-    evidence depends on. Passing results are only read by primary key, for named runs.
+
+def load_histories_many(
+    session: Session,
+    requests: Sequence[tuple[Target, Sequence[str]]],
+    window_days: int = 90,
+    run_links: RunLinks | None = None,
+) -> list[Histories] | None:
+    """Each target's tests' histories before its own cut-off (in ``requests`` order), or None
+    if the repo is unknown. Every target must be in the same repo.
+
+    A fixed number of batched queries, whatever the number of targets and tests: the cut-offs,
+    the runs before them (metadata only, each tagged with the targets whose window it is in),
+    test keys, which tests have any earlier result, their failures (a partial index by test),
+    the outcomes flaky evidence needs (primary-key probes), main outcomes newest first (at most
+    three rounds, each run read once for every target's keys, plus one look before the
+    windows for streaks older than them), the changes of the runs that flaky evidence depends
+    on, and the targets' own re-runs. Each target then keeps only its own history (its
+    cut-off, its attempt left out, its window), exactly as if it had been loaded alone.
+    Passing results are only read by primary key, for named runs.
     """
+    if not requests:
+        return []
+    repos = {target.repo for target, _ in requests}
+    if len(repos) != 1:
+        raise ValueError(f"targets of one repo only, got {sorted(repos)}")
     session.execute(text("SET LOCAL jit = off"))  # compiling costs more than these queries
     repo_id = session.execute(
-        text("SELECT id FROM repos WHERE name = :name"), {"name": target.repo}
+        text("SELECT id FROM repos WHERE name = :name"), {"name": repos.pop()}
     ).scalar_one_or_none()
     if repo_id is None:
         return None
-
-    cut_at = target.as_of or datetime.now(UTC)
-    if cut_at.tzinfo is None:
-        cut_at = cut_at.replace(tzinfo=UTC)
-    cut_id, run_id, has_reruns = _NO_RUN, None, False
-    if target.ci_run_id is not None:
-        row = session.execute(
-            text(
-                "SELECT r.id, COALESCE(r.started_at, r.created_at), EXISTS ("
-                "  SELECT 1 FROM runs x WHERE x.repo_id = r.repo_id AND x.ci_run_id = r.ci_run_id"
-                "  AND x.run_attempt = r.run_attempt AND COALESCE(x.variant, '') = :variant"
-                "  AND x.rerun > 0 AND x.commit_sha = r.commit_sha)"
-                " FROM runs r WHERE r.repo_id = :repo_id"
-                " AND r.ci_run_id = :ci AND r.run_attempt = :attempt"
-                " AND COALESCE(r.variant, '') = :variant AND r.rerun = 0"
-            ),
-            {
-                "repo_id": repo_id,
-                "ci": target.ci_run_id,
-                "attempt": target.run_attempt,
-                "variant": target.variant or "",
-            },
-        ).first()
-        if row is not None:
-            run_id, cut_at, cut_id, has_reruns = row[0], row[1], row[0], row[2]
-    params: dict[str, Any] = {
-        "repo_id": repo_id,
-        "cut_at": cut_at,
-        "cut_id": cut_id,
-        "ci_run_id": target.ci_run_id,
-        "run_attempt": target.run_attempt,
-    }
-
+    now = datetime.now(UTC)
+    loads = [_Load.of(i, target, test_ids, now) for i, (target, test_ids) in enumerate(requests)]
     days = window_days if window_days > 0 else _ALL_HISTORY_DAYS
-    runs = {
-        row[0]: _Run(*row)
-        for row in session.execute(
-            text(
-                f"""
-                WITH before AS MATERIALIZED (
-                    SELECT r.id, r.commit_sha, r.branch, r.is_main, r.variant,
-                           COALESCE(r.started_at, r.created_at) AS run_at, r.ci_run_id,
-                           r.changed_files_known, r.affected IS NOT NULL AS has_links, r.rerun
-                    FROM runs r WHERE r.repo_id = :repo_id AND {_BEFORE}
-                )
-                SELECT * FROM before
-                WHERE run_at >= (SELECT max(run_at) FROM before) - make_interval(days => :days)
-                """
-            ),
-            {**params, "days": days},
-        )
-    }
-    window_start = max(r.run_at for r in runs.values()) - timedelta(days=days) if runs else cut_at
-
-    keys: dict[int, str] = {}
-    paths: dict[str, str | None] = {}
-    for key, test_id, file_path, file_path_at in session.execute(
-        text(
-            "SELECT id, test_id, file_path, file_path_at FROM tests"
-            " WHERE repo_id = :repo_id AND test_id = ANY(:ids)"
-        ),
-        {"repo_id": repo_id, "ids": list(dict.fromkeys(test_ids))},
-    ):
-        keys[key] = test_id
-        # A path reported by the triaged run or a later one would be peeking.
-        paths[test_id] = file_path if file_path_at is not None and file_path_at < cut_at else None
-    seen: set[int] = set()
-    if keys:
-        seen.update(
-            session.scalars(
-                text(
-                    f"""
-                    SELECT k.key FROM unnest(CAST(:keys AS integer[])) AS k(key)
-                    WHERE EXISTS (SELECT 1 FROM test_results tr JOIN runs r ON r.id = tr.run_id
-                                  WHERE tr.test_key = k.key AND {_BEFORE})
-                    """
-                ),
-                {**params, "keys": list(keys)},
-            )
-        )
-
-    builder = _Builder(session, target, runs, params, window_start, run_links)
-    histories = builder.build(seen, keys, paths)
-    if has_reruns and keys:
-        _add_reruns(session, params, target, keys, histories)
-    return Histories(cut_at, run_id, histories)
+    batch = _Batch(session, repo_id, loads, days, run_links)
+    batch.cut_offs()
+    batch.load_runs()
+    batch.load_tests()
+    batch.build()
+    batch.add_reruns()
+    return [Histories(load.cut_at, load.run_id, load.histories) for load in loads]
 
 
-def _add_reruns(
-    session: Session,
-    params: Mapping[str, Any],
-    target: Target,
-    keys: Mapping[int, str],
-    histories: dict[str, TestHistory],
-) -> None:
-    """The triaged attempt's own re-runs of its variant: rule 1's "same code, different
-    outcome". Re-runs come after the run, so this is the one read past the cut-off."""
-    passes: dict[str, list[int]] = defaultdict(list)
-    failures: dict[str, list[int]] = defaultdict(list)
-    for rerun, key, outcome in session.execute(
-        text(
-            f"""
-            SELECT r.rerun, tr.test_key, {_OUTCOME}
-            FROM runs r JOIN test_results tr ON tr.run_id = r.id
-            WHERE r.repo_id = :repo_id AND r.ci_run_id = :ci_run_id
-              AND r.run_attempt = :run_attempt AND COALESCE(r.variant, '') = :variant
-              AND r.rerun > 0 AND r.commit_sha = :commit
-              AND tr.test_key = ANY(CAST(:keys AS integer[]))
-            GROUP BY r.id, r.rerun, tr.test_key
-            ORDER BY r.rerun
-            """
-        ),
-        {
-            **params,
-            "variant": target.variant or "",
-            "commit": target.commit_sha,
-            "keys": sorted(keys),
-        },
-    ):
-        if outcome == PASSED_CODE:
-            passes[keys[key]].append(rerun)
-        elif outcome in _FAILED:
-            failures[keys[key]].append(rerun)
-    for test_id in passes.keys() | failures.keys():
-        histories[test_id] = replace(
-            histories[test_id],
-            rerun_passes=tuple(passes[test_id]),
-            rerun_failures=tuple(failures[test_id]),
-        )
+@dataclass
+class _Load:
+    """One target of a batched load, and what was loaded for it."""
+
+    idx: int
+    target: Target
+    test_ids: list[str]  # unique, in request order
+    cut_at: datetime
+    cut_id: int = _NO_RUN
+    run_id: int | None = None
+    has_reruns: bool = False
+    runs: dict[int, _Run] = field(default_factory=dict)
+    window_start: datetime | None = None
+    keys: dict[int, str] = field(default_factory=dict)
+    paths: dict[str, str | None] = field(default_factory=dict)
+    seen: set[int] = field(default_factory=set)
+    histories: dict[str, TestHistory] = field(default_factory=dict)
+
+    @classmethod
+    def of(cls, idx: int, target: Target, test_ids: Sequence[str], now: datetime) -> _Load:
+        cut_at = target.as_of or now
+        if cut_at.tzinfo is None:
+            cut_at = cut_at.replace(tzinfo=UTC)
+        return cls(idx, target, list(dict.fromkeys(test_ids)), cut_at)
 
 
-class _Builder:
-    """The batched queries behind ``load_histories``, for the seen tests."""
+# The targets of a batch as a table, ``t(idx, cut_at, cut_id, ci, attempt, variant,
+# window_start, commit)``, and the cut-off condition (``_BEFORE``) per target.
+_TARGETS = """
+    unnest(CAST(:t_idx AS integer[]), CAST(:t_cut_at AS timestamptz[]),
+           CAST(:t_cut_id AS bigint[]), CAST(:t_ci AS text[]), CAST(:t_attempt AS integer[]),
+           CAST(:t_variant AS text[]), CAST(:t_window_start AS timestamptz[]),
+           CAST(:t_commit AS text[]))
+        AS t(idx, cut_at, cut_id, ci, attempt, variant, window_start, commit)
+"""
+_BEFORE_T = """
+    (COALESCE(r.started_at, r.created_at), r.id) < (t.cut_at, t.cut_id)
+    AND (t.ci IS NULL OR r.ci_run_id IS DISTINCT FROM t.ci OR r.run_attempt <> t.attempt)
+"""
+
+
+class _Batch:
+    """The queries behind ``load_histories_many``: each reads the union of what the targets
+    need; each target's ``_Builder`` keeps its own part."""
 
     def __init__(
         self,
         session: Session,
-        target: Target,
-        runs: dict[int, _Run],
-        params: dict[str, Any],
-        window_start: datetime,
-        run_links: RunLinks | None = None,
+        repo_id: int,
+        loads: list[_Load],
+        days: int,
+        run_links: RunLinks | None,
     ) -> None:
         self.session = session
+        self.repo_id = repo_id
+        self.loads = loads
+        self.days = days
         self.run_links = run_links
-        self.target = target
-        self.runs = runs
-        self.params = params
-        self.window_start = window_start
-        self.by_pair: dict[tuple[str, str | None], list[_Run]] = defaultdict(list)
-        self.by_branch: dict[tuple[str, str | None], list[_Run]] = defaultdict(list)
-        for run in sorted(runs.values(), key=lambda r: r.order):
-            self.by_pair[(run.commit_sha, run.variant)].append(run)
-            self.by_branch[(run.branch, run.variant)].append(run)
-        self.branch_pos = {
-            run.id: i for runs_ in self.by_branch.values() for i, run in enumerate(runs_)
+
+    def _targets(self, loads: Sequence[_Load] | None = None) -> dict[str, Any]:
+        loads = self.loads if loads is None else loads
+        return {
+            "t_idx": [load.idx for load in loads],
+            "t_cut_at": [load.cut_at for load in loads],
+            "t_cut_id": [load.cut_id for load in loads],
+            "t_ci": [load.target.ci_run_id for load in loads],
+            "t_attempt": [load.target.run_attempt for load in loads],
+            "t_variant": [load.target.variant for load in loads],
+            "t_window_start": [load.window_start or load.cut_at for load in loads],
+            "t_commit": [load.target.commit_sha for load in loads],
         }
 
-    def build(
-        self, seen: set[int], keys: dict[int, str], paths: dict[str, str | None]
-    ) -> dict[str, TestHistory]:
-        histories = {
-            test_id: TestHistory(file_path=paths.get(test_id)) for test_id in keys.values()
-        }
-        if not seen:
-            return histories
-        failures = self._failures(seen)  # (run, key) with any failed attempt, in the window
-        commit = self.target.commit_sha
-        same_commit = self.by_pair.get((commit, self.target.variant), []) if commit else []
-        next_runs = {run_id: nxt for run_id, _ in failures if (nxt := self._next_on_branch(run_id))}
-        pairs = {(r.id, k) for k in seen for r in same_commit}
-        for run_id, key in failures:
-            run = self.runs[run_id]
-            pairs.update((r.id, key) for r in self.by_pair[(run.commit_sha, run.variant)])
-            if run_id in next_runs:
-                pairs.add((next_runs[run_id].id, key))
-        outcomes = self._outcomes(pairs)
-        main = self._main(seen)
-        unrelated = self._unrelated_fail_then_pass(failures, next_runs, outcomes, keys, paths)
+    def cut_offs(self) -> None:
+        """A recorded run (by CI run attempt and variant) sets its target's cut-off."""
+        recorded = [load for load in self.loads if load.target.ci_run_id is not None]
+        if not recorded:
+            return
+        rows = self.session.execute(
+            text(
+                f"""
+                SELECT t.idx, r.id, COALESCE(r.started_at, r.created_at), EXISTS (
+                    SELECT 1 FROM runs x WHERE x.repo_id = r.repo_id
+                      AND x.ci_run_id = r.ci_run_id AND x.run_attempt = r.run_attempt
+                      AND COALESCE(x.variant, '') = COALESCE(t.variant, '')
+                      AND x.rerun > 0 AND x.commit_sha = r.commit_sha)
+                FROM {_TARGETS}
+                JOIN runs r ON r.repo_id = :repo_id AND r.ci_run_id = t.ci
+                    AND r.run_attempt = t.attempt
+                    AND COALESCE(r.variant, '') = COALESCE(t.variant, '') AND r.rerun = 0
+                """
+            ),
+            {"repo_id": self.repo_id, **self._targets(recorded)},
+        )
+        for idx, run_id, run_at, has_reruns in rows:
+            load = self.loads[idx]
+            load.run_id, load.cut_at, load.cut_id, load.has_reruns = (
+                run_id, run_at, run_id, has_reruns)  # fmt: skip
 
-        failed_runs: dict[int, list[int]] = defaultdict(list)
-        for run_id, key in failures:
-            failed_runs[key].append(run_id)
-        for key in seen:
-            test_id = keys[key]
-            failed = sorted(
-                (self.runs[r] for r in failed_runs[key] if _final_failed(outcomes, r, key)),
-                key=lambda r: r.order,
-            )
-            events = self._same_commit_events(key, failed_runs[key], failures, outcomes)
-            events += unrelated.get(key, [])
-            events.sort(key=lambda e: max(r.run_at for r in e.failed), reverse=True)
-            streak, last_pass, others = main.get(key, (None, None, ()))
-            histories[test_id] = TestHistory(
-                seen=True,
-                file_path=paths.get(test_id),
-                broken_on_main=streak,
-                last_main_pass=last_pass,
-                other_variants_failing=others,
-                same_commit_passes=tuple(
-                    r.ref for r in same_commit if outcomes.get((r.id, key), _NONE).any_passed
+    def load_runs(self) -> None:
+        """Every target's window: the runs before its cut-off (its own attempt left out) at
+        most ``days`` older than the newest of them. One read, each run tagged with the
+        targets whose window it is in."""
+        rows = self.session.execute(
+            text(
+                f"""
+                WITH t AS (SELECT * FROM {_TARGETS}),
+                before AS MATERIALIZED (  -- narrow: (target, run) pairs
+                    SELECT t.idx, r.id, COALESCE(r.started_at, r.created_at) AS run_at
+                    FROM t JOIN runs r ON r.repo_id = :repo_id AND {_BEFORE_T}
                 ),
-                flaky=tuple(events),
-                failures_in_window=len(failed),
-                last_failed_at=failed[-1].run_at if failed else None,
+                newest AS (SELECT idx, max(run_at) AS run_at FROM before GROUP BY idx),
+                windows AS (  -- each run once, with the targets whose window it is in
+                    SELECT b.id, array_agg(b.idx) AS targets
+                    FROM before b JOIN newest n ON n.idx = b.idx
+                    WHERE b.run_at >= n.run_at - make_interval(days => :days)
+                    GROUP BY b.id
+                )
+                SELECT r.id, r.commit_sha, r.branch, r.is_main, r.variant,
+                       COALESCE(r.started_at, r.created_at), r.ci_run_id,
+                       r.changed_files_known, r.affected IS NOT NULL, r.rerun, w.targets
+                FROM windows w JOIN runs r ON r.id = w.id
+                """
+            ),
+            {"repo_id": self.repo_id, "days": self.days, **self._targets()},
+        )
+        for *columns, targets in rows:
+            run = _Run(*columns)
+            for idx in targets:
+                self.loads[idx].runs[run.id] = run
+        for load in self.loads:
+            load.window_start = (
+                max(r.run_at for r in load.runs.values()) - timedelta(days=self.days)
+                if load.runs
+                else load.cut_at
             )
-        return histories
 
-    # -- queries --
+    def load_tests(self) -> None:
+        """Test keys and paths (as of each cut-off), and which tests ran before it."""
+        ids = list(dict.fromkeys(t for load in self.loads for t in load.test_ids))
+        found = {
+            test_id: (key, file_path, file_path_at)
+            for key, test_id, file_path, file_path_at in self.session.execute(
+                text(
+                    "SELECT id, test_id, file_path, file_path_at FROM tests"
+                    " WHERE repo_id = :repo_id AND test_id = ANY(:ids)"
+                ),
+                {"repo_id": self.repo_id, "ids": ids},
+            )
+        }
+        pairs: list[tuple[int, int]] = []
+        for load in self.loads:
+            for test_id in load.test_ids:
+                if test_id not in found:
+                    continue
+                key, file_path, file_path_at = found[test_id]
+                load.keys[key] = test_id
+                # A path reported by the triaged run or a later one would be peeking.
+                load.paths[test_id] = (
+                    file_path if file_path_at is not None and file_path_at < load.cut_at else None
+                )
+                pairs.append((load.idx, key))
+        if not pairs:
+            return
+        for idx, key in self.session.execute(
+            text(
+                f"""
+                SELECT p.idx, p.key
+                FROM unnest(CAST(:p_idx AS integer[]), CAST(:p_key AS integer[])) AS p(idx, key)
+                JOIN {_TARGETS} ON t.idx = p.idx
+                WHERE EXISTS (SELECT 1 FROM test_results tr JOIN runs r ON r.id = tr.run_id
+                              WHERE tr.test_key = p.key AND {_BEFORE_T})
+                """
+            ),
+            {
+                "p_idx": [idx for idx, _ in pairs],
+                "p_key": [key for _, key in pairs],
+                **self._targets(),
+            },
+        ):
+            self.loads[idx].seen.add(key)
+
+    def build(self) -> None:
+        """Every target's histories from shared reads, phase by phase."""
+        for load in self.loads:
+            load.histories = {
+                test_id: TestHistory(file_path=load.paths.get(test_id))
+                for test_id in load.keys.values()
+            }
+        builders = [_Builder(load, self.run_links) for load in self.loads if load.seen]
+        if not builders:
+            return
+        failures = self._failures({key for b in builders for key in b.load.seen})
+        pairs: set[tuple[int, int]] = set()
+        for b in builders:
+            pairs |= b.prepare(failures)
+        outcomes = self._outcomes(pairs)
+
+        for b in builders:
+            b.main_start()
+        for n in range(len(_MAIN_CHUNKS) + 1):
+            asked = {b: b.main_request(n) for b in builders}
+            main = self._main_outcomes({b: r for b, r in asked.items() if r is not None})
+            for b, request in asked.items():
+                if request is not None:
+                    b.main_apply(n, main)
+        older = {b: keys for b in builders if (keys := b.older_keys())}
+        if older:
+            for b, rows in self._older_main(older).items():
+                b.older_apply(rows)
+
+        candidates = {b: b.unrelated_candidates(outcomes) for b in builders}
+        changes = self._run_changes({r.id for c in candidates.values() for x in c for r in x[:2]})
+        for b in builders:
+            b.finish(outcomes, candidates[b], changes)
+
+    def add_reruns(self) -> None:
+        """Each recorded target's own re-runs of its variant: rule 1's "same code, different
+        outcome". Re-runs come after the run, so this is the one read past a cut-off."""
+        loads = [load for load in self.loads if load.has_reruns and load.keys]
+        if not loads:
+            return
+        pairs = [(load.idx, key) for load in loads for key in sorted(load.keys)]
+        passes: dict[tuple[int, str], list[int]] = defaultdict(list)
+        failures: dict[tuple[int, str], list[int]] = defaultdict(list)
+        for idx, rerun, key, outcome in self.session.execute(
+            text(
+                f"""
+                SELECT p.idx, r.rerun, tr.test_key, {_OUTCOME}
+                FROM unnest(CAST(:p_idx AS integer[]), CAST(:p_key AS integer[])) AS p(idx, key)
+                JOIN {_TARGETS} ON t.idx = p.idx
+                JOIN runs r ON r.repo_id = :repo_id AND r.ci_run_id = t.ci
+                    AND r.run_attempt = t.attempt
+                    AND COALESCE(r.variant, '') = COALESCE(t.variant, '')
+                    AND r.rerun > 0 AND r.commit_sha = t.commit
+                JOIN test_results tr ON tr.run_id = r.id AND tr.test_key = p.key
+                GROUP BY p.idx, r.id, r.rerun, tr.test_key
+                ORDER BY p.idx, r.rerun
+                """
+            ),
+            {
+                "repo_id": self.repo_id,
+                "p_idx": [idx for idx, _ in pairs],
+                "p_key": [key for _, key in pairs],
+                **self._targets(),
+            },
+        ):
+            test_id = self.loads[idx].keys[key]
+            if outcome == PASSED_CODE:
+                passes[(idx, test_id)].append(rerun)
+            elif outcome in _FAILED:
+                failures[(idx, test_id)].append(rerun)
+        for idx, test_id in passes.keys() | failures.keys():
+            histories = self.loads[idx].histories
+            histories[test_id] = replace(
+                histories[test_id],
+                rerun_passes=tuple(passes[(idx, test_id)]),
+                rerun_failures=tuple(failures[(idx, test_id)]),
+            )
+
+    # -- shared reads --
 
     def _failures(self, keys: set[int]) -> set[tuple[int, int]]:
         rows = self.session.execute(
@@ -849,7 +933,7 @@ class _Builder:
             ),
             {"keys": sorted(keys)},
         )
-        return {(run_id, key) for run_id, key in rows if run_id in self.runs}
+        return {(run_id, key) for run_id, key in rows}
 
     def _outcomes(self, pairs: set[tuple[int, int]]) -> dict[tuple[int, int], _Outcome]:
         if not pairs:
@@ -873,99 +957,86 @@ class _Builder:
         }
 
     def _main_outcomes(
-        self, run_ids: Sequence[int], keys: Iterable[int]
+        self, requests: Mapping[_Builder, tuple[list[int], list[int]]]
     ) -> dict[tuple[int, int], tuple[int, str | None]]:
-        if not run_ids:
+        """Final outcomes of (run, test) for every builder's runs and keys. Builders asking
+        for the same keys share a key group (a matrix's legs mostly fail the same tests), so
+        the request stays as small as one builder's (runs + keys) per distinct key set."""
+        groups: dict[frozenset[int], int] = {}
+        run_groups: set[tuple[int, int]] = set()
+        for run_ids, keys in requests.values():
+            group = groups.setdefault(frozenset(keys), len(groups))
+            run_groups.update((run_id, group) for run_id in run_ids)
+        if not run_groups:
             return {}
+        ordered = sorted(run_groups)
+        key_groups = sorted((g, k) for keys, g in groups.items() for k in keys)
         rows = self.session.execute(
             text(
                 f"""
-                SELECT r.id, x.test_key, x.outcome, x.message
-                FROM unnest(CAST(:runs AS bigint[])) AS r(id)
+                WITH g AS (
+                    SELECT grp, array_agg(key) AS keys
+                    FROM unnest(CAST(:g_grp AS integer[]), CAST(:g_key AS integer[]))
+                        AS g(grp, key)
+                    GROUP BY grp
+                )
+                SELECT r.run_id, x.test_key, x.outcome, x.message
+                FROM unnest(CAST(:runs AS bigint[]), CAST(:grps AS integer[])) AS r(run_id, grp)
+                JOIN g ON g.grp = r.grp
                 CROSS JOIN LATERAL (
                     SELECT tr.test_key, {_OUTCOME} AS outcome,
                            (array_agg(tr.message ORDER BY tr.attempt DESC))[1] AS message
                     FROM test_results tr
-                    WHERE tr.run_id = r.id AND tr.test_key = ANY(CAST(:keys AS integer[]))
+                    WHERE tr.run_id = r.run_id AND tr.test_key = ANY(g.keys)
                     GROUP BY tr.test_key
                 ) x
                 """
             ),
-            {"runs": list(run_ids), "keys": sorted(keys)},
+            {
+                "runs": [r for r, _ in ordered],
+                "grps": [g for _, g in ordered],
+                "g_grp": [g for g, _ in key_groups],
+                "g_key": [k for _, k in key_groups],
+            },
         )
         return {(r, k): (outcome, message) for r, k, outcome, message in rows}
 
-    def _main(
-        self, keys: set[int]
-    ) -> dict[int, tuple[Streak | None, RunRef | None, tuple[RunRef, ...]]]:
-        """Per test: its failing streak on main (this variant), latest main pass, and other
-        variants whose latest main run it failed in."""
-        variant = self.target.variant
-        mains = sorted(
-            (r for r in self.runs.values() if r.is_main and r.variant == variant),
-            key=lambda r: r.order,
-            reverse=True,
-        )
-        latest_other: dict[str | None, _Run] = {}
-        # A re-run holds a few tests only: never a variant's "latest main run".
-        for run in sorted((r for r in self.runs.values() if r.is_main), key=lambda r: r.order):
-            if run.variant != variant and not run.rerun:
-                latest_other[run.variant] = run
-        walks = {key: _MainWalk() for key in keys}
-
-        # The newest main runs first (with each other variant's latest), then older ones for
-        # the tests that haven't passed yet.
-        first, second = _MAIN_CHUNKS
-        rounds = (mains[:first], mains[first : first + second], mains[first + second :])
-        for n, chunk in enumerate(rounds):
-            others = list(latest_other.values()) if n == 0 else []
-            pending = [key for key, walk in walks.items() if not walk.resolved]
-            if not others and not (chunk and pending):
-                continue
-            outcomes = self._main_outcomes(
-                [r.id for r in chunk + others], keys if others else pending
-            )
-            for key in pending:
-                for run in chunk:
-                    if walks[key].step(run, *outcomes.get((run.id, key), _ABSENT)):
-                        break
-            for run in others:
-                for key in keys:
-                    if outcomes.get((run.id, key), _ABSENT)[0] in _FAILED:
-                        walks[key].others.append(run.ref)
-
-        # Failing for every main run of the window: the streak may have started before it.
-        older = [key for key, walk in walks.items() if not walk.resolved and walk.failing]
-        if older:
-            for run, key, outcome in self._older_main(older):
-                walks[key].step(run, outcome, None)
-
-        return {key: walk.result(variant) for key, walk in walks.items()}
-
-    def _older_main(self, keys: list[int]) -> list[tuple[_Run, int, int]]:
+    def _older_main(
+        self, requests: Mapping[_Builder, list[int]]
+    ) -> dict[_Builder, list[tuple[_Run, int, int]]]:
+        """Main outcomes of this variant from before each builder's window, for the tests
+        failing on main for the whole window (by ``test_key``)."""
+        by_idx = {b.load.idx: b for b in requests}
+        pairs = [(b.load.idx, key) for b, keys in requests.items() for key in keys]
         rows = self.session.execute(
             text(
                 f"""
-                SELECT r.id, r.commit_sha, r.branch, r.is_main, r.variant,
+                SELECT p.idx, r.id, r.commit_sha, r.branch, r.is_main, r.variant,
                        COALESCE(r.started_at, r.created_at) AS run_at, r.ci_run_id,
                        r.changed_files_known, r.affected IS NOT NULL, r.rerun, tr.test_key,
                        {_OUTCOME}
-                FROM test_results tr JOIN runs r ON r.id = tr.run_id
-                WHERE tr.test_key = ANY(:keys) AND r.repo_id = :repo_id AND r.is_main
-                  AND r.variant IS NOT DISTINCT FROM CAST(:variant AS text)
-                  AND COALESCE(r.started_at, r.created_at) < :window_start AND {_BEFORE}
-                GROUP BY r.id, tr.test_key
+                FROM unnest(CAST(:p_idx AS integer[]), CAST(:p_key AS integer[])) AS p(idx, key)
+                JOIN {_TARGETS} ON t.idx = p.idx
+                JOIN test_results tr ON tr.test_key = p.key
+                JOIN runs r ON r.id = tr.run_id
+                WHERE r.repo_id = :repo_id AND r.is_main
+                  AND r.variant IS NOT DISTINCT FROM t.variant
+                  AND COALESCE(r.started_at, r.created_at) < t.window_start AND {_BEFORE_T}
+                GROUP BY p.idx, r.id, tr.test_key
                 """
             ),
             {
-                **self.params,
-                "keys": keys,
-                "variant": self.target.variant,
-                "window_start": self.window_start,
+                "repo_id": self.repo_id,
+                "p_idx": [idx for idx, _ in pairs],
+                "p_key": [key for _, key in pairs],
+                **self._targets(),
             },
         ).all()
-        found = [(_Run(*row[:10]), row[10], row[11]) for row in rows]
-        found.sort(key=lambda item: item[0].order, reverse=True)
+        found: dict[_Builder, list[tuple[_Run, int, int]]] = defaultdict(list)
+        for row in rows:
+            found[by_idx[row[0]]].append((_Run(*row[1:11]), row[11], row[12]))
+        for items in found.values():
+            items.sort(key=lambda item: item[0].order, reverse=True)
         return found
 
     def _run_changes(self, run_ids: set[int]) -> dict[int, Change]:
@@ -986,11 +1057,161 @@ class _Builder:
             changes[run_id] = Change.from_graph(changed, graph)
         return changes
 
+
+# (failed run, the branch's next run, test key): a candidate unrelated fail-then-pass event.
+_Candidate = tuple[_Run, _Run, int]
+
+
+class _Builder:
+    """One target's histories, from the batch's shared reads (no queries of its own)."""
+
+    def __init__(self, load: _Load, run_links: RunLinks | None = None) -> None:
+        self.load = load
+        self.run_links = run_links
+        self.target = load.target
+        self.runs = load.runs
+        self.by_pair: dict[tuple[str, str | None], list[_Run]] = defaultdict(list)
+        self.by_branch: dict[tuple[str, str | None], list[_Run]] = defaultdict(list)
+        for run in sorted(self.runs.values(), key=lambda r: r.order):
+            self.by_pair[(run.commit_sha, run.variant)].append(run)
+            self.by_branch[(run.branch, run.variant)].append(run)
+        self.branch_pos = {
+            run.id: i for runs_ in self.by_branch.values() for i, run in enumerate(runs_)
+        }
+        commit = self.target.commit_sha
+        self.same_commit = self.by_pair.get((commit, self.target.variant), []) if commit else []
+        self.failures: set[tuple[int, int]] = set()
+        self.next_runs: dict[int, _Run] = {}
+
+    def prepare(self, failures: set[tuple[int, int]]) -> set[tuple[int, int]]:
+        """Keep this target's failures (seen tests, runs in its window); the (run, test)
+        outcomes its flaky evidence needs."""
+        seen = self.load.seen
+        self.failures = {(r, k) for r, k in failures if r in self.runs and k in seen}
+        self.next_runs = {
+            run_id: nxt for run_id, _ in self.failures if (nxt := self._next_on_branch(run_id))
+        }
+        pairs = {(r.id, k) for k in seen for r in self.same_commit}
+        for run_id, key in self.failures:
+            run = self.runs[run_id]
+            pairs.update((r.id, key) for r in self.by_pair[(run.commit_sha, run.variant)])
+            if run_id in self.next_runs:
+                pairs.add((self.next_runs[run_id].id, key))
+        return pairs
+
+    # -- the main streak: this variant's main runs, newest first, in rounds --
+
+    def main_start(self) -> None:
+        variant = self.target.variant
+        self.mains = sorted(
+            (r for r in self.runs.values() if r.is_main and r.variant == variant),
+            key=lambda r: r.order,
+            reverse=True,
+        )
+        latest_other: dict[str | None, _Run] = {}
+        # A re-run holds a few tests only: never a variant's "latest main run".
+        for run in sorted((r for r in self.runs.values() if r.is_main), key=lambda r: r.order):
+            if run.variant != variant and not run.rerun:
+                latest_other[run.variant] = run
+        self.others = list(latest_other.values())
+        self.walks = {key: _MainWalk() for key in self.load.seen}
+        first, second = _MAIN_CHUNKS
+        self.rounds = (
+            self.mains[:first], self.mains[first : first + second], self.mains[first + second :]
+        )  # fmt: skip
+        self.pending: list[int] = []
+
+    def main_request(self, n: int) -> tuple[list[int], list[int]] | None:
+        """Round ``n``'s (runs, keys) to read, or None if this round has nothing to do: the
+        newest main runs first (with each other variant's latest), then older ones for the
+        tests that haven't passed yet."""
+        chunk = self.rounds[n]
+        others = self.others if n == 0 else []
+        self.pending = [key for key, walk in self.walks.items() if not walk.resolved]
+        if not others and not (chunk and self.pending):
+            return None
+        keys = sorted(self.walks) if others else self.pending
+        return [r.id for r in chunk + others], keys
+
+    def main_apply(
+        self, n: int, outcomes: Mapping[tuple[int, int], tuple[int, str | None]]
+    ) -> None:
+        chunk = self.rounds[n]
+        for key in self.pending:
+            for run in chunk:
+                if self.walks[key].step(run, *outcomes.get((run.id, key), _ABSENT)):
+                    break
+        if n == 0:
+            for run in self.others:
+                for key in self.walks:
+                    if outcomes.get((run.id, key), _ABSENT)[0] in _FAILED:
+                        self.walks[key].others.append(run.ref)
+
+    def older_keys(self) -> list[int]:
+        """Failing on main for every main run of the window: the streak may have started
+        before it."""
+        return [key for key, walk in self.walks.items() if not walk.resolved and walk.failing]
+
+    def older_apply(self, rows: list[tuple[_Run, int, int]]) -> None:
+        for run, key, outcome in rows:
+            self.walks[key].step(run, outcome, None)
+
+    # -- flaky evidence --
+
+    def unrelated_candidates(
+        self, outcomes: Mapping[tuple[int, int], _Outcome]
+    ) -> list[_Candidate]:
+        candidates = []
+        for run_id, key in sorted(self.failures):
+            run, nxt = self.runs[run_id], self.next_runs.get(run_id)
+            if (
+                nxt is not None
+                and _final_failed(outcomes, run_id, key)
+                and outcomes.get((nxt.id, key), _NONE).outcome == PASSED_CODE
+                and all(r.changed_files_known and self._has_links(r) for r in (run, nxt))
+            ):
+                candidates.append((run, nxt, key))
+        return candidates
+
+    def finish(
+        self,
+        outcomes: Mapping[tuple[int, int], _Outcome],
+        candidates: list[_Candidate],
+        changes: Mapping[int, Change],
+    ) -> None:
+        load = self.load
+        unrelated = self._unrelated_fail_then_pass(candidates, outcomes, changes)
+        main = {key: walk.result(self.target.variant) for key, walk in self.walks.items()}
+        failed_runs: dict[int, list[int]] = defaultdict(list)
+        for run_id, key in self.failures:
+            failed_runs[key].append(run_id)
+        for key in load.seen:
+            test_id = load.keys[key]
+            failed = sorted(
+                (self.runs[r] for r in failed_runs[key] if _final_failed(outcomes, r, key)),
+                key=lambda r: r.order,
+            )
+            events = self._same_commit_events(key, failed_runs[key], outcomes)
+            events += unrelated.get(key, [])
+            events.sort(key=lambda e: max(r.run_at for r in e.failed), reverse=True)
+            streak, last_pass, others = main.get(key, (None, None, ()))
+            load.histories[test_id] = TestHistory(
+                seen=True,
+                file_path=load.paths.get(test_id),
+                broken_on_main=streak,
+                last_main_pass=last_pass,
+                other_variants_failing=others,
+                same_commit_passes=tuple(
+                    r.ref for r in self.same_commit if outcomes.get((r.id, key), _NONE).any_passed
+                ),
+                flaky=tuple(events),
+                failures_in_window=len(failed),
+                last_failed_at=failed[-1].run_at if failed else None,
+            )
+
     def _has_links(self, run: _Run) -> bool:
         """Stored links, or (eval only) links ``run_links`` can supply."""
         return run.has_links or (self.run_links is not None and self.run_links(run.id) is not None)
-
-    # -- flaky evidence --
 
     def _next_on_branch(self, run_id: int) -> _Run | None:
         """The branch's next run (same variant) on a different commit, before the cut-off."""
@@ -1002,14 +1223,13 @@ class _Builder:
         self,
         key: int,
         failed_runs: Sequence[int],
-        failures: set[tuple[int, int]],
         outcomes: Mapping[tuple[int, int], _Outcome],
     ) -> list[FlakyEvent]:
         events = []
         groups = {(self.runs[r].commit_sha, self.runs[r].variant) for r in failed_runs}
         for commit, variant in sorted(groups, key=lambda g: (g[0], g[1] or "")):
             runs = self.by_pair[(commit, variant)]
-            failed = [r for r in runs if (r.id, key) in failures]
+            failed = [r for r in runs if (r.id, key) in self.failures]
             passed = [r for r in runs if outcomes.get((r.id, key), _NONE).any_passed]
             if failed and passed:
                 messages = tuple(
@@ -1029,25 +1249,13 @@ class _Builder:
 
     def _unrelated_fail_then_pass(
         self,
-        failures: set[tuple[int, int]],
-        next_runs: Mapping[int, _Run],
+        candidates: list[_Candidate],
         outcomes: Mapping[tuple[int, int], _Outcome],
-        keys: Mapping[int, str],
-        paths: Mapping[str, str | None],
+        changes: Mapping[int, Change],
     ) -> dict[int, list[FlakyEvent]]:
-        candidates = []
-        for run_id, key in sorted(failures):
-            run, nxt = self.runs[run_id], next_runs.get(run_id)
-            if (
-                nxt is not None
-                and _final_failed(outcomes, run_id, key)
-                and outcomes.get((nxt.id, key), _NONE).outcome == PASSED_CODE
-                and all(r.changed_files_known and self._has_links(r) for r in (run, nxt))
-            ):
-                candidates.append((run, nxt, key))
         if not candidates:
             return {}
-        changes = self._run_changes({r.id for run, nxt, _ in candidates for r in (run, nxt)})
+        keys, paths = self.load.keys, self.load.paths
         tests_by_run: dict[int, set[int]] = defaultdict(set)
         for run, nxt, key in candidates:
             tests_by_run[run.id].add(key)
@@ -1218,6 +1426,19 @@ def triage_ci_run(
     ):
         changed[run_id].append(path)
     failures = recorded_failures(session, run_ids)
+    # Every failing variant's histories in one batched load: the query count doesn't grow
+    # with the number of variants.
+    failing = [run for run in runs if failures[run.id]]
+    loaded = load_histories_many(
+        session,
+        [
+            (Target(repo, run.commit_sha, run.variant, ci_run_id, run_attempt),
+             [f.test_id for f in failures[run.id]])
+            for run in failing
+        ],
+        window_days,
+    )  # fmt: skip
+    histories = dict(zip((run.id for run in failing), loaded or [], strict=True))
 
     results = []
     for run in runs:
@@ -1226,10 +1447,11 @@ def triage_ci_run(
             Change.from_graph(changed[run.id], run.affected) if links_known else Change((), False)
         )
         report = None
-        if failures[run.id]:
-            target = Target(repo, run.commit_sha, run.variant, ci_run_id, run_attempt)
-            report = triage_run(session, target, failures[run.id], change, window_days,
-                                known_flaky=run.known_flaky)  # fmt: skip
+        if run.id in histories:
+            h = histories[run.id]
+            results_ = triage(failures[run.id], h.tests, change, window_days,
+                              known_flaky=run.known_flaky)  # fmt: skip
+            report = TriageReport(h.cut_at, h.run_id, results_)
         results.append(VariantTriage(
             run.id, run.variant, run.commit_sha, run.changed_files_known, links_known, report,
             reruns[run.variant], run.known_flaky_changed,

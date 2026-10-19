@@ -107,6 +107,15 @@ flaky when it passes ([Flaky tests](#flaky-tests)).
   regressions (rdflib's remote-service tests): that's what [`rerun-unknown`](#flaky-tests) is
   for.
 
+**Performance** (rdflib history, before → after the October 2026 work; results identical
+before and after, checked on real data; details in
+[the eval results](docs/eval-results.md#performance)):
+
+- Triage of a 22-variant CI run attempt (the PR comment's verdicts): 1,032 → 220 ms, and
+  180 → 12 queries. The query count no longer grows with the number of variants.
+- `/select`: 605 → 237 ms for the selection itself.
+- Ingesting a 9,891-result upload: about 2.2 → 1.25 s.
+
 ## Quickstart
 
 Start the server with Postgres. The API token is a shared secret you choose:

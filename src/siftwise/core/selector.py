@@ -59,7 +59,7 @@ import functools
 import posixpath
 import re
 import shlex
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -168,6 +168,10 @@ _PY_IDENTIFIER = re.compile(r"[A-Za-z_]\w*\Z")
 # cirq-google/cirq_google/ops/x_test.py as "cirq-google.cirq_google.ops.x_test", so directories
 # above the Python packages may hold characters no module name can, such as "-".
 _PY_DIRECTORY = re.compile(r"[A-Za-z0-9_][\w-]*\Z")
+# A dotted name whose every part is _PY_DIRECTORY (``[\w-]`` has no ``.``: same parts as split).
+_PY_DIRECTORIES = re.compile(r"[A-Za-z0-9_][\w-]*(?:\.[A-Za-z0-9_][\w-]*)*\Z")
+# What a doctest classname can't contain: whitespace (as str.isspace) or "/".
+_NOT_A_MODULE = re.compile(r"[\s/]")
 _GO_TOP_LEVEL = re.compile(r"(Test|Fuzz|Example|Benchmark)")
 
 
@@ -329,11 +333,13 @@ def select_tests(
     ``junit_dir``: each pytest command writes ``--junitxml=<junit_dir>/siftwise-<n>.xml``, so
     a line of several pytest commands doesn't overwrite one report with the next.
     """
+    # Every known test classified once, for the selection and its time estimate.
+    tests = _index(history.tests.values() if history else ())
     selection = _select(
         history, changed_files, changed_files_known, config or SelectorConfig(),
-        affected_packages, affected_files, deleted_files, junit_dir,
+        affected_packages, affected_files, deleted_files, junit_dir, tests,
     )  # fmt: skip
-    return _with_estimate(selection, history)
+    return _with_estimate(selection, history, tests)
 
 
 def _select(
@@ -345,6 +351,7 @@ def _select(
     affected_files: Mapping[str, Sequence[str]] | None,
     deleted_files: Iterable[str],
     junit_dir: str | None,
+    tests: Mapping[str, _Test],
 ) -> Selection:
     affected_packages = affected_packages or {}
     affected_files = {
@@ -353,7 +360,6 @@ def _select(
         if (path := normalize_path(file))
     }
     deleted = frozenset(p for p in (normalize_path(f) for f in deleted_files) if p)
-    tests = _index(history.tests.values() if history else ())
 
     def full(reason: str) -> Selection:
         runners = {t.runner for t in tests.values() if t.runner is not None}
@@ -608,8 +614,15 @@ class WouldRun:
     doesn't name: everything in a Python file or Go package run whole, and the subtests of a
     Go test selected with ``-run``. Precomputed, for many lookups."""
 
-    def __init__(self, selection: Selection | SelectionScope) -> None:
+    def __init__(
+        self,
+        selection: Selection | SelectionScope,
+        py_file: Callable[[str], str | None] | None = None,
+    ) -> None:
+        """``py_file``: ``pytest_file`` (a test ID's file, no reported path), or a faster
+        lookup giving the same answers."""
         scope = selection if isinstance(selection, SelectionScope) else SelectionScope.of(selection)
+        self.py_file = py_file or pytest_file
         self.full = scope.full
         self.selected = scope.test_ids
         self.go_packages = scope.go_packages
@@ -629,13 +642,28 @@ class WouldRun:
         if (package, name.split("/", 1)[0]) in self.go_top_level:
             return True
         # `pytest path/test_x.py`: every test in the file, new ones too.
-        return bool(self.py_files) and pytest_file(test_id) in self.py_files
+        return bool(self.py_files) and self.py_file(test_id) in self.py_files
 
 
-def _with_estimate(selection: Selection, history: RepoHistory | None) -> Selection:
+def _indexed_py_file(index: Mapping[str, _Test]) -> Callable[[str], str | None]:
+    """``pytest_file(test_id)`` from the index when the test was classified the same way (no
+    file path); a test with a reported path is classified again without it."""
+
+    def py_file(test_id: str) -> str | None:
+        test = index.get(test_id)
+        if test is None or test.file_path is not None:
+            return pytest_file(test_id)
+        return test.py_path if test.runner is Runner.PYTEST else None
+
+    return py_file
+
+
+def _with_estimate(
+    selection: Selection, history: RepoHistory | None, index: Mapping[str, _Test]
+) -> Selection:
     if history is None:
         return selection
-    runs = WouldRun(selection)
+    runs = WouldRun(selection, _indexed_py_file(index))
     total = would_run = 0.0
     for test in history.tests.values():
         if not test.avg_duration_ms or is_go_subtest(test.test_id):
@@ -893,7 +921,7 @@ def _is_doctest(classname: str, name: str, ext: str) -> bool:
     """pytest ``--doctest-modules`` items: the classname is the module (``rdflib.container``)
     and the name is the documented object's dotted path inside it
     (``rdflib.container.Container``), or the module itself for its module docstring."""
-    if not classname or ext not in ("", ".py") or any(c.isspace() or c == "/" for c in classname):
+    if not classname or ext not in ("", ".py") or _NOT_A_MODULE.search(classname):
         return False
     return name.startswith(classname + ".") or (name == classname and "." in classname)
 
@@ -975,9 +1003,9 @@ def _python_location(classname: str, file_path: str | None) -> tuple[str, tuple[
 
     ``tests.unit.test_foo.TestBar`` -> ``("tests/unit/test_foo.py", ("TestBar",))``.
     """
-    parts = classname.split(".")
-    if not classname or not all(_PY_DIRECTORY.match(p) for p in parts):
+    if not _PY_DIRECTORIES.match(classname):
         return None
+    parts = classname.split(".")
     py_file = file_path if file_path and file_path.endswith(".py") else None
     module_end = max(
         (i for i, p in enumerate(parts) if _is_python_test_module(p) and _PY_IDENTIFIER.match(p)),

@@ -3,10 +3,13 @@
 import io
 import json
 import subprocess
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -33,6 +36,7 @@ from siftwise.core.selector import (
     SelectorConfig,
     load_history,
 )
+from tests.gofixture import go_list_output
 
 PKG = "github.com/acme/shop/cart"
 
@@ -814,3 +818,96 @@ def test_each_retry_is_logged_without_the_token(
         f"github: attempt 4/4 failed (ConnectError) on GET {zipball}; giving up",
     ]
     assert token not in err and "Bearer" not in err
+
+
+# --- --jobs: Go graphs built in parallel --------------------------------------------------------
+
+
+def fake_go_list(roots: list[Path]) -> Any:
+    """``go list`` for gofixture's module, wherever the tree was unpacked; records the roots."""
+
+    def run(go: str, root: Path, env: Any) -> subprocess.CompletedProcess[bytes]:
+        roots.append(root)
+        time.sleep(0.05)  # long enough for the parallel builds to overlap
+        return subprocess.CompletedProcess([go], 0, go_list_output(root).encode(), b"")
+
+    return run
+
+
+def test_parallel_go_graphs_write_the_same_cache_as_one_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shas = [f"{n:040x}" for n in (1, 2, 3)]
+    files = {"go.mod": "module example.com/m\n", "a/a.go": "package a\n", "b/b.go": "package b\n"}
+    roots: list[Path] = []
+    monkeypatch.setattr(ev, "_run_go_list", fake_go_list(roots))
+    serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+    serial.mkdir()
+    parallel.mkdir()
+
+    with respx.mock(assert_all_mocked=True) as gh:
+        for sha in shas:
+            gh.get(f"https://api.github.com/repos/acme/shop/zipball/{sha}").respond(
+                content=zipball(files, sha))  # fmt: skip
+        one = ev.GraphProvider(None, "go", serial, ev.GitHubSource("t", "acme/shop"))
+        for sha in shas:  # --jobs 1: built lazily, one tree at a time
+            assert one.go_graph_at(sha)[0] is not None
+        one.close()
+        serial_roots, roots[:] = list(roots), []
+        built = ev.prefetch_go_graphs(
+            [*shas, shas[0]], 3, parallel, "go", "t", "acme/shop", None,
+            executor=lambda n: ThreadPoolExecutor(max_workers=n),
+        )  # fmt: skip
+
+    assert built == 3
+    assert len(set(roots)) == 3 and not set(roots) & set(serial_roots)  # private trees
+    listing = sorted(f.name for f in parallel.iterdir())
+    assert listing == sorted(f.name for f in serial.iterdir())  # no unpack dirs, no temp files
+    cached = [f"{kind}-{sha}.json" for kind in ("gograph", "files") for sha in shas]
+    assert listing == sorted(cached)
+    for name in listing:
+        assert (parallel / name).read_bytes() == (serial / name).read_bytes(), name
+    # Cached: nothing to build again.
+    assert ev.prefetch_go_graphs(shas, 3, parallel, "go", "t", "acme/shop", None) == 0
+
+
+def test_jobs_needs_source_github() -> None:
+    app = typer.Typer()
+    app.command()(ev.main)
+
+    result = CliRunner().invoke(app, ["--repo", REPO, "--jobs", "2", "--checkout", "."])
+
+    assert result.exit_code == 2
+    assert "--jobs > 1 needs --source github" in result.output
+
+
+def test_cache_writes_are_atomic(tmp_path: Path) -> None:
+    path = tmp_path / "gograph-x.json"
+    bodies = [json.dumps({"n": n, "pad": "x" * 200_000}) for n in range(4)]
+    seen: list[int] = []
+    stop = False
+
+    def write(body: str) -> None:
+        for _ in range(25):
+            ev._write_atomic(path, body)
+
+    def read() -> None:
+        while not stop:
+            time.sleep(0.002)  # a reader opens the file now and then, as the eval does
+            if path.exists():
+                try:
+                    seen.append(json.loads(path.read_text(encoding="utf-8"))["n"])
+                except PermissionError:  # Windows: the file is being replaced right now
+                    continue
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(write, bodies))
+    finally:
+        stop = True
+        reader.join(timeout=30)
+
+    assert seen and set(seen) <= {0, 1, 2, 3}  # every read was a whole file
+    assert [f.name for f in tmp_path.iterdir()] == ["gograph-x.json"]  # no temp files left

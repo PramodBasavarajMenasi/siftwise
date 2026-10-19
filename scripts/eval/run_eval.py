@@ -54,9 +54,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import Executor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -577,7 +579,7 @@ class GitHubCompare:
             if response.status_code != httpx.codes.OK:
                 return None  # not cached: a later run may succeed
             data = response.json()
-            cache.write_text(json.dumps({"files": data.get("files", [])}))
+            _write_atomic(cache, json.dumps({"files": data.get("files", [])}))
         entries = data.get("files", [])
         if len(entries) >= COMPARE_FILE_CAP:
             return None  # truncated
@@ -680,12 +682,14 @@ class GraphProvider:
         cache_dir: Path,
         github: GitHubSource | None = None,
         goos: str | None = None,
+        unpack_root: Path | None = None,
     ) -> None:
         self.checkout = checkout
         self.go = go
         self.cache_dir = cache_dir
         self.github = github
         self.goos = goos
+        self.unpack_root = unpack_root or cache_dir  # where this provider's own dir goes
         # The one commit unpacked from GitHub at a time: (sha, directory). The directory is
         # private to this provider: evals running side by side each wipe their own tree.
         self._unpacked: tuple[str, Path] | None = None
@@ -704,14 +708,14 @@ class GraphProvider:
         if self._unpacked and self._unpacked[0] == sha:
             return self._unpacked[1]
         if self._src is None:
-            self._src = Path(tempfile.mkdtemp(prefix="src-", dir=self.cache_dir))
+            self._src = Path(tempfile.mkdtemp(prefix="src-", dir=self.unpack_root))
         self._unpacked = None
         root = self._src / "tree"
         shutil.rmtree(_long_path(root), ignore_errors=True)
         files = self.github.extract(sha, root)
         if files is None:
             return None
-        (self.cache_dir / f"files-{sha}.json").write_text(json.dumps(files))
+        _write_atomic(self.cache_dir / f"files-{sha}.json", json.dumps(files))
         self._unpacked = (sha, root)
         return root
 
@@ -729,20 +733,13 @@ class GraphProvider:
             return None, f"no source for {sha[:7]}"
         # go list evaluates build tags for the host: list for the platform CI tests on.
         env = {**os.environ, **({"GOOS": self.goos} if self.goos else {})}
-        proc = subprocess.run(
-            [self.go, "list", "-deps", "-test", "-json", "./..."],
-            cwd=root,
-            capture_output=True,
-            timeout=1800,
-            check=False,
-            env=env,
-        )
+        proc = _run_go_list(self.go, root, env)
         if proc.returncode != 0:
             error = proc.stderr.decode(errors="replace").strip().splitlines()[-1:] or ["?"]
-            cache.write_text(json.dumps({"error": error[0][:300]}))
+            _write_atomic(cache, json.dumps({"error": error[0][:300]}))
             return None, f"go list failed at {sha[:7]}: {error[0][:120]}"
         graph = build_graph(parse_go_list(proc.stdout.decode(errors="replace")), root)
-        cache.write_text(json.dumps(graph.to_json()))
+        _write_atomic(cache, json.dumps(graph.to_json()))
         return graph, f"import graph at {sha[:7]}"
 
     def close(self) -> None:
@@ -762,7 +759,7 @@ class GraphProvider:
         if root is None:
             return None
         graph = build_py_graph(root)
-        cache.write_text(json.dumps(graph.to_json()))
+        _write_atomic(cache, json.dumps(graph.to_json()))
         return graph
 
     def deleted_at(self, sha: str, paths: list[str]) -> tuple[str, ...] | None:
@@ -788,7 +785,7 @@ class GraphProvider:
         if proc.returncode != 0:
             return None
         files = sorted(f for f in proc.stdout.decode("utf-8", errors="replace").split("\0") if f)
-        cache.write_text(json.dumps(files))
+        _write_atomic(cache, json.dumps(files))
         return frozenset(files)
 
     def _fetch(self, sha: str) -> bool:
@@ -809,6 +806,91 @@ class GraphProvider:
         return subprocess.run(
             ["git", "-C", str(self.checkout), *args], capture_output=True, timeout=600, check=False
         )
+
+
+def _run_go_list(go: str, root: Path, env: Mapping[str, str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [go, "list", "-deps", "-test", "-json", "./..."],
+        cwd=root,
+        capture_output=True,
+        timeout=1800,
+        check=False,
+        env=dict(env),
+    )
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    """Write a cache file so no reader ever sees half of it, from any process: a temporary
+    file in the same directory, then ``os.replace``. Cache files are named by commit and built
+    deterministically, so two writers of one file write the same content. On Windows a replace
+    is refused while another process replaces or reads the target: retried with backoff (~3 s),
+    and if it's still refused but the file exists, another writer already put it there."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    delay = 0.01
+    for _ in range(30):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(delay)
+            delay = min(delay * 2, 0.2)
+    tmp.unlink(missing_ok=True)
+    if not path.exists():
+        raise PermissionError(f"could not write {path}")
+
+
+def build_go_graph(
+    sha: str,
+    go: str,
+    cache_dir: Path,
+    token: str,
+    repo: str,
+    goos: str | None,
+    unpack_root: Path,
+) -> tuple[str, str]:
+    """One commit's Go graph into the cache, from its zipball: a ``--jobs`` task. Its own
+    provider and unpack directory (removed after), so tasks never share a tree."""
+    graphs = GraphProvider(None, go, cache_dir, GitHubSource(token, repo), goos, unpack_root)
+    try:
+        return sha, graphs.go_graph_at(sha)[1]
+    finally:
+        graphs.close()
+
+
+def prefetch_go_graphs(
+    shas: Sequence[str],
+    jobs: int,
+    cache_dir: Path,
+    go: str,
+    token: str,
+    repo: str,
+    goos: str | None,
+    executor: Callable[[int], Executor] = lambda n: ProcessPoolExecutor(max_workers=n),
+) -> int:
+    """Build the Go graphs the evaluation will read, ``jobs`` at a time, before it starts.
+    The evaluation then reads them from the cache as usual, so results never depend on the
+    build order. A task's error (a network outage after retries) stops the eval, as it would
+    without ``--jobs``. Returns how many graphs were built."""
+    missing = [s for s in dict.fromkeys(shas) if not (cache_dir / f"gograph-{s}.json").exists()]
+    if not missing:
+        return 0
+    unpack_root = Path(tempfile.mkdtemp(prefix="jobs-", dir=cache_dir))
+    started = time.perf_counter()
+    try:
+        with executor(jobs) as pool:
+            futures = [
+                pool.submit(build_go_graph, sha, go, cache_dir, token, repo, goos, unpack_root)
+                for sha in missing
+            ]
+            for done, future in enumerate(as_completed(futures), start=1):
+                _, note = future.result()
+                typer.echo(f"go graphs: {done}/{len(missing)} ({note})", err=True)
+    finally:
+        shutil.rmtree(_long_path(unpack_root), ignore_errors=True)
+    typer.echo(f"go graphs: {len(missing)} built with --jobs {jobs} in "
+               f"{time.perf_counter() - started:.0f}s", err=True)  # fmt: skip
+    return len(missing)
 
 
 # --- evaluation ---------------------------------------------------------------------------
@@ -1578,6 +1660,14 @@ def main(
         ".eval-cache"
     ),
     verbose: Annotated[bool, typer.Option("--verbose", help="Details for every run.")] = False,
+    jobs: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            help="Build Go import graphs this many at a time before evaluating (--source github "
+            "only: each build unpacks its own tree). Selection modes; --triage builds lazily.",
+        ),
+    ] = 1,
     triage: Annotated[
         bool,
         typer.Option(
@@ -1587,6 +1677,13 @@ def main(
         ),
     ] = False,
 ) -> None:
+    if jobs > 1 and source != "github":
+        typer.echo(
+            "error: --jobs > 1 needs --source github: one --checkout can't hold two commits at "
+            "once",
+            err=True,
+        )
+        raise typer.Exit(2)
     cache_dir.mkdir(parents=True, exist_ok=True)
     if checkout and not go_module:
         go_module = read_go_module(checkout)
@@ -1599,12 +1696,13 @@ def main(
         generated=repo_config.generated if repo_config else (),
     )
     github_source = None
+    source_token = ""
     if source == "github":
-        token = _github_token()
-        if not token:
+        source_token = _github_token() or ""
+        if not source_token:
             typer.echo("error: --source github needs GITHUB_TOKEN", err=True)
             raise typer.Exit(2)
-        github_source = GitHubSource(token, repo)
+        github_source = GitHubSource(source_token, repo)
     graphs = GraphProvider(checkout, go, cache_dir, github_source, goos)
     with get_sessionmaker()() as session:
         repo_id = session.execute(
@@ -1655,12 +1753,17 @@ def main(
 
         def run_all(title: str, targets: list[TargetRun]) -> list[Result]:
             typer.echo(f"\n# {title}")
+            todo = [
+                t
+                for t in targets
+                if not (wanted and not t.commit_sha.startswith(wanted))
+                and target_key(t) not in done
+            ]
+            if jobs > 1 and is_go:
+                shas = [t.commit_sha for t in todo if t.changed_files is not None]
+                prefetch_go_graphs(shas, jobs, cache_dir, go, source_token, repo, goos)
             results = []
-            for target in targets:
-                if wanted and not target.commit_sha.startswith(wanted):
-                    continue
-                if target_key(target) in done:
-                    continue
+            for target in todo:
                 result = evaluate(session, index, target, config, graphs, durations, is_go)
                 print_result(result, verbose)
                 results.append(result)
