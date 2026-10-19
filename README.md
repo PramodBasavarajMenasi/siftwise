@@ -216,7 +216,7 @@ The first rule that applies decides:
 `failures: [{test_id, message, file_path}]` (up to 5,000). Exit codes: 0 ok, 1 API error,
 2 usage error, 4 a failure got a `--fail-on` verdict (off by default). 500 failures on rdflib
 take about 0.25 s, or 1 s with a cold cache (`scripts/bench_triage.py`). The GitHub Action
-doesn't triage yet.
+puts the verdicts in the PR comment ([Failure verdicts](#failure-verdicts)).
 
 ## Coding agents (MCP)
 
@@ -332,9 +332,9 @@ only exception is [`fail-on`](#fail-on), which you opt into.
 
 | Action | When | What |
 |---|---|---|
-| `actions/select` | before tests | picks tests; outputs `mode`, `command`, `selected`, `total`, `reason`, `junit-dir`; posts one sticky PR comment and a job summary |
-| `actions/record` | after tests, `if: always()` | uploads JUnit with the run ID and attempt, the PR head commit (not the merge commit), branch, variant, start time and changed files; in a single job, then [triages the failures](#failure-verdicts) |
-| `actions/rollup` | once after a matrix | [triages the failures](#failure-verdicts) of every leg, then updates test stats once for all legs (`POST /repos/{repo}/rollup`) |
+| `actions/select` | before tests | picks tests; outputs `mode`, `command`, `selected`, `total`, `reason`, `junit-dir` (and the [shadow](#shadow-mode) outputs); posts one sticky PR comment and a job summary |
+| `actions/record` | after tests, `if: always()` | uploads JUnit with the run ID and attempt, the PR head commit (not the merge commit), branch, variant, start time and changed files; in a single job, then [triages the failures](#failure-verdicts) and reports a [shadow run](#shadow-mode) |
+| `actions/rollup` | once after a matrix | [triages the failures](#failure-verdicts) of every leg and reports a [shadow run](#shadow-mode), then updates test stats once for all legs (`POST /repos/{repo}/rollup`) |
 
 **Setup:**
 - **Secrets:** add `SIFTWISE_URL` (your server) and `SIFTWISE_TOKEN` (its `SIFTWISE_API_TOKEN`).
@@ -502,8 +502,60 @@ the listed verdicts, on any leg:
 
 Without `fail-on` (the default), siftwise never fails anything.
 
+### Shadow mode
+
+How often would siftwise's selection have missed a real failure? Shadow mode measures it on
+your own CI. On a sampled run the full suite runs while siftwise stores what it would have
+selected; after the run is recorded, the server checks every failure against that selection:
+
+```yaml
+      - id: siftwise
+        uses: PramodBasavarajMenasi/siftwise/actions/select@main
+        with:
+          server-url: ${{ secrets.SIFTWISE_URL }}
+          token: ${{ secrets.SIFTWISE_TOKEN }}
+          shadow: 10%          # or always; off by default
+```
+
+- **`shadow`:** `off` (default), `always`, or a percentage of CI runs. Sampling hashes the run
+  ID, so every matrix leg and every re-run attempt of a run agrees. An invalid value is a
+  warning and turns shadow mode off.
+- **A shadow run always runs the full suite.** `select` outputs `mode: full` and an empty
+  `command` before it calls the server, so your workflow's full-suite branch runs whatever
+  happens. Shadow mode never fails or shortens a run. Shadow runs record their results to
+  history as usual.
+- **Matrix legs** can set `variant` on `select` too (the same value as `record`'s), so each leg's
+  selection is stored for that leg. Without it one selection covers every leg.
+- **Where verdicts are computed** (`rollup` after a matrix, `record` in a single job), the
+  failures section of the PR comment and the job summary get a line like "**Shadow run:**
+  would have run 120 of 692 tests (70% time saved) and caught 3 of 4 failures (1 flaky not
+  counted)", then the missed tests (at most 20). The time saved is measured on the run's own
+  durations. Failures that triage calls flaky are counted separately, never as misses;
+  pre-existing and unknown ones count.
+- **Outputs:** `select` has `shadow`, `shadow-mode` (what siftwise would have done),
+  `shadow-selected` and `shadow-total`; `rollup` and `record` have `shadow`, `shadow-mode`,
+  `shadow-caught` and `shadow-missed`.
+- **Not counted, with a warning:** a selection the server couldn't store (the warning gives
+  the reason: `incomplete_selection`, `commit_conflict` or `storage_error`), siftwise
+  unreachable at select time, or a comparison that failed. No siftwise token (fork PRs): no
+  shadow run.
+
+Recall over time comes from `GET /repos/{repo}/recall?days=30`, or:
+
+```sh
+siftwise report --repo acme/shop --days 30
+# Recall 98.7% (148 of 150) over 40 shadow runs; selective runs only: 96.0% (48 of 50) over 25
+```
+
+The first figure counts every shadow run, including those where siftwise would have run the
+full suite anyway (a fallback catches everything), so the report always shows it with the
+selective-only figure. Below that come the misses by verdict, the measured time saved, the runs
+not counted (by reason: no upload, commit mismatch, compare error, cancelled) and the misses,
+newest first. `--json` prints the API response.
+
 `.github/workflows/action-e2e.yml` runs all three actions against a real server on every push
-and PR of this repo, including a deliberately failing test's verdict and `fail-on`.
+and PR of this repo, including a deliberately failing test's verdict, `fail-on` and a shadow
+run.
 
 
 ## Features
@@ -617,9 +669,9 @@ on a backfilled repo with `uv run python -m scripts.eval.run_eval --repo owner/n
 
 ## Roadmap
 
-- **Next:** a `v0` tag for the GitHub Action.
-- **Then:** verdicts in the Action's PR comment, and a triage eval on real history.
-- **Later:** a recall harness, docs and launch.
+- **Next:** recall data from [shadow mode](#shadow-mode) on real repos, miss causes, flaky
+  handling (`known_flaky`, re-run detection) and packaging (a light CLI, a Docker image).
+- **Then:** a `v0.1.0` release on PyPI, docs and launch.
 
 ## Contributing
 

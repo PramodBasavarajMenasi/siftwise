@@ -1,14 +1,24 @@
-"""POST /select: which tests to run for a change."""
+"""POST /select: which tests to run for a change (and, for a shadow run, store the selection)."""
 
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from siftwise.core.schemas import EstimatedMs, SelectedTestOut, SelectRequest, SelectResponse
-from siftwise.core.selector import DependsRule, SelectorConfig, load_history, select_tests
+from siftwise.core.selector import (
+    DependsRule,
+    Selection,
+    SelectorConfig,
+    load_history,
+    select_tests,
+)
+from siftwise.core.shadow import STORAGE_ERROR, ShadowTarget, store_selection
 from siftwise.db import get_session
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -16,7 +26,8 @@ router = APIRouter()
 def post_select(
     body: SelectRequest, session: Annotated[Session, Depends(get_session)]
 ) -> SelectResponse:
-    """Select tests for a change. Falls back to the full suite whenever unsure."""
+    """Select tests for a change. Falls back to the full suite whenever unsure. With
+    ``shadow``, also stores the selection for that (full-suite) run's recall."""
     config = SelectorConfig(
         always_run=tuple(body.always_run),
         depends=tuple(DependsRule(rule.tests, tuple(rule.on)) for rule in body.depends),
@@ -36,6 +47,7 @@ def post_select(
         deleted_files=body.deleted_files,
         junit_dir=body.junit_dir,
     )
+    shadow_reason = _store_shadow(session, body, selection) if body.shadow else None
     return SelectResponse(
         repo=body.repo,
         mode=selection.mode.value,
@@ -59,4 +71,21 @@ def post_select(
             )
             for t in selection.tests
         ],
+        shadow_stored=None if body.shadow is None else shadow_reason is None,
+        shadow_reason=shadow_reason,
     )
+
+
+def _store_shadow(session: Session, body: SelectRequest, selection: Selection) -> str | None:
+    """Store a shadow run's selection; None, or why it wasn't stored. Never fails the request:
+    the caller runs the full suite whatever happens, and an unstored selection only means the
+    run isn't counted."""
+    assert body.shadow is not None
+    shadow = body.shadow
+    target = ShadowTarget(shadow.ci_run_id, shadow.run_attempt, shadow.variant, shadow.commit_sha)
+    try:
+        return store_selection(session, body.repo, target, selection)
+    except SQLAlchemyError:
+        logger.exception("shadow selection not stored for %s run %s", body.repo, shadow.ci_run_id)
+        session.rollback()
+        return STORAGE_ERROR

@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from siftwise import __version__
 from siftwise.api.auth import BearerAuthMiddleware
 from siftwise.api.limits import BodySizeLimitMiddleware
-from siftwise.api.routes import explain, history, repos, runs, select, triage
+from siftwise.api.routes import explain, history, repos, runs, select, shadow, triage
 from siftwise.config import Settings, get_settings
 
 
@@ -22,6 +22,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(triage.router)
     app.include_router(explain.router)
     app.include_router(repos.router)
+    app.include_router(shadow.router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

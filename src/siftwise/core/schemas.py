@@ -169,10 +169,34 @@ class ChangeRequest(ChangeGraph):
     )
 
 
+Sha40 = Annotated[
+    str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^[0-9a-fA-F]{40}$")
+]
+
+
+class ShadowIn(BaseModel):
+    """A shadow run: the full suite runs, and the server stores this selection to compare
+    with the recorded results (``POST /repos/{repo}/shadow``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ci_run_id: NonEmpty255
+    run_attempt: int = Field(default=1, ge=1)
+    variant: Variant = Field(
+        default=None,
+        description="Matrix leg the selection is for; null = every leg of the attempt",
+    )
+    commit_sha: Sha40 = Field(description="The commit being tested (the run must match it)")
+
+
 class SelectRequest(ChangeRequest):
     """Body of ``POST /select``."""
 
     always_run: list[Glob] = Field(default_factory=list, max_length=1000)
+    shadow: ShadowIn | None = Field(
+        default=None,
+        description="Store the selection for a shadow run (one running the full suite)",
+    )
     junit_dir: Annotated[str, StringConstraints(min_length=1, max_length=1024)] | None = Field(
         default=None,
         description="Directory for pytest JUnit reports: each pytest command gets "
@@ -213,6 +237,17 @@ class SelectResponse(BaseModel):
         description="Estimated test time from history; full mode runs everything"
     )
     tests: list[SelectedTestOut] = Field(description="Selected tests; empty in full mode")
+    shadow_stored: bool | None = Field(
+        default=None,
+        description="Shadow runs only: the selection was stored (false: this run won't be "
+        "counted in recall)",
+    )
+    shadow_reason: str | None = Field(
+        default=None,
+        description="Why a shadow selection wasn't stored: 'incomplete_selection' (a selected "
+        "test unknown), 'commit_conflict' (the attempt holds another commit's selection) or "
+        "'storage_error'; null when stored",
+    )
 
 
 class BrokenVariant(BaseModel):
@@ -499,3 +534,114 @@ class ExplainResponse(BaseModel):
     flaky_counts: dict[str, int]
     window_days: int
     selection: ExplainSelectionOut
+
+
+# --- shadow mode --------------------------------------------------------------------------
+
+
+class ShadowCompareRequest(BaseModel):
+    """Body of ``POST /repos/{repo}/shadow``: a recorded shadow CI run attempt to compare."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ci_run_id: NonEmpty255
+    run_attempt: int = Field(default=1, ge=1)
+
+
+class ShadowSelectionOut(BaseModel):
+    variant: str | None = Field(description="null: the selection for every leg")
+    commit_sha: str
+    mode: str = Field(description="What siftwise would have done: 'full' or 'selective'")
+    reason: str
+    selected_count: int
+    total_known: int
+    estimated_ms: EstimatedMs = Field(description="Estimated at select time from history")
+    status: str = Field(
+        description="'compared', 'no_upload', 'commit_mismatch', 'compare_error' or 'pending'"
+    )
+
+
+class ShadowVariantOut(BaseModel):
+    variant: str | None
+    run_id: int
+    status: str = Field(description="'compared', 'commit_mismatch' or 'no_selection'")
+    failing: int
+    caught: int
+    missed: int
+    flaky: int = Field(description="Failures triage calls flaky: neither caught nor missed")
+    tests_total: int = Field(description="Tests in this run (Go subtests left out)")
+    tests_would_run: int
+    ms_total: float = Field(description="Measured durations in this run")
+    ms_would_run: float
+
+
+class ShadowTimeOut(BaseModel):
+    total_ms: float = Field(description="Measured test time of the full-suite runs")
+    would_run_ms: float = Field(description="Of that, the tests the selection would have run")
+    saved: float | None = Field(description="1 - would_run / total; null without durations")
+
+
+class ShadowMissOut(BaseModel):
+    test_id: str
+    verdict: str = Field(description="Triage's verdict (the worst over the missed variants)")
+    variants: list[str | None] = Field(description="The variants whose selection missed it")
+
+
+class ShadowCompareResponse(BaseModel):
+    repo: str
+    ci_run_id: str
+    run_attempt: int
+    shadow: bool = Field(description="A selection was stored: this was a shadow run")
+    counted: bool = Field(description="At least one variant was compared")
+    mode: str | None = Field(
+        description="'selective' if every compared variant's selection was; null if none was"
+    )
+    selections: list[ShadowSelectionOut]
+    variants: list[ShadowVariantOut]
+    failing_tests: int = Field(description="Distinct failing tests (flaky ones included)")
+    caught: int
+    missed: int
+    flaky_excluded: int
+    missed_by_verdict: dict[str, int]
+    missed_tests: list[ShadowMissOut] = Field(description="At most 100")
+    time: ShadowTimeOut
+
+
+class RecallStatsOut(BaseModel):
+    runs: int = Field(description="Shadow CI run attempts")
+    failures: int = Field(description="Failing tests, one per test and run attempt")
+    flaky_excluded: int = Field(description="Failures triage called flaky: not in recall")
+    caught: int
+    missed: int
+    recall: float | None = Field(description="caught / (caught + missed); null with neither")
+    missed_by_verdict: dict[str, int]
+
+
+class RecallMissOut(BaseModel):
+    test_id: str
+    ci_run_id: str
+    run_attempt: int
+    commit_sha: str
+    variants: list[str | None]
+    verdict: str
+    selection_mode: str
+    at: datetime = Field(description="When the run happened")
+
+
+class RecallResponse(BaseModel):
+    repo: str
+    days: int
+    since: datetime
+    shadow_runs: int = Field(description="Compared shadow CI run attempts")
+    selective_runs: int
+    full_runs: int = Field(description="Shadow runs where siftwise would have run everything")
+    not_counted: dict[str, int] = Field(
+        description="Stored selections never compared, by reason: no_upload, commit_mismatch, "
+        "compare_error, cancelled (the compare never ran, 6+ hours after select)"
+    )
+    in_progress: int = Field(description="Selections from the last 6 hours not compared yet")
+    all: RecallStatsOut = Field(description="Every shadow run")
+    selective: RecallStatsOut = Field(description="Selective shadow runs only")
+    time: ShadowTimeOut
+    misses: list[RecallMissOut] = Field(description="Newest first, at most 100")
+    misses_truncated: bool

@@ -78,6 +78,20 @@ outputs:
   report:
     description: Path of the Markdown failures report (what went to the job summary).
     value: ${{ steps.record.outputs.report }}
+  shadow:
+    description: "'true' if this run was a shadow run that siftwise compared, else 'false'."
+    value: ${{ steps.record.outputs.shadow }}
+  shadow-mode:
+    description: "In a shadow run, what siftwise would have done: 'selective' or 'full'."
+    value: ${{ steps.record.outputs.shadow-mode }}
+  shadow-caught:
+    description: >-
+      In a counted shadow run, failing tests the selection would have run (flaky ones not
+      counted).
+    value: ${{ steps.record.outputs.shadow-caught }}
+  shadow-missed:
+    description: In a counted shadow run, failing tests the selection would have skipped.
+    value: ${{ steps.record.outputs.shadow-missed }}
 runs:
   using: composite
   steps:

@@ -21,8 +21,11 @@ from siftwise.core.selector import (
     Mode,
     RepoHistory,
     Runner,
+    SelectedTest,
     Selection,
+    SelectionScope,
     SelectorConfig,
+    WouldRun,
     build_file_scope,
     glob_match,
     is_build_file,
@@ -1412,3 +1415,80 @@ def test_module_and_class_parts_must_still_be_python_names(test_id: str) -> None
     # Only directories above the test module may hold "-": the rest is Python names (and a
     # classname with no test module is no pytest location at all).
     assert select(history(test_id), "pkg-a/x.py").mode is Mode.FULL
+
+
+# --- SelectionScope (what shadow mode stores) ----------------------------------------------
+
+
+def _would_run_before_scope(selection: Selection, test_id: str) -> bool:
+    """WouldRun as it was before it read a SelectionScope (kept here as the reference)."""
+    if selection.mode is Mode.FULL or test_id in {t.test_id for t in selection.tests}:
+        return True
+    package, _, name = test_id.partition("::")
+    if package in set(selection.go_packages_run_whole):
+        return True
+    go_top_level = {
+        (p, n.split("/", 1)[0])
+        for t in selection.tests
+        if t.runner is Runner.GO
+        for p, _, n in [t.test_id.partition("::")]
+    }
+    if (package, name.split("/", 1)[0]) in go_top_level:
+        return True
+    files = set(selection.python_files_run_whole)
+    return bool(files) and pytest_file(test_id) in files
+
+
+def test_would_run_from_a_scope_matches_the_selection() -> None:
+    hist = history(
+        "tests.test_cart::test_total",
+        "tests.test_cart.TestDiscount::test_applies",
+        "tests.test_io::test_read",
+        "rdflib.container::rdflib.container.Seq",  # a doctest
+        f"{CLI}::TestAdd",
+        f"{CLI}::TestAdd/sub",
+        f"{COREUNIX}::TestAddFile",
+        f"{KUBO}/core::TestCore",
+    )
+    probes = [
+        *hist.tests,
+        "tests.test_cart::test_brand_new",
+        "tests.test_io::test_new",
+        f"{CLI}::TestAdd/new_subtest",
+        f"{CLI}::TestNew",
+        f"{COREUNIX}::TestNew/sub",
+        "rdflib.container::rdflib.container.Bag",
+        "elsewhere::test_x",
+    ]
+    selections = [
+        select(hist, "tests/test_cart.py"),  # a Python test file run whole
+        select(hist, "src/io.py"),  # node IDs
+        select(hist, "rdflib/container.py"),  # doctest module
+        select(hist, "core/coreunix/add.go", go_module=KUBO),  # Go package run whole
+        select_tests(
+            hist,
+            ["core/coreunix/add.go"],
+            True,
+            SelectorConfig(go_module=KUBO),
+            affected_packages={CLI: [COREUNIX]},
+        ),
+        select(hist, "pyproject.toml"),  # full
+        # A Go test selected by history (co-change, recently failed): `go test -run`, so its
+        # subtests run too, but not the rest of its package.
+        Selection(
+            mode=Mode.SELECTIVE,
+            reason="-run",
+            selected_count=1,
+            total_known=8,
+            commands=(),
+            tests=(SelectedTest(f"{CLI}::TestAdd/sub", ("r",), Runner.GO, None),),
+        ),
+    ]
+    assert SelectionScope.of(selections[-1]).go_packages == frozenset()
+    for selection in selections:
+        scope = SelectionScope.of(selection)
+        for test_id in probes:
+            expected = _would_run_before_scope(selection, test_id)
+            assert WouldRun(selection)(test_id) is expected, (selection.reason, test_id)
+            assert WouldRun(scope)(test_id) is expected, (selection.reason, test_id)
+    assert {s.mode for s in selections} == {Mode.FULL, Mode.SELECTIVE}

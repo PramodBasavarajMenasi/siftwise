@@ -3,7 +3,8 @@ name: Action e2e
 # Dogfoods actions/select, record and rollup on siftwise itself, against a real server: an
 # empty history (full suite), recording this run's JUnit (plus one deliberately failing test),
 # the rollup's failure verdicts in the job summary and PR comment, fail-on, a second selection
-# that sees the history, and the fail-open paths (server down, no token, shallow clone).
+# that sees the history, the fail-open paths (server down, no token, shallow clone), and a
+# shadow run (full suite, the stored selection's caught and missed failures).
 
 on:
   push:
@@ -273,6 +274,120 @@ jobs:
           test "$FAILON_HIT" = failure
           test "$FAILON_MISS" = success
           test "$DOWN_FAILON" = failure   # fail closed: fail-on is set
+
+      # Shadow mode: the full suite runs while siftwise stores what it would have selected; the
+      # rollup then counts the failures that selection caught or missed. Its own variant: this
+      # is the same CI run attempt as the steps above (a step can't change GITHUB_RUN_ID). On a
+      # PR no signal reliably selects the always-failing test (recently-failed reads main runs
+      # only), so an untracked .siftwise.toml pins it with always_run; select diffs commits, so
+      # the file is never part of the change. A new failing test that no signal reaches is the
+      # miss. A full selection (e.g. a commit touching a workflow) catches both.
+      - name: Shadow - pin the always-failing test
+        run: printf 'always_run = ["test_e2e_failing::*"]\n' > .siftwise.toml
+
+      - name: Shadow - select (shadow always)
+        id: shadow
+        uses: ./actions/select
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          shadow: always
+          variant: shadow-e2e
+          junit-dir: ${{ runner.temp }}/shadow-junit
+
+      - name: Shadow - the full suite, plus a new failing test
+        env:
+          MODE: ${{ steps.shadow.outputs.mode }}
+          COMMAND: ${{ steps.shadow.outputs.command }}
+          SHADOW: ${{ steps.shadow.outputs.shadow }}
+          FIRST_JUNIT: ${{ steps.first.outputs.junit-dir }}
+          JUNIT_DIR: ${{ steps.shadow.outputs.junit-dir }}
+        run: |
+          rm .siftwise.toml
+          test "$SHADOW" = true
+          test "$MODE" = full     # a shadow run never selects
+          test -z "$COMMAND"      # the workflow runs its own full suite
+          # This job already ran the full suite and the failing test: their reports stand in.
+          cp "$FIRST_JUNIT/full.xml" "$FIRST_JUNIT/e2e-failing.xml" "$JUNIT_DIR/"
+          dir="$RUNNER_TEMP/e2e_shadow"
+          mkdir -p "$dir"
+          printf 'def test_e2e_shadow_new():\n    assert 1 == 2\n' > "$dir/test_e2e_shadow_new.py"
+          if uv run pytest "$dir/test_e2e_shadow_new.py" --rootdir "$dir" -p no:cacheprovider \
+              --junitxml="$JUNIT_DIR/e2e-shadow-new.xml"; then
+            echo "the new failing test passed"; exit 1
+          fi
+          test -z "$(git status --porcelain)"
+
+      - name: Shadow - record
+        uses: ./actions/record
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          variant: shadow-e2e
+          junit-dir: ${{ steps.shadow.outputs.junit-dir }}
+
+      - name: Shadow - rollup (compares the shadow run; comments on the PR)
+        id: shadow_rollup
+        uses: ./actions/rollup
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+
+      - name: Check the shadow run
+        env:
+          SHADOW_MODE: ${{ steps.shadow.outputs.shadow-mode }}
+          SELECTED: ${{ steps.shadow.outputs.shadow-selected }}
+          TOTAL: ${{ steps.shadow.outputs.shadow-total }}
+          ROLLUP_SHADOW: ${{ steps.shadow_rollup.outputs.shadow }}
+          ROLLUP_MODE: ${{ steps.shadow_rollup.outputs.shadow-mode }}
+          CAUGHT: ${{ steps.shadow_rollup.outputs.shadow-caught }}
+          MISSED: ${{ steps.shadow_rollup.outputs.shadow-missed }}
+          REPORT: ${{ steps.shadow_rollup.outputs.report }}
+        run: |
+          cat "$REPORT"
+          echo "would have run $SELECTED of $TOTAL ($SHADOW_MODE): caught=$CAUGHT missed=$MISSED"
+          test "$ROLLUP_SHADOW" = true
+          test "$ROLLUP_MODE" = "$SHADOW_MODE"
+          recall=$(curl -sf -H "Authorization: Bearer $TOKEN" \
+            "$SERVER/repos/$GITHUB_REPOSITORY/recall?days=1")
+          echo "$recall" | jq .
+          # Both failures are new to this attempt's history (triage leaves out the whole
+          # attempt), so neither is flaky: each counts as caught or missed.
+          echo "$recall" | jq -e '.shadow_runs == 1 and .all.failures == 2 and .all.flaky_excluded == 0'
+          case "$SHADOW_MODE" in
+            selective)
+              # Pinned by always_run: caught. New, outside every signal: missed.
+              test "$CAUGHT" = 1
+              test "$MISSED" = 1
+              grep -F 'and caught 1 of 2 failures' "$REPORT"
+              grep -F -- '- <code>test\_e2e\_shadow\_new::test\_e2e\_shadow\_new</code> (unknown)' "$REPORT"
+              echo "$recall" | jq -e '.selective_runs == 1 and .selective.caught == 1
+                and .selective.missed == 1 and .all.missed_by_verdict.unknown == 1
+                and .misses[0].test_id == "test_e2e_shadow_new::test_e2e_shadow_new"
+                and .misses[0].variants == ["shadow-e2e"]'
+              ;;
+            full)
+              test "$CAUGHT" = 2
+              test "$MISSED" = 0
+              grep -F 'would have run all' "$REPORT"
+              grep -F 'and caught 2 of 2 failures' "$REPORT"
+              echo "$recall" | jq -e '.full_runs == 1 and .selective_runs == 0 and .all.missed == 0'
+              ;;
+            *) echo "unexpected shadow-mode: '$SHADOW_MODE'"; exit 1 ;;
+          esac
+
+      # Same-repo PRs only, as above.
+      - name: Check the shadow lines in the PR comment
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          body=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            --jq '.[] | select(.body | contains("<!-- siftwise -->")) | .body')
+          echo "$body"
+          grep -F -- '- **Mode:** full (shadow run)' <<< "$body"
+          grep -F '**Shadow run:** would have run' <<< "$body"
 
       - name: Server log
         if: failure()

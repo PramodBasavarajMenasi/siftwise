@@ -17,11 +17,18 @@ Failure verdicts come after the run's last upload: from ``rollup`` after a matri
 ``record`` in a single job. The server triages what the uploads stored (``POST
 /repos/{repo}/triage``), so that step needs no checkout. The sticky PR comment has two
 sections, each written by its own step: the selection (``select``) and the failures.
+
+Shadow mode (``shadow`` on ``select``: off, always, or a percentage of CI runs, sampled by a
+hash of the run ID so every leg agrees): the full suite runs (``mode=full``, decided before any
+server call), while the server stores what siftwise would have selected. Where triage runs,
+``POST /repos/{repo}/shadow`` then counts the failures it would have caught or missed: live
+recall. Shadow mode never fails or shortens a run; problems are warnings.
 """
 
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import re
@@ -69,6 +76,13 @@ COMMENT_ROWS = 20  # rows per comment table (the visible one and the collapsed o
 REASON_CHARS = 120
 NOTHING_RECORDED = "nothing recorded for this attempt"
 NO_TOKEN = "no siftwise token (secrets aren't available to pull requests from forks)"
+SHADOW_REASON = "shadow run: the full suite runs, to check what siftwise would have caught"
+_NOT_COUNTED = {
+    "commit_mismatch": "the recorded results are for another commit",
+    "no_upload": "no results were recorded for its variant",
+    "compare_error": "the server failed to compare it",
+    "pending": "it was never compared",
+}
 
 Env = Mapping[str, str]
 
@@ -173,8 +187,11 @@ def select_step(
     junit_dir: Annotated[str, typer.Option(envvar="SIFTWISE_JUNIT_DIR")] = "",
     comment: Annotated[bool, typer.Option(envvar="SIFTWISE_COMMENT")] = True,
     github_token: Annotated[str, typer.Option(envvar="SIFTWISE_GITHUB_TOKEN")] = "",
+    shadow: Annotated[str, typer.Option(envvar="SIFTWISE_SHADOW")] = "off",
+    variant: Annotated[str, typer.Option(envvar="SIFTWISE_VARIANT")] = "",
 ) -> None:
-    """Select tests for this run and set the step's outputs."""
+    """Select tests for this run and set the step's outputs. In a shadow run the outputs say
+    run the full suite, and the server stores the selection to measure recall."""
     from siftwise.cli import main as cli  # main registers this app: import it lazily
 
     env = os.environ
@@ -191,6 +208,16 @@ def select_step(
     # For the record step later in the job: where the reports are, and when the job started.
     _append(env, "GITHUB_ENV", {"SIFTWISE_JUNIT_DIR": junit_dir,
                                 "SIFTWISE_SELECT_STARTED_AT": _now()})  # fmt: skip
+    rate = parse_shadow(shadow)
+    if rate is None:
+        _annotate("warning", f"siftwise: invalid shadow value {shadow!r} (use off, always or a "
+                  "percentage such as 10%); shadow mode is off")  # fmt: skip
+        rate = 0.0
+    # A shadow run needs somewhere to store the selection: a token, a run ID and the commit.
+    in_shadow = bool(token and ctx.run_id and ctx.head_sha) and sampled(repo, ctx.run_id, rate)
+    if in_shadow:
+        # Decided before any server call can fail: whatever happens next, the full suite runs.
+        _append(env, "GITHUB_OUTPUT", {"mode": "full", "command": "", "shadow": "true"})
 
     result: dict[str, Any] | None = None
     if not token:
@@ -199,6 +226,13 @@ def select_step(
         try:
             body = cli.selection_request(repo, ctx.base, ctx.head_sha or "HEAD",
                                          junit_dir=junit_dir)  # fmt: skip
+            if in_shadow:
+                body["shadow"] = {
+                    "ci_run_id": ctx.run_id,
+                    "run_attempt": ctx.run_attempt,
+                    "variant": variant or None,
+                    "commit_sha": ctx.head_sha,
+                }
             result = cli.post_json(server, token, "/select", body, timeout=SELECT_TIMEOUT)
             problem = ""
         except cli.SiftwiseError as exc:
@@ -213,6 +247,19 @@ def select_step(
         _annotate("warning", f"siftwise: {problem}; running the full suite")
         result = fail_open_result(problem)
 
+    would_have: dict[str, Any] | None = None  # in a shadow run: what siftwise would have run
+    not_counted = ""
+    if in_shadow:
+        if problem:
+            not_counted = problem
+        else:
+            would_have = result
+            if result.get("shadow_stored") is not True:
+                not_counted = f"the selection wasn't stored ({result.get('shadow_reason')})"
+        if not_counted:
+            _annotate("warning", f"siftwise: shadow run not counted: {not_counted}")
+        result = shadow_result(result)
+
     estimated = result.get("estimated_ms") or {}
     _append(env, "GITHUB_OUTPUT", {
         "mode": result["mode"],
@@ -223,8 +270,13 @@ def select_step(
         "junit-dir": junit_dir,
         "estimated-ms-total": str(round(estimated.get("total", 0))),
         "estimated-ms-would-run": str(round(estimated.get("would_run", 0))),
+        "shadow": "true" if in_shadow else "false",
+        "shadow-mode": would_have["mode"] if would_have else "",
+        "shadow-selected": str(would_have["selected_count"]) if would_have else "",
+        "shadow-total": str(would_have["total_known"]) if would_have else "",
     })  # fmt: skip
-    table = selection_markdown(result, ctx.head_sha)
+    table = selection_markdown(result, ctx.head_sha, shadow=in_shadow, would_have=would_have,
+                               not_counted=not_counted)  # fmt: skip
     notes = []
     if comment and ctx.pr_number is not None:
         if ctx.fork:
@@ -237,6 +289,9 @@ def select_step(
     _append_summary(env, "\n" + table + "".join(f"\n> {note}\n" for note in notes))
     typer.echo(f"siftwise: {result['mode']} ({result['selected_count']} of "
                f"{result['total_known']} known tests): {result['reason']}")  # fmt: skip
+    if would_have:
+        typer.echo(f"siftwise: shadow run: would have run {would_have['selected_count']} of "
+                   f"{would_have['total_known']} ({would_have['mode']})")  # fmt: skip
 
 
 @app.command("record")
@@ -274,8 +329,10 @@ def record_step(
         response = None
         if not problem:
             response, problem = fetch_triage(server, token, repo, ctx)
+        shadow = fetch_shadow(server, token, repo, ctx)
+        _shadow_outputs(env, shadow)
         code = report_failures(ctx, response, problem, comment=comment,
-                               github_token=github_token, fail_on=gate)  # fmt: skip
+                               github_token=github_token, fail_on=gate, shadow=shadow)  # fmt: skip
         if code:
             raise typer.Exit(code)
 
@@ -352,12 +409,18 @@ def rollup_step(
     ctx = load_context(env, has_commit=lambda _ref: False)
     repo = repo or ctx.repo
     code = 0
+    # A shadow run's comparison, after every leg recorded (a no-op answer otherwise).
+    shadow = fetch_shadow(server, token, repo, ctx)
+    _shadow_outputs(env, shadow)
     if triage:
         response, problem = fetch_triage(server, token, repo, ctx)
         code = report_failures(ctx, response, problem, comment=comment,
-                               github_token=github_token, fail_on=gate)  # fmt: skip
-    elif gate:
-        _annotate("warning", "siftwise: fail-on has no effect with triage turned off")
+                               github_token=github_token, fail_on=gate, shadow=shadow)  # fmt: skip
+    else:
+        if gate:
+            _annotate("warning", "siftwise: fail-on has no effect with triage turned off")
+        if shadow is not None:
+            _append_summary(env, "\n" + shadow_markdown(shadow))
     if not token:
         _annotate("warning", "siftwise: no token (fork pull request?); stats not updated")
     else:
@@ -389,9 +452,34 @@ def fail_open_result(problem: str) -> dict[str, Any]:
     }
 
 
-def selection_markdown(result: dict[str, Any], head_sha: str) -> str:
+def shadow_result(result: dict[str, Any]) -> dict[str, Any]:
+    """A shadow run's outputs: the full suite, whatever siftwise would have selected."""
+    total = (result.get("estimated_ms") or {}).get("total") or 0.0
+    return {
+        **result,
+        "mode": "full",
+        "command": "",
+        "reason": SHADOW_REASON,
+        "selected_count": result["total_known"],
+        "estimated_ms": {"total": total, "would_run": total},
+    }
+
+
+def selection_markdown(
+    result: dict[str, Any],
+    head_sha: str,
+    *,
+    shadow: bool = False,
+    would_have: dict[str, Any] | None = None,
+    not_counted: str = "",
+) -> str:
     """The selection as a short Markdown list (step summary and PR comment). A list, not a
-    two-column table: a table needs a header row, and this one had nothing to put in it."""
+    two-column table: a table needs a header row, and this one had nothing to put in it.
+
+    In a shadow run ``result`` is the full suite that runs; ``would_have`` is the selection
+    siftwise made (None if it couldn't), and ``not_counted`` why recall won't count the run."""
+    if shadow:
+        return _shadow_selection_markdown(result, head_sha, would_have, not_counted)
     mode, total_known = result["mode"], result["total_known"]
     if mode == "full":
         tests = f"all ({total_known:,} known)" if total_known else "all"
@@ -408,6 +496,40 @@ def selection_markdown(result: dict[str, Any], head_sha: str) -> str:
                      f"({100 * saved / total:.0f}% saved)"))  # fmt: skip
     if mode == "full":
         rows.append(("Why the full suite", _cell(result["reason"])))
+    return _selection_list(rows, head_sha)
+
+
+def _shadow_selection_markdown(
+    result: dict[str, Any], head_sha: str, would_have: dict[str, Any] | None, not_counted: str
+) -> str:
+    total_known = result["total_known"]
+    rows = [
+        ("Mode", "full (shadow run)"),
+        ("Tests", f"all ({total_known:,} known)" if total_known else "all"),
+    ]
+    if would_have is not None:
+        rows.append(("Would have run", _would_have_run(would_have)))
+    rows.append(("Why the full suite", SHADOW_REASON))
+    if not_counted:
+        rows.append(("Recall", f"this run won't be counted: {_cell(not_counted)}"))
+    return _selection_list(rows, head_sha)
+
+
+def _would_have_run(selection: dict[str, Any]) -> str:
+    total_known = selection["total_known"]
+    if selection["mode"] == "full":
+        return f"all ({_cell(selection['reason'])})"
+    if not selection["command"]:
+        return f"none of {total_known:,} known tests (none affected)"
+    ran = f"{selection['selected_count']:,} of {total_known:,} known tests"
+    estimated = selection.get("estimated_ms") or {}
+    total, would_run = estimated.get("total") or 0.0, estimated.get("would_run") or 0.0
+    if total > 0:
+        ran += f" (~{100 * (total - would_run) / total:.0f}% time saved, estimated)"
+    return ran
+
+
+def _selection_list(rows: list[tuple[str, str]], head_sha: str) -> str:
     items = "\n".join(f"- **{k}:** {v}" for k, v in rows)
     commit = f" for `{head_sha[:7]}`" if head_sha else ""
     return f"### siftwise test selection{commit}\n\n{items}\n"
@@ -546,9 +668,11 @@ def report_failures(
     comment: bool,
     github_token: str,
     fail_on: frozenset[str],
+    shadow: dict[str, Any] | None = None,
 ) -> int:
-    """Write the failures to the job summary, a report file and the PR comment, and set the
-    outputs. Returns the exit code: 1 only for ``fail_on`` (a match, or no verdicts)."""
+    """Write the failures (and a shadow run's recall line) to the job summary, a report file
+    and the PR comment, and set the outputs. Returns the exit code: 1 only for ``fail_on`` (a
+    match, or no verdicts); the shadow comparison never affects it."""
     env = os.environ
     if response is None:
         _annotate("warning", f"siftwise: failure verdicts unavailable: {problem}")
@@ -556,6 +680,9 @@ def report_failures(
     else:
         in_comment = failures_markdown(response, ctx.run_url, max_rows=COMMENT_ROWS)
         in_summary = failures_markdown(response, ctx.run_url)
+    if shadow is not None:
+        in_comment += "\n" + shadow_markdown(shadow)
+        in_summary += "\n" + shadow_markdown(shadow)
     notes = []
     if comment and ctx.pr_number is not None:
         if ctx.fork:
@@ -609,6 +736,98 @@ def report_failures(
     listed = ", ".join(tests[:10]) + (f" and {len(tests) - 10} more" if len(tests) > 10 else "")
     _annotate("error", f"siftwise: fail-on matched {', '.join(hit)}: {listed}")
     return 1
+
+
+# --- shadow mode ----------------------------------------------------------------------------
+
+
+def parse_shadow(value: str) -> float | None:
+    """The ``shadow`` input as a sampling rate (0 = off, 1 = always), or None if invalid."""
+    text = value.strip().lower()
+    if text in ("", "off"):
+        return 0.0
+    if text == "always":
+        return 1.0
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)%", text)
+    if match and float(match[1]) <= 100:
+        return float(match[1]) / 100
+    return None
+
+
+def sampled(repo: str, run_id: str, rate: float) -> bool:
+    """Whether this CI run is a shadow run. Deterministic per run ID, so every matrix leg (and
+    every re-run attempt) of the run agrees without talking to the others."""
+    if rate <= 0 or not run_id:
+        return False
+    if rate >= 1:
+        return True
+    digest = hashlib.sha256(f"{repo}\n{run_id}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64 < rate
+
+
+def fetch_shadow(server: str, token: str, repo: str, ctx: Context) -> dict[str, Any] | None:
+    """``POST /repos/{repo}/shadow`` for this run attempt: the comparison if this was a
+    shadow run, else None. A failure only warns: the run just isn't counted."""
+    from siftwise.cli import main as cli
+
+    if not token or not ctx.run_id:
+        return None
+    body = {"ci_run_id": ctx.run_id, "run_attempt": ctx.run_attempt}
+    try:
+        result = cli.post_json(server, token, f"/repos/{repo}/shadow", body,
+                               timeout=TRIAGE_TIMEOUT)  # fmt: skip
+    except cli.SiftwiseError as exc:
+        if exc.status != httpx.codes.NOT_FOUND:  # 404: a repo siftwise doesn't know, no shadow
+            _annotate("warning", f"siftwise: shadow comparison failed: {exc}; this run won't "
+                      "be counted in recall")  # fmt: skip
+        return None
+    return result if result.get("shadow") else None
+
+
+def shadow_markdown(response: dict[str, Any], *, max_rows: int = COMMENT_ROWS) -> str:
+    """The shadow run's line: what siftwise would have run, and the failures it would have
+    caught; then the missed tests (at most ``max_rows``)."""
+    if not response["counted"]:
+        reasons = sorted({_NOT_COUNTED.get(s["status"], s["status"])
+                          for s in response["selections"]})  # fmt: skip
+        return f"**Shadow run:** not counted: {'; '.join(reasons) or 'nothing compared'}.\n"
+    compared = [s for s in response["selections"] if s["status"] == "compared"]
+    total = max(s["total_known"] for s in compared)
+    if response["mode"] == "full":
+        ran = f"all {total:,} tests (the full suite)"
+    else:
+        counts = {s["selected_count"] for s in compared}
+        ran = f"{'up to ' if len(counts) > 1 else ''}{max(counts):,} of {total:,} tests"
+        saved = response["time"]["saved"]
+        if saved is not None:
+            ran += f" ({saved:.0%} time saved)"
+    caught, missed = response["caught"], response["missed"]
+    if caught + missed:
+        outcome = f"caught {caught} of {caught + missed} failures"
+    else:
+        outcome = "had no failures to catch"
+    flaky = response["flaky_excluded"]
+    if flaky:
+        outcome += f" ({flaky} flaky not counted)"
+    lines = [f"**Shadow run:** would have run {ran} and {outcome}."]
+    listed = response["missed_tests"][:max_rows]
+    if listed:
+        lines += ["", "Missed:"]
+        lines += [f"- <code>{_md(m['test_id'])}</code> ({_LABELS.get(m['verdict'], ('?',))[0]})"
+                  for m in listed]  # fmt: skip
+        if missed > len(listed):
+            lines.append(f"- +{missed - len(listed)} more")
+    return "\n".join(lines) + "\n"
+
+
+def _shadow_outputs(env: Env, response: dict[str, Any] | None) -> None:
+    counted = response is not None and response["counted"]
+    _append(env, "GITHUB_OUTPUT", {
+        "shadow": "true" if response is not None else "false",
+        "shadow-mode": (response or {}).get("mode") or "",
+        "shadow-caught": str(response["caught"]) if counted and response else "",
+        "shadow-missed": str(response["missed"]) if counted and response else "",
+    })  # fmt: skip
 
 
 @dataclass
