@@ -10,7 +10,16 @@ from sqlalchemy.orm import Session
 
 from siftwise.core.history import recompute_test_stats
 from siftwise.core.junit import ParsedTestResult
-from siftwise.core.models import RUN_UNIQUE_INDEX, ChangedFile, Repo, Run, TestResult
+from siftwise.core.models import (
+    MESSAGE_MAX_BYTES,
+    RUN_UNIQUE_INDEX,
+    STATUS_CODES,
+    ChangedFile,
+    Repo,
+    Run,
+    TestResult,
+    truncate_utf8,
+)
 from siftwise.core.schemas import RunMetadata, StatusCounts
 
 
@@ -107,22 +116,8 @@ def create_run(
             )
         results = list(results)
         keys = _test_keys(session, repo_id, run.id, results)
-        rows = [
-            {
-                "run_id": run.id,
-                "test_key": keys[r.test_id],
-                "status": r.status,
-                "duration_ms": r.duration_ms,
-                "attempt": r.attempt,
-                "message": r.message,
-            }
-            for r in results
-        ]
-        if rows:
-            # render_nulls: by default the ORM drops None-valued keys and starts a new batch
-            # whenever the key set changes, so rows alternating message=None / message="..."
-            # went one or two per round trip (~20s for 4k rows over Docker networking).
-            session.execute(insert(TestResult).execution_options(render_nulls=True), rows)
+        if results:
+            _insert_results(session, run.id, keys, results)
         # Same transaction: stats never reflect a run that failed to commit, or vice versa.
         if rollup:  # skipped in batch mode; POST /repos/{repo}/rollup catches up later
             recompute_test_stats(session, repo_id, run.id, window_days)
@@ -138,6 +133,41 @@ def create_run(
     return run, True
 
 
+# One statement for all of a run's results: arrays in, ``unnest`` out. Status codes and message
+# truncation as the columns' types apply them (``StatusCode``, ``TruncatedText``).
+_INSERT_RESULTS_SQL = text(
+    """INSERT INTO test_results (run_id, test_key, duration_ms, attempt, status, message)
+    SELECT :run_id, r.test_key, r.duration_ms, r.attempt, r.status, r.message
+    FROM unnest(CAST(:keys AS integer[]), CAST(:durations AS integer[]),
+                CAST(:attempts AS smallint[]), CAST(:statuses AS smallint[]),
+                CAST(:messages AS text[]))
+        AS r(test_key, duration_ms, attempt, status, message)
+    """
+)
+
+
+def _insert_results(
+    session: Session, run_id: int, keys: dict[str, int], results: list[ParsedTestResult]
+) -> None:
+    """Insert the run's results in one statement (the ORM's executemany sent batches). On
+    rdflib's 9,891 results the insert itself takes ~75 ms; most of the statement's ~0.9 s is
+    the two foreign keys' per-row checks (``runs``, ``tests``)."""
+    session.execute(
+        _INSERT_RESULTS_SQL,
+        {
+            "run_id": run_id,
+            "keys": [keys[r.test_id] for r in results],
+            "durations": [r.duration_ms for r in results],
+            "attempts": [r.attempt for r in results],
+            "statuses": [STATUS_CODES[r.status] for r in results],
+            "messages": [
+                None if r.message is None else truncate_utf8(r.message, MESSAGE_MAX_BYTES)
+                for r in results
+            ],
+        },
+    )
+
+
 def _test_keys(
     session: Session, repo_id: int, run_id: int, results: list[ParsedTestResult]
 ) -> dict[str, int]:
@@ -146,22 +176,21 @@ def _test_keys(
     test_ids = sorted({r.test_id for r in results})
     if not test_ids:
         return {}
-    # Sorted, so concurrent uploads lock new keys in the same order (no deadlock).
-    session.execute(
-        text(
-            "INSERT INTO tests (repo_id, test_id) "
-            "SELECT :repo_id, t FROM unnest(CAST(:test_ids AS text[])) t ORDER BY t "
-            "ON CONFLICT (repo_id, test_id) DO NOTHING"
-        ),
-        {"repo_id": repo_id, "test_ids": test_ids},
-    )
-    keys: dict[str, int] = {
-        test_id: key
-        for key, test_id in session.execute(
-            text("SELECT id, test_id FROM tests WHERE repo_id = :repo_id AND test_id = ANY(:ids)"),
-            {"repo_id": repo_id, "ids": test_ids},
+    keys = _existing_keys(session, repo_id, test_ids)
+    # Almost every test is already known: insert only the new ones (the upsert of all 9,891
+    # rdflib IDs cost 0.5 s even when none was new). Sorted, so concurrent uploads lock new
+    # keys in the same order (no deadlock); a concurrent upload may still create one first.
+    missing = [t for t in test_ids if t not in keys]
+    if missing:
+        session.execute(
+            text(
+                "INSERT INTO tests (repo_id, test_id) "
+                "SELECT :repo_id, t FROM unnest(CAST(:test_ids AS text[])) t ORDER BY t "
+                "ON CONFLICT (repo_id, test_id) DO NOTHING"
+            ),
+            {"repo_id": repo_id, "test_ids": missing},
         )
-    }
+        keys.update(_existing_keys(session, repo_id, missing))
     paths = {keys[r.test_id]: r.file_path for r in results if r.file_path}
     if paths:
         # Latest by run time, like everything "latest": a backfilled older run keeps its hands
@@ -179,6 +208,16 @@ def _test_keys(
             {"keys": list(paths), "paths": list(paths.values()), "run_id": run_id},
         )
     return keys
+
+
+def _existing_keys(session: Session, repo_id: int, test_ids: list[str]) -> dict[str, int]:
+    return {
+        test_id: key
+        for key, test_id in session.execute(
+            text("SELECT id, test_id FROM tests WHERE repo_id = :repo_id AND test_id = ANY(:ids)"),
+            {"repo_id": repo_id, "ids": test_ids},
+        )
+    }
 
 
 def count_results(session: Session, run_id: int) -> StatusCounts:

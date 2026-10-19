@@ -14,7 +14,8 @@ the week-2 code (its history isn't in the current database):
 - [agent-substrate/substrate](#agent-substratesubstrate): a busy Go repo (one module, ~2,000
   packages) with real failures: recall, with and without a declared rule for its e2e suites.
 
-And of triage's verdicts, on rdflib and substrate: [Triage eval](#triage-eval).
+And of triage's verdicts, on rdflib and substrate: [Triage eval](#triage-eval). Server and
+eval speed-ups, with before/after numbers: [Performance](#performance).
 
 ## ipfs/kubo
 
@@ -832,3 +833,48 @@ uv run python -m scripts.eval.run_eval --repo agent-substrate/substrate --langua
 
 rdflib took 47 minutes; substrate about 3½ hours, mostly building Go import graphs (about 3
 minutes per commit on Windows).
+
+## Performance
+
+Measured on 2026-10-19 on a Windows laptop, Postgres 16 in Docker, on the rdflib and substrate
+histories above. Every change gives identical results; each was checked on real data before
+and after, and the tests compare the new code with the old.
+
+| Path | Before | After | Identical results, checked by |
+|---|---|---|---|
+| Triage of rdflib's widest CI run attempt (22 variants; the Action's `rollup`, `POST /repos/{repo}/triage`) | 1,032 ms, 180 queries | 220 ms, 12 queries | full `triage_ci_run` output for all 41 rdflib attempts with failures (13,329 triaged failures) and all 765 multi-variant substrate attempts, byte for byte |
+| Shadow-run comparison, 1 / 5 / 20 variants (synthetic) | 27 / 75 / 255 queries | 27 / 27 / 27 | the shadow tests |
+| `select_tests` (the selection inside `/select`), rdflib, a one-file change | 605 ms | 237 ms | the full selections for the 40 newest diffs of each repo, plus 3 edge cases |
+| `select_tests`, rdflib, a docs-only change | 315 ms | 210 ms | same |
+| `select_tests`, substrate | 128 ms | 99 ms | same |
+| Ingest of a 9,891-result rdflib upload (`POST /runs`, rollup deferred) | ~2.2 s | ~1.25 s | the stored rows, row for row |
+| Eval Go graphs, 12 substrate commits (`run_eval --jobs 4` vs serial) | — | about 1.8× faster (estimated, see below) | the graph cache files and the eval's results, byte for byte |
+
+- **Triage:** every variant of an attempt is loaded in one batch (`load_histories_many`): the
+  same fixed queries read what all variants need, then each variant keeps its own history (its
+  cut-off, its own attempt left out, its window). Before, each variant cost about 10 queries.
+  A one-variant `/triage` is unchanged: 500 rdflib failures in 0.22-0.24 s. The "before" figure
+  is the old one-load-per-variant pattern timed the same way.
+- **Selection:** each known test is classified once instead of twice (the time estimate
+  reuses it), and two hot character loops became regular expressions. `load_history` (about
+  0.18 s on rdflib) is unchanged.
+- **Ingest:** only test IDs not seen before are inserted into `tests` (inserting all 9,891 cost
+  0.5 s even when none was new), and the results go in one `INSERT ... SELECT FROM unnest`.
+  That insert itself takes about 75 ms; most of the remaining time is the two foreign keys'
+  checks, one per row each (about 0.67 s), which aren't changed.
+- **`run_eval --jobs N`:** Go import graphs are built N at a time, each in its own unpack
+  directory, with atomic cache writes. On 12 substrate commits `--jobs 4` built every graph in
+  1,006 s. The serial run took 3,949 s, but its first four commits ran `go list` with a cold
+  Go module cache (5.5-12 minutes each against about 1.5 later), and the parallel run came
+  second. From the serial run's eight warm commits (152 s each), a warm serial run of 12 would
+  take about 1,830 s: **about 1.8× with a warm Go module cache** (estimated from the serial
+  run's warm commits; CPU-bound on a laptop: four parallel `go list` runs took about 4.5
+  minutes each instead of 1.5).
+- **Not changed:** the repo rollup (rdflib 119 s, substrate 19 s). Limiting it to tests with
+  results in the stats window saves nothing on these histories (every test is active) and would
+  cost 12-17 s to find the active tests; stale tests cost about 30 ms per batch of them.
+
+**Measuring note:** on Windows with Docker Desktop, connect to `127.0.0.1`, not `localhost`.
+Through `localhost`, every query whose parameters exceed about 8 KB stalls about 45 ms (two
+1,100-integer arrays: 48 ms against 5 ms), which hides batching gains. All numbers above are
+through `127.0.0.1`.

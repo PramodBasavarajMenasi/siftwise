@@ -2,6 +2,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ import pytest
 from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
+from siftwise.core import selector
 from siftwise.core.history import recompute_repo_stats
 from siftwise.core.ingest import create_run
 from siftwise.core.junit import ParsedTestResult, Status
@@ -1492,3 +1494,85 @@ def test_would_run_from_a_scope_matches_the_selection() -> None:
             assert WouldRun(selection)(test_id) is expected, (selection.reason, test_id)
             assert WouldRun(scope)(test_id) is expected, (selection.reason, test_id)
     assert {s.mode for s in selections} == {Mode.FULL, Mode.SELECTIVE}
+
+
+# --- classification speed-ups give identical answers -----------------------------------------
+
+
+def test_the_doctest_regex_matches_exactly_what_isspace_matched() -> None:
+    # _NOT_A_MODULE replaced `any(c.isspace() or c == "/" ...)`: the same characters, all of them.
+    for code in range(sys.maxunicode + 1):
+        c = chr(code)
+        assert bool(selector._NOT_A_MODULE.search(c)) == (c.isspace() or c == "/"), hex(code)
+
+
+@pytest.mark.parametrize(
+    "classname",
+    ["tests.test_x", "cirq-google.cirq_google.ops.x_test", "a", "a.", ".a", "a..b", "-a.b",
+     "a.-b", "a.b-c.test_d", "9a.test_b", "a b.test_c", "a/b.test_c", "ünï.test_cödé", "",
+     "a.b\n", "tests.test_x.TestY", "x\u00a0y.test_z"],
+)  # fmt: skip
+def test_the_dotted_directory_regex_matches_the_per_part_check(classname: str) -> None:
+    per_part = bool(classname) and all(
+        selector._PY_DIRECTORY.match(part) for part in classname.split(".")
+    )
+    assert bool(selector._PY_DIRECTORIES.match(classname)) == per_part
+
+
+ODD_HISTORY = history(
+    "tests.test_cart::test_total",
+    ("tests.test_cart.TestDiscount::test_applies", "tests/test_cart.py"),
+    ("tests.test_moved::test_a", "elsewhere/test_moved.py"),  # a reported path that differs
+    ("web::adds", "web/cart.test.js"),
+    "rdflib.container::rdflib.container.Seq",  # a doctest
+    "pytest::rdflib.plugins.broken",  # a collection error
+    "cirq-google.cirq_google.ops.x_test::test_y",  # a directory that isn't a Python name
+    "odd name.test_z::test_w",
+    f"{CLI}::TestAdd",
+    f"{CLI}::TestAdd/sub",
+)
+
+
+def test_the_estimates_index_lookup_answers_like_pytest_file() -> None:
+    index = selector._index(ODD_HISTORY.tests.values())
+    lookup = selector._indexed_py_file(index)
+
+    for test_id in [*ODD_HISTORY.tests, "tests.test_cart::test_new", "elsewhere::x"]:
+        assert lookup(test_id) == pytest_file(test_id), test_id
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [["src/cart.py"], ["tests/test_cart.py"], ["elsewhere/test_moved.py"], ["rdflib/container.py"],
+     ["docs/x.md"], ["web/cart.ts"], ["test/cli/add.go"], ["pyproject.toml"]],
+)  # fmt: skip
+def test_select_tests_output_is_unchanged_by_the_speed_ups(
+    changed: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Durations, so the estimate (and its WouldRun lookups) does real work.
+    hist = RepoHistory(tests={
+        t.test_id: KnownTest(t.test_id, t.file_path, 10.0) for t in ODD_HISTORY.tests.values()
+    })  # fmt: skip
+    config = SelectorConfig(go_module=KUBO)
+    new = select_tests(hist, changed, True, config)
+
+    # The behaviour before: the char-by-char doctest check, the per-part directory check, and
+    # the estimate classifying every test again (pytest_file).
+    real_is_doctest, real_location = selector._is_doctest, selector._python_location
+
+    def old_is_doctest(classname: str, name: str, ext: str) -> bool:
+        if any(c.isspace() or c == "/" for c in classname):
+            return False
+        return real_is_doctest(classname, name, ext)
+
+    def old_location(classname: str, file_path: str | None) -> tuple[str, tuple[str, ...]] | None:
+        if not classname or not all(selector._PY_DIRECTORY.match(p) for p in classname.split(".")):
+            return None
+        return real_location(classname, file_path)
+
+    monkeypatch.setattr(selector, "_is_doctest", old_is_doctest)
+    monkeypatch.setattr(selector, "_python_location", old_location)
+    monkeypatch.setattr(selector, "_indexed_py_file", lambda _index: pytest_file)
+    old = select_tests(hist, changed, True, config)
+
+    assert new == old
