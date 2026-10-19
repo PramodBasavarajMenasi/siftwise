@@ -1,4 +1,6 @@
-# Weekly updates for the digest-pinned images and the workflows' actions.
+# Weekly updates for the digest-pinned images and the workflows' actions: one grouped PR per
+# ecosystem (a group's "*" pattern takes every update; with `directories`, one PR across all
+# of them). Ignored updates stay ignored inside a group.
 version: 2
 updates:
   # Dockerfile: the python and uv base images. Python stays on 3.12 (digest and patch updates
@@ -10,6 +12,9 @@ updates:
     ignore:
       - dependency-name: python
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    groups:
+      docker:
+        patterns: ["*"]
 
   # docker-compose.yml: the Postgres image. Digest updates only within 16: a new major can't
   # open the existing data volume (it needs pg_upgrade).
@@ -20,6 +25,9 @@ updates:
     ignore:
       - dependency-name: postgres
         update-types: ["version-update:semver-major"]
+    groups:
+      docker-compose:
+        patterns: ["*"]
 
   # .github/workflows/*.yml and the composite actions' own steps.
   - package-ecosystem: github-actions
@@ -30,3 +38,6 @@ updates:
       - /actions/rollup
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
