@@ -1277,3 +1277,23 @@ def test_record_in_a_single_job_compares_a_shadow_run(
     assert result.exit_code == 0, result.output
     assert "**Shadow run:** would have run 120 of 692" in sent_body(created)
     assert gh.outputs()["shadow-missed"] == "1"
+
+
+def test_shadow_markdown_shows_each_missed_tests_cause() -> None:
+    missed = [
+        {"test_id": "t::new_x", "verdict": "unknown", "variants": [None], "cause": "new_test",
+         "cause_detail": "no result for this test before this run"},
+        {"test_id": "t::db[a|b]", "verdict": "new_regression", "variants": [None],
+         "cause": "config_gap", "cause_detail": "…"},
+        {"test_id": "t::q", "verdict": "pre_existing", "variants": [None], "cause": "no_link",
+         "cause_detail": "…"},
+        {"test_id": "t::old", "verdict": "unknown", "variants": [None]},  # an older server
+    ]  # fmt: skip
+    lines = gha.shadow_markdown(compare_response(missed=4, missed_tests=missed)).splitlines()
+
+    assert lines[-4:] == [
+        r"- <code>t::new\_x</code>: new test (verdict: unknown)",
+        r"- <code>t::db\[a\|b\]</code>: config gap (verdict: new regression)",
+        "- <code>t::q</code>: no link to the change (verdict: pre-existing)",
+        "- <code>t::old</code> (unknown)",
+    ]

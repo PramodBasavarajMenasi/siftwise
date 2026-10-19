@@ -911,6 +911,27 @@ def pytest_file(test_id: str, file_path: str | None = None) -> str | None:
     return test.py_path if test.runner is Runner.PYTEST else None
 
 
+def locate_test(
+    test_id: str, file_path: str | None = None, go_module: str | None = None
+) -> tuple[str, str] | None:
+    """Where a test lives, as a ``[[depends]]`` rule names it: (its directory, the rule's
+    ``tests`` glob). pytest and Jest: the test's file; Go: its package directory, as
+    ``<dir>/*`` (rules match Go tests as ``<package dir>/<TestName>``). None if it can't be
+    derived (no file, or a Go package outside ``go_module``)."""
+    test = _classify(KnownTest(test_id, file_path))
+    if test.runner is Runner.GO:
+        if go_module and test.classname == go_module:
+            return "", "*"
+        if not go_module or not test.classname.startswith(go_module + "/"):
+            return None
+        directory = test.classname[len(go_module) + 1 :]
+        return directory, f"{directory}/*"
+    path = test.py_path if test.runner is Runner.PYTEST else test.file_path
+    if not path:
+        return None
+    return posixpath.dirname(path), path
+
+
 def _collection_error_path(module: str, file_path: str | None) -> str | None:
     """The file of a dotted module name: ``a.b.c`` -> ``a/b/c.py`` (or its file_path).
 

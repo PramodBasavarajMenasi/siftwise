@@ -585,6 +585,12 @@ class ShadowMissOut(BaseModel):
     test_id: str
     verdict: str = Field(description="Triage's verdict (the worst over the missed variants)")
     variants: list[str | None] = Field(description="The variants whose selection missed it")
+    cause: str | None = Field(
+        default=None,
+        description="Why it was missed: 'new_test', 'flaky_history', 'config_gap', 'no_link' "
+        "or 'unknown'",
+    )
+    cause_detail: str | None = Field(default=None, description="The evidence, in a line")
 
 
 class ShadowCompareResponse(BaseModel):
@@ -615,6 +621,10 @@ class RecallStatsOut(BaseModel):
     missed: int
     recall: float | None = Field(description="caught / (caught + missed); null with neither")
     missed_by_verdict: dict[str, int]
+    missed_by_cause: dict[str, int] = Field(
+        description="new_test, flaky_history, config_gap, no_link, unknown; plus "
+        "'unclassified' for misses compared before causes existed"
+    )
 
 
 class RecallMissOut(BaseModel):
@@ -626,6 +636,28 @@ class RecallMissOut(BaseModel):
     verdict: str
     selection_mode: str
     at: datetime = Field(description="When the run happened")
+    cause: str | None = Field(description="Why it was missed; null if unclassified")
+    cause_detail: str | None
+    suggestion: str | None = Field(
+        description="A .siftwise.toml [[depends]] rule to consider (config gaps only)"
+    )
+
+
+class SuggestionOut(BaseModel):
+    rule: str = Field(description="A .siftwise.toml [[depends]] rule, as TOML. Never applied")
+    misses: int = Field(description="Config-gap misses it would have caught")
+    test_ids: list[str]
+
+
+class RecallPeriodOut(BaseModel):
+    start: datetime = Field(description="Monday 00:00 UTC")
+    end: datetime = Field(description="The next Monday 00:00 UTC")
+    shadow_runs: int
+    selective_runs: int
+    full_runs: int
+    all: RecallStatsOut
+    selective: RecallStatsOut
+    time: ShadowTimeOut
 
 
 class RecallResponse(BaseModel):
@@ -645,3 +677,12 @@ class RecallResponse(BaseModel):
     time: ShadowTimeOut
     misses: list[RecallMissOut] = Field(description="Newest first, at most 100")
     misses_truncated: bool
+    suggestions: list[SuggestionOut] = Field(
+        description="Rules that would have caught config-gap misses, most misses first"
+    )
+    linked_not_selected: int = Field(
+        description="Misses linked to the change but not selected: possibly a selector bug"
+    )
+    periods: list[RecallPeriodOut] | None = Field(
+        default=None, description="With by=week: each week, oldest first, empty ones included"
+    )

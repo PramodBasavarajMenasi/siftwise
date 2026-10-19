@@ -813,11 +813,30 @@ def shadow_markdown(response: dict[str, Any], *, max_rows: int = COMMENT_ROWS) -
     listed = response["missed_tests"][:max_rows]
     if listed:
         lines += ["", "Missed:"]
-        lines += [f"- <code>{_md(m['test_id'])}</code> ({_LABELS.get(m['verdict'], ('?',))[0]})"
-                  for m in listed]  # fmt: skip
+        lines += [_missed_line(m) for m in listed]
         if missed > len(listed):
             lines.append(f"- +{missed - len(listed)} more")
     return "\n".join(lines) + "\n"
+
+
+# Why a shadow run's selection missed a test (core/shadow.py CAUSES).
+_CAUSE_LABELS = {
+    "new_test": "new test",
+    "flaky_history": "flaky history",
+    "config_gap": "config gap",
+    "no_link": "no link to the change",
+    "unknown": "unknown cause",
+}
+
+
+def _missed_line(miss: Mapping[str, Any]) -> str:
+    """A missed test with its cause and verdict (just the verdict from an older server)."""
+    verdict = _LABELS.get(miss["verdict"], (miss["verdict"],))[0]
+    test = f"<code>{_md(miss['test_id'])}</code>"
+    cause = miss.get("cause")
+    if not cause:
+        return f"- {test} ({_md(verdict)})"
+    return f"- {test}: {_md(_CAUSE_LABELS.get(cause, cause))} (verdict: {_md(verdict)})"
 
 
 def _shadow_outputs(env: Env, response: dict[str, Any] | None) -> None:

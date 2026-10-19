@@ -7,13 +7,18 @@ caught, missed, or flaky (counted apart, never a miss). ``recall`` sums it up ov
 
 Units: a test in one CI run attempt. It's flaky only if every variant it failed in says flaky;
 otherwise it's missed if any non-flaky failing variant's selection wouldn't have run it.
+
+Every miss gets a cause (``miss_cause``), from evidence the server has: triage's history and
+links for the test, and the run's recorded change. When the evidence doesn't say, ``unknown``.
 """
 
 import logging
+import posixpath
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -30,8 +35,18 @@ from siftwise.core.models import (
     ShadowResult,
     ShadowSelection,
 )
-from siftwise.core.selector import Mode, Selection, SelectionScope, WouldRun, is_go_subtest
-from siftwise.core.triage import triage_ci_run
+from siftwise.core.selector import (
+    JS_EXTENSIONS,
+    Mode,
+    Selection,
+    SelectionScope,
+    WouldRun,
+    is_generated,
+    is_go_subtest,
+    is_ignorable,
+    locate_test,
+)
+from siftwise.core.triage import SAME_COMMIT, TriageResult, Verdict, triage_ci_run
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +67,22 @@ UNKNOWN_REPO = "unknown_repo"
 INCOMPLETE_SELECTION = "incomplete_selection"  # a selected test has no key: would under-count
 COMMIT_CONFLICT = "commit_conflict"  # the attempt and variant hold another commit's selection
 STORAGE_ERROR = "storage_error"  # the database failed (set by the /select route)
+
+# Why a failure was missed (``shadow_failures.cause``), most specific first: a unit missed in
+# several variants takes the first of its variants' causes in this order.
+NEW_TEST = "new_test"  # no result before the run
+FLAKY_HISTORY = "flaky_history"  # flaky before, but not called flaky now
+CONFIG_GAP = "config_gap"  # a non-code file in the test's own directory changed
+NO_LINK = "no_link"  # the change is known and nothing in it links to the test
+UNKNOWN_CAUSE = "unknown"
+CAUSES = (NEW_TEST, FLAKY_HISTORY, CONFIG_GAP, NO_LINK, UNKNOWN_CAUSE)
+UNCLASSIFIED = "unclassified"  # compared before causes existed (migration 0009): re-compare
+LINKED_NOT_SELECTED = (
+    "linked to the change but not selected (selector didn't know the test at select time?)"
+)
+# What an import graph or path mapping can follow; any other changed file is "non-code".
+CODE_EXTENSIONS = frozenset({".py", ".go"}) | JS_EXTENSIONS
+CHANGED_SHOWN = 5  # changed files listed as a no_link miss's context
 
 
 @dataclass(frozen=True)
@@ -127,6 +158,13 @@ def store_selection(
     return None if stored == target.commit_sha else COMMIT_CONFLICT
 
 
+@dataclass(frozen=True)
+class MissCause:
+    cause: str  # one of CAUSES
+    detail: str
+    suggestion: str | None = None  # a [[depends]] rule to consider (config_gap only)
+
+
 # --- counting ---------------------------------------------------------------------------------
 
 
@@ -139,6 +177,7 @@ class FailureRow:
     would_run: bool
     verdict: str
     selective: bool  # the variant's selection was selective
+    cause: MissCause | None = None  # a miss's cause; None if not a miss or not classified
 
 
 @dataclass(frozen=True)
@@ -150,6 +189,7 @@ class Unit:
     verdict: str  # a miss: the worst verdict of its missed variants; else the worst overall
     selective: bool  # every failing variant's selection was selective
     variants: tuple[str | None, ...]  # a miss: the variants that missed it; else all failing
+    cause: MissCause | None = None  # a miss: the most specific of its missed variants' causes
 
 
 def units(rows: Iterable[FailureRow]) -> list[Unit]:
@@ -170,7 +210,11 @@ def units(rows: Iterable[FailureRow]) -> list[Unit]:
             outcome, rows = CAUGHT, counted
         verdict = min((row.verdict for row in rows), key=_verdict_rank)
         variants = tuple(sorted({row.variant for row in rows}, key=lambda v: v or ""))
-        result.append(Unit(test_id, outcome, verdict, selective, variants))
+        cause = None
+        if outcome == MISSED:
+            causes = [row.cause for row in missed if row.cause is not None]
+            cause = min(causes, key=lambda c: CAUSES.index(c.cause), default=None)
+        result.append(Unit(test_id, outcome, verdict, selective, variants, cause))
     return result
 
 
@@ -187,6 +231,7 @@ class Tally:
     missed: int = 0
     flaky_excluded: int = 0
     missed_by_verdict: Counter[str] = field(default_factory=Counter)
+    missed_by_cause: Counter[str] = field(default_factory=Counter)
 
     @property
     def failures(self) -> int:
@@ -203,6 +248,7 @@ class Tally:
         elif unit.outcome == MISSED:
             self.missed += 1
             self.missed_by_verdict[unit.verdict] += 1
+            self.missed_by_cause[unit.cause.cause if unit.cause else UNCLASSIFIED] += 1
         else:
             self.flaky_excluded += 1
 
@@ -217,6 +263,80 @@ class Time:
     @property
     def saved(self) -> float | None:
         return 1 - self.would_run_ms / self.total_ms if self.total_ms else None
+
+
+# --- miss causes ----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RunChange:
+    """What a recorded run's upload stored about its change."""
+
+    changed_files: tuple[str, ...] = ()
+    links_known: bool = False  # the diff was known and runs.affected stored
+    go_module: str | None = None
+    generated: tuple[str, ...] = ()
+
+
+def miss_cause(result: TriageResult, change: RunChange, file_path: str | None = None) -> MissCause:
+    """Why the selection missed this failure, from evidence only; ``unknown`` when it doesn't
+    say. First that applies: a test new in this run; a test with flaky history (but not called
+    flaky now); unknown change links, or links the selection didn't act on (unknown); a
+    non-code file changed in the test's own directory (config gap, with a ``[[depends]]`` rule
+    to consider); otherwise nothing in the known change links to it (no link)."""
+    history = result.history
+    if not history.seen:
+        return MissCause(NEW_TEST, "no result for this test before this run")
+    if history.flaky:
+        kinds = Counter(event.kind for event in history.flaky)
+        same, other = kinds[SAME_COMMIT], len(history.flaky) - kinds[SAME_COMMIT]
+        return MissCause(FLAKY_HISTORY, f"flaky {len(history.flaky)} time(s) before ({same} "
+                         f"same-commit, {other} unrelated fail-then-pass), but not called flaky "
+                         "now")  # fmt: skip
+    if not change.links_known:
+        return MissCause(UNKNOWN_CAUSE, "the run's change links weren't recorded (unknown diff, "
+                         "or an import graph failed or was skipped)")  # fmt: skip
+    if result.links:
+        return MissCause(UNKNOWN_CAUSE, LINKED_NOT_SELECTED)
+    location = locate_test(result.test_id, file_path or history.file_path, change.go_module)
+    nearby = _non_code_in(location[0], change) if location and location[0] else []
+    if location and nearby:
+        shown = _shown(nearby)
+        suggestion = None
+        if result.verdict is not Verdict.PRE_EXISTING:  # failing on main anyway: no rule helps
+            dirs = sorted({posixpath.dirname(path) for path in nearby})
+            suggestion = depends_rule(location[1], [f"{d}/**" for d in dirs])
+        return MissCause(CONFIG_GAP, f"non-code file(s) changed in the test's directory, which "
+                         f"no import graph follows: {shown}", suggestion)  # fmt: skip
+    relevant = [p for p in change.changed_files if not is_ignorable(p, change.generated)]
+    context = f"; changed: {_shown(relevant)}" if relevant else ""
+    return MissCause(NO_LINK, f"nothing in the change links to this test{context}")
+
+
+def _non_code_in(directory: str, change: RunChange) -> list[str]:
+    return sorted(
+        path
+        for path in change.changed_files
+        if path.startswith(directory + "/")
+        and posixpath.splitext(path)[1] not in CODE_EXTENSIONS
+        and not is_generated(path, change.generated)
+    )
+
+
+def _shown(paths: Sequence[str]) -> str:
+    shown = ", ".join(paths[:CHANGED_SHOWN])
+    more = len(paths) - CHANGED_SHOWN
+    return f"{shown} and {more} more" if more > 0 else shown
+
+
+def depends_rule(tests: str, on: Sequence[str]) -> str:
+    """A ``.siftwise.toml`` ``[[depends]]`` rule, as TOML (basic strings, escaped)."""
+    quoted = ", ".join(_toml_string(glob) for glob in on)
+    return f"[[depends]]\ntests = {_toml_string(tests)}\non = [{quoted}]"
+
+
+def _toml_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 # --- comparing ------------------------------------------------------------------------------
@@ -335,7 +455,8 @@ def _compare(
     failing_ids = sorted({
         r.test_id for v in triaged for r in (v.report.results if v.report else ())
     })  # fmt: skip
-    keys = _test_keys(session, selections[0].repo_id, failing_ids)
+    keys, paths = _failing_tests(session, selections[0].repo_id, failing_ids)
+    changes = _run_changes(session, run_ids)
 
     variants: list[VariantComparison] = []
     rows: list[FailureRow] = []
@@ -353,10 +474,16 @@ def _compare(
         would_run = WouldRun(scopes[selection.id])
         selective = selection.mode == Mode.SELECTIVE.value
         results = v.report.results if v.report else []
-        variant_rows = [
-            FailureRow(r.test_id, v.variant, would_run(r.test_id), r.verdict.value, selective)
-            for r in results
-        ]
+        change = changes.get(v.run_id, RunChange())
+        change = RunChange(change.changed_files, v.links_known, change.go_module,
+                           change.generated)  # fmt: skip
+        variant_rows = []
+        for r in results:
+            runs_it = would_run(r.test_id)
+            missed = not runs_it and r.verdict is not Verdict.FLAKY
+            cause = miss_cause(r, change, paths.get(r.test_id)) if missed else None
+            variant_rows.append(FailureRow(r.test_id, v.variant, runs_it, r.verdict.value,
+                                           selective, cause))  # fmt: skip
         rows.extend(variant_rows)
         timed = [(t, ms) for t, ms in durations[v.run_id] if not is_go_subtest(t)]
         ran = [(t, ms) for t, ms in timed if would_run(t)]
@@ -392,6 +519,9 @@ def _compare(
                 would_run=row.would_run,
                 verdict=r.verdict.value,
                 confidence=r.confidence.value,
+                cause=row.cause.cause if row.cause else None,
+                cause_detail=row.cause.detail if row.cause else None,
+                suggestion=row.cause.suggestion if row.cause else None,
             )
             for r, row in zip(results, variant_rows, strict=True)
         )
@@ -446,6 +576,47 @@ def _durations(session: Session, run_ids: Sequence[int]) -> dict[int, list[tuple
     return durations
 
 
+def _failing_tests(
+    session: Session, repo_id: int, test_ids: Sequence[str]
+) -> tuple[dict[str, int], dict[str, str]]:
+    """The failing tests' keys, and their reported file paths (Jest needs one to be located)."""
+    keys: dict[str, int] = {}
+    paths: dict[str, str] = {}
+    for test_id, key, path in session.execute(
+        text(
+            "SELECT test_id, id, file_path FROM tests "
+            "WHERE repo_id = :repo_id AND test_id = ANY(:ids)"
+        ),
+        {"repo_id": repo_id, "ids": list(test_ids)},
+    ):
+        keys[test_id] = key
+        if path:
+            paths[test_id] = path
+    return keys, paths
+
+
+def _run_changes(session: Session, run_ids: Sequence[int]) -> dict[int, RunChange]:
+    """Each run's stored change: changed files, and from ``runs.affected`` the Go module and
+    generated globs. ``links_known`` is filled in from triage."""
+    files: dict[int, list[str]] = defaultdict(list)
+    for run_id, path in session.execute(
+        text("SELECT run_id, path FROM changed_files WHERE run_id = ANY(:ids) ORDER BY path"),
+        {"ids": list(run_ids)},
+    ):
+        files[run_id].append(path)
+    changes = {}
+    for run_id, affected in session.execute(
+        text("SELECT id, affected FROM runs WHERE id = ANY(:ids)"), {"ids": list(run_ids)}
+    ):
+        graph: Mapping[str, Any] = affected or {}
+        changes[run_id] = RunChange(
+            tuple(files[run_id]),
+            go_module=graph.get("go_module"),
+            generated=tuple(graph.get("generated") or ()),
+        )
+    return changes
+
+
 def _test_keys(session: Session, repo_id: int, test_ids: Sequence[str]) -> dict[str, int]:
     return {
         test_id: key
@@ -469,6 +640,28 @@ class Miss:
     verdict: str
     selection_mode: str
     at: datetime
+    cause: MissCause | None = None
+
+
+@dataclass
+class Suggestion:
+    """A ``[[depends]]`` rule that would have caught config-gap misses (never applied)."""
+
+    rule: str
+    misses: int = 0
+    test_ids: set[str] = field(default_factory=set)
+
+
+@dataclass
+class Period:
+    """One week of shadow runs (by selection time): Monday 00:00 UTC to the next Monday."""
+
+    start: datetime
+    end: datetime
+    all: Tally = field(default_factory=Tally)
+    selective: Tally = field(default_factory=Tally)
+    full_runs: int = 0
+    time: Time = field(default_factory=Time)
 
 
 @dataclass
@@ -481,13 +674,30 @@ class Recall:
     in_progress: int = 0
     time: Time = field(default_factory=Time)
     misses: list[Miss] = field(default_factory=list)
+    suggestions: list[Suggestion] = field(default_factory=list)
+    # Misses linked to the change but not selected: possibly a selector bug.
+    linked_not_selected: int = 0
+    periods: list[Period] | None = None  # by week, when asked for
 
 
-def recall(session: Session, repo: str, days: int, now: datetime | None = None) -> Recall | None:
+def week_start(at: datetime) -> datetime:
+    """Monday 00:00 UTC of ``at``'s week."""
+    day = at.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    return day - timedelta(days=day.weekday())
+
+
+def recall(
+    session: Session,
+    repo: str,
+    days: int,
+    now: datetime | None = None,
+    *,
+    by_week: bool = False,
+) -> Recall | None:
     """Recall over the shadow selections stored in the last ``days`` days. None for an
     unknown repo. A run counts as selective only if every compared variant's selection was:
     full selections (fallbacks, unknown diffs) catch everything and never enter
-    ``selective``."""
+    ``selective``. ``by_week``: also per week (by selection time), empty weeks included."""
     repo_id = session.scalars(select(Repo.id).where(Repo.name == repo)).one_or_none()
     if repo_id is None:
         return None
@@ -512,14 +722,23 @@ def recall(session: Session, repo: str, days: int, now: datetime | None = None) 
             report.not_counted[CANCELLED] += 1
 
     # Compared variants, by CI run attempt.
-    attempts: dict[tuple[str, int], list[tuple[str, float, float, datetime, str]]] = defaultdict(
-        list
+    attempts: dict[tuple[str, int], list[tuple[str, float, float, datetime, str, datetime]]] = (
+        defaultdict(list)
     )
-    for ci_run_id, run_attempt, mode, ms_total, ms_would_run, at, commit in session.execute(
+    for (
+        ci_run_id,
+        run_attempt,
+        mode,
+        ms_total,
+        ms_would_run,
+        at,
+        commit,
+        selected_at,
+    ) in session.execute(
         text(
             """
             SELECT s.ci_run_id, s.run_attempt, s.mode, sr.ms_total, sr.ms_would_run,
-                   COALESCE(r.started_at, r.created_at), r.commit_sha
+                   COALESCE(r.started_at, r.created_at), r.commit_sha, s.created_at
             FROM shadow_selections s
             JOIN shadow_results sr ON sr.selection_id = s.id
             JOIN runs r ON r.id = sr.run_id
@@ -528,13 +747,26 @@ def recall(session: Session, repo: str, days: int, now: datetime | None = None) 
         ),
         params,
     ):
-        attempts[(ci_run_id, run_attempt)].append((mode, ms_total, ms_would_run, at, commit))
+        attempts[(ci_run_id, run_attempt)].append(
+            (mode, ms_total, ms_would_run, at, commit, selected_at)
+        )
     failures: dict[tuple[str, int], list[FailureRow]] = defaultdict(list)
-    for ci_run_id, run_attempt, mode, variant, test_id, would_run, verdict in session.execute(
+    for (
+        ci_run_id,
+        run_attempt,
+        mode,
+        variant,
+        test_id,
+        would_run,
+        verdict,
+        cause,
+        detail,
+        suggestion,
+    ) in session.execute(
         text(
             """
             SELECT s.ci_run_id, s.run_attempt, s.mode, r.variant, t.test_id, f.would_run,
-                   f.verdict
+                   f.verdict, f.cause, f.cause_detail, f.suggestion
             FROM shadow_selections s
             JOIN shadow_results sr ON sr.selection_id = s.id
             JOIN runs r ON r.id = sr.run_id
@@ -545,29 +777,53 @@ def recall(session: Session, repo: str, days: int, now: datetime | None = None) 
         ),
         params,
     ):
-        failures[(ci_run_id, run_attempt)].append(
-            FailureRow(test_id, variant, would_run, verdict, mode == Mode.SELECTIVE.value)
-        )
+        failures[(ci_run_id, run_attempt)].append(FailureRow(
+            test_id, variant, would_run, verdict, mode == Mode.SELECTIVE.value,
+            MissCause(cause, detail or "", suggestion) if cause else None,
+        ))  # fmt: skip
 
+    periods: dict[datetime, Period] = {}
+    if by_week:
+        start = week_start(report.since)
+        while start <= now:
+            periods[start] = Period(start, start + timedelta(days=7))
+            start += timedelta(days=7)
+        report.periods = list(periods.values())
+    suggestions: dict[str, Suggestion] = {}
     for attempt, variants in attempts.items():
         selective = all(mode == Mode.SELECTIVE.value for mode, *_ in variants)
         at = max(row[3] for row in variants)
         commit = variants[0][4]
-        report.all.runs += 1
-        if selective:
-            report.selective.runs += 1
-        else:
-            report.full_runs += 1
-        report.time.total_ms += sum(row[1] for row in variants)
-        report.time.would_run_ms += sum(row[2] for row in variants)
-        for unit in units(failures[attempt]):
-            report.all.add(unit)
+        targets: list[Recall | Period] = [report]
+        period = periods.get(week_start(min(row[5] for row in variants)))
+        if period is not None:
+            targets.append(period)
+        for target in targets:
+            target.all.runs += 1
             if selective:
-                report.selective.add(unit)
-            if unit.outcome == MISSED:
-                report.misses.append(Miss(
-                    unit.test_id, attempt[0], attempt[1], commit, unit.variants, unit.verdict,
-                    Mode.SELECTIVE.value if unit.selective else Mode.FULL.value, at,
-                ))  # fmt: skip
+                target.selective.runs += 1
+            else:
+                target.full_runs += 1
+            target.time.total_ms += sum(row[1] for row in variants)
+            target.time.would_run_ms += sum(row[2] for row in variants)
+        for unit in units(failures[attempt]):
+            for target in targets:
+                target.all.add(unit)
+                if selective:
+                    target.selective.add(unit)
+            if unit.outcome != MISSED:
+                continue
+            report.misses.append(Miss(
+                unit.test_id, attempt[0], attempt[1], commit, unit.variants, unit.verdict,
+                Mode.SELECTIVE.value if unit.selective else Mode.FULL.value, at, unit.cause,
+            ))  # fmt: skip
+            if unit.cause and unit.cause.detail == LINKED_NOT_SELECTED:
+                report.linked_not_selected += 1
+            if unit.cause and unit.cause.suggestion:
+                rule = suggestions.setdefault(unit.cause.suggestion,
+                                              Suggestion(unit.cause.suggestion))  # fmt: skip
+                rule.misses += 1
+                rule.test_ids.add(unit.test_id)
     report.misses.sort(key=lambda m: (m.at, m.test_id), reverse=True)
+    report.suggestions = sorted(suggestions.values(), key=lambda s: (-s.misses, s.rule))
     return report

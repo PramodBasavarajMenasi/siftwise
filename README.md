@@ -529,7 +529,7 @@ selected; after the run is recorded, the server checks every failure against tha
 - **Where verdicts are computed** (`rollup` after a matrix, `record` in a single job), the
   failures section of the PR comment and the job summary get a line like "**Shadow run:**
   would have run 120 of 692 tests (70% time saved) and caught 3 of 4 failures (1 flaky not
-  counted)", then the missed tests (at most 20). The time saved is measured on the run's own
+  counted)", then the missed tests with their cause (at most 20). The time saved is measured on the run's own
   durations. Failures that triage calls flaky are counted separately, never as misses;
   pre-existing and unknown ones count.
 - **Outputs:** `select` has `shadow`, `shadow-mode` (what siftwise would have done),
@@ -554,9 +554,28 @@ siftwise report --repo acme/shop --days 30
 
 The first figure counts every shadow run, including those where siftwise would have run the
 full suite anyway (a fallback catches everything), so the report always shows it with the
-selective-only figure. Below that come the misses by verdict, the measured time saved, the runs
-not counted (by reason: no upload, commit mismatch, compare error, cancelled) and the misses,
-newest first. `--json` prints the API response.
+selective-only figure. Below that come the misses by verdict and by cause, the measured time
+saved, the runs not counted (by reason: no upload, commit mismatch, compare error, cancelled)
+and the misses, newest first. `--by week` prints recall, caught, missed and time saved per
+week instead; `--json` prints the API response.
+
+Each miss gets a cause, from evidence the server already has (`unknown` when it doesn't say):
+
+| Cause | Evidence |
+|---|---|
+| `new_test` | no result for the test before the run |
+| `flaky_history` | flaky before, but not called flaky this time |
+| `config_gap` | a non-code file (data, fixture, golden file) changed in the test's own directory, which no import graph follows |
+| `no_link` | the change is known and nothing in it links to the test (the report lists what changed) |
+| `unknown` | the run's change links weren't recorded, or the test was linked but not selected (the report warns: possibly a selector bug) |
+
+For config gaps, the report suggests a `.siftwise.toml` rule, which siftwise never applies itself:
+
+```toml
+[[depends]]
+tests = "tests/test_db.py"
+on = ["tests/data/**"]
+```
 
 `.github/workflows/action-e2e.yml` runs all three actions against a real server on every push
 and PR of this repo, including a deliberately failing test's verdict, `fail-on` and a shadow
@@ -672,8 +691,8 @@ Database tests are skipped when `SIFTWISE_TEST_DATABASE_URL` is unset. After upg
 database past migration 0005, run `POST /repos/{repo}/rollup` once per repo. Migration 0006
 rewrites `test_results` in place (it needs free disk for a second, smaller copy while it runs);
 run `VACUUM ANALYZE test_results` afterwards. Migration 0007 builds a small index on failed
-results (seconds; it blocks writes to `test_results` meanwhile). Migration 0008 only adds the
-shadow-mode tables. Replay the selector
+results (seconds; it blocks writes to `test_results` meanwhile). Migrations 0008 and 0009 only add the
+shadow-mode tables and columns. Replay the selector
 on a backfilled repo with `uv run python -m scripts.eval.run_eval --repo owner/name --checkout <clone>`.
 
 ## Roadmap

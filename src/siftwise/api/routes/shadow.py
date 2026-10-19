@@ -1,7 +1,7 @@
 """Shadow mode. POST /repos/{repo}/shadow: compare a recorded shadow run with its stored
 selection. GET /repos/{repo}/recall: live recall over the last days."""
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
@@ -11,6 +11,7 @@ from siftwise.config import Settings
 from siftwise.core.schemas import (
     EstimatedMs,
     RecallMissOut,
+    RecallPeriodOut,
     RecallResponse,
     RecallStatsOut,
     ShadowCompareRequest,
@@ -19,8 +20,18 @@ from siftwise.core.schemas import (
     ShadowSelectionOut,
     ShadowTimeOut,
     ShadowVariantOut,
+    SuggestionOut,
 )
-from siftwise.core.shadow import MAX_MISSES, MISSED, VERDICT_ORDER, Tally, Time, compare_ci_run
+from siftwise.core.shadow import (
+    CAUSES,
+    MAX_MISSES,
+    MISSED,
+    UNCLASSIFIED,
+    VERDICT_ORDER,
+    Tally,
+    Time,
+    compare_ci_run,
+)
 from siftwise.core.shadow import recall as shadow_recall
 from siftwise.db import get_session
 
@@ -76,7 +87,13 @@ def post_shadow_compare(
         flaky_excluded=tally.flaky_excluded,
         missed_by_verdict=_by_verdict(tally),
         missed_tests=[
-            ShadowMissOut(test_id=u.test_id, verdict=u.verdict, variants=list(u.variants))
+            ShadowMissOut(
+                test_id=u.test_id,
+                verdict=u.verdict,
+                variants=list(u.variants),
+                cause=u.cause.cause if u.cause else None,
+                cause_detail=u.cause.detail if u.cause else None,
+            )
             for u in missed[:MAX_MISSES]
         ],
         time=_time(result.time),
@@ -88,11 +105,14 @@ def get_recall(
     repo: str,
     session: Annotated[Session, Depends(get_session)],
     days: Annotated[int, Query(ge=1, le=365, description="Shadow runs of the last N days")] = 30,
+    by: Annotated[
+        Literal["week"] | None, Query(description="Also per week (Monday 00:00 UTC)")
+    ] = None,
 ) -> RecallResponse:
     """Live recall from shadow runs: failures the selection would have caught or missed (flaky
-    ones excluded), over every shadow run and over selective ones only, and the measured time
-    the selection would have saved."""
-    report = shadow_recall(session, repo, days)
+    ones excluded), over every shadow run and over selective ones only, the measured time the
+    selection would have saved, why each failure was missed, and rules to consider."""
+    report = shadow_recall(session, repo, days, by_week=by == "week")
     if report is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown repo {repo!r}")
     return RecallResponse(
@@ -117,10 +137,33 @@ def get_recall(
                 verdict=m.verdict,
                 selection_mode=m.selection_mode,
                 at=m.at,
+                cause=m.cause.cause if m.cause else None,
+                cause_detail=m.cause.detail if m.cause else None,
+                suggestion=m.cause.suggestion if m.cause else None,
             )
             for m in report.misses[:MAX_MISSES]
         ],
         misses_truncated=len(report.misses) > MAX_MISSES,
+        suggestions=[
+            SuggestionOut(rule=s.rule, misses=s.misses, test_ids=sorted(s.test_ids))
+            for s in report.suggestions
+        ],
+        linked_not_selected=report.linked_not_selected,
+        periods=None
+        if report.periods is None
+        else [
+            RecallPeriodOut(
+                start=p.start,
+                end=p.end,
+                shadow_runs=p.all.runs,
+                selective_runs=p.selective.runs,
+                full_runs=p.full_runs,
+                all=_stats(p.all),
+                selective=_stats(p.selective),
+                time=_time(p.time),
+            )
+            for p in report.periods
+        ],
     )
 
 
@@ -138,7 +181,16 @@ def _stats(tally: Tally) -> RecallStatsOut:
         missed=tally.missed,
         recall=tally.recall,
         missed_by_verdict=_by_verdict(tally),
+        missed_by_cause=_by_cause(tally),
     )
+
+
+def _by_cause(tally: Tally) -> dict[str, int]:
+    """Misses per cause; 'unclassified' only when some misses predate causes."""
+    counts = {cause: tally.missed_by_cause[cause] for cause in CAUSES}
+    if tally.missed_by_cause[UNCLASSIFIED]:
+        counts[UNCLASSIFIED] = tally.missed_by_cause[UNCLASSIFIED]
+    return counts
 
 
 def _time(time: Time) -> ShadowTimeOut:
