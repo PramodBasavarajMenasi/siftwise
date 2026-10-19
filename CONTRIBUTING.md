@@ -2,7 +2,7 @@
 
 Issues and pull requests are welcome. This page covers the dev setup, the checks CI runs,
 migrations, and what a PR needs. For how the pieces fit, read
-[docs/architecture.md](docs/architecture.md) first.
+[ARCHITECTURE.md](ARCHITECTURE.md) first.
 
 ## Setup
 

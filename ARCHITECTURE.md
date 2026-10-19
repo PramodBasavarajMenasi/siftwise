@@ -1,8 +1,8 @@
 # Architecture
 
 How siftwise is put together: the components, what happens on one CI run, the data model,
-and the design rules everything else follows. For setup, see the [README](../README.md); for
-how the evals measure, [eval methodology](eval-methodology.md).
+and the design rules everything else follows. For setup, see the [README](README.md); for
+how the evals measure, [eval methodology](docs/eval-methodology.md).
 
 ## Components
 
@@ -90,7 +90,7 @@ from local JUnit files, and `POST /explain` for one test.
   macOS is a platform difference, not flakiness. The selector ignores variants.
 
 Migrations live in `src/siftwise/migrations` and ship in the wheel; see
-[CONTRIBUTING.md](../CONTRIBUTING.md#migrations).
+[CONTRIBUTING.md](CONTRIBUTING.md#migrations).
 
 ## Selection
 
@@ -182,4 +182,4 @@ A fixed number of queries per request, whatever the number of failures or matrix
 triage of a CI run attempt uses at most 17 queries (12 on rdflib's 22-leg attempt), and a
 shadow comparison 27. `/select` reads
 passing results only through `test_stats`. Measurements and the before/after numbers:
-[eval results, Performance](eval-results.md#performance).
+[eval results, Performance](docs/eval-results.md#performance).
