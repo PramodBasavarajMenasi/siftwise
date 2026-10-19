@@ -87,8 +87,10 @@ every module to nearly every test file, so safe file-level selection still runs 
 suite. The 10.4% comes from PRs that only touch lint configs. Bigger savings need codebases with
 independent parts (monorepos), or per-test coverage. The one miss, `test_service_with_bound_solutions`,
 calls a remote SPARQL service and also failed in 2 earlier unrelated runs: it's flaky, and
-[triage](#triage) should label it rather than count it as a miss. It doesn't yet: see triage
-below.
+[triage](#triage) should label it rather than count it as a miss. Every rdflib change links to
+it, so listing it in `known_flaky` makes it `unknown` ("re-run to tell"), not flaky; the
+Action's `rerun-unknown` with `rerun-verdicts: unknown,new_regression` re-runs it and calls it
+flaky when it passes ([Flaky tests](#flaky-tests)).
 
 **Triage** (a verdict per failure, scored against what happened next; details in
 [the triage eval](docs/eval-results.md#triage-eval)):
@@ -102,7 +104,8 @@ below.
 - **Flaky precision is mostly by construction:** almost every `flaky` verdict is rule 1, a
   pass of the same commit seen before the failure, which is also the flaky label's evidence.
   Without re-runs, on a repo where every change links to every test, flaky tests look like
-  regressions (rdflib's remote-service tests).
+  regressions (rdflib's remote-service tests): that's what [`rerun-unknown`](#flaky-tests) is
+  for.
 
 ## Quickstart
 
@@ -185,9 +188,10 @@ The first rule that applies decides:
 
 | # | Situation | Verdict | Confidence |
 |---|---|---|---|
-| 1 | The same commit and variant passed before (a re-run or a retry) | **flaky** | high |
-| 2 | Failing on main for this variant, at the last main run before this one | **pre-existing** | high for a streak of 2+ main runs or a matching message, else medium; at most medium if the change also touches the test |
+| 1 | The same commit and variant passed before (a re-run or a retry), or passed on one of this run's [re-runs](#flaky-tests) | **flaky** | high |
+| 2 | Failing on main for this variant, at the last main run before this one | **pre-existing** (a `known_flaky` listing is only noted) | high for a streak of 2+ main runs or a matching message, else medium; at most medium if the change also touches the test |
 | 3 | The diff is unknown | **unknown** | low |
+| 3b | Listed in `known_flaky` | linked to the change: **unknown**, re-run to tell; else **flaky** | low; flaky: medium, high with strong flaky history (as rule 7) |
 | 4 | No history before this run | **new regression** if the test's own file changed (medium), else **unknown** | |
 | 5 | Linked to the change, but known flaky | **unknown**: re-run to tell | low |
 | 6 | Linked to the change | **new regression** | high: the test's file or path mapping; medium: an import, a `[[depends]]` rule or a nested build file; low: a root build/CI file. One level lower without a passing main run to compare with |
@@ -209,10 +213,14 @@ The first rule that applies decides:
   without them (e.g. backfilled ones) never count as evidence.
 - **Failure messages** are evidence only. Normalised (numbers, addresses, temp paths and
   timestamps removed), a match raises confidence; a mismatch is noted, never decisive.
+- **`known_flaky`** (in [`.siftwise.toml`](#configuration)) comes from the base ref by default
+  (`--known-flaky-source base|head`), so a change can't mark its own failures flaky; when the
+  checkout's list differs, `siftwise triage` says the change applies after merge. The MCP server
+  always uses the base's list.
 
 `--json` prints the full response: per test, the verdict, confidence, reasons and evidence
 (links, the main streak, flaky events by kind, history). The API is `POST /triage`, with
-`/select`'s change fields plus `commit_sha`, `variant`, `ci_run_id` and
+`/select`'s change fields plus `commit_sha`, `variant`, `ci_run_id`, `known_flaky` and
 `failures: [{test_id, message, file_path}]` (up to 5,000). Exit codes: 0 ok, 1 API error,
 2 usage error, 4 a failure got a `--fail-on` verdict (off by default). 500 failures on rdflib
 take about 0.25 s, or 1 s with a cold cache (`scripts/bench_triage.py`). The GitHub Action
@@ -333,7 +341,7 @@ only exception is [`fail-on`](#fail-on), which you opt into.
 | Action | When | What |
 |---|---|---|
 | `actions/select` | before tests | picks tests; outputs `mode`, `command`, `selected`, `total`, `reason`, `junit-dir` (and the [shadow](#shadow-mode) outputs); posts one sticky PR comment and a job summary |
-| `actions/record` | after tests, `if: always()` | uploads JUnit with the run ID and attempt, the PR head commit (not the merge commit), branch, variant, start time and changed files; in a single job, then [triages the failures](#failure-verdicts) and reports a [shadow run](#shadow-mode) |
+| `actions/record` | after tests, `if: always()` | uploads JUnit with the run ID and attempt, the PR head commit (not the merge commit), branch, variant, start time, changed files and [`known_flaky`](#flaky-tests); optionally [re-runs unknown failures](#flaky-tests); in a single job, then [triages the failures](#failure-verdicts) and reports a [shadow run](#shadow-mode) |
 | `actions/rollup` | once after a matrix | [triages the failures](#failure-verdicts) of every leg and reports a [shadow run](#shadow-mode), then updates test stats once for all legs (`POST /repos/{repo}/rollup`) |
 
 **Setup:**
@@ -500,7 +508,48 @@ the listed verdicts, on any leg:
   there). A missing `SIFTWISE_TOKEN` secret on your own repo looks the same: watch for that
   warning.
 
+- **A PR can't excuse its own failures with `known_flaky`:** `record` applies the PR base
+  commit's list (see [Flaky tests](#flaky-tests) and [Security and limits](#security-and-limits)).
+
 Without `fail-on` (the default), siftwise never fails anything.
+
+### Flaky tests
+
+Two ways to keep known flakes from reading as regressions, both in `record`:
+
+```yaml
+      - if: always()
+        uses: PramodBasavarajMenasi/siftwise/actions/record@main
+        with:
+          server-url: ${{ secrets.SIFTWISE_URL }}
+          token: ${{ secrets.SIFTWISE_TOKEN }}
+          rerun-unknown: 2         # re-run unknown failures up to twice
+          rerun-prefix: uv run     # how pytest runs in your job (e.g. poetry run)
+```
+
+- **`known_flaky`** in [`.siftwise.toml`](#configuration): a failing listed test not linked to
+  the change is flaky (medium); linked, it's unknown ("re-run to tell"). For a pull request,
+  `record` applies the **base commit's** list (`known-flaky-source: base`, the default), so a PR
+  can't mark its own failures flaky and get past `fail-on`; when the PR changes the list, the
+  comment says "known_flaky changes in this PR apply after merge". `known-flaky-source: head`
+  applies the PR's own list instead. A push always applies its own.
+- **`rerun-unknown: N`** (0 to 3, default 0): after uploading, `record` triages its own leg,
+  re-runs failures whose verdict is in `rerun-verdicts` (`unknown`, or
+  `unknown,new_regression`) with pytest node IDs, and records each re-run. A test that passes
+  on one is **flaky**, high ("passed on re-run 1 of this commit and variant"); one that fails
+  again keeps its verdict, with a note. Tests still failing go round again, up to N times.
+- **Limits:** at most `rerun-max-tests` tests (20) within `rerun-timeout-minutes` (10) for all
+  rounds; a round cut off is discarded. pytest only for now; tests whose file isn't in the
+  checkout, and other runners, aren't re-run. `rerun-prefix` is split like a shell would, and
+  the command runs without a shell. Re-runs write their JUnit outside the checkout and leave no
+  pytest cache.
+- **Fail open:** no token, no verdicts, pytest missing, a timeout or a failed upload is a
+  warning; the verdicts stay what they were. Re-runs never turn a red job green; the PR comment
+  and `fail-on` use the verdicts after them. Outputs: `rerun-tests`, `rerun-passed`.
+- **Where:** in a matrix each leg re-runs its own failures (it has the checkout and the
+  environment), and `rollup` triages after every leg, re-runs included. In a single job,
+  `record` re-runs, then triages. Selection is unchanged: known-flaky tests still run when
+  selected.
 
 ### Shadow mode
 
@@ -530,8 +579,8 @@ selected; after the run is recorded, the server checks every failure against tha
   failures section of the PR comment and the job summary get a line like "**Shadow run:**
   would have run 120 of 692 tests (70% time saved) and caught 3 of 4 failures (1 flaky not
   counted)", then the missed tests with their cause (at most 20). The time saved is measured
-  on the run's own durations. Failures that triage calls flaky are counted separately, never
-  as misses; pre-existing and unknown ones count.
+  on the run's own durations. Failures that triage calls flaky (including `known_flaky` and
+  re-run passes) are counted separately, never as misses; pre-existing and unknown ones count.
 - **Outputs:** `select` has `shadow`, `shadow-mode` (what siftwise would have done),
   `shadow-selected` and `shadow-total`; `rollup` and `record` have `shadow`, `shadow-mode`,
   `shadow-caught` and `shadow-missed`.
@@ -598,8 +647,9 @@ on = ["tests/data/**"]
 ```
 
 `.github/workflows/action-e2e.yml` runs all three actions against a real server on every push
-and PR of this repo, including a deliberately failing test's verdict, `fail-on` and a shadow
-run.
+and PR of this repo, including a deliberately failing test's verdict, `fail-on`, a shadow
+run, `known_flaky` from the checkout and from the PR base, and `rerun-unknown` on a test that
+fails once.
 
 
 ## Features
@@ -619,6 +669,8 @@ run.
 - ✅ Shadow mode: sampled CI runs run the full suite and report what the selection would have
   caught or missed, with a cause for every miss; `siftwise report` (`GET /repos/{repo}/recall`)
   for recall, by week too, and `.siftwise.toml` rules to consider for config gaps
+- ✅ Flaky handling: `known_flaky` in `.siftwise.toml` (a PR's base list, so a PR can't excuse
+  its own failures) and `rerun-unknown` in the Action (pytest re-runs; a pass makes it flaky)
 
 ## How it compares
 
@@ -643,6 +695,7 @@ runs. siftwise uses no instrumentation; when its graphs can't see a dependency, 
 ```toml
 always_run = ["tests/smoke/**", "tests.test_health::*"]  # test file paths or test IDs
 generated = ["build/reports/**"]          # more files your test runs write (see below)
+known_flaky = ["tests/test_net.py"]       # triage: unlinked failures are flaky (see below)
 
 [[depends]]                               # dependencies no import graph can see
 tests = "test/cli/**"                     # test file paths, or <Go package dir>/<TestName>
@@ -657,6 +710,10 @@ Files that test runs write never count as changed code, even untracked or commit
 mistake: `junit*.xml`, `coverage.xml`, `.coverage`, `.coverage.*`, `htmlcov/`, `*.log`,
 `.pytest_cache/` and `__pycache__/`, at any depth. Like docs, they never select a test or force
 the full suite. `generated` adds to that list.
+
+`known_flaky` is for [triage](#triage) only (selection still runs listed tests): a listed
+test's failure is flaky unless the change links to it. CI applies a pull request's **base**
+list ([Flaky tests](#flaky-tests)).
 
 | Variable | Used by | Default |
 |---|---|---|
@@ -680,6 +737,9 @@ the full suite. `generated` adds to that list.
   your tests print, so treat the database as you treat CI logs.
 - **Public PR comments** show test IDs, verdicts and siftwise's own reasons, never raw failure
   messages.
+- **Protect your workflows.** The base-branch known_flaky rule assumes the workflow itself is
+  protected. A PR that edits .github/workflows/ can change any gate, so protect workflows with
+  CODEOWNERS or a ruleset.
 - **Stats cover the window only.** Per-test stats use the last `SIFTWISE_STATS_WINDOW_DAYS`
   (90) days before the repo's newest run. A test not seen within the window loses its stats row
   on the next rollup; its raw results stay, and `GET /tests/{id}/history` shows them with
@@ -713,18 +773,18 @@ database past migration 0005, run `POST /repos/{repo}/rollup` once per repo. Mig
 rewrites `test_results` in place (it needs free disk for a second, smaller copy while it runs);
 run `VACUUM ANALYZE test_results` afterwards. Migration 0007 builds a small index on failed
 results (seconds; it blocks writes to `test_results` meanwhile). Migrations 0008 and 0009 only add the
-shadow-mode tables and columns. Replay the selector
+shadow-mode tables and columns. Migration 0010 adds `runs.known_flaky` and `runs.rerun` and
+rebuilds the small `runs` unique index. Replay the selector
 on a backfilled repo with `uv run python -m scripts.eval.run_eval --repo owner/name --checkout <clone>`.
 
 ## Roadmap
 
 - **Done:** recording and history, test selection with import graphs and safe fallbacks, the
   GitHub Action, failure triage with verdicts in the PR comment and `fail-on`, the MCP server,
-  the triage eval, [shadow mode](#shadow-mode) with `siftwise report` (by week too), and miss
-  causes.
-- **Next:** flaky handling (`known_flaky`, same-commit re-run detection), performance (batched
-  triage and rollup queries), packaging (a light CLI, a Docker image) and dogfooding: shadow
-  mode on siftwise and another repo, for real recall data.
+  the triage eval, [shadow mode](#shadow-mode) with `siftwise report` (by week too), miss
+  causes, and [flaky handling](#flaky-tests) (`known_flaky`, `rerun-unknown`).
+- **Next:** performance (batched triage and rollup queries), packaging (a light CLI, a Docker
+  image) and dogfooding: shadow mode on siftwise and another repo, for real recall data.
 - **Then:** a `v0.1.0` release on PyPI, docs and launch.
 
 ## Contributing

@@ -253,6 +253,26 @@ def test_triage_on_a_clean_tree_sends_the_commit(checkout: Path, api: respx.Mock
     assert out["tested_code"] == f"commit {head[:7]}"
 
 
+def test_known_flaky_is_the_bases_never_the_agents_edit(
+    checkout: Path, api: respx.MockRouter
+) -> None:
+    git(checkout, "stash", "-u")
+    git(checkout, "checkout", "-q", "main")
+    (checkout / ".siftwise.toml").write_text('known_flaky = ["tests.test_db::*"]\n')
+    git(checkout, "add", ".siftwise.toml")
+    git(checkout, "commit", "-q", "-m", "config")
+    git(checkout, "checkout", "-q", "feature")
+    git(checkout, "stash", "pop")
+    (checkout / ".siftwise.toml").write_text('known_flaky = ["**"]\n')  # the agent's edit
+    triage = api.post(f"{SERVER}/triage").respond(json=triage_response(verdict("a::b", "flaky")))
+    explain = api.post(f"{SERVER}/explain").respond(json=explanation())
+
+    call("triage_failure", {"failures": [{"test_id": "a::b"}]})
+    call("explain", {"test_id": "a::b"})
+
+    assert sent(triage)["known_flaky"] == sent(explain)["known_flaky"] == ["tests.test_db::*"]
+
+
 @pytest.mark.usefixtures("checkout")
 def test_triage_fails_open_without_verdicts(api: respx.MockRouter) -> None:
     api.post(f"{SERVER}/triage").mock(side_effect=[httpx.ConnectError("refused")])

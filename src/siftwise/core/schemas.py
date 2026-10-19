@@ -1,7 +1,7 @@
 """Pydantic request/response schemas."""
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Self
 
 from pydantic import (
     BaseModel,
@@ -10,6 +10,7 @@ from pydantic import (
     Field,
     StringConstraints,
     field_validator,
+    model_validator,
 )
 
 from siftwise.core.junit import Status, normalize_path
@@ -99,6 +100,29 @@ class RunMetadata(BaseModel):
         "if they weren't computed (or failed): triage then treats this run's relatedness to "
         "its failures as unknown.",
     )
+    known_flaky: list[Glob] = Field(
+        default_factory=list,
+        max_length=1000,
+        description="The known_flaky globs triage applies to this run. For a PR, the base "
+        "commit's list: a PR must not mark its own failures flaky.",
+    )
+    known_flaky_changed: bool = Field(
+        default=False,
+        description="The PR's own known_flaky differs from the list sent (it applies after merge)",
+    )
+    rerun: int = Field(
+        default=0,
+        ge=0,
+        le=10,
+        description="0 = the run itself; n = the n-th re-run of failing tests within the same CI "
+        "run attempt and variant (needs ci_run_id)",
+    )
+
+    @model_validator(mode="after")
+    def _rerun_needs_ci_run(self) -> Self:
+        if self.rerun and self.ci_run_id is None:
+            raise ValueError("a re-run (rerun > 0) needs ci_run_id")
+        return self
 
     @field_validator("changed_files")
     @classmethod
@@ -151,6 +175,7 @@ class RunLookupResponse(BaseModel):
     run_attempt: int
     variant: str | None
     commit_sha: str
+    rerun: int = 0
 
 
 class ChangeRequest(ChangeGraph):
@@ -351,6 +376,12 @@ class TriageRequest(ChangeRequest):
         "the history, and a recorded run of this variant sets the cut-off time.",
     )
     run_attempt: int = Field(default=1, ge=1)
+    known_flaky: list[Glob] = Field(
+        default_factory=list,
+        max_length=1000,
+        description="known_flaky globs from .siftwise.toml (test IDs and file paths): a failing "
+        "listed test not linked to the change is flaky",
+    )
     as_of: datetime | None = Field(
         default=None,
         description="Only history strictly before this time counts (default: the recorded "
@@ -412,6 +443,13 @@ class HistoryOut(BaseModel):
         description="Latest main run of this variant it passed"
     )
     flaky_counts: dict[str, int] = Field(description="Flaky events by kind, in the window")
+    rerun_passes: list[int] = Field(
+        default_factory=list,
+        description="Re-runs (numbers) of this CI run attempt and variant where the test passed",
+    )
+    rerun_failures: list[int] = Field(
+        default_factory=list, description="Re-runs where it failed again"
+    )
 
 
 class EvidenceOut(BaseModel):
@@ -429,6 +467,9 @@ class TriageResultOut(BaseModel):
     verdict: str = Field(description="'new_regression', 'pre_existing', 'flaky' or 'unknown'")
     confidence: str = Field(description="'high', 'medium' or 'low'")
     reasons: list[str]
+    known_flaky: str | None = Field(
+        default=None, description="The known_flaky glob the test matches, if any"
+    )
     evidence: EvidenceOut
 
 
@@ -457,6 +498,12 @@ class RunTriageRequest(BaseModel):
         description="Most results returned (one per failing test and variant), worst verdicts "
         "first and never splitting a test's variants; counts always cover every failure",
     )
+    variants: list[Variant] | None = Field(
+        default=None,
+        max_length=100,
+        description="Only these variants (null in the list = the run without a variant); "
+        "default every recorded variant",
+    )
 
 
 class VariantTriageOut(BaseModel):
@@ -469,6 +516,11 @@ class VariantTriageOut(BaseModel):
         description="The run's change links were stored. If not, the change counts as unknown"
     )
     failing: int = Field(description="Failing tests in this variant")
+    reruns: int = Field(default=0, description="Re-run uploads of this variant's failing tests")
+    known_flaky_changed: bool = Field(
+        default=False,
+        description="The PR changes known_flaky; the change applies after merge",
+    )
     counts: dict[str, int] = Field(description="This variant's failing tests per verdict")
 
 
@@ -502,6 +554,12 @@ class ExplainRequest(ChangeRequest):
     test_id: Annotated[str, StringConstraints(min_length=1, max_length=4096)]
     variant: Variant = Field(default=None, description="Matrix leg for the main-streak evidence")
     always_run: list[Glob] = Field(default_factory=list, max_length=1000)
+    known_flaky: list[Glob] = Field(
+        default_factory=list,
+        max_length=1000,
+        description="known_flaky globs from .siftwise.toml (test IDs and file paths): a failing "
+        "listed test not linked to the change is flaky",
+    )
 
 
 class OutcomeOut(BaseModel):
@@ -532,6 +590,9 @@ class ExplainResponse(BaseModel):
     recent: list[OutcomeOut] = Field(description="Latest runs it appeared in, newest first")
     flaky: list[FlakyEventOut] = Field(description="Flaky events in the window, newest first")
     flaky_counts: dict[str, int]
+    known_flaky: str | None = Field(
+        default=None, description="The known_flaky glob the test matches, if any"
+    )
     window_days: int
     selection: ExplainSelectionOut
 

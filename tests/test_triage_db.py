@@ -58,6 +58,9 @@ def record(
     graph: ChangeGraph | None = NO_LINKS,
     message: str | None = "AssertionError: assert 2 == 3",
     file_path: str | None = None,
+    rerun: int = 0,
+    known_flaky: Sequence[str] = (),
+    known_flaky_changed: bool = False,
 ) -> Run:
     """One run. ``changed`` None = unknown diff; ``graph`` None = no stored change links."""
     results = []
@@ -81,6 +84,9 @@ def record(
         changed_files=list(changed or ()),
         changed_files_known=changed is not None,
         affected=graph,
+        rerun=rerun,
+        known_flaky=list(known_flaky),
+        known_flaky_changed=known_flaky_changed,
     )
     run, created = create_run(session, meta, results, rollup=False)
     assert created
@@ -568,6 +574,134 @@ def test_ci_run_file_paths_from_later_runs_are_not_used(db_session: Session) -> 
     record(db_session, commit=3, hour=9, tests={"web::adds": P}, file_path="web/moved.test.js")
 
     assert verdicts(ci_triage(db_session, "11")[0]) == {"web::adds": Verdict.UNKNOWN}
+
+
+# --- same-commit re-runs as evidence for later runs ---------------------------------------
+
+
+def test_a_later_attempt_passing_is_same_commit_evidence_for_later_runs(
+    db_session: Session,
+) -> None:
+    # Attempt 1 failed, "Re-run jobs" (attempt 2, same commit) passed: a later run of another
+    # commit sees a same_commit event and, unlinked, calls the test flaky.
+    record(db_session, commit=1, hour=1, tests={TEST: P})
+    record(db_session, commit=5, hour=2, branch="b", ci_run_id="20", tests={TEST: F})
+    record(db_session, commit=5, hour=3, branch="b", ci_run_id="20", run_attempt=2,
+           tests={TEST: P})  # fmt: skip
+
+    later = result(db_session, commit=6, as_of=at(10))
+
+    [event] = later.history.flaky
+    assert (event.kind, event.commit_sha) == (SAME_COMMIT, sha(5))
+    assert ([r.ci_run_id for r in event.failed], [r.ci_run_id for r in event.passed]) == (
+        ["20"], ["20"])  # fmt: skip
+    assert (later.verdict, later.confidence.value) == (Verdict.FLAKY, "medium")
+
+
+def test_another_ci_run_of_the_same_commit_passing_is_same_commit_evidence(
+    db_session: Session,
+) -> None:
+    # A push run and a PR run of one SHA: the PR run failed, the push run passed later.
+    record(db_session, commit=1, hour=1, tests={TEST: P})
+    record(db_session, commit=5, hour=2, branch="b", ci_run_id="pr-run", tests={TEST: F})
+    record(db_session, commit=5, hour=2.5, branch="b", ci_run_id="push-run", tests={TEST: P})
+
+    [event] = result(db_session, commit=6, as_of=at(10)).history.flaky
+
+    assert (event.kind, [r.ci_run_id for r in event.passed]) == (SAME_COMMIT, ["push-run"])
+
+
+# --- known_flaky and re-runs of a recorded attempt ----------------------------------------
+
+
+def test_ci_run_applies_the_runs_stored_known_flaky(db_session: Session) -> None:
+    record(db_session, commit=1, hour=1, tests={TEST: P, OTHER: P})
+    record(db_session, commit=2, hour=5, branch="pr", ci_run_id="30", tests={TEST: F, OTHER: F},
+           known_flaky=["tests.test_cart::*"], known_flaky_changed=True)  # fmt: skip
+
+    [linux] = ci_triage(db_session, "30")
+
+    assert verdicts(linux) == {TEST: Verdict.FLAKY, OTHER: Verdict.UNKNOWN}
+    assert linux.known_flaky_changed
+    assert linux.report is not None
+    listed = next(r for r in linux.report.results if r.test_id == TEST)
+    assert (listed.confidence.value, listed.known_flaky) == ("medium", "tests.test_cart::*")
+
+
+def test_re_run_uploads_are_stored_beside_the_run(db_session: Session) -> None:
+    run = record(db_session, commit=2, hour=5, branch="pr", ci_run_id="31", tests={TEST: F})
+    rerun = record(db_session, commit=2, hour=5.2, branch="pr", ci_run_id="31", rerun=1,
+                   tests={TEST: P})  # fmt: skip
+
+    assert (run.rerun, rerun.rerun) == (0, 1)
+    assert rerun.id != run.id
+    # The same re-run again is a duplicate of it, not of the run.
+    meta = RunMetadata(repo=REPO, commit_sha=sha(2), branch="pr", is_main=False,
+                       ci_run_id="31", variant="linux", rerun=1)  # fmt: skip
+    again, created = create_run(db_session, meta, [], rollup=False)
+    assert (again.id, created) == (rerun.id, False)
+
+
+def test_a_re_run_needs_a_ci_run_id() -> None:
+    with pytest.raises(ValueError, match="needs ci_run_id"):
+        RunMetadata(repo=REPO, commit_sha=sha(2), branch="pr", is_main=False, rerun=1)
+
+
+def test_ci_run_passing_on_a_re_run_of_its_variant_is_flaky(db_session: Session) -> None:
+    record(db_session, commit=1, hour=1, tests={TEST: P, OTHER: P})
+    record(db_session, commit=2, hour=5, branch="pr", ci_run_id="32", tests={TEST: F, OTHER: F})
+    record(db_session, commit=2, hour=5.1, branch="pr", ci_run_id="32", rerun=1,
+           tests={TEST: F, OTHER: F})  # fmt: skip
+    record(db_session, commit=2, hour=5.2, branch="pr", ci_run_id="32", rerun=2,
+           tests={TEST: P, OTHER: F})  # fmt: skip
+    # Another leg's re-run is not this variant's evidence.
+    record(db_session, commit=2, hour=5, branch="pr", ci_run_id="32", variant="macos",
+           tests={OTHER: P})  # fmt: skip
+    record(db_session, commit=2, hour=5.3, branch="pr", ci_run_id="32", variant="macos",
+           rerun=1, tests={OTHER: P})  # fmt: skip
+
+    linux, macos = ci_triage(db_session, "32")  # re-runs are never variants
+
+    assert (linux.reruns, macos.reruns) == (2, 1)
+    assert linux.report is not None
+    by_test = {r.test_id: r for r in linux.report.results}
+    flaky, again = by_test[TEST], by_test[OTHER]
+    assert (flaky.verdict, flaky.confidence.value) == (Verdict.FLAKY, "high")
+    assert flaky.reasons[0] == (
+        "passed on re-run 2 of this commit and variant: same code, different outcome"
+    )
+    assert (flaky.history.rerun_passes, flaky.history.rerun_failures) == ((2,), (1,))
+    assert again.verdict is Verdict.UNKNOWN
+    assert again.reasons[-1] == "failed again on 2 re-runs"
+
+
+def test_re_runs_are_ordinary_history_for_later_runs(db_session: Session) -> None:
+    record(db_session, commit=1, hour=1, tests={TEST: P})
+    record(db_session, commit=5, hour=2, branch="b", ci_run_id="33", tests={TEST: F})
+    record(db_session, commit=5, hour=2.1, branch="b", ci_run_id="33", rerun=1,
+           tests={TEST: P})  # fmt: skip
+
+    [event] = result(db_session, commit=6, as_of=at(10)).history.flaky
+
+    assert (event.kind, event.commit_sha) == (SAME_COMMIT, sha(5))
+
+
+def test_ci_run_triages_only_the_variants_asked_for(db_session: Session) -> None:
+    record(db_session, commit=1, hour=1, tests={TEST: P})
+    record(db_session, commit=2, hour=5, branch="pr", ci_run_id="34", tests={TEST: F})
+    record(db_session, commit=2, hour=5, branch="pr", ci_run_id="34", variant="macos",
+           tests={TEST: F})  # fmt: skip
+    record(db_session, commit=2, hour=5, branch="pr", ci_run_id="34", variant=None,
+           tests={TEST: F})  # fmt: skip
+
+    def only(*variants: str | None) -> list[str | None]:
+        found = triage_ci_run(db_session, REPO, "34", variants=variants)
+        assert found is not None
+        return [v.variant for v in found]
+
+    assert only("macos") == ["macos"]
+    assert only(None, "linux") == [None, "linux"]
+    assert only("windows") == []
 
 
 def test_ci_run_unknown_repo_or_attempt(db_session: Session) -> None:

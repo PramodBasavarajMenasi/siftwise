@@ -1,8 +1,8 @@
 name: siftwise record
 description: >-
   Upload the run's JUnit reports to siftwise (use with if: always()). In a single job, also
-  triage the run's failures into the PR comment and job summary. Never fails the job unless
-  fail-on is set: problems are warnings.
+  triage the run's failures into the PR comment and job summary. Optionally re-run unknown
+  failures (rerun-unknown). Never fails the job unless fail-on is set: problems are warnings.
 inputs:
   server-url:
     description: siftwise server URL (e.g. secrets.SIFTWISE_URL).
@@ -66,6 +66,38 @@ inputs:
       PRs) it only warns: that run is not gated.
     required: false
     default: ""
+  known-flaky-source:
+    description: >-
+      Whose .siftwise.toml known_flaky list triage applies to a pull request: 'base' (the PR
+      base commit's, so a PR can't mark its own failures flaky and get past fail-on; edits
+      apply after merge) or 'head' (the checkout's). Pushes always use their own.
+    required: false
+    default: base
+  rerun-unknown:
+    description: >-
+      Re-run this leg's failures whose verdict is in rerun-verdicts up to this many times
+      (0-3; 0 = off), with pytest node IDs, and record each re-run: a test that passes on one
+      becomes flaky ("passed on re-run"). pytest only. Never fails the step.
+    required: false
+    default: "0"
+  rerun-verdicts:
+    description: "Verdicts to re-run: 'unknown' (default) or 'unknown,new_regression'."
+    required: false
+    default: unknown
+  rerun-max-tests:
+    description: Most failing tests re-run (1-100).
+    required: false
+    default: "20"
+  rerun-timeout-minutes:
+    description: Time limit for all re-runs together (1-60 minutes); a re-run cut off is discarded.
+    required: false
+    default: "10"
+  rerun-prefix:
+    description: >-
+      Command prefix for pytest, e.g. 'uv run' or 'poetry run' (split like a shell would,
+      run without a shell).
+    required: false
+    default: ""
 outputs:
   verdicts-available:
     description: "'true' if the run's failures were triaged, else 'false'."
@@ -92,6 +124,12 @@ outputs:
   shadow-missed:
     description: In a counted shadow run, failing tests the selection would have skipped.
     value: ${{ steps.record.outputs.shadow-missed }}
+  rerun-tests:
+    description: With rerun-unknown, how many failing tests were re-run.
+    value: ${{ steps.record.outputs.rerun-tests }}
+  rerun-passed:
+    description: With rerun-unknown, how many of them passed on a re-run (now flaky).
+    value: ${{ steps.record.outputs.rerun-passed }}
 runs:
   using: composite
   steps:
@@ -118,4 +156,10 @@ runs:
         SIFTWISE_TRIAGE: ${{ inputs.triage }}
         SIFTWISE_COMMENT: ${{ inputs.comment }}
         SIFTWISE_FAIL_ON: ${{ inputs.fail-on }}
+        SIFTWISE_KNOWN_FLAKY_SOURCE: ${{ inputs.known-flaky-source }}
+        SIFTWISE_RERUN_UNKNOWN: ${{ inputs.rerun-unknown }}
+        SIFTWISE_RERUN_VERDICTS: ${{ inputs.rerun-verdicts }}
+        SIFTWISE_RERUN_MAX_TESTS: ${{ inputs.rerun-max-tests }}
+        SIFTWISE_RERUN_TIMEOUT_MINUTES: ${{ inputs.rerun-timeout-minutes }}
+        SIFTWISE_RERUN_PREFIX: ${{ inputs.rerun-prefix }}
       run: '"$(uv tool dir --bin)/siftwise" gha record'

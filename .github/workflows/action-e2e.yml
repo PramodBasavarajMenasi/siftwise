@@ -3,8 +3,9 @@ name: Action e2e
 # Dogfoods actions/select, record and rollup on siftwise itself, against a real server: an
 # empty history (full suite), recording this run's JUnit (plus one deliberately failing test),
 # the rollup's failure verdicts in the job summary and PR comment, fail-on, a second selection
-# that sees the history, the fail-open paths (server down, no token, shallow clone), and a
-# shadow run (full suite, the stored selection's caught and missed failures).
+# that sees the history, the fail-open paths (server down, no token, shallow clone), a shadow
+# run (full suite, the stored selection's caught and missed failures), known_flaky from the
+# checkout or the PR base, and rerun-unknown (a test that fails once, then passes: flaky).
 
 on:
   push:
@@ -400,6 +401,134 @@ jobs:
           echo "$body"
           grep -F -- '- **Mode:** full (shadow run)' <<< "$body"
           grep -F '**Shadow run:** would have run' <<< "$body"
+
+      # known_flaky: the always-failing test, listed in an untracked .siftwise.toml. Its own
+      # variants of this attempt, checked through the API (verdicts per variant, no comment).
+      # known-flaky-source: head applies the checkout's list; the default (base) applies the PR
+      # base commit's, which has none: a PR can't mark its own failures flaky. A change to a root
+      # build or CI file (this workflow) links every test, and linked + listed is unknown.
+      - name: Known flaky - list the always-failing test
+        env:
+          FIRST_JUNIT: ${{ steps.first.outputs.junit-dir }}
+        run: |
+          printf 'known_flaky = ["test_e2e_failing::*"]\n' > .siftwise.toml
+          mkdir -p "$RUNNER_TEMP/known-flaky-junit"
+          cp "$FIRST_JUNIT/e2e-failing.xml" "$RUNNER_TEMP/known-flaky-junit/"
+
+      - name: Known flaky - record (known-flaky-source head)
+        uses: ./actions/record
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          variant: known-flaky-e2e
+          junit-dir: ${{ runner.temp }}/known-flaky-junit
+          known-flaky-source: head
+
+      - name: Known flaky - record (the default source)
+        uses: ./actions/record
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          variant: known-flaky-base-e2e
+          junit-dir: ${{ runner.temp }}/known-flaky-junit
+
+      - name: Check the known-flaky verdicts
+        run: |
+          rm .siftwise.toml
+          git status --porcelain
+          test -z "$(git status --porcelain)"
+          triage() {
+            curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+              -d "{\"ci_run_id\": \"$GITHUB_RUN_ID\", \"run_attempt\": $GITHUB_RUN_ATTEMPT, \"variants\": [\"$1\"]}" \
+              "$SERVER/repos/$GITHUB_REPOSITORY/triage"
+          }
+          failing='.results[] | select(.test_id == "test_e2e_failing::test_e2e_always_fails")'
+          head=$(triage known-flaky-e2e)
+          echo "$head" | jq .
+          echo "$head" | jq -e "$failing | .known_flaky == \"test_e2e_failing::*\""
+          echo "$head" | jq -e '.variants[0].known_flaky_changed == false'
+          if echo "$head" | jq -e "$failing | .evidence.links == []" > /dev/null; then
+            echo "$head" | jq -e "$failing | .verdict == \"flaky\" and .confidence == \"medium\"
+              and .reasons[0] == \"listed in known_flaky ('test_e2e_failing::*')\""
+          else
+            echo "$head" | jq -e "$failing | .verdict == \"unknown\"
+              and .reasons[0] == \"linked to this change but listed in known_flaky: re-run to tell\""
+          fi
+          base=$(triage known-flaky-base-e2e)
+          echo "$base" | jq .
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # Not on the base commit's list; the PR's own list applies after merge.
+            echo "$base" | jq -e "$failing | .known_flaky == null and .verdict != \"flaky\""
+            echo "$base" | jq -e '.variants[0].known_flaky_changed == true'
+          else
+            # A push applies its own list.
+            echo "$base" | jq -e "$failing | .known_flaky == \"test_e2e_failing::*\""
+          fi
+
+      # rerun-unknown: a test inside the checkout (so its node ID resolves) that fails once,
+      # then passes (a marker file outside the checkout). record triages its own variant,
+      # re-runs the unknown failures with pytest and records the re-run: the test becomes flaky,
+      # "passed on re-run 1". The always-failing test is unknown too, but its file is outside
+      # the checkout, so it isn't re-run and stays unknown.
+      - name: Re-run - a test that fails the first time only
+        env:
+          FIRST_JUNIT: ${{ steps.first.outputs.junit-dir }}
+        run: |
+          junit="$RUNNER_TEMP/rerun-junit"
+          mkdir -p "$junit" e2e_rerun
+          cp "$FIRST_JUNIT/e2e-failing.xml" "$junit/"
+          cat > e2e_rerun/test_e2e_flaky.py <<'EOF'
+          import os
+          import pathlib
+
+          MARKER = pathlib.Path(os.environ["RUNNER_TEMP"]) / "e2e-flaky-ran"
+
+
+          def test_e2e_fails_once():
+              first = not MARKER.exists()
+              MARKER.touch()
+              assert not first, "fails the first time only"
+          EOF
+          if uv run pytest e2e_rerun/test_e2e_flaky.py -p no:cacheprovider \
+              --junitxml="$junit/e2e-flaky.xml"; then
+            echo "the flaky test passed the first time"; exit 1
+          fi
+
+      - name: Re-run - record (rerun-unknown)
+        id: rerun
+        uses: ./actions/record
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          variant: rerun-e2e
+          junit-dir: ${{ runner.temp }}/rerun-junit
+          rerun-unknown: 1
+          rerun-prefix: uv run
+
+      - name: Check the re-run
+        env:
+          TESTS: ${{ steps.rerun.outputs.rerun-tests }}
+          PASSED: ${{ steps.rerun.outputs.rerun-passed }}
+        run: |
+          rm -r e2e_rerun
+          git status --porcelain
+          test -z "$(git status --porcelain)"
+          echo "re-ran $TESTS test(s), $PASSED passed"
+          test "$TESTS" = 1
+          test "$PASSED" = 1
+          url="$SERVER/runs/lookup?repo=$GITHUB_REPOSITORY&ci_run_id=$GITHUB_RUN_ID&run_attempt=$GITHUB_RUN_ATTEMPT&variant=rerun-e2e&rerun=1"
+          curl -sf -H "Authorization: Bearer $TOKEN" "$url" | jq -e '.rerun == 1'
+          triage=$(curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d "{\"ci_run_id\": \"$GITHUB_RUN_ID\", \"run_attempt\": $GITHUB_RUN_ATTEMPT, \"variants\": [\"rerun-e2e\"]}" \
+            "$SERVER/repos/$GITHUB_REPOSITORY/triage")
+          echo "$triage" | jq .
+          echo "$triage" | jq -e '.variants[0].reruns == 1'
+          echo "$triage" | jq -e '.results[]
+            | select(.test_id == "e2e_rerun.test_e2e_flaky::test_e2e_fails_once")
+            | .verdict == "flaky" and .confidence == "high"
+              and (.reasons[0] | startswith("passed on re-run 1 of this commit and variant"))'
+          echo "$triage" | jq -e '.results[]
+            | select(.test_id == "test_e2e_failing::test_e2e_always_fails") | .verdict == "unknown"'
 
       - name: Server log
         if: failure()

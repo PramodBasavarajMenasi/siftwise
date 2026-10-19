@@ -226,6 +226,8 @@ def _triage(
             **change.fields,
             "commit_sha": commit,
             "variant": variant,
+            # The base's list: an agent's own edit to known_flaky must not excuse its failures.
+            "known_flaky": list(cli.known_flaky(change.config, base).globs),
             "failures": found,
         }
         result = _post(config, "/triage", body)
@@ -264,6 +266,7 @@ def _explain(
             "repo": repo,
             **change.fields,
             "always_run": list(change.config.always_run),
+            "known_flaky": list(cli.known_flaky(change.config, base).globs),
             "test_id": test_id,
             "variant": variant,
         }

@@ -90,6 +90,20 @@ def test_triage_response(client: TestClient) -> None:
 
 
 @pytest.mark.usefixtures("seeded")
+def test_triage_applies_known_flaky(client: TestClient) -> None:
+    body = {"changed_files": ["src/unrelated.py"], "failures": [{"test_id": OTHER}]}
+
+    plain = post_triage(client, **body).json()["results"][0]
+    listed = post_triage(client, **body, known_flaky=["tests/test_db.py", "tests.test_db::*"])
+    result = listed.json()["results"][0]
+
+    assert (plain["verdict"], plain["known_flaky"]) == ("unknown", None)
+    assert (result["verdict"], result["confidence"]) == ("flaky", "medium")
+    assert result["known_flaky"] == "tests.test_db::*"
+    assert result["reasons"][0] == "listed in known_flaky ('tests.test_db::*')"
+
+
+@pytest.mark.usefixtures("seeded")
 def test_recorded_run_sets_the_cut_off(client: TestClient, db_session: Session) -> None:
     run = record(db_session, commit=99, hour=50, tests={TEST: F}, branch="pr", ci_run_id="5",
                  graph=ChangeGraph())  # fmt: skip
@@ -193,6 +207,39 @@ def test_run_triage_limit_cuts_whole_tests_and_keeps_true_counts(
     # A test with more variants than the limit: its first rows, never nothing.
     assert [(r["test_id"], r["variant"]) for r in tiny["results"]] == [(TEST, "linux")]
     assert tiny["counts"] == cut["counts"]
+
+
+def test_run_triage_of_some_variants(client: TestClient, db_session: Session) -> None:
+    record_matrix(db_session)
+    record(db_session, commit=50, hour=5.5, branch="pr", ci_run_id="77", rerun=1,
+           changed=["src/cart.py"], tests={OTHER: P})  # fmt: skip
+
+    macos = post_run_triage(client, "77", variants=["macos"]).json()
+    linux = post_run_triage(client, "77", variants=["linux"]).json()
+    missing = post_run_triage(client, "77", variants=["windows"])
+
+    assert [v["variant"] for v in macos["variants"]] == ["macos"]
+    assert {r["variant"] for r in macos["results"]} == {"macos"}
+    [variant] = linux["variants"]
+    assert (variant["reruns"], variant["known_flaky_changed"]) == (1, False)
+    other = next(r for r in linux["results"] if r["test_id"] == OTHER)
+    assert (other["verdict"], other["evidence"]["history"]["rerun_passes"]) == ("flaky", [1])
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == (
+        "no runs recorded for CI run 77 attempt 1 (variants ['windows'])"
+    )
+
+
+def test_run_triage_reports_a_changed_known_flaky(client: TestClient, db_session: Session) -> None:
+    record(db_session, commit=1, hour=1, tests={TEST: P})
+    record(db_session, commit=2, hour=2, branch="pr", ci_run_id="81", tests={TEST: F},
+           known_flaky=["tests.test_cart::*"], known_flaky_changed=True)  # fmt: skip
+
+    body = post_run_triage(client, "81").json()
+
+    assert body["variants"][0]["known_flaky_changed"] is True
+    [listed] = body["results"]
+    assert (listed["verdict"], listed["known_flaky"]) == ("flaky", "tests.test_cart::*")
 
 
 def test_run_triage_without_failures(client: TestClient, db_session: Session) -> None:

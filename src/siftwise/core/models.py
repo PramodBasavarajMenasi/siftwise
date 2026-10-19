@@ -24,6 +24,7 @@ from sqlalchemy import (
     Text,
     TypeDecorator,
     UniqueConstraint,
+    false,
     func,
     text,
     true,
@@ -120,14 +121,16 @@ class Run(Base):
     __table_args__ = (
         Index(None, "repo_id", "commit_sha"),
         Index(None, "repo_id", "is_main", "created_at"),
-        # Idempotent ingest key, one row per matrix variant. NULL variants dedupe with each
-        # other via COALESCE; a NULL ci_run_id never conflicts (Postgres NULLs are distinct).
+        # Idempotent ingest key, one row per matrix variant (and re-run of it). NULL variants
+        # dedupe with each other via COALESCE; a NULL ci_run_id never conflicts (Postgres NULLs
+        # are distinct).
         Index(
             RUN_UNIQUE_INDEX,
             "repo_id",
             "ci_run_id",
             "run_attempt",
             text("COALESCE(variant, '')"),
+            "rerun",
             unique=True,
         ),
     )
@@ -150,6 +153,14 @@ class Run(Base):
     # rules), for triage's "was this failure related to the run's change". NULL = not sent
     # (backfill, older uploads, a failed graph): relatedness unknown.
     affected: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    # The known_flaky globs triage applies to this run (a PR: the base commit's .siftwise.toml,
+    # so a PR can't mark its own failures flaky); known_flaky_changed: the PR's list differs.
+    known_flaky: Mapped[list[str]] = mapped_column(ARRAY(Text), server_default=text("'{}'::text[]"))
+    known_flaky_changed: Mapped[bool] = mapped_column(Boolean, server_default=false())
+    # 0 = the run itself; n = the Action's n-th re-run of its failing tests (same CI run
+    # attempt, variant and commit). Attempt-level readers (triage and shadow compare of an
+    # attempt, lookups) skip re-runs; as history they are ordinary runs of the commit.
+    rerun: Mapped[int] = mapped_column(SmallInteger, server_default="0")
 
     # When the run happened. Use this (never created_at alone) wherever "latest" matters:
     # backfill ingests old runs late, so created_at is ingest time, not run time.

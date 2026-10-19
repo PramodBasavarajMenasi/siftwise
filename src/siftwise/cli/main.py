@@ -6,6 +6,7 @@ import re
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -21,6 +22,7 @@ from siftwise.cli.repoconfig import (
     RepoConfig,
     RepoConfigError,
     load_repo_config,
+    loads_repo_config,
     read_go_module,
 )
 from siftwise.core.junit import JUnitParseError, Status, parse_junit
@@ -36,6 +38,11 @@ EXIT_FULL_SUITE_NO_COMMAND = 3
 EXIT_FAIL_ON = 4
 
 VERDICTS = ("new_regression", "pre_existing", "flaky", "unknown")
+
+
+class KnownFlakySource(StrEnum):
+    BASE = "base"
+    HEAD = "head"
 
 
 class SiftwiseError(Exception):
@@ -214,6 +221,13 @@ def triage_command(
     py_imports: Annotated[
         bool, typer.Option(help="Link Python tests through a static import graph.")
     ] = True,
+    known_flaky_source: Annotated[
+        KnownFlakySource,
+        typer.Option(
+            help="Whose .siftwise.toml known_flaky applies: BASE's (default: a change can't "
+            "mark its own failures flaky) or the checkout's."
+        ),
+    ] = KnownFlakySource.BASE,
 ) -> None:
     """Triage a run's failing tests: new regression, pre-existing on main, flaky or unknown.
 
@@ -247,6 +261,9 @@ def triage_command(
     except RepoConfigError as exc:
         _err(f"error: {exc}")
         raise typer.Exit(EXIT_USAGE) from exc
+    flaky = known_flaky(change.config, base, known_flaky_source)
+    if flaky.changed:
+        _err("siftwise: known_flaky changes in this change apply after merge")
     body: dict[str, Any] = {
         "repo": repo,
         **change.fields,
@@ -254,6 +271,7 @@ def triage_command(
         "variant": variant,
         "ci_run_id": ci_run_id,
         "run_attempt": run_attempt,
+        "known_flaky": list(flaky.globs),
         "failures": failures,
     }
     try:
@@ -487,8 +505,7 @@ def local_change(
     Raises RepoConfigError for an invalid .siftwise.toml.
     """
     root = git_toplevel() or Path.cwd()
-    config_path = root / FILE_NAME
-    config = load_repo_config(config_path) if config_path.is_file() else RepoConfig()
+    config = local_config(root)
 
     if not base:
         diff = None
@@ -520,6 +537,40 @@ def local_change(
         if py_imports:
             fields["affected_files"] = files or {}
     return LocalChange(fields, config, complete)
+
+
+def local_config(root: Path | None = None) -> RepoConfig:
+    """The checkout's .siftwise.toml (at the git top level), or an empty config if there is
+    none. Raises RepoConfigError for an invalid file."""
+    path = (root or git_toplevel() or Path.cwd()) / FILE_NAME
+    return load_repo_config(path) if path.is_file() else RepoConfig()
+
+
+@dataclass(frozen=True)
+class KnownFlaky:
+    globs: tuple[str, ...]  # what triage applies
+    changed: bool  # the checkout's list differs from it (applies after merge)
+
+
+def known_flaky(
+    config: RepoConfig, base: str | None, source: str = KnownFlakySource.BASE
+) -> KnownFlaky:
+    """The ``known_flaky`` globs triage applies. From BASE's .siftwise.toml by default, so a
+    change (a PR, an agent's edit) can't mark its own failures flaky. Without a base the diff
+    is unknown and triage never calls a listed test flaky anyway, so the checkout's list is
+    used. A missing or invalid file at BASE has no list."""
+    head = config.known_flaky
+    if source == KnownFlakySource.HEAD or not base:
+        return KnownFlaky(head, False)
+    content = git_output("show", f"{base}:{FILE_NAME}")
+    globs: tuple[str, ...] = ()
+    if content is not None:
+        try:
+            globs = loads_repo_config(content.decode("utf-8", "replace"),
+                                      f"{base}:{FILE_NAME}").known_flaky  # fmt: skip
+        except RepoConfigError as exc:
+            _err(f"siftwise: ignoring known_flaky at {base}: {exc}")
+    return KnownFlaky(globs, sorted(set(head)) != sorted(set(globs)))
 
 
 def selection_request(

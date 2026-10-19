@@ -2,6 +2,7 @@
 
 always_run = ["tests/smoke/**"]
 generated = ["build/reports/**"]    # more generated files (siftwise ignores reports by default)
+known_flaky = ["tests/test_net.py::*"]   # triage: failing + not linked to the change -> flaky
 
 [[depends]]                         # binary-level suites with no import edge to the code
 tests = "test/cli/**"
@@ -30,18 +31,28 @@ class RepoConfig:
     always_run: tuple[str, ...] = ()
     # Globs of generated files, on top of selector.GENERATED_GLOBS: never changed source.
     generated: tuple[str, ...] = ()
+    # Test ID / file path globs triage calls flaky when they fail unlinked to the change.
+    known_flaky: tuple[str, ...] = ()
 
 
 def load_repo_config(path: Path) -> RepoConfig:
     try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
         raise RepoConfigError(f"{path}: {exc}") from exc
-    return parse_repo_config(data, str(path))
+    return loads_repo_config(content, str(path))
+
+
+def loads_repo_config(content: str, source: str = FILE_NAME) -> RepoConfig:
+    try:
+        data = tomllib.loads(content)
+    except tomllib.TOMLDecodeError as exc:
+        raise RepoConfigError(f"{source}: {exc}") from exc
+    return parse_repo_config(data, source)
 
 
 def parse_repo_config(data: dict[str, Any], source: str = FILE_NAME) -> RepoConfig:
-    unknown = set(data) - {"depends", "always_run", "generated"}
+    unknown = set(data) - {"depends", "always_run", "generated", "known_flaky"}
     if unknown:
         raise RepoConfigError(f"{source}: unknown key(s): {', '.join(sorted(unknown))}")
 
@@ -51,6 +62,9 @@ def parse_repo_config(data: dict[str, Any], source: str = FILE_NAME) -> RepoConf
     generated = data.get("generated", [])
     if not _is_str_list(generated):
         raise RepoConfigError(f"{source}: generated must be a list of strings")
+    known_flaky = data.get("known_flaky", [])
+    if not _is_str_list(known_flaky):
+        raise RepoConfigError(f"{source}: known_flaky must be a list of strings")
 
     rules = data.get("depends", [])
     if not isinstance(rules, list):
@@ -70,7 +84,7 @@ def parse_repo_config(data: dict[str, Any], source: str = FILE_NAME) -> RepoConf
         if not _is_str_list(on) or not on or all(p.startswith("!") for p in on):
             raise RepoConfigError(f"{where}: 'on' needs at least one non-'!' glob")
         depends.append(DependsRule(tests, tuple(on)))
-    return RepoConfig(tuple(depends), tuple(always_run), tuple(generated))
+    return RepoConfig(tuple(depends), tuple(always_run), tuple(generated), tuple(known_flaky))
 
 
 def _is_str_list(value: object) -> bool:

@@ -15,9 +15,14 @@ from siftwise.core.schemas import RunMetadata, StatusCounts
 
 
 def find_run(
-    session: Session, repo: str, ci_run_id: str, run_attempt: int, variant: str | None = None
+    session: Session,
+    repo: str,
+    ci_run_id: str,
+    run_attempt: int,
+    variant: str | None = None,
+    rerun: int = 0,
 ) -> Run | None:
-    """The run stored for this CI run attempt and matrix variant, if any."""
+    """The run stored for this CI run attempt and matrix variant (and re-run), if any."""
     return session.scalars(
         select(Run)
         .join(Repo, Run.repo_id == Repo.id)
@@ -26,6 +31,7 @@ def find_run(
             Run.ci_run_id == ci_run_id,
             Run.run_attempt == run_attempt,
             Run.variant.is_(None) if variant is None else Run.variant == variant,
+            Run.rerun == rerun,
         )
     ).one_or_none()
 
@@ -33,12 +39,18 @@ def find_run(
 def stored_variants(
     session: Session, repo: str, ci_run_id: str, run_attempt: int
 ) -> list[str | None]:
-    """The variants stored for this CI run attempt (None = a run without a variant)."""
+    """The variants stored for this CI run attempt (None = a run without a variant); re-runs
+    aren't variants."""
     return list(
         session.scalars(
             select(Run.variant)
             .join(Repo, Run.repo_id == Repo.id)
-            .where(Repo.name == repo, Run.ci_run_id == ci_run_id, Run.run_attempt == run_attempt)
+            .where(
+                Repo.name == repo,
+                Run.ci_run_id == ci_run_id,
+                Run.run_attempt == run_attempt,
+                Run.rerun == 0,
+            )
             .order_by(Run.variant.nulls_first())
         )
     )
@@ -48,7 +60,7 @@ def find_existing_run(session: Session, meta: RunMetadata) -> Run | None:
     """The run already stored for this upload, if any. Runs without a CI id never match."""
     if meta.ci_run_id is None:
         return None
-    return find_run(session, meta.repo, meta.ci_run_id, meta.run_attempt, meta.variant)
+    return find_run(session, meta.repo, meta.ci_run_id, meta.run_attempt, meta.variant, meta.rerun)
 
 
 def create_run(
@@ -82,6 +94,9 @@ def create_run(
             started_at=meta.started_at,
             changed_files_known=meta.changed_files_known,
             affected=meta.affected.model_dump() if meta.affected is not None else None,
+            known_flaky=meta.known_flaky,
+            known_flaky_changed=meta.known_flaky_changed,
+            rerun=meta.rerun,
         )
         session.add(run)
         session.flush()
