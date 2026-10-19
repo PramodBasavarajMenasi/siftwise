@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -417,6 +418,8 @@ def test_record_uploads_with_run_metadata(
         # For triage: what the change links to (here, no test file imports src/cart.py).
         "affected": {"affected_packages": {}, "affected_files": {}, "depends": [],
                      "go_module": None, "generated": []},
+        "known_flaky": [],  # the PR base's .siftwise.toml has none
+        "known_flaky_changed": False,
     }  # fmt: skip
     assert sorted(names) == ["junit.xml", "siftwise-1.xml"]
     assert url.params["defer_rollup"] == "true"  # a variant: one rollup job after the matrix
@@ -1014,6 +1017,370 @@ def test_record_with_nothing_recorded_fails_only_with_fail_on(
     assert ("::error::siftwise verdicts unavailable (nothing recorded for this attempt "
             "(no JUnit files)); failing because fail-on is set") in result.output  # fmt: skip
     assert "Failure verdicts unavailable: nothing recorded" in sent_body(created)
+
+
+# --- flaky handling: known_flaky and re-runs ------------------------------------------------
+
+
+def recorded_runs(route: respx.Route) -> list[dict[str, Any]]:
+    """The metadata of every ``POST /runs`` call, in order."""
+    metas = []
+    for call in route.calls:
+        content_type = call.request.headers["content-type"]
+        boundary = content_type.split("boundary=")[1].encode()
+        for part in call.request.content.split(b"--" + boundary):
+            if b'name="metadata"' in part:
+                metas.append(json.loads(part.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n", 1)[0]))
+    return metas
+
+
+def record_routes(api: respx.MockRouter) -> respx.Route:
+    Path("junit.xml").write_text("<testsuite/>")
+    api.get(f"{GH}/repos/{REPO}/actions/runs/555").respond(404)
+    return api.post(f"{SERVER}/runs").respond(
+        201, json={"run_id": 9, "created": True, "counts": {"total": 1}})  # fmt: skip
+
+
+def base_with_config(repo: dict[str, str], content: str) -> dict[str, str]:
+    """A new PR base on main with this .siftwise.toml; the PR branch stays as it was."""
+    root = Path.cwd()
+    git(root, "checkout", "-q", "main")
+    (root / ".siftwise.toml").write_text(content)
+    git(root, "add", ".siftwise.toml")
+    git(root, "commit", "-q", "-m", "config")
+    base = git(root, "rev-parse", "HEAD")
+    git(root, "checkout", "-q", "feature")
+    return {**repo, "base": base}
+
+
+def test_a_pr_records_its_base_commits_known_flaky(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    upload = record_routes(api)
+    shas = base_with_config(repo, 'known_flaky = ["tests.test_net::*"]\n')
+    # The PR's own edit (untracked here) must not excuse its failures.
+    Path(".siftwise.toml").write_text('known_flaky = ["tests.test_cart::*"]\n')
+
+    base = gh.run("record", "pull_request", pr_event(shas), SIFTWISE_VARIANT="linux")
+    head = gh.run("record", "pull_request", pr_event(shas), SIFTWISE_VARIANT="linux",
+                  SIFTWISE_KNOWN_FLAKY_SOURCE="head")  # fmt: skip
+
+    assert base.exit_code == head.exit_code == 0, base.output
+    first, second = recorded_runs(upload)
+    assert (first["known_flaky"], first["known_flaky_changed"]) == (["tests.test_net::*"], True)
+    assert "known_flaky changes in this PR apply after merge" in base.output
+    assert (second["known_flaky"], second["known_flaky_changed"]) == (
+        ["tests.test_cart::*"], False)  # fmt: skip
+    assert "apply after merge" not in head.output
+
+
+def test_a_push_records_its_own_known_flaky(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    upload = record_routes(api)
+    Path(".siftwise.toml").write_text('known_flaky = ["tests.test_cart::*"]\n')
+    push = {"before": repo["base"], "repository": {"default_branch": "main"}}
+
+    result = gh.run("record", "push", push, GITHUB_SHA=repo["head"], GITHUB_REF_NAME="feature",
+                    SIFTWISE_VARIANT="linux")  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    [meta] = recorded_runs(upload)
+    assert (meta["known_flaky"], meta["known_flaky_changed"]) == (["tests.test_cart::*"], False)
+
+
+def test_an_invalid_known_flaky_source_or_config(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    upload = record_routes(api)
+    Path(".siftwise.toml").write_text("known_flaky = 3\n")
+
+    result = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux",
+                    SIFTWISE_KNOWN_FLAKY_SOURCE="main")  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    assert "::warning::siftwise: invalid known-flaky-source 'main'" in result.output
+    [meta] = recorded_runs(upload)
+    assert (meta["known_flaky"], meta["known_flaky_changed"]) == ([], False)
+
+
+def test_parse_rerun_defaults_and_values() -> None:
+    assert gha.parse_rerun("", "", "", "", "") == gha.Rerun()
+    assert gha.parse_rerun("3", "unknown, new_regression", "50", "30", "uv run --frozen") == (
+        gha.Rerun(3, frozenset({"unknown", "new_regression"}), 50, 1800, ("uv", "run", "--frozen"))
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "warning", "expected"),
+    [
+        (("4", "", "", "", ""), "invalid rerun-unknown '4'", gha.Rerun()),
+        (("x", "", "", "", ""), "invalid rerun-unknown 'x'", gha.Rerun()),
+        (("1", "flaky", "", "", ""), "invalid rerun-verdicts 'flaky'", gha.Rerun(1)),
+        (("1", "unknown,pre_existing", "", "", ""), "invalid rerun-verdicts", gha.Rerun(1)),
+        (("1", "", "0", "", ""), "invalid rerun-max-tests '0'", gha.Rerun(1)),
+        (("1", "", "101", "", ""), "invalid rerun-max-tests '101'", gha.Rerun(1)),
+        (("1", "", "", "61", ""), "invalid rerun-timeout-minutes '61'", gha.Rerun(1)),
+        (("1", "", "", "", "uv 'run"), "invalid rerun-prefix", gha.Rerun()),
+    ],
+)
+def test_parse_rerun_warns_and_uses_the_default(
+    capsys: pytest.CaptureFixture[str], args: tuple[str, ...], warning: str, expected: gha.Rerun
+) -> None:
+    assert gha.parse_rerun(*args) == expected
+    assert f"::warning::siftwise: {warning}" in capsys.readouterr().out
+
+
+class FakePytest:
+    """Stands in for the re-run's pytest: writes a JUnit report with the given outcomes."""
+
+    def __init__(self, *rounds: dict[str, str]) -> None:
+        self.rounds = list(rounds)  # per call: test ID -> "passed" | "failed"
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str], timeout: float) -> None:
+        self.calls.append(argv)
+        report = next(a.split("=", 1)[1] for a in argv if a.startswith("--junitxml="))
+        cases = []
+        for test_id, outcome in self.rounds.pop(0).items():
+            classname, _, name = test_id.partition("::")
+            body = "<failure message='boom'/>" if outcome == "failed" else ""
+            cases.append(f'<testcase classname="{classname}" name="{name}">{body}</testcase>')
+        Path(report).parent.mkdir(parents=True, exist_ok=True)
+        Path(report).write_text(f"<testsuite>{''.join(cases)}</testsuite>")
+
+
+def rerun_setup(
+    api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, fake: Any, *results: dict[str, Any]
+) -> tuple[respx.Route, respx.Route]:
+    Path("tests").mkdir(exist_ok=True)
+    Path("tests/test_cart.py").write_text("def test_total(): pass\n")
+    Path("tests/test_pay.py").write_text("def test_card(): pass\n")
+    monkeypatch.setattr(gha, "run_command", fake)
+    upload = record_routes(api)
+    triage = api.post(f"{SERVER}/repos/{REPO}/triage").respond(
+        json=triage_response(*results, variants=("linux",)))  # fmt: skip
+    return upload, triage
+
+
+CART, PAY = "tests.test_cart::test_total", "tests.test_pay::test_card"
+
+
+def test_a_matrix_leg_re_runs_its_unknown_failures(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakePytest({CART: "passed"})
+    upload, triage = rerun_setup(
+        api, monkeypatch, fake,
+        failure(CART, "unknown"),
+        failure("tests.test_gone::test_x", "unknown"),  # its file isn't in the checkout
+        failure("github.com/acme/shop/pay::TestA", "unknown"),  # Go: not re-run in v1
+        failure(PAY, "new_regression"),  # not in rerun-verdicts
+    )  # fmt: skip
+
+    result = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux",
+                    SIFTWISE_RERUN_UNKNOWN="2", SIFTWISE_RERUN_PREFIX="uv run")  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    # Only this leg's verdicts: the other legs may not be recorded yet.
+    assert json.loads(triage.calls.last.request.content)["variants"] == ["linux"]
+    [argv] = fake.calls  # passed on the first re-run: no second one
+    assert argv[:3] == ["uv", "run", "pytest"]
+    assert argv[4:] == ["-p", "no:cacheprovider", "tests/test_cart.py::test_total"]
+    assert argv[3].startswith(f"--junitxml={gh.dir}")  # outside the checkout's JUnit globs
+    run, rerun = recorded_runs(upload)
+    assert (run.get("rerun"), rerun["rerun"]) == (None, 1)
+    assert {k: v for k, v in rerun.items() if k not in ("rerun", "started_at")} == {
+        k: v for k, v in run.items() if k != "started_at"}  # fmt: skip
+    assert upload.calls.last.request.url.params["defer_rollup"] == "true"
+    assert gh.outputs()["rerun-tests"] == "1" and gh.outputs()["rerun-passed"] == "1"
+    line = ("siftwise: re-ran 1 failure (unknown) in 1 round: 1 passed on a re-run (now flaky); "
+            "2 not re-run (its file isn't in the checkout; not a pytest test (only pytest is "
+            "re-run))")  # fmt: skip
+    assert line in result.output and line in gh.summary.read_text()
+
+
+def test_tests_still_failing_go_round_again_within_the_caps(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    Path("tests").mkdir()
+    Path("tests/test_more.py").write_text("def test_x(): pass\n")
+    fake = FakePytest(
+        {CART: "failed", PAY: "failed"}, {CART: "failed", PAY: "passed"}, {CART: "failed"}
+    )
+    upload, _ = rerun_setup(
+        api, monkeypatch, fake, failure(CART, "unknown"), failure(PAY, "new_regression"),
+        failure("tests.test_more::test_x", "unknown"),
+    )  # fmt: skip
+
+    result = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux",
+                    SIFTWISE_RERUN_UNKNOWN="3", SIFTWISE_RERUN_VERDICTS="unknown,new_regression",
+                    SIFTWISE_RERUN_MAX_TESTS="2")  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    # Worst first (the server's order), capped at 2; only tests still failing go round again.
+    assert [call[4:] for call in fake.calls] == [
+        ["tests/test_cart.py::test_total", "tests/test_pay.py::test_card"],
+        ["tests/test_cart.py::test_total", "tests/test_pay.py::test_card"],
+        ["tests/test_cart.py::test_total"],
+    ]
+    assert [m.get("rerun") for m in recorded_runs(upload)] == [None, 1, 2, 3]
+    assert "re-ran 2 failures (unknown or new_regression) in 3 rounds: 1 passed" in result.output
+    assert "1 not re-run (over rerun-max-tests (2))" in result.output
+
+
+@pytest.mark.parametrize(
+    ("fake", "warning"),
+    [
+        (subprocess.TimeoutExpired("pytest", 1), "re-run 1 hit the rerun-timeout-minutes limit"),
+        (FileNotFoundError("pytest"), "couldn't run pytest"),
+        (None, "re-run 1 wrote no JUnit report"),
+    ],
+)
+def test_re_runs_fail_open(
+    gh: Runner,
+    repo: dict[str, str],
+    api: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    fake: BaseException | None,
+    warning: str,
+) -> None:
+    def broken(argv: list[str], timeout: float) -> None:
+        if fake is not None:
+            raise fake
+
+    upload, _ = rerun_setup(api, monkeypatch, broken, failure(CART, "unknown"))
+
+    result = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux",
+                    SIFTWISE_RERUN_UNKNOWN="1")  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    assert f"::warning::siftwise: re-runs stopped: {warning}" in result.output
+    assert [m.get("rerun") for m in recorded_runs(upload)] == [None]  # nothing uploaded
+    assert gh.outputs()["rerun-passed"] == "0"
+
+
+def test_re_runs_fail_open_when_triage_or_the_upload_fails(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakePytest({CART: "passed"})
+    upload, triage = rerun_setup(api, monkeypatch, fake, failure(CART, "unknown"))
+    triage.respond(500, json={"detail": "boom"})
+
+    no_verdicts = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux",
+                         SIFTWISE_RERUN_UNKNOWN="1")  # fmt: skip
+
+    assert no_verdicts.exit_code == 0
+    assert "::warning::siftwise: re-runs skipped: verdicts unavailable" in no_verdicts.output
+    assert fake.calls == []
+
+    triage.respond(json=triage_response(failure(CART, "unknown"), variants=("linux",)))
+    upload.side_effect = [httpx.Response(201, json={"run_id": 9, "created": True}),
+                          httpx.ConnectError("refused")]  # fmt: skip
+    not_recorded = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux",
+                          SIFTWISE_RERUN_UNKNOWN="1")  # fmt: skip
+
+    assert not_recorded.exit_code == 0
+    assert "::warning::siftwise: re-runs stopped: re-run 1 not recorded" in not_recorded.output
+
+
+def test_a_re_run_reporting_other_test_ids_changes_nothing(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakePytest({"test_cart::test_total": "passed"})  # another rootdir: another ID
+    rerun_setup(api, monkeypatch, fake, failure(CART, "unknown"))
+
+    result = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux",
+                    SIFTWISE_RERUN_UNKNOWN="2")  # fmt: skip
+
+    assert len(fake.calls) == 1  # not reported: running it again wouldn't help
+    assert gh.outputs()["rerun-passed"] == "0"
+    assert ("0 passed on a re-run (now flaky), 1 not in the re-run's report under the same "
+            "test ID") in result.output  # fmt: skip
+
+
+def test_no_re_runs_by_default_or_without_failures_to_re_run(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakePytest()
+    _, triage = rerun_setup(api, monkeypatch, fake, failure(CART, "flaky"))
+
+    off = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux")
+    nothing = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux",
+                     SIFTWISE_RERUN_UNKNOWN="1")  # fmt: skip
+
+    assert off.exit_code == nothing.exit_code == 0
+    assert triage.call_count == 1 and fake.calls == []  # only the second asked for verdicts
+    assert "re-ran" not in off.output + nothing.output
+    assert gh.outputs()["rerun-tests"] == "0"
+
+
+def test_a_single_job_re_runs_then_triages_every_variant(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakePytest({CART: "passed"})
+    upload, triage = rerun_setup(api, monkeypatch, fake)
+    triage.side_effect = [
+        httpx.Response(200, json=triage_response(failure(CART, "unknown", None),
+                                                 variants=(None,))),
+        httpx.Response(200, json=triage_response(failure(CART, "flaky", None,
+                       reason="passed on re-run 1 of this commit and variant"), variants=(None,))),
+    ]  # fmt: skip
+    created = pr_routes(api, repo["head"])
+
+    result = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_RERUN_UNKNOWN="1",
+                    SIFTWISE_FAIL_ON="unknown")  # fmt: skip
+
+    assert result.exit_code == 0, result.output  # flaky after the re-run: fail-on not hit
+    first, second = (json.loads(c.request.content) for c in triage.calls)
+    assert (first["variants"], "variants" in second) == ([None], False)
+    assert "rollup" not in str(upload.calls.last.request.url)
+    assert "passed on re-run 1 of this commit and variant" in sent_body(created)
+
+
+def test_a_real_pytest_re_run_reports_the_same_test_id(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    # End to end: the node ID siftwise derives runs the test, and pytest's JUnit names it with
+    # the recorded test ID. It fails once (a marker file), then passes.
+    marker = gh.dir / "ran-once"
+    Path("tests").mkdir()
+    Path("tests/test_flaky.py").write_text(
+        "import pathlib\n"
+        f"MARKER = pathlib.Path({str(marker)!r})\n"
+        "def test_once():\n"
+        "    first = not MARKER.exists()\n"
+        "    MARKER.touch()\n"
+        "    assert not first\n"
+    )
+    marker.touch()  # the CI run's failure already happened
+    upload = record_routes(api)
+    api.post(f"{SERVER}/repos/{REPO}/triage").respond(json=triage_response(
+        failure("tests.test_flaky::test_once", "unknown"), variants=("linux",)))  # fmt: skip
+
+    result = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux",
+                    SIFTWISE_RERUN_UNKNOWN="1",
+                    SIFTWISE_RERUN_PREFIX=f"{Path(sys.executable).as_posix()} -m")  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    assert gh.outputs()["rerun-passed"] == "1", result.output
+    assert [m.get("rerun") for m in recorded_runs(upload)] == [None, 1]
+    assert not Path(".pytest_cache").exists()  # -p no:cacheprovider: the checkout stays clean
+
+
+def test_the_comment_says_when_a_pr_changes_known_flaky() -> None:
+    changed = triage_response(failure("t::a", "unknown"))
+    changed["variants"][0]["known_flaky_changed"] = True
+    quiet = triage_response(variants=("linux",))
+    quiet["variants"][0]["known_flaky_changed"] = True
+
+    assert "> known_flaky changes in this PR apply after merge." in gha.failures_markdown(
+        changed, RUN_URL)  # fmt: skip
+    assert gha.failures_markdown(quiet, RUN_URL) == (
+        "### Failures\n\n> known_flaky changes in this PR apply after merge.\n\n"
+        "No failing tests in 1 recorded variant.\n"
+    )
+    assert "apply after merge" not in gha.failures_markdown(triage_response(), RUN_URL)
 
 
 # --- shadow mode --------------------------------------------------------------------------

@@ -505,8 +505,7 @@ def local_change(
     Raises RepoConfigError for an invalid .siftwise.toml.
     """
     root = git_toplevel() or Path.cwd()
-    config_path = root / FILE_NAME
-    config = load_repo_config(config_path) if config_path.is_file() else RepoConfig()
+    config = local_config(root)
 
     if not base:
         diff = None
@@ -538,6 +537,13 @@ def local_change(
         if py_imports:
             fields["affected_files"] = files or {}
     return LocalChange(fields, config, complete)
+
+
+def local_config(root: Path | None = None) -> RepoConfig:
+    """The checkout's .siftwise.toml (at the git top level), or an empty config if there is
+    none. Raises RepoConfigError for an invalid file."""
+    path = (root or git_toplevel() or Path.cwd()) / FILE_NAME
+    return load_repo_config(path) if path.is_file() else RepoConfig()
 
 
 @dataclass(frozen=True)

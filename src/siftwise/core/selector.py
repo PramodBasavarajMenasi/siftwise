@@ -911,6 +911,16 @@ def pytest_file(test_id: str, file_path: str | None = None) -> str | None:
     return test.py_path if test.runner is Runner.PYTEST else None
 
 
+def pytest_node(test_id: str, file_path: str | None = None) -> str | None:
+    """The pytest node ID that runs exactly ``test_id`` (``path::Class::test[param]``), or
+    None if it isn't a single pytest item by ID (doctests, collection errors, other runners)."""
+    test = _classify(KnownTest(test_id, file_path))
+    node = test.py_node
+    if test.runner is not Runner.PYTEST or test.doctest or not node or "::" not in node:
+        return None
+    return node
+
+
 def locate_test(
     test_id: str, file_path: str | None = None, go_module: str | None = None
 ) -> tuple[str, str] | None:

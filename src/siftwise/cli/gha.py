@@ -23,6 +23,13 @@ hash of the run ID so every leg agrees): the full suite runs (``mode=full``, dec
 server call), while the server stores what siftwise would have selected. Where triage runs,
 ``POST /repos/{repo}/shadow`` then counts the failures it would have caught or missed: live
 recall. Shadow mode never fails or shortens a run; problems are warnings.
+
+Flaky handling in ``record``: ``known_flaky`` from ``.siftwise.toml`` is recorded with the run
+(a PR's from its BASE commit by default, so a PR can't mark its own failures flaky and get past
+``fail-on``). ``rerun-unknown: N`` re-runs this leg's failures with an ``unknown`` verdict (pytest
+node IDs, no shell) up to N times, capped in tests and time, and uploads each round as a re-run
+of the run (``rerun = n``); triage then calls a test that passed on a re-run flaky. Fail open:
+any problem is a warning, and the verdicts stay what they were.
 """
 
 from __future__ import annotations
@@ -32,10 +39,13 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
+import tempfile
+import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
@@ -43,7 +53,9 @@ from typing import Annotated, Any
 import httpx
 import typer
 
-from siftwise.cli.repoconfig import RepoConfigError
+from siftwise.cli.repoconfig import RepoConfig, RepoConfigError
+from siftwise.core.junit import JUnitParseError, Status, parse_junit
+from siftwise.core.selector import pytest_node
 
 app = typer.Typer(help="GitHub Actions steps (used by actions/select, record and rollup).")
 
@@ -77,6 +89,15 @@ REASON_CHARS = 120
 NOTHING_RECORDED = "nothing recorded for this attempt"
 NO_TOKEN = "no siftwise token (secrets aren't available to pull requests from forks)"
 SHADOW_REASON = "shadow run: the full suite runs, to check what siftwise would have caught"
+KNOWN_FLAKY_AFTER_MERGE = "known_flaky changes in this PR apply after merge"
+# Re-runs (record's rerun-* inputs).
+RERUN_VERDICTS = frozenset({"unknown", "new_regression"})
+DEFAULT_RERUN_VERDICTS = frozenset({"unknown"})
+MAX_RERUN_ROUNDS = 3
+DEFAULT_RERUN_MAX_TESTS = 20
+MAX_RERUN_TESTS = 100
+DEFAULT_RERUN_MINUTES = 10
+MAX_RERUN_MINUTES = 60
 _NOT_COUNTED = {
     "commit_mismatch": "the recorded results are for another commit",
     "no_upload": "no results were recorded for its variant",
@@ -308,11 +329,22 @@ def record_step(
     triage: Annotated[str, typer.Option(envvar="SIFTWISE_TRIAGE")] = "auto",
     comment: Annotated[bool, typer.Option(envvar="SIFTWISE_COMMENT")] = True,
     fail_on: Annotated[str, typer.Option(envvar="SIFTWISE_FAIL_ON")] = "",
+    known_flaky_source: Annotated[str, typer.Option(envvar="SIFTWISE_KNOWN_FLAKY_SOURCE")] = "base",
+    rerun_unknown: Annotated[str, typer.Option(envvar="SIFTWISE_RERUN_UNKNOWN")] = "0",
+    rerun_verdicts: Annotated[str, typer.Option(envvar="SIFTWISE_RERUN_VERDICTS")] = "unknown",
+    rerun_max_tests: Annotated[str, typer.Option(envvar="SIFTWISE_RERUN_MAX_TESTS")] = "20",
+    rerun_timeout_minutes: Annotated[
+        str, typer.Option(envvar="SIFTWISE_RERUN_TIMEOUT_MINUTES")
+    ] = "10",
+    rerun_prefix: Annotated[str, typer.Option(envvar="SIFTWISE_RERUN_PREFIX")] = "",
 ) -> None:
-    """Upload this run's JUnit reports, then (in a single job) triage its failures. Never
-    fails the job, unless ``fail_on`` is set."""
+    """Upload this run's JUnit reports, re-run its unknown failures if asked, then (in a
+    single job) triage its failures. Never fails the job, unless ``fail_on`` is set."""
     env = os.environ
     gate = parse_fail_on(fail_on)
+    source = parse_known_flaky_source(known_flaky_source)
+    rerun = parse_rerun(rerun_unknown, rerun_verdicts, rerun_max_tests, rerun_timeout_minutes,
+                        rerun_prefix)  # fmt: skip
     ctx = load_context(env, base_ref)
     repo = repo or ctx.repo
     # A matrix leg defers the rollup to one `actions/rollup` job: the per-upload rollup costs
@@ -324,7 +356,16 @@ def record_step(
     if gate and not do_triage:
         _annotate("warning", "siftwise: fail-on has no effect where verdicts aren't computed "
                   "(a matrix leg): set it on actions/rollup")  # fmt: skip
-    problem = _record(ctx, server, token, repo, junit, junit_dir, variant, defer, github_token)
+    problem, metadata = _record(ctx, server, token, repo, junit, junit_dir, variant, defer,
+                                github_token, source)  # fmt: skip
+    if metadata is not None and rerun.rounds:
+        report = rerun_failures(ctx, server, token, repo, variant, metadata, defer, rerun)
+        _append(env, "GITHUB_OUTPUT", {"rerun-tests": str(len(report.tests)),
+                                       "rerun-passed": str(len(report.passed))})  # fmt: skip
+        line = report.line(rerun)
+        if line:
+            typer.echo(line)
+            _append_summary(env, f"\n{line}\n")
     if do_triage:
         response = None
         if not problem:
@@ -347,19 +388,22 @@ def _record(
     variant: str,
     defer: bool,
     github_token: str,
-) -> str:
-    """Upload the reports; returns why nothing was recorded, or "" on success."""
+    known_flaky_source: str = "base",
+) -> tuple[str, dict[str, Any] | None]:
+    """Upload the reports: ("", the run's metadata) on success, else (why nothing was
+    recorded, None)."""
     from siftwise.cli import main as cli
 
     env = os.environ
     if not token:
         _annotate("warning", "siftwise: no token (fork pull request?); results not recorded")
-        return NO_TOKEN
+        return NO_TOKEN, None
     files = find_junit(junit, junit_dir)
     if not files:
         _annotate("warning", f"siftwise: no JUnit files match {junit!r}"
                   f"{f' or {junit_dir}/*.xml' if junit_dir else ''}; nothing recorded")  # fmt: skip
-        return f"{NOTHING_RECORDED} (no JUnit files)"
+        return f"{NOTHING_RECORDED} (no JUnit files)", None
+    known_flaky, changed = recorded_known_flaky(ctx, known_flaky_source)
     # Same diff as the select step, so a recorded run's changed files are what was selected on,
     # and its import graphs, so triage can later tell if a failure was related to the change.
     metadata = {
@@ -372,20 +416,24 @@ def _record(
         "variant": variant or None,
         "started_at": run_started_at(ctx, github_token, env),
         **cli.recorded_change(ctx.base, ctx.head_sha or "HEAD"),
+        "known_flaky": known_flaky,
+        "known_flaky_changed": changed,
     }
     try:
         result = cli.upload_run(server, token, files, metadata, defer_rollup=defer,
                                 timeout=RECORD_TIMEOUT)  # fmt: skip
     except cli.SiftwiseError as exc:
         _annotate("warning", f"siftwise: results not recorded: {exc}")
-        return f"{NOTHING_RECORDED} ({exc})"
+        return f"{NOTHING_RECORDED} ({exc})", None
     state = "stored" if result.get("created") else "already stored"
     line = (f"siftwise: run {result.get('run_id')} {state}: {len(files)} file(s), "
             f"{result.get('counts', {}).get('total', '?')} results"
             f"{' (stats update deferred to the rollup job)' if defer else ''}")  # fmt: skip
     typer.echo(line)
     _append_summary(env, f"\n{line}\n")
-    return ""
+    if changed:
+        typer.echo(f"siftwise: {KNOWN_FLAKY_AFTER_MERGE}")
+    return "", metadata
 
 
 @app.command("rollup")
@@ -738,6 +786,204 @@ def report_failures(
     return 1
 
 
+# --- flaky handling -------------------------------------------------------------------------
+
+
+def parse_known_flaky_source(value: str) -> str:
+    """``known-flaky-source``: 'base' (default) or 'head'; anything else warns, then base."""
+    text = value.strip().lower() or "base"
+    if text not in ("base", "head"):
+        _annotate("warning", f"siftwise: invalid known-flaky-source {value!r} (use base or "
+                  "head); using base")  # fmt: skip
+        return "base"
+    return text
+
+
+def recorded_known_flaky(ctx: Context, source: str = "base") -> tuple[list[str], bool]:
+    """(``known_flaky`` globs triage applies to this run, whether the PR's own list differs).
+    A PR uses its base commit's list unless ``source`` is 'head', so a PR can't mark its own
+    failures flaky and get past fail-on; a push uses its own. An invalid checkout file has no
+    list (record warns about it with the change links)."""
+    from siftwise.cli import main as cli
+
+    try:
+        config = cli.local_config()
+    except RepoConfigError:
+        config = RepoConfig()
+    if ctx.event_name not in PULL_REQUEST_EVENTS:
+        return list(config.known_flaky), False
+    flaky = cli.known_flaky(config, ctx.base, source)
+    return list(flaky.globs), flaky.changed
+
+
+@dataclass(frozen=True)
+class Rerun:
+    """record's re-run settings."""
+
+    rounds: int = 0  # rerun-unknown: 0 = off
+    verdicts: frozenset[str] = DEFAULT_RERUN_VERDICTS
+    max_tests: int = DEFAULT_RERUN_MAX_TESTS
+    timeout_s: float = DEFAULT_RERUN_MINUTES * 60
+    prefix: tuple[str, ...] = ()  # e.g. ("uv", "run")
+
+
+def parse_rerun(
+    rounds: str, verdicts: str, max_tests: str, timeout_minutes: str, prefix: str
+) -> Rerun:
+    """The rerun-* inputs. An invalid value warns and falls back to its default (an
+    unparsable prefix turns re-runs off: what to run is unknown)."""
+    n = _int_input("rerun-unknown", rounds, 0, 0, MAX_RERUN_ROUNDS)
+    chosen = frozenset(v.strip() for v in verdicts.replace(",", " ").split())
+    if chosen - RERUN_VERDICTS or (verdicts.strip() and not chosen):
+        _annotate("warning", f"siftwise: invalid rerun-verdicts {verdicts!r} (use unknown or "
+                  "unknown,new_regression); using unknown")  # fmt: skip
+        chosen = DEFAULT_RERUN_VERDICTS
+    tests = _int_input("rerun-max-tests", max_tests, DEFAULT_RERUN_MAX_TESTS, 1, MAX_RERUN_TESTS)
+    minutes = _int_input("rerun-timeout-minutes", timeout_minutes, DEFAULT_RERUN_MINUTES, 1,
+                         MAX_RERUN_MINUTES)  # fmt: skip
+    try:
+        argv = tuple(shlex.split(prefix))
+    except ValueError as exc:
+        _annotate("warning", f"siftwise: invalid rerun-prefix {prefix!r} ({exc}); no re-runs")
+        n, argv = 0, ()
+    return Rerun(n, chosen or DEFAULT_RERUN_VERDICTS, tests, minutes * 60, argv)
+
+
+def _int_input(name: str, value: str, default: int, low: int, high: int) -> int:
+    text = value.strip()
+    if not text:
+        return default
+    if not text.isdigit() or not low <= int(text) <= high:
+        _annotate("warning", f"siftwise: invalid {name} {value!r} (a whole number from {low} to "
+                  f"{high}); using {default}")  # fmt: skip
+        return default
+    return int(text)
+
+
+@dataclass
+class RerunReport:
+    tests: list[str] = field(default_factory=list)  # re-run
+    passed: list[str] = field(default_factory=list)  # passed on a re-run: flaky
+    skipped: list[tuple[str, str]] = field(default_factory=list)  # (test, why not re-run)
+    over_cap: int = 0  # candidates left out by rerun-max-tests
+    unmatched: list[str] = field(default_factory=list)  # re-run, but not reported by its ID
+    rounds: int = 0  # re-runs done (uploaded)
+    problem: str = ""
+
+    def line(self, rerun: Rerun) -> str:
+        """One line for the log and job summary ("" if there was nothing to re-run)."""
+        if not (self.tests or self.skipped or self.problem):
+            return ""
+        verdicts = " or ".join(sorted(rerun.verdicts, reverse=True))
+        line = (f"siftwise: re-ran {_plural(len(self.tests), 'failure')} ({verdicts}) in "
+                f"{_plural(self.rounds, 'round')}")  # fmt: skip
+        if self.tests:
+            line += f": {len(self.passed)} passed on a re-run (now flaky)"
+        if self.unmatched:
+            line += f", {len(self.unmatched)} not in the re-run's report under the same test ID"
+        skipped = [why for _, why in self.skipped]
+        if self.over_cap:
+            skipped += [f"over rerun-max-tests ({rerun.max_tests})"] * self.over_cap
+        if skipped:
+            why = "; ".join(sorted(set(skipped)))
+            line += f"; {len(skipped)} not re-run ({why})"
+        if self.problem:
+            line += f"; stopped: {self.problem}"
+        return line
+
+
+def rerun_failures(
+    ctx: Context,
+    server: str,
+    token: str,
+    repo: str,
+    variant: str,
+    metadata: Mapping[str, Any],
+    defer: bool,
+    rerun: Rerun,
+) -> RerunReport:
+    """Re-run this leg's failures whose verdict is in ``rerun.verdicts``: triage only this
+    variant (the other legs may not be recorded yet), run the failing pytest node IDs again (no
+    shell; tests still failing go round again, up to ``rerun.rounds`` times, within
+    ``rerun.timeout_s`` in all), and upload each round as ``rerun = n`` of this run. Fail open:
+    a problem stops the re-runs with a warning, and what was uploaded stands."""
+    from siftwise.cli import main as cli
+
+    report = RerunReport()
+    body = {"ci_run_id": ctx.run_id, "run_attempt": ctx.run_attempt, "limit": TRIAGE_LIMIT,
+            "variants": [variant or None]}  # fmt: skip
+    try:
+        response = cli.post_json(server, token, f"/repos/{repo}/triage", body,
+                                 timeout=TRIAGE_TIMEOUT)  # fmt: skip
+    except cli.SiftwiseError as exc:
+        report.problem = f"verdicts unavailable ({exc})"
+        _annotate("warning", f"siftwise: re-runs skipped: {report.problem}")
+        return report
+    nodes: dict[str, str] = {}
+    for result in response["results"]:
+        test_id = result["test_id"]
+        if result["verdict"] not in rerun.verdicts or test_id in nodes:
+            continue
+        node = pytest_node(test_id)
+        if node is None:
+            report.skipped.append((test_id, "not a pytest test (only pytest is re-run)"))
+        elif not Path(node.partition("::")[0]).is_file():
+            report.skipped.append((test_id, "its file isn't in the checkout"))
+        else:
+            nodes[test_id] = node
+    report.tests = list(nodes)[: rerun.max_tests]
+    report.over_cap = len(nodes) - len(report.tests)
+
+    out = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir())
+    out = out / f"siftwise-rerun-{uuid.uuid4().hex[:8]}"  # outside the checkout's JUnit globs
+    deadline = time.monotonic() + rerun.timeout_s
+    remaining = report.tests
+    for n in range(1, rerun.rounds + 1):
+        if not remaining:
+            break
+        left = deadline - time.monotonic()
+        if left <= 0:
+            report.problem = "the rerun-timeout-minutes limit was reached"
+            break
+        xml = out / f"rerun-{n}.xml"
+        argv = [*rerun.prefix, "pytest", f"--junitxml={xml}", "-p", "no:cacheprovider",
+                *(nodes[t] for t in remaining)]  # fmt: skip
+        typer.echo(f"siftwise: re-run {n}: {shlex.join(argv)}")
+        try:
+            run_command(argv, left)
+        except subprocess.TimeoutExpired:
+            report.problem = f"re-run {n} hit the rerun-timeout-minutes limit (results discarded)"
+            break
+        except OSError as exc:
+            report.problem = f"couldn't run pytest ({exc})"
+            break
+        try:
+            final = {r.test_id: r.status for r in parse_junit(xml.read_bytes())}  # last attempt
+        except (OSError, JUnitParseError) as exc:
+            report.problem = f"re-run {n} wrote no JUnit report ({exc})"
+            break
+        try:
+            cli.upload_run(server, token, [xml], {**metadata, "rerun": n, "started_at": _now()},
+                           defer_rollup=defer, timeout=RECORD_TIMEOUT)  # fmt: skip
+        except cli.SiftwiseError as exc:
+            report.problem = f"re-run {n} not recorded ({exc})"
+            break
+        report.rounds = n
+        report.passed += [t for t in remaining if final.get(t) is Status.PASSED]
+        # A test the report doesn't name (a different rootdir, other options) stays unknown.
+        report.unmatched += [t for t in remaining if t not in final]
+        remaining = [t for t in remaining if final.get(t) in (Status.FAILED, Status.ERROR)]
+    if report.problem:
+        _annotate("warning", f"siftwise: re-runs stopped: {report.problem}")
+    return report
+
+
+def run_command(argv: list[str], timeout: float) -> None:
+    """Run a re-run's command (no shell); its output goes to the step's log. Raises
+    TimeoutExpired or OSError."""
+    subprocess.run(argv, timeout=timeout, check=False)
+
+
 # --- shadow mode ----------------------------------------------------------------------------
 
 
@@ -885,13 +1131,19 @@ def failures_markdown(
     job summary gets everything the server returned."""
     variants = [v.get("variant") for v in response["variants"]]
     total = response["failing_tests"]
+    # The PR edits known_flaky: this run used the base branch's list.
+    note = (
+        [f"> {KNOWN_FLAKY_AFTER_MERGE}.", ""]
+        if any(v.get("known_flaky_changed") for v in response["variants"])
+        else []
+    )
     if not total:
         recorded = _plural(len(variants), "recorded variant")
-        return f"### Failures\n\nNo failing tests in {recorded}.\n"
+        return "\n".join(["### Failures", "", *note, f"No failing tests in {recorded}.", ""])
     rows = failure_rows(response)
     shown = [r for r in rows if r.verdict not in COLLAPSED][:max_rows]
     collapsed = [r for r in rows if r.verdict in COLLAPSED][:max_rows]
-    lines = [f"### Failures: {counts_line(response['counts'])}", ""]
+    lines = [f"### Failures: {counts_line(response['counts'])}", "", *note]
     for v in response["variants"]:
         if v.get("failing") and not v.get("links_known"):
             where = f"<code>{_md(v['variant'])}</code>" if v.get("variant") else "this run"
