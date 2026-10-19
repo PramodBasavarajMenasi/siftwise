@@ -1,3 +1,4 @@
+# shadow-mode selective check
 """POST /explain: one test's history, flaky evidence and selection for a change."""
 
 from typing import Annotated
