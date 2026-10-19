@@ -22,7 +22,7 @@
   <a href="#github-action">GitHub Action</a> ·
   <a href="#coding-agents-mcp">MCP</a> ·
   <a href="#results-on-real-repos">Results</a> ·
-  <a href="docs/architecture.md">Architecture</a>
+  <a href="ARCHITECTURE.md">Architecture</a>
 </p>
 
 <p align="center">
@@ -57,7 +57,21 @@ failure with its verdict, and the failure the selection would have missed, with 
   <img alt="siftwise PR comment: would have run 197 of 900 tests, two failures with verdicts, and one missed test with its cause, new test" src="docs/images/shadow-comment-2.png" width="700">
 </p>
 
-**How it works** ([architecture](docs/architecture.md)):
+## How it works
+
+```mermaid
+flowchart LR
+    A["CI run, PR or<br/>agent branch"] --> B["siftwise select<br/>(git diff + import graph)"]
+    B --> C[("siftwise server<br/>Postgres per-test history")]
+    C --> D["test command<br/>+ reasons"]
+    D --> E["run tests"]
+    E --> F["record JUnit"]
+    F --> C
+    F --> G["rollup: triage verdicts<br/>+ shadow compare"]
+    G --> H["PR comment"]
+```
+
+Full details: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - **Record.** CI uploads JUnit XML with the commit, branch, changed files and what the change
   links to. The server keeps every result and rolls up per-test history.
@@ -223,7 +237,7 @@ flaky           medium tests.test_net::test_fetch
 siftwise: 3 failing test(s): 1 new regression, 1 pre existing, 1 flaky, 0 unknown
 ```
 
-The rules, in order, are in [the architecture doc](docs/architecture.md#triage-verdicts).
+The rules, in order, are in [the architecture doc](ARCHITECTURE.md#triage-verdicts).
 Only runs before the triaged one count, so triaging an old run gives the answer it would have
 got live. `--json` prints the verdicts with their evidence. Exit codes: 0 ok, 1 API error, 2
 usage error, 4 a failure got a `--fail-on` verdict (off by default). 500 failures on rdflib
@@ -373,7 +387,7 @@ The comment is left alone if the PR got new commits since the run started, and a
 selection drops the old commit's failures. Raw failure messages are never shown (the comment
 is public). Outputs: `verdicts-available`, `counts` (JSON, per verdict) and `report` (the
 summary's Markdown, as a file). How each verdict is decided:
-[triage verdicts](docs/architecture.md#triage-verdicts).
+[triage verdicts](ARCHITECTURE.md#triage-verdicts).
 
 ### fail-on
 
@@ -716,7 +730,7 @@ the fallbacks and `.siftwise.toml` cover it.
 ## Contributing
 
 Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) for the dev
-setup, the checks and the PR checklist, and [docs/architecture.md](docs/architecture.md) for
+setup, the checks and the PR checklist, and [ARCHITECTURE.md](ARCHITECTURE.md) for
 how the pieces fit.
 
 ## License

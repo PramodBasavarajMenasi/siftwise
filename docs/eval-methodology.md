@@ -2,7 +2,7 @@
 
 How siftwise's numbers are measured, where the measurements are biased, and what they do and
 don't prove. The numbers themselves are in [eval-results.md](eval-results.md); the design
-they test is in [architecture.md](architecture.md).
+they test is in [ARCHITECTURE.md](../ARCHITECTURE.md).
 
 ## What we measure, and why in this order
 
@@ -123,7 +123,7 @@ diff.
 
 Shadow mode measures recall on live CI instead of replays: a sampled run runs the full suite
 while siftwise stores what it would have selected; after the run is recorded, each failure is
-checked against that selection (see [architecture](architecture.md#shadow-comparison)).
+checked against that selection (see [architecture](../ARCHITECTURE.md#shadow-comparison)).
 
 - **Verdicts first:** failures triage calls flaky are counted apart, never as caught or
   missed; pre-existing and unknown failures count.
