@@ -529,9 +529,9 @@ selected; after the run is recorded, the server checks every failure against tha
 - **Where verdicts are computed** (`rollup` after a matrix, `record` in a single job), the
   failures section of the PR comment and the job summary get a line like "**Shadow run:**
   would have run 120 of 692 tests (70% time saved) and caught 3 of 4 failures (1 flaky not
-  counted)", then the missed tests with their cause (at most 20). The time saved is measured on the run's own
-  durations. Failures that triage calls flaky are counted separately, never as misses;
-  pre-existing and unknown ones count.
+  counted)", then the missed tests with their cause (at most 20). The time saved is measured
+  on the run's own durations. Failures that triage calls flaky are counted separately, never
+  as misses; pre-existing and unknown ones count.
 - **Outputs:** `select` has `shadow`, `shadow-mode` (what siftwise would have done),
   `shadow-selected` and `shadow-total`; `rollup` and `record` have `shadow`, `shadow-mode`,
   `shadow-caught` and `shadow-missed`.
@@ -540,10 +540,10 @@ selected; after the run is recorded, the server checks every failure against tha
   unreachable at select time, or a comparison that failed. No siftwise token (fork PRs): no
   shadow run.
 
-Example from a real PR: on a one-line change, siftwise would have run 197 of 876 tests (53% time
-saved estimated), caught the pinned failing test, and reported the new test it missed.
+Example from a real PR: on a one-line change, siftwise would have run 197 of 900 tests (56% time
+saved), caught the pinned failing test, and reported the one it missed with its cause: new test.
 
-![siftwise shadow-run PR comment](docs/images/shadow-comment.png)
+![siftwise shadow-run PR comment](docs/images/shadow-comment-2.png)
 
 Recall over time comes from `GET /repos/{repo}/recall?days=30`, or:
 
@@ -556,8 +556,23 @@ The first figure counts every shadow run, including those where siftwise would h
 full suite anyway (a fallback catches everything), so the report always shows it with the
 selective-only figure. Below that come the misses by verdict and by cause, the measured time
 saved, the runs not counted (by reason: no upload, commit mismatch, compare error, cancelled)
-and the misses, newest first. `--by week` prints recall, caught, missed and time saved per
-week instead; `--json` prints the API response.
+and the misses, newest first. `--json` prints the API response. `--by week` prints recall,
+caught, missed and time saved per week instead (Monday to Monday UTC, empty weeks included),
+again with the selective-only recall next to the all-runs one:
+
+```sh
+siftwise report --repo acme/shop --days 30 --by week
+```
+
+```text
+Recall 98.7% (148 of 150) over 40 shadow runs; selective runs only: 96.0% (48 of 50) over 25
+
+Week of     Runs  Recall (all)        Selective  Recall (selective)  Caught  Missed  Time saved
+2026-09-28    11  100.0% (41 of 41)           7  100.0% (13 of 13)       41       0         38%
+2026-10-05    12  98.0% (49 of 50)            8  95.0% (19 of 20)        49       1         41%
+2026-10-12     0  n/a (no failures)           0  n/a (no failures)        0       0           -
+2026-10-19    17  98.3% (58 of 59)           10  94.1% (16 of 17)        58       1         44%
+```
 
 Each miss gets a cause, from evidence the server already has (`unknown` when it doesn't say):
 
@@ -569,7 +584,12 @@ Each miss gets a cause, from evidence the server already has (`unknown` when it 
 | `no_link` | the change is known and nothing in it links to the test (the report lists what changed) |
 | `unknown` | the run's change links weren't recorded, or the test was linked but not selected (the report warns: possibly a selector bug) |
 
-For config gaps, the report suggests a `.siftwise.toml` rule, which siftwise never applies itself:
+A miss that was linked to the change but not selected (`linked_not_selected` in the API)
+makes the report print a warning: the selector may not have known the test when it selected,
+which can be a selector bug.
+
+For config gaps only, the report suggests a `.siftwise.toml` rule. It is shown for you to
+review; siftwise never applies it:
 
 ```toml
 [[depends]]
@@ -597,7 +617,8 @@ run.
 - ✅ Failure verdicts in the Action's PR comment and job summary, and an opt-in `fail-on` gate
 - ✅ MCP server for coding agents (`siftwise mcp`): `select_tests`, `triage_failure`, `explain`
 - ✅ Shadow mode: sampled CI runs run the full suite and report what the selection would have
-  caught or missed; `siftwise report` (`GET /repos/{repo}/recall`) for recall over time
+  caught or missed, with a cause for every miss; `siftwise report` (`GET /repos/{repo}/recall`)
+  for recall, by week too, and `.siftwise.toml` rules to consider for config gaps
 
 ## How it compares
 
@@ -699,9 +720,11 @@ on a backfilled repo with `uv run python -m scripts.eval.run_eval --repo owner/n
 
 - **Done:** recording and history, test selection with import graphs and safe fallbacks, the
   GitHub Action, failure triage with verdicts in the PR comment and `fail-on`, the MCP server,
-  the triage eval, and [shadow mode](#shadow-mode) with `siftwise report`.
-- **Next:** recall data from shadow mode on real repos, miss causes, flaky handling
-  (`known_flaky`, re-run detection) and packaging (a light CLI, a Docker image).
+  the triage eval, [shadow mode](#shadow-mode) with `siftwise report` (by week too), and miss
+  causes.
+- **Next:** flaky handling (`known_flaky`, same-commit re-run detection), performance (batched
+  triage and rollup queries), packaging (a light CLI, a Docker image) and dogfooding: shadow
+  mode on siftwise and another repo, for real recall data.
 - **Then:** a `v0.1.0` release on PyPI, docs and launch.
 
 ## Contributing
