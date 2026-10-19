@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Anonymous Docker Hub pulls hit rate limits on shared runners ("toomanyrequests"):
       # pull python and postgres through Google's Docker Hub mirror. Same images, same digests.
@@ -41,7 +41,7 @@ jobs:
           sudo systemctl restart docker
 
       # uv only: the quickstart installs the CLI with `uv tool install` itself.
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
 
       # Prints the server's logs if it fails; stops the server and deletes its volume either way.
       - name: Run the README Quickstart
