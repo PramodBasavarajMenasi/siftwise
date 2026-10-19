@@ -33,6 +33,12 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, column_property, mapped_column
 
+# test_results.status is a smallint (codes in core/codes.py, re-exported here).
+from siftwise.core.codes import FAILED_CODES_SQL as FAILED_CODES_SQL
+from siftwise.core.codes import PASSED_CODE as PASSED_CODE
+from siftwise.core.codes import SKIPPED_CODE as SKIPPED_CODE
+from siftwise.core.codes import STATUS_BY_CODE as STATUS_BY_CODE
+from siftwise.core.codes import STATUS_CODES as STATUS_CODES
 from siftwise.core.junit import Status
 
 # Deterministic constraint names so Alembic autogenerate and downgrades are stable.
@@ -46,19 +52,6 @@ NAMING_CONVENTION = {
 
 
 RUN_UNIQUE_INDEX = "uq_runs_repo_ci_run_attempt_variant"
-
-# test_results.status is a smallint. Raw SQL uses these codes (see FAILED_CODES_SQL).
-STATUS_CODES: dict[Status, int] = {
-    Status.PASSED: 0,
-    Status.FAILED: 1,
-    Status.SKIPPED: 2,
-    Status.ERROR: 3,
-}
-STATUS_BY_CODE = {code: status for status, code in STATUS_CODES.items()}
-PASSED_CODE = STATUS_CODES[Status.PASSED]
-SKIPPED_CODE = STATUS_CODES[Status.SKIPPED]
-# "failed or error": both count as a failure everywhere. For raw SQL: ``status IN (1, 3)``.
-FAILED_CODES_SQL = f"({STATUS_CODES[Status.FAILED]}, {STATUS_CODES[Status.ERROR]})"
 
 MESSAGE_MAX_BYTES = 4096
 TRUNCATION_MARKER = "…[truncated]"

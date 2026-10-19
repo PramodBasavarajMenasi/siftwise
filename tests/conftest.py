@@ -1,6 +1,5 @@
 import os
 from collections.abc import Iterator
-from pathlib import Path
 
 import pytest
 from alembic import command
@@ -8,14 +7,12 @@ from alembic.config import Config
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session
 
-ROOT = Path(__file__).resolve().parent.parent
+from siftwise import migrate
 
 
 def alembic_config(url: str) -> Config:
-    config = Config(str(ROOT / "alembic.ini"))
-    config.set_main_option("script_location", str(ROOT / "alembic"))
-    config.set_main_option("sqlalchemy.url", url)
-    return config
+    """The packaged migrations (what `siftwise server migrate` runs)."""
+    return migrate.alembic_config(url)
 
 
 @pytest.fixture(autouse=True)

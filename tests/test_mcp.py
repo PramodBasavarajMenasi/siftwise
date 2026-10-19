@@ -401,6 +401,7 @@ def test_mcp_command_without_the_extra_exits_2(monkeypatch: pytest.MonkeyPatch) 
     result = CliRunner().invoke(app, ["mcp"])
 
     assert result.exit_code == EXIT_USAGE
+    assert "pip install 'siftwise[mcp]'" in result.output
     assert 'uv tool install ".[mcp]"' in result.output
 
 

@@ -13,8 +13,8 @@ from typing import Annotated, Any
 import httpx
 import typer
 
-from siftwise import __version__
-from siftwise.cli import gha
+from siftwise import __version__, extras
+from siftwise.cli import gha, server
 from siftwise.cli.gograph import build_graph, run_go_list
 from siftwise.cli.pygraph import build_py_graph
 from siftwise.cli.repoconfig import (
@@ -29,6 +29,7 @@ from siftwise.core.junit import JUnitParseError, Status, parse_junit
 
 app = typer.Typer(help="Siftwise: test impact analysis for CI.", no_args_is_help=True)
 app.add_typer(gha.app, name="gha")
+app.add_typer(server.app, name="server")
 
 # `siftwise select` exit codes, besides 0 (success, including "no tests affected").
 EXIT_API_ERROR = 1
@@ -454,10 +455,7 @@ def mcp_command() -> None:
     except ImportError as exc:
         if not (exc.name or "").startswith("mcp"):
             raise
-        _err(
-            "error: `siftwise mcp` needs the mcp extra. From a siftwise checkout: "
-            'uv tool install ".[mcp]"'
-        )
+        _err(f"error: `siftwise mcp` needs the mcp extra: {extras.install_hint('mcp')}")
         raise typer.Exit(EXIT_USAGE) from exc
     serve()
 

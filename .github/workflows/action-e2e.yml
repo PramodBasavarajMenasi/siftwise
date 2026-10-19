@@ -64,10 +64,10 @@ jobs:
 
       - name: Start a siftwise server
         run: |
-          uv run alembic upgrade head
-          # The venv's uvicorn, not `uv run`: a uv process left running holds the uv cache lock,
-          # and setup-uv's post-job `uv cache prune` then times out waiting for it.
-          nohup .venv/bin/uvicorn siftwise.api.main:app --port 8000 > "$RUNNER_TEMP/server.log" 2>&1 &
+          # `siftwise server start` migrates, then serves. The venv's siftwise, not `uv run`: a uv
+          # process left running holds the uv cache lock, and setup-uv's post-job `uv cache prune`
+          # then times out waiting for it.
+          nohup .venv/bin/siftwise server start --port 8000 > "$RUNNER_TEMP/server.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/server.pid"
           for _ in $(seq 60); do curl -sf "$SERVER/healthz" && exit 0; sleep 1; done
           cat "$RUNNER_TEMP/server.log"
