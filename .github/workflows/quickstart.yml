@@ -41,7 +41,7 @@ jobs:
           sudo systemctl restart docker
 
       # uv only: the quickstart installs the CLI with `uv tool install` itself.
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v6
 
       # Prints the server's logs if it fails; stops the server and deletes its volume either way.
       - name: Run the README Quickstart
