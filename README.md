@@ -11,18 +11,18 @@
 </p>
 
 <p align="center">
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="ARCHITECTURE.md">Architecture</a> ·
+  <a href="docs/eval-results.md">Eval results</a> ·
+  <a href="docs/eval-methodology.md">Eval methodology</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
+<p align="center">
   <a href="https://github.com/PramodBasavarajMenasi/siftwise/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/PramodBasavarajMenasi/siftwise/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue">
   <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange">
-</p>
-
-<p align="center">
-  <a href="#quickstart">Quickstart</a> ·
-  <a href="#github-action">GitHub Action</a> ·
-  <a href="#coding-agents-mcp">MCP</a> ·
-  <a href="#results-on-real-repos">Results</a> ·
-  <a href="ARCHITECTURE.md">Architecture</a>
 </p>
 
 <p align="center">
@@ -695,6 +695,9 @@ the fallbacks and `.siftwise.toml` cover it.
 
 ## Security and limits
 
+Found a vulnerability? Report it privately, as [SECURITY.md](SECURITY.md) describes, not in a
+public issue.
+
 - **One token per server, with full access.** `SIFTWISE_API_TOKEN` is a single shared secret:
   every client (CI, the CLI, the MCP server) uses it, and it can read and write the history of
   **every repo** on the server. There are no per-repo, read-only or per-user tokens. Run a
@@ -731,7 +734,7 @@ the fallbacks and `.siftwise.toml` cover it.
 
 Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) for the dev
 setup, the checks and the PR checklist, and [ARCHITECTURE.md](ARCHITECTURE.md) for
-how the pieces fit.
+how the pieces fit. Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
