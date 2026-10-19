@@ -30,9 +30,9 @@
 
 <p align="center"><sub>If siftwise looks useful, a ⭐ helps others find it.</sub></p>
 
-> **Alpha, early development.** The server, CLI, test selection, GitHub Action and MCP server
-> work, and selection has been evaluated on real repos. Failure triage is new and not evaluated
-> yet. APIs and the database schema may change.
+> **Alpha, early development.** The server, CLI, test selection, failure triage, GitHub Action
+> and MCP server work. Selection and triage have been evaluated on real repos' history; shadow
+> mode, which measures recall on live CI, is new. APIs and the database schema may change.
 
 ## The problem
 
@@ -540,6 +540,11 @@ selected; after the run is recorded, the server checks every failure against tha
   unreachable at select time, or a comparison that failed. No siftwise token (fork PRs): no
   shadow run.
 
+Example from a real PR: on a one-line change, siftwise would have run 197 of 876 tests (53% time
+saved estimated), caught the pinned failing test, and reported the new test it missed.
+
+![siftwise shadow-run PR comment](docs/images/shadow-comment.png)
+
 Recall over time comes from `GET /repos/{repo}/recall?days=30`, or:
 
 ```sh
@@ -569,8 +574,11 @@ run.
 - ✅ Self-hosted: one FastAPI service and Postgres, stateless workers
 - ✅ GitHub Action (select, record, rollup) with a sticky PR comment; fails open
 - ✅ Failure triage (`siftwise triage`, `POST /triage`): new regression vs pre-existing on main
-  vs flaky, with evidence
+  vs flaky, with evidence; evaluated on rdflib and substrate history
+- ✅ Failure verdicts in the Action's PR comment and job summary, and an opt-in `fail-on` gate
 - ✅ MCP server for coding agents (`siftwise mcp`): `select_tests`, `triage_failure`, `explain`
+- ✅ Shadow mode: sampled CI runs run the full suite and report what the selection would have
+  caught or missed; `siftwise report` (`GET /repos/{repo}/recall`) for recall over time
 
 ## How it compares
 
@@ -664,13 +672,17 @@ Database tests are skipped when `SIFTWISE_TEST_DATABASE_URL` is unset. After upg
 database past migration 0005, run `POST /repos/{repo}/rollup` once per repo. Migration 0006
 rewrites `test_results` in place (it needs free disk for a second, smaller copy while it runs);
 run `VACUUM ANALYZE test_results` afterwards. Migration 0007 builds a small index on failed
-results (seconds; it blocks writes to `test_results` meanwhile). Replay the selector
+results (seconds; it blocks writes to `test_results` meanwhile). Migration 0008 only adds the
+shadow-mode tables. Replay the selector
 on a backfilled repo with `uv run python -m scripts.eval.run_eval --repo owner/name --checkout <clone>`.
 
 ## Roadmap
 
-- **Next:** recall data from [shadow mode](#shadow-mode) on real repos, miss causes, flaky
-  handling (`known_flaky`, re-run detection) and packaging (a light CLI, a Docker image).
+- **Done:** recording and history, test selection with import graphs and safe fallbacks, the
+  GitHub Action, failure triage with verdicts in the PR comment and `fail-on`, the MCP server,
+  the triage eval, and [shadow mode](#shadow-mode) with `siftwise report`.
+- **Next:** recall data from shadow mode on real repos, miss causes, flaky handling
+  (`known_flaky`, re-run detection) and packaging (a light CLI, a Docker image).
 - **Then:** a `v0.1.0` release on PyPI, docs and launch.
 
 ## Contributing
