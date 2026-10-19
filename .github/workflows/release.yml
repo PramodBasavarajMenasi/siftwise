@@ -108,7 +108,7 @@ jobs:
           labels: |
             org.opencontainers.image.version=${{ needs.check.outputs.version }}
 
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
