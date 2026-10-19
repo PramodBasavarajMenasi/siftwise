@@ -258,6 +258,8 @@ SHADOW_STATUSES = (
     SHADOW_COMPARE_ERROR,
 )
 SHADOW_UNIQUE_INDEX = "uq_shadow_selections_repo_ci_run_attempt_variant"
+# Why a failure was missed (core/shadow.py CAUSES, most specific first).
+MISS_CAUSES = ("new_test", "flaky_history", "config_gap", "no_link", "unknown")
 
 
 class ShadowSelection(Base):
@@ -333,6 +335,11 @@ class ShadowFailure(Base):
     and triage's verdict (flaky ones are not misses)."""
 
     __tablename__ = "shadow_failures"
+    __table_args__ = (
+        CheckConstraint(
+            "cause IN (" + ", ".join(f"'{c}'" for c in MISS_CAUSES) + ")", name="cause"
+        ),
+    )
 
     run_id: Mapped[int] = mapped_column(
         ForeignKey("shadow_results.run_id", ondelete="CASCADE"), primary_key=True
@@ -343,3 +350,8 @@ class ShadowFailure(Base):
     would_run: Mapped[bool] = mapped_column(Boolean)
     verdict: Mapped[str] = mapped_column(String(32))
     confidence: Mapped[str] = mapped_column(String(16))
+    # Misses only (NULL otherwise, and for misses compared before migration 0009): why it was
+    # missed, the evidence in a line, and a [[depends]] rule to consider (config gaps).
+    cause: Mapped[str | None] = mapped_column(String(32))
+    cause_detail: Mapped[str | None] = mapped_column(Text)
+    suggestion: Mapped[str | None] = mapped_column(Text)

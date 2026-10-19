@@ -120,8 +120,10 @@ def test_compare_and_recall(client: TestClient, db_session: Session) -> None:
     assert (body["failing_tests"], body["caught"], body["missed"], body["flaky_excluded"]) == (
         2, 1, 1, 0)  # fmt: skip
     assert body["missed_by_verdict"] == {"new_regression": 0, "unknown": 1, "pre_existing": 0}
-    assert body["missed_tests"] == [{"test_id": OTHER, "verdict": "unknown",
-                                     "variants": ["linux"]}]  # fmt: skip
+    assert body["missed_tests"] == [{
+        "test_id": OTHER, "verdict": "unknown", "variants": ["linux"], "cause": "no_link",
+        "cause_detail": "nothing in the change links to this test; changed: src/cart.py",
+    }]  # fmt: skip
     [selection] = body["selections"]
     assert (selection["selected_count"], selection["total_known"], selection["status"]) == (
         1, 2, "compared")  # fmt: skip
@@ -135,12 +137,25 @@ def test_compare_and_recall(client: TestClient, db_session: Session) -> None:
     assert recall["all"] == recall["selective"] == {
         "runs": 1, "failures": 2, "flaky_excluded": 0, "caught": 1, "missed": 1, "recall": 0.5,
         "missed_by_verdict": {"new_regression": 0, "unknown": 1, "pre_existing": 0},
+        "missed_by_cause": {"new_test": 0, "flaky_history": 0, "config_gap": 0, "no_link": 1,
+                            "unknown": 0},
     }  # fmt: skip
     [miss] = recall["misses"]
     assert (miss["test_id"], miss["ci_run_id"], miss["commit_sha"], miss["selection_mode"]) == (
         OTHER, SHADOW, sha(50), "selective")  # fmt: skip
+    assert (miss["cause"], miss["suggestion"]) == ("no_link", None)
+    assert miss["cause_detail"] == "nothing in the change links to this test; changed: src/cart.py"
     assert (recall["not_counted"], recall["in_progress"], recall["misses_truncated"]) == (
         {}, 0, False)  # fmt: skip
+    assert (recall["suggestions"], recall["linked_not_selected"], recall["periods"]) == (
+        [], 0, None)  # fmt: skip
+
+    weekly = client.get(f"/repos/{REPO}/recall", params={"days": 7, "by": "week"},
+                        headers=AUTH).json()  # fmt: skip
+    periods = weekly["periods"]
+    assert len(periods) in (1, 2)  # 7 days touch one or two Monday-to-Monday weeks
+    assert [p["start"] < p["end"] for p in periods] == [True] * len(periods)
+    assert periods[-1]["shadow_runs"] == 1 and periods[-1]["all"] == recall["all"]
 
 
 @pytest.mark.usefixtures("seeded")
@@ -155,8 +170,8 @@ def test_unknown_repo_invalid_days_and_auth(client: TestClient) -> None:
     assert client.post("/repos/no/repo/shadow", json={"ci_run_id": "1"},
                        headers=AUTH).status_code == 404  # fmt: skip
     assert client.get("/repos/no/repo/recall", headers=AUTH).status_code == 404
-    for days in (0, 366):
-        response = client.get(f"/repos/{REPO}/recall", params={"days": days}, headers=AUTH)
+    for params in ({"days": 0}, {"days": 366}, {"by": "month"}):
+        response = client.get(f"/repos/{REPO}/recall", params=params, headers=AUTH)
         assert response.status_code == 422
     assert client.get(f"/repos/{REPO}/recall").status_code == 401
     assert client.post(f"/repos/{REPO}/shadow", json={"ci_run_id": "1"}).status_code == 401

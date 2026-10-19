@@ -286,20 +286,29 @@ def report_command(
     json_output: Annotated[
         bool, typer.Option("--json", help="Print the full API response as JSON.")
     ] = False,
+    by: Annotated[
+        str | None, typer.Option(help="'week': recall, caught, missed and time saved per week.")
+    ] = None,
 ) -> None:
     """Live recall from shadow runs: how many failures the selection would have caught or
-    missed, over every shadow run and over selective ones only, and the time it would have
-    saved. Needs SIFTWISE_API_TOKEN. Exit codes: 0 ok, 1 API error, 2 usage error."""
+    missed (and why), over every shadow run and over selective ones only, the time it would
+    have saved, and .siftwise.toml rules to consider. Needs SIFTWISE_API_TOKEN. Exit codes:
+    0 ok, 1 API error, 2 usage error."""
+    if by not in (None, "week"):
+        _err(f"error: --by must be 'week', not {by!r}")
+        raise typer.Exit(EXIT_USAGE)
     token = _token()
+    params: dict[str, Any] = {"days": days, **({"by": by} if by else {})}
     try:
-        result = get_json(server, token, f"/repos/{repo}/recall", {"days": days})
+        result = get_json(server, token, f"/repos/{repo}/recall", params)
     except SiftwiseError as exc:
         _err(f"error: {exc}")
         raise typer.Exit(EXIT_API_ERROR) from exc
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
-    for line in recall_lines(result):
+    lines = weekly_lines(result) if by == "week" else recall_lines(result)
+    for line in lines:
         typer.echo(line)
 
 
@@ -317,6 +326,13 @@ def recall_lines(result: dict[str, Any]) -> list[str]:
     if every["missed"]:
         lines.append(f"Missed by verdict: {_verdicts(every['missed_by_verdict'])} (all runs); "
                      f"{_verdicts(selective['missed_by_verdict'])} (selective)")  # fmt: skip
+        lines.append(f"Missed by cause: {_causes(every['missed_by_cause'])} (all runs); "
+                     f"{_causes(selective['missed_by_cause'])} (selective)")  # fmt: skip
+    linked = result.get("linked_not_selected") or 0
+    if linked:
+        lines.append(f"Warning: {_plural(linked, 'miss')} linked to the change but not "
+                     "selected: the selector may not have known the test at select time. "
+                     "This may be a selector bug.")  # fmt: skip
     time = result["time"]
     if time["saved"] is not None:
         lines.append(f"Time saved (measured on the shadow runs): {time['saved']:.1%} of "
@@ -337,9 +353,54 @@ def recall_lines(result: dict[str, Any]) -> list[str]:
             lines.append(f"  {miss['at'][:10]}  {miss['verdict']:<14} {miss['test_id']}  "
                          f"(run {miss['ci_run_id']} attempt {miss['run_attempt']}, "
                          f"{miss['commit_sha'][:7]}, {variants})")  # fmt: skip
+            cause = CAUSE_LABELS.get(miss.get("cause") or "unclassified", miss.get("cause"))
+            detail = f": {miss['cause_detail']}" if miss.get("cause_detail") else ""
+            lines.append(f"      {cause}{detail}")
         if result["misses_truncated"]:
             lines.append("  ... more not shown (--json has the first 100)")
+    if result.get("suggestions"):
+        lines += ["", "Suggested .siftwise.toml rules (review before adding; siftwise never "
+                  "applies them):"]  # fmt: skip
+        for suggestion in result["suggestions"]:
+            tests = ", ".join(suggestion["test_ids"])
+            lines += ["", f"# would have caught {_plural(suggestion['misses'], 'miss')}: "
+                      f"{tests}", *suggestion["rule"].splitlines()]  # fmt: skip
     return lines
+
+
+def weekly_lines(result: dict[str, Any]) -> list[str]:
+    """``siftwise report --by week``: the overall line, then one row per week, oldest first.
+    Each row has the selective-only recall next to the all-runs one."""
+    lines = recall_lines(result)[:1]
+    header = (
+        f"{'Week of':<10}  {'Runs':>4}  {'Recall (all)':<18}  {'Selective':>9}  "
+        f"{'Recall (selective)':<18}  {'Caught':>6}  {'Missed':>6}  {'Time saved':>10}"
+    )
+    lines += ["", header]
+    for period in result.get("periods") or []:
+        every, selective = period["all"], period["selective"]
+        saved = period["time"]["saved"]
+        lines.append(
+            f"{period['start'][:10]:<10}  {period['shadow_runs']:>4}  {_recall(every):<18}  "
+            f"{period['selective_runs']:>9}  {_recall(selective):<18}  {every['caught']:>6}  "
+            f"{every['missed']:>6}  {('-' if saved is None else f'{saved:.0%}'):>10}"
+        )
+    return lines
+
+
+CAUSE_LABELS = {
+    "new_test": "new test",
+    "flaky_history": "flaky history",
+    "config_gap": "config gap",
+    "no_link": "no link",
+    "unknown": "unknown cause",
+    "unclassified": "unclassified (compared before causes existed)",
+}
+
+
+def _causes(counts: dict[str, int]) -> str:
+    parts = [f"{n} {CAUSE_LABELS.get(cause, cause)}" for cause, n in counts.items() if n]
+    return ", ".join(parts) or "none"
 
 
 def _recall(stats: dict[str, Any]) -> str:

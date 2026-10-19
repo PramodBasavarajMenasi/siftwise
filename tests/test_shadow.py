@@ -1,7 +1,7 @@
 """Shadow mode (core/shadow.py): storing selections, comparing shadow runs, recall."""
 
 from collections.abc import Mapping, Sequence
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -22,20 +22,27 @@ from siftwise.core.models import (
     ShadowSelection,
     Test,
 )
-from siftwise.core.selector import Mode, Runner, SelectedTest, Selection
+from siftwise.core.selector import ChangeLink, Mode, Runner, SelectedTest, Selection, Strength
 from siftwise.core.shadow import (
     CAUGHT,
     FLAKY,
     MISSED,
     NO_SELECTION,
     FailureRow,
+    MissCause,
+    RunChange,
     ShadowTarget,
     Tally,
+    Unit,
     compare_ci_run,
+    depends_rule,
+    miss_cause,
     recall,
     store_selection,
     units,
+    week_start,
 )
+from siftwise.core.triage import SAME_COMMIT, FlakyEvent, TestHistory, TriageResult, Verdict
 from tests.test_triage_db import OTHER, REPO, TEST, F, P, record, sha
 
 FLAKY_TEST = "tests.test_flaky::test_sometimes"
@@ -433,3 +440,262 @@ def test_compare_query_count_does_not_grow_with_failures(db_session: Session) ->
 
     assert few == lots
     assert lots <= 24, lots  # one variant: triage_ci_run's queries plus 9 of shadow's own
+
+
+# --- miss causes (pure) ---------------------------------------------------------------------
+
+GO_MODULE = "github.com/acme/shop"
+KNOWN = RunChange(("src/cart.py",), links_known=True, go_module=GO_MODULE)
+LINK = ChangeLink("path mapping", "src/cart.py", "tests/test_cart.py tests src/cart.py",
+                  Strength.HIGH)  # fmt: skip
+EVENT = FlakyEvent(SAME_COMMIT, sha(3), "linux", (), ())
+
+
+def result(
+    test_id: str = OTHER,
+    *,
+    seen: bool = True,
+    verdict: Verdict = Verdict.UNKNOWN,
+    links: tuple[ChangeLink, ...] = (),
+    flaky: tuple[FlakyEvent, ...] = (),
+    file_path: str | None = None,
+) -> TriageResult:
+    history = TestHistory(seen=seen, flaky=flaky, file_path=file_path)
+    return TriageResult(test_id, verdict, Strength.LOW, ("r",), links, history)
+
+
+def change(*files: str, links_known: bool = True, generated: tuple[str, ...] = ()) -> RunChange:
+    return RunChange(files, links_known, GO_MODULE, generated)
+
+
+def test_a_new_test_is_new_whatever_else_holds() -> None:
+    cause = miss_cause(result(seen=False, flaky=(EVENT,), links=(LINK,)), KNOWN)
+    assert (cause.cause, cause.detail) == ("new_test", "no result for this test before this run")
+
+
+def test_flaky_history_but_not_called_flaky_now() -> None:
+    cause = miss_cause(result(verdict=Verdict.PRE_EXISTING, flaky=(EVENT, EVENT)), KNOWN)
+    assert cause.cause == "flaky_history"
+    assert cause.detail == ("flaky 2 time(s) before (2 same-commit, 0 unrelated fail-then-pass), "
+                            "but not called flaky now")  # fmt: skip
+    assert cause.suggestion is None
+
+
+def test_unknown_change_links_or_links_the_selection_did_not_act_on() -> None:
+    unrecorded = miss_cause(result(), change("tests/data/x.json", links_known=False))
+    assert unrecorded.cause == "unknown" and "change links weren't recorded" in unrecorded.detail
+
+    linked = miss_cause(result(links=(LINK,)), KNOWN)
+    assert (linked.cause, linked.detail) == ("unknown", shadow.LINKED_NOT_SELECTED)
+    assert linked.detail == ("linked to the change but not selected (selector didn't know the "
+                             "test at select time?)")  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("test_id", "file_path", "changed", "tests_glob", "on"),
+    [
+        # pytest: a fixture next to the test file
+        (OTHER, None, "tests/data/db.json", "tests/test_db.py", "tests/data/**"),
+        # Go: a golden file in the package's testdata
+        (f"{GO_MODULE}/pay::TestCharge", None, "pay/testdata/charge.golden", "pay/*",
+         "pay/testdata/**"),
+        # Jest: located by its reported file
+        ("cart.test::adds", "web/cart.test.ts", "web/fixtures/cart.yaml", "web/cart.test.ts",
+         "web/fixtures/**"),
+    ],
+)  # fmt: skip
+def test_config_gap_suggests_a_depends_rule(
+    test_id: str, file_path: str | None, changed: str, tests_glob: str, on: str
+) -> None:
+    cause = miss_cause(result(test_id, file_path=file_path), change(changed, "src/other.py"))
+
+    assert cause.cause == "config_gap"
+    assert cause.detail == ("non-code file(s) changed in the test's directory, which no import "
+                            f"graph follows: {changed}")  # fmt: skip
+    assert cause.suggestion == f'[[depends]]\ntests = "{tests_glob}"\non = ["{on}"]'
+
+
+def test_config_gap_without_a_suggestion_for_a_pre_existing_failure() -> None:
+    cause = miss_cause(result(verdict=Verdict.PRE_EXISTING), change("tests/data/db.json"))
+    assert (cause.cause, cause.suggestion) == ("config_gap", None)
+
+
+@pytest.mark.parametrize(
+    ("test_id", "changed"),
+    [
+        (OTHER, "tests/test_cart.py"),  # code: an import graph would have seen it
+        (OTHER, "tests/junit.xml"),  # generated by the run
+        (OTHER, "fixtures/db.json"),  # not in the test's directory
+        ("test_root::test_x", "data.json"),  # a test at the root: every file would be "in" it
+        ("other.module/pay::TestCharge", "pay/testdata/x.golden"),  # a Go package outside go_module
+    ],
+)
+def test_no_config_gap_without_its_evidence(test_id: str, changed: str) -> None:
+    assert miss_cause(result(test_id), change(changed)).cause == "no_link"
+
+
+def test_no_link_lists_the_non_ignorable_changed_files_and_suggests_nothing() -> None:
+    files = ("README.md", "docs/a.rst", *(f"src/m{i}.py" for i in range(7)), "out/junit.xml")
+    cause = miss_cause(result(), change(*files))
+
+    assert cause.cause == "no_link"
+    assert cause.detail == ("nothing in the change links to this test; changed: src/m0.py, "
+                            "src/m1.py, src/m2.py, src/m3.py, src/m4.py and 2 more")  # fmt: skip
+    assert cause.suggestion is None
+    assert miss_cause(result(), change("README.md")).detail == (
+        "nothing in the change links to this test"
+    )
+
+
+def test_depends_rule_quotes_toml() -> None:
+    assert depends_rule('a "b".py', ["c\\d/**"]) == (
+        '[[depends]]\ntests = "a \\"b\\".py"\non = ["c\\\\d/**"]'
+    )
+
+
+def test_a_unit_takes_its_most_specific_cause() -> None:
+    no_link = MissCause("no_link", "n")
+    new = MissCause("new_test", "t")
+    [unit] = units([
+        FailureRow("t::x", "a", False, "unknown", True, no_link),
+        FailureRow("t::x", "b", False, "unknown", True, new),
+        FailureRow("t::x", "c", True, "unknown", True),
+    ])  # fmt: skip
+    assert (unit.outcome, unit.cause) == (MISSED, new)
+    tally = Tally()
+    tally.add(unit)
+    tally.add(Unit("t::y", MISSED, "unknown", True, ("a",)))  # compared before causes
+    assert tally.missed_by_cause == {"new_test": 1, "unclassified": 1}
+
+
+# --- miss causes (DB, through compare) ------------------------------------------------------
+
+FLAKY_ON_MAIN = "tests.test_queue::test_drain"
+
+
+def causes(db_session: Session, ci: str = SHADOW) -> dict[str, tuple[str | None, str | None]]:
+    run_ids = [v.run_id for v in compare(db_session, ci).variants]
+    stored = db_session.execute(
+        select(Test.test_id, ShadowFailure.cause, ShadowFailure.suggestion)
+        .join(Test, Test.id == ShadowFailure.test_key)
+        .where(ShadowFailure.run_id.in_(run_ids), ShadowFailure.cause.is_not(None))
+    )
+    return {test_id: (cause, suggestion) for test_id, cause, suggestion in stored}
+
+
+@pytest.mark.usefixtures("seeded")
+def test_each_cause_is_stored_with_the_miss(db_session: Session) -> None:
+    # FLAKY_ON_MAIN: a same-commit flake on main, then failing on main: pre-existing now, with
+    # flaky history.
+    record(db_session, commit=2, hour=2, tests={FLAKY_ON_MAIN: F})
+    record(db_session, commit=2, hour=2.5, tests={FLAKY_ON_MAIN: P})
+    record(db_session, commit=3, hour=3, tests={FLAKY_ON_MAIN: F})
+    record(db_session, commit=4, hour=4, tests={FLAKY_ON_MAIN: F})
+    # The selection runs nothing; the change touches src/cart.py (linked to TEST) and a fixture
+    # next to tests/test_db.py (OTHER).
+    assert store(db_session, selection(PASSING))
+    record(db_session, commit=50, hour=6, branch="pr", ci_run_id=SHADOW,
+           tests={TEST: F, OTHER: F, NEW: F, FLAKY_ON_MAIN: F, f"{GO}::TestC": F},
+           changed=("src/cart.py", "tests/data/db.json"))  # fmt: skip
+
+    found = causes(db_session)
+
+    assert found == {
+        NEW: ("new_test", None),
+        FLAKY_ON_MAIN: ("flaky_history", None),
+        TEST: ("unknown", None),  # linked, yet not selected
+        OTHER: ("config_gap", '[[depends]]\ntests = "tests/test_db.py"\non = ["tests/data/**"]'),
+        f"{GO}::TestC": ("no_link", None),  # no go_module recorded: can't be located
+    }
+    failures = db_session.scalars(select(ShadowFailure)).all()
+    assert all((f.cause is None) == f.would_run or f.verdict == "flaky" for f in failures)
+
+
+@pytest.mark.usefixtures("seeded")
+def test_a_run_without_change_links_has_unknown_causes(db_session: Session) -> None:
+    assert store(db_session, selection(PASSING))
+    record(db_session, commit=50, hour=6, branch="pr", ci_run_id=SHADOW, tests={OTHER: F},
+           changed=("tests/data/db.json",), graph=None)  # fmt: skip
+
+    assert causes(db_session) == {OTHER: ("unknown", None)}
+
+
+@pytest.mark.usefixtures("seeded")
+def test_recall_reports_causes_suggestions_and_selector_doubts(db_session: Session) -> None:
+    for n, ci in enumerate(("gap-1", "gap-2")):
+        assert store(db_session, selection(PASSING), ci=ci)
+        record(db_session, commit=50, hour=6 + n, branch="pr", ci_run_id=ci, tests={OTHER: F},
+               changed=("tests/data/db.json",))  # fmt: skip
+        compare(db_session, ci)
+    assert store(db_session, selection(PASSING), ci="linked")
+    shadow_run(db_session, {TEST: F}, ci="linked", hour=8)
+    compare(db_session, "linked")
+    # A miss compared before causes existed.
+    assert store(db_session, selection(PASSING), ci="old")
+    shadow_run(db_session, {NEW: F}, ci="old", hour=9)
+    run_ids = [v.run_id for v in compare(db_session, "old").variants]
+    db_session.execute(update(ShadowFailure).where(ShadowFailure.run_id.in_(run_ids))
+                       .values(cause=None, cause_detail=None))  # fmt: skip
+
+    report = recall(db_session, REPO, 30)
+
+    assert report is not None
+    assert report.all.missed_by_cause == {"config_gap": 2, "unknown": 1, "unclassified": 1}
+    [suggestion] = report.suggestions
+    assert (suggestion.misses, suggestion.test_ids) == (2, {OTHER})
+    assert suggestion.rule.startswith('[[depends]]\ntests = "tests/test_db.py"')
+    assert report.linked_not_selected == 1
+    linked = next(m for m in report.misses if m.ci_run_id == "linked")
+    assert linked.cause is not None and linked.cause.detail == shadow.LINKED_NOT_SELECTED
+
+
+# --- recall by week --------------------------------------------------------------------------
+
+
+def test_week_start_is_monday_utc() -> None:
+    sunday_night = datetime(2026, 10, 18, 23, 30, tzinfo=UTC)
+    assert week_start(sunday_night) == datetime(2026, 10, 12, tzinfo=UTC)
+    assert week_start(datetime(2026, 10, 19, 0, 0, tzinfo=UTC)) == datetime(2026, 10, 19,
+                                                                          tzinfo=UTC)  # fmt: skip
+    eastern = timezone(timedelta(hours=-5))  # Sunday 22:00 there is Monday 03:00 UTC
+    assert week_start(datetime(2026, 10, 18, 22, 0, tzinfo=eastern)) == datetime(
+        2026, 10, 19, tzinfo=UTC)  # fmt: skip
+
+
+@pytest.mark.usefixtures("seeded")
+def test_recall_by_week(db_session: Session) -> None:
+    now = datetime(2026, 10, 21, 12, tzinfo=UTC)  # a Wednesday
+    selected_at = {
+        "w1-sel": datetime(2026, 9, 29, 10, tzinfo=UTC),  # week of Sep 28: selective, a miss
+        "w1-full": datetime(2026, 10, 4, 23, tzinfo=UTC),  # Sunday, same week: full
+        "w3-sel": datetime(2026, 10, 19, 0, 0, tzinfo=UTC),  # Monday 00:00: week of Oct 19
+    }
+    for n, ci in enumerate(selected_at):
+        sel = selection(mode=Mode.FULL) if ci == "w1-full" else selection(TEST)
+        assert store(db_session, sel, ci=ci)
+        shadow_run(db_session, {TEST: F, OTHER: F, PASSING: P}, ci=ci, hour=6 + n)
+        compare(db_session, ci)
+        db_session.execute(update(ShadowSelection).where(ShadowSelection.ci_run_id == ci)
+                           .values(created_at=selected_at[ci]))  # fmt: skip
+
+    report = recall(db_session, REPO, 30, now, by_week=True)
+
+    assert report is not None and report.periods is not None
+    weeks = [(p.start.date().isoformat(), p.all.runs, p.selective.runs, p.full_runs,
+              p.all.caught, p.all.missed) for p in report.periods]  # fmt: skip
+    assert weeks == [
+        ("2026-09-21", 0, 0, 0, 0, 0),  # the window starts Sep 21, mid-week: still shown
+        ("2026-09-28", 2, 1, 1, 3, 1),  # selective: TEST caught, OTHER missed; full: both
+        ("2026-10-05", 0, 0, 0, 0, 0),  # empty weeks are shown
+        ("2026-10-12", 0, 0, 0, 0, 0),
+        ("2026-10-19", 1, 1, 0, 1, 1),
+    ]
+    first = report.periods[1]
+    assert (first.selective.recall, first.all.recall) == (0.5, 0.75)
+    assert first.time.saved is not None and report.periods[2].time.saved is None
+    assert report.periods[0].all.recall is None
+    assert all(p.end - p.start == timedelta(days=7) for p in report.periods)
+    # The totals are the sum of the weeks.
+    assert report.all.runs == sum(p.all.runs for p in report.periods) == 3
+    plain = recall(db_session, REPO, 30, now)
+    assert plain is not None and plain.periods is None  # not asked for

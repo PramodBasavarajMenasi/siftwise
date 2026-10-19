@@ -343,6 +343,9 @@ jobs:
           CAUGHT: ${{ steps.shadow_rollup.outputs.shadow-caught }}
           MISSED: ${{ steps.shadow_rollup.outputs.shadow-missed }}
           REPORT: ${{ steps.shadow_rollup.outputs.report }}
+          # `siftwise report` reads its token from here (the job sets it too; explicit for the
+          # CLI calls below).
+          SIFTWISE_API_TOKEN: ${{ env.TOKEN }}
         run: |
           cat "$REPORT"
           echo "would have run $SELECTED of $TOTAL ($SHADOW_MODE): caught=$CAUGHT missed=$MISSED"
@@ -356,15 +359,24 @@ jobs:
           echo "$recall" | jq -e '.shadow_runs == 1 and .all.failures == 2 and .all.flaky_excluded == 0'
           case "$SHADOW_MODE" in
             selective)
-              # Pinned by always_run: caught. New, outside every signal: missed.
+              # Pinned by always_run: caught. New, outside every signal: missed, as a new test
+              # (no result before this run).
               test "$CAUGHT" = 1
               test "$MISSED" = 1
               grep -F 'and caught 1 of 2 failures' "$REPORT"
-              grep -F -- '- <code>test\_e2e\_shadow\_new::test\_e2e\_shadow\_new</code> (unknown)' "$REPORT"
+              grep -F -- '- <code>test\_e2e\_shadow\_new::test\_e2e\_shadow\_new</code>: new test (verdict: unknown)' "$REPORT"
               echo "$recall" | jq -e '.selective_runs == 1 and .selective.caught == 1
                 and .selective.missed == 1 and .all.missed_by_verdict.unknown == 1
+                and .all.missed_by_cause.new_test == 1
                 and .misses[0].test_id == "test_e2e_shadow_new::test_e2e_shadow_new"
-                and .misses[0].variants == ["shadow-e2e"]'
+                and .misses[0].variants == ["shadow-e2e"]
+                and .misses[0].cause == "new_test" and .misses[0].suggestion == null'
+              report=$(uv run siftwise report --repo "$GITHUB_REPOSITORY" --days 1 --server "$SERVER")
+              echo "$report"
+              grep -F 'Missed by cause: 1 new test (all runs); 1 new test (selective)' <<< "$report"
+              grep -F '      new test: no result for this test before this run' <<< "$report"
+              uv run siftwise report --repo "$GITHUB_REPOSITORY" --days 1 --server "$SERVER" --by week \
+                | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} +1 +50\.0% \(1 of 2\) +1 +50\.0% \(1 of 2\) +1 +1 '
               ;;
             full)
               test "$CAUGHT" = 2
