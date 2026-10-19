@@ -460,6 +460,10 @@ def _compare(
 
     variants: list[VariantComparison] = []
     rows: list[FailureRow] = []
+    # Inserted together at the end (results first: failures refer to them), so the number of
+    # statements doesn't grow with the number of variants.
+    stored_results: list[ShadowResult] = []
+    stored_failures: list[ShadowFailure] = []
     used: dict[int, list[str]] = defaultdict(list)  # selection id -> its variants' statuses
     for v in triaged:
         selection = by_variant.get(v.variant) or by_variant.get(None)
@@ -505,14 +509,13 @@ def _compare(
             ms_would_run=float(sum(ms for _, ms in ran)),
         )
         variants.append(compared)
-        session.add(ShadowResult(
+        stored_results.append(ShadowResult(
             run_id=v.run_id, selection_id=selection.id, failing=compared.failing,
             caught=compared.caught, missed=compared.missed, flaky=compared.flaky,
             tests_total=compared.tests_total, tests_would_run=compared.tests_would_run,
             ms_total=compared.ms_total, ms_would_run=compared.ms_would_run,
         ))  # fmt: skip
-        session.flush()
-        session.add_all(
+        stored_failures.extend(
             ShadowFailure(
                 run_id=v.run_id,
                 test_key=keys[r.test_id],
@@ -525,6 +528,9 @@ def _compare(
             )
             for r, row in zip(results, variant_rows, strict=True)
         )
+    session.add_all(stored_results)
+    session.flush()
+    session.add_all(stored_failures)
 
     for selection in selections:
         statuses = used.get(selection.id, [])

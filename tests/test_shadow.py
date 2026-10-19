@@ -43,7 +43,17 @@ from siftwise.core.shadow import (
     week_start,
 )
 from siftwise.core.triage import SAME_COMMIT, FlakyEvent, TestHistory, TriageResult, Verdict
-from tests.test_triage_db import OTHER, REPO, TEST, F, P, record, sha
+from tests.test_triage_db import (
+    OTHER,
+    REPO,
+    TEST,
+    F,
+    P,
+    counted,
+    matrix_history,
+    record,
+    sha,
+)
 
 FLAKY_TEST = "tests.test_flaky::test_sometimes"
 NEW = "tests.test_new::test_it"  # never recorded before the shadow run
@@ -483,6 +493,20 @@ def test_compare_query_count_does_not_grow_with_failures(db_session: Session) ->
 
     assert few == lots
     assert lots <= 24, lots  # one variant: triage_ci_run's queries plus 9 of shadow's own
+
+
+def test_compare_query_count_does_not_grow_with_variants(db_session: Session) -> None:
+    counts = {}
+    for legs in (1, 5, 20):
+        ci = f"shadow-{legs}"
+        matrix_history(db_session, ci, legs)
+        assert store(db_session, selection(TEST), ci=ci, commit=99)  # every leg's selection
+        compared = compare(db_session, ci)
+        assert len(compared.variants) == legs and compared.tally.failures > 0
+        counts[legs] = counted(db_session, lambda: compare(db_session, ci))  # noqa: B023
+
+    assert counts[1] == counts[5] == counts[20], counts
+    assert counts[20] <= 30, counts
 
 
 # --- miss causes (pure) ---------------------------------------------------------------------

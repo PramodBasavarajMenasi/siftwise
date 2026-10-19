@@ -1,6 +1,6 @@
 """Triage against the database: evidence from history, no peeking, batched queries."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -24,6 +24,7 @@ from siftwise.core.triage import (
     VariantTriage,
     Verdict,
     load_histories,
+    load_histories_many,
     triage_ci_run,
     triage_run,
 )
@@ -481,6 +482,107 @@ def test_other_legs_of_the_triaged_ci_run_are_left_out(db_session: Session) -> N
     assert triaged.history.other_variants_failing == ()
     # Without the CI run ID, an earlier upload is just history.
     assert [r.variant for r in unidentified.history.other_variants_failing] == ["macos"]
+
+
+# --- many variants: one batched load ----------------------------------------------------------
+
+BROKEN = "tests.test_broken::test_always"  # fails on every main run: the look before the window
+
+
+def matrix_history(session: Session, prefix: str, legs: int) -> list[str]:
+    """``legs`` variants with the same history: main runs (passing, then a streak that never
+    passes, and a streak that does), an unrelated fail-then-pass, then CI run ``prefix`` failing
+    on every leg, each leg with a re-run. Returns the variants."""
+    variants = [f"{prefix}-v{i}" for i in range(legs)]
+    tests = {TEST: P, OTHER: P, BROKEN: F}
+    for v in variants:
+        for n in range(1, 16):  # past the first main round (10 runs)
+            record(session, commit=n, hour=n, variant=v,
+                   tests={**tests, OTHER: F if n > 12 else P})  # fmt: skip
+        # An unrelated fail-then-pass on a branch (with a re-run of the failing commit).
+        branch = f"{prefix}-feature"
+        for commit, hour, status in ((30, 30, F), (30, 30.5, F), (31, 31, P)):
+            record(session, commit=commit, hour=hour, branch=branch, variant=v,
+                   tests={TEST: status}, changed=("src/other.py",))  # fmt: skip
+    failing: dict[str, Status | Sequence[Status]] = {TEST: F, OTHER: F, BROKEN: F}
+    for v in variants:
+        record(session, commit=99, hour=50, branch="pr", ci_run_id=prefix, variant=v,
+               tests=failing)  # fmt: skip
+        record(session, commit=99, hour=50.5, branch="pr", ci_run_id=prefix, variant=v, rerun=1,
+               tests={TEST: P, OTHER: F})  # fmt: skip
+    return variants
+
+
+def counted(session: Session, fn: Callable[[], object]) -> int:
+    statements: list[str] = []
+
+    def before(*args: Any) -> None:
+        if not args[2].startswith(("SAVEPOINT", "RELEASE")):  # the test session's own
+            statements.append(args[2])
+
+    engine = session.get_bind()
+    event.listen(engine, "before_cursor_execute", before)
+    try:
+        fn()
+    finally:
+        event.remove(engine, "before_cursor_execute", before)
+    return len(statements)
+
+
+def test_ci_run_query_count_does_not_grow_with_variants(db_session: Session) -> None:
+    counts = {}
+    for legs in (1, 5, 20):
+        variants = matrix_history(db_session, f"m{legs}", legs)
+        triaged = ci_triage(db_session, f"m{legs}")
+        assert [v.variant for v in triaged] == sorted(variants)
+        assert all(v.report and len(v.report.results) == 3 for v in triaged)
+        counts[legs] = counted(db_session, lambda: ci_triage(db_session, f"m{legs}"))  # noqa: B023
+
+    assert counts[1] == counts[5] == counts[20], counts
+    # Every phase runs here: triage_ci_run's 4 reads plus the loader's 13 (jit, repo, cut-offs,
+    # runs, tests, seen, failures, outcomes, 2 main rounds, the look before the window, change
+    # links, re-runs). 15 main runs: a third round needs more than 60.
+    assert counts[20] <= 17, counts
+
+
+def test_a_batched_load_equals_each_target_loaded_alone(db_session: Session) -> None:
+    variants = matrix_history(db_session, "b", 3)
+    # Another attempt of the same commit, and runs between the legs' cut-offs.
+    record(db_session, commit=99, hour=49, branch="pr", ci_run_id="b", run_attempt=2,
+           variant=variants[0], tests={TEST: P, OTHER: F})  # fmt: skip
+    record(db_session, commit=98, hour=50.2, branch="pr", variant=variants[1],
+           tests={TEST: P, BROKEN: F})  # fmt: skip
+    ids = [TEST, OTHER, BROKEN, "tests.test_new::test_unseen"]
+    targets = [
+        *(Target(REPO, sha(99), v, "b", 1) for v in variants),  # recorded legs: their cut-offs
+        Target(REPO, sha(99), variants[0], "b", 2),  # another attempt
+        Target(REPO, sha(99), variants[1], as_of=at(20)),  # a time cut-off, earlier history
+        Target(REPO, None, variants[2], as_of=at(60)),  # uncommitted code (no same commit)
+        Target(REPO, sha(5), None, "unrecorded", as_of=at(45)),  # no such run: as_of decides
+    ]
+    requests = [(target, ids if i == 0 else ids[: 2 + i % 3]) for i, target in enumerate(targets)]
+
+    together = load_histories_many(db_session, requests)
+    alone = [load_histories(db_session, target, test_ids) for target, test_ids in requests]
+
+    assert together == alone
+    # The batch saw real evidence: streaks, flaky events, re-runs, unseen tests.
+    first = alone[0]
+    assert first is not None
+    assert first.tests[BROKEN].broken_on_main is not None
+    assert first.tests[TEST].flaky and first.tests[TEST].rerun_passes == (1,)
+    dirty = alone[5]  # uncommitted code: no same-commit pass, though commit 99 passed TEST
+    assert dirty is not None and dirty.tests[TEST].same_commit_passes == ()
+
+
+def test_a_batched_load_needs_one_repo(db_session: Session) -> None:
+    record(db_session, commit=1, hour=1, tests={TEST: P})
+
+    assert load_histories_many(db_session, []) == []
+    assert load_histories_many(db_session, [(Target("no/repo", None), [TEST])]) is None
+    with pytest.raises(ValueError, match="one repo"):
+        load_histories_many(db_session, [(Target(REPO, None), [TEST]),
+                                         (Target("other/repo", None), [TEST])])  # fmt: skip
 
 
 # --- a recorded CI run attempt ------------------------------------------------------------
