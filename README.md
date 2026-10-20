@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img alt="siftwise" src="assets/logo-light.svg" width="370">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/PramodBasavarajMenasi/siftwise/main/assets/logo-dark.svg">
+    <img alt="siftwise" src="https://raw.githubusercontent.com/PramodBasavarajMenasi/siftwise/main/assets/logo-light.svg" width="370">
   </picture>
 </p>
 
@@ -12,10 +12,11 @@
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
-  <a href="ARCHITECTURE.md">Architecture</a> ·
-  <a href="docs/eval-results.md">Eval results</a> ·
-  <a href="docs/eval-methodology.md">Eval methodology</a> ·
-  <a href="CONTRIBUTING.md">Contributing</a>
+  <a href="https://github.com/PramodBasavarajMenasi/siftwise/blob/main/ARCHITECTURE.md">Architecture</a> ·
+  <a href="https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-results.md">Eval results</a> ·
+  <a href="https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-methodology.md">Eval methodology</a> ·
+  <a href="https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CHANGELOG.md">Changelog</a> ·
+  <a href="https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CONTRIBUTING.md">Contributing</a>
 </p>
 
 <p align="center">
@@ -43,18 +44,18 @@ and Linear found that as development accelerates, CI becomes a bottleneck, becau
 still has to pass through it
 ([AI coding has made CI a bottleneck](https://linear.app/now/ci-bottleneck-reworked)).
 
-> **Status: alpha** (`0.1.0.dev0`). Evaluated on four real repos' CI history; not on PyPI
-> yet. APIs and the database schema may change before 1.0.
+> **Status: alpha** (`0.1.0`). Evaluated on four real repos' CI history. APIs and the
+> database schema may change before 1.0.
 
 <p align="center">
-  <img alt="siftwise select on an rdflib commit: 325 test files import the changed modules, 17921 of 18020 known tests selected, and a pytest command" src="assets/demo.svg" width="900">
+  <img alt="siftwise select on an rdflib commit: 325 test files import the changed modules, 17921 of 18020 known tests selected, and a pytest command" src="https://raw.githubusercontent.com/PramodBasavarajMenasi/siftwise/main/assets/demo.svg" width="900">
 </p>
 
 The sticky PR comment on a [shadow run](#shadow-mode): what siftwise would have run, each
 failure with its verdict, and the failure the selection would have missed, with its cause.
 
 <p align="center">
-  <img alt="siftwise PR comment: would have run 197 of 900 tests, two failures with verdicts, and one missed test with its cause, new test" src="docs/images/shadow-comment-2.png" width="700">
+  <img alt="siftwise PR comment: would have run 197 of 900 tests, two failures with verdicts, and one missed test with its cause, new test" src="https://raw.githubusercontent.com/PramodBasavarajMenasi/siftwise/main/docs/images/shadow-comment-2.png" width="700">
 </p>
 
 ## How it works
@@ -71,7 +72,7 @@ flowchart LR
     G --> H["PR comment"]
 ```
 
-Full details: [ARCHITECTURE.md](ARCHITECTURE.md).
+Full details: [ARCHITECTURE.md](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/ARCHITECTURE.md).
 
 - **Record.** CI uploads JUnit XML with the commit, branch, changed files and what the change
   links to. The server keeps every result and rolls up per-test history.
@@ -87,34 +88,38 @@ Full details: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 From zero to a first selection in about 5 minutes, on a small example project. You need
 Docker, git and [uv](https://docs.astral.sh/uv/). The commands are bash: on Windows, use Git
-Bash or WSL. CI runs the blocks below exactly as written
-([quickstart.yml](.github/workflows/quickstart.yml)).
+Bash or WSL. CI runs the blocks below on every change
+([quickstart.yml](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/.github/workflows/quickstart.yml)), with the server image and the CLI built
+from the checkout.
 
 ```sh
 git clone https://github.com/PramodBasavarajMenasi/siftwise.git
 cd siftwise
 ```
 
-**1. Start the server** with Postgres. The API token is a shared secret you choose; it goes in
-`.env`, which `docker compose` reads:
+**1. Start the server** with Postgres, from the published image
+(`ghcr.io/pramodbasavarajmenasi/siftwise:0.1.0`). The API token is a shared secret you choose;
+it goes in `.env`, which `docker compose` reads:
 
 ```sh quickstart
 [ -f .env ] || echo "SIFTWISE_API_TOKEN=$(openssl rand -hex 32)" > .env
-docker compose up -d --build --wait     # builds the image, waits until both services are healthy
+docker compose up -d --wait             # pulls the image, waits until both services are healthy
 curl -fsS http://localhost:8000/healthz # {"status":"ok"}
 ```
+
+To run the server from your checkout instead (when you change it), add `--build`.
 
 **2. Install the CLI** (the light install, without the server's dependencies) and give it the
 token:
 
 ```sh quickstart
-uv tool install .                       # later: pip install siftwise
+uv tool install siftwise                # or: pip install siftwise
 export SIFTWISE_API_TOKEN=$(sed -n 's/^SIFTWISE_API_TOKEN=//p' .env)
 ```
 
 If `siftwise` isn't found afterwards, run `uv tool update-shell` once and open a new shell.
 
-**3. Record a first run.** Copy [the example project](examples/quickstart) into a git repo of
+**3. Record a first run.** Copy [the example project](https://github.com/PramodBasavarajMenasi/siftwise/tree/main/examples/quickstart) into a git repo of
 its own, run its tests with a JUnit report, and upload the report:
 
 ```sh quickstart
@@ -160,19 +165,23 @@ if it fails, the full suite runs.
 | `pip install 'siftwise[server]'` | plus the API server: `siftwise server start` and `migrate` (FastAPI, SQLAlchemy, Postgres driver) | 50 MB |
 | `pip install 'siftwise[mcp]'` | plus `siftwise mcp`, for [coding agents](#coding-agents-mcp) | 49 MB |
 
-siftwise isn't on PyPI yet: from a checkout, `uv tool install .` (or `".[server]"`,
-`".[mcp]"`). A command whose extra is missing exits 2 and prints the install command.
-`siftwise --version` prints the version.
+For a command-line tool, `uv tool install siftwise` (or `pipx install siftwise`) gives it its
+own environment; add the extras the same way (`uv tool install 'siftwise[mcp]'`). From a
+checkout: `uv tool install .` (or `".[server]"`, `".[mcp]"`). A command whose extra is missing
+exits 2 and prints the install command. `siftwise --version` prints the version.
 
 ### Run the server
 
-With Docker, from a checkout (the image isn't published yet):
+With Docker, from the published image:
 
 ```sh
-docker build -t siftwise .
 docker run -d -p 8000:8000 -e SIFTWISE_API_TOKEN=... \
-    -e SIFTWISE_DATABASE_URL=postgresql+psycopg://user:password@db-host:5432/siftwise siftwise
+    -e SIFTWISE_DATABASE_URL=postgresql+psycopg://user:password@db-host:5432/siftwise \
+    ghcr.io/pramodbasavarajmenasi/siftwise:0.1.0
 ```
+
+To build the image from a checkout instead: `docker build -t siftwise .`, then run `siftwise`
+in place of the image name.
 
 - **The image** (about 80 MB to pull, 350 MB unpacked) runs `siftwise server start` as a
   non-root user: it applies the database migrations, then serves on port 8000. Migrations take
@@ -183,11 +192,13 @@ docker run -d -p 8000:8000 -e SIFTWISE_API_TOKEN=... \
 - **Reaching it from CI:** the quickstart's `docker-compose.yml` publishes the API on
   `127.0.0.1` only (port `SIFTWISE_PORT`, default 8000) and keeps Postgres inside Docker. Put
   the server behind a reverse proxy with TLS: the token travels in a request header.
-- **Upgrading:** after pulling a new siftwise version, rebuild with `docker compose up -d
-  --build`. Compose otherwise keeps the old image, and once the database has a newer migration
-  than that image knows, its `siftwise server start` fails with `Can't locate revision ...` and
-  the container restarts in a loop. A few migrations need a step after them: see
-  [the migration notes](CONTRIBUTING.md#upgrade-notes).
+- **Upgrading:** change the image tag to the new version (the quickstart's
+  `docker-compose.yml` names it; a newer checkout already has it), then `docker compose up -d`:
+  the new image migrates the database when it starts. Never go back to an older image: once
+  the database has a migration that image doesn't know, its `siftwise server start` fails with
+  `Can't locate revision ...` and the container restarts in a loop. If you build from a
+  checkout (`--build`), rebuild after every pull for the same reason. A few migrations need a
+  step after them: see [the migration notes](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CONTRIBUTING.md#upgrade-notes).
 
 ### Seed history from past CI runs
 
@@ -237,7 +248,7 @@ flaky           medium tests.test_net::test_fetch
 siftwise: 3 failing test(s): 1 new regression, 1 pre existing, 1 flaky, 0 unknown
 ```
 
-The rules, in order, are in [the architecture doc](ARCHITECTURE.md#triage-verdicts).
+The rules, in order, are in [the architecture doc](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/ARCHITECTURE.md#triage-verdicts).
 Only runs before the triaged one count, so triaging an old run gives the answer it would have
 got live. `--json` prints the verdicts with their evidence. Exit codes: 0 ok, 1 API error, 2
 usage error, 4 a failure got a `--fail-on` verdict (off by default). 500 failures on rdflib
@@ -262,7 +273,9 @@ checkout and never block CI: if the server is unreachable, times out or returns 
   `pull-requests: write` (the comment).
 - **Full history:** check out with `fetch-depth: 0`. `select` fails with a clear message on a
   shallow clone, the only way it fails.
-- **Version:** the examples use `@main`; pin a release tag once one exists.
+- **Version:** the examples use `@main`; pin a release tag (`@v0.1.0`) or a commit SHA for
+  reproducible CI. The actions install the CLI from their own checkout, so the CLI's version
+  always matches the tag.
 
 **Never use these actions with `pull_request_target`.** That event runs with secrets on code
 from the PR, so a fork could read your siftwise token. Use `pull_request`: on fork PRs, secrets
@@ -387,7 +400,7 @@ The comment is left alone if the PR got new commits since the run started, and a
 selection drops the old commit's failures. Raw failure messages are never shown (the comment
 is public). Outputs: `verdicts-available`, `counts` (JSON, per verdict) and `report` (the
 summary's Markdown, as a file). How each verdict is decided:
-[triage verdicts](ARCHITECTURE.md#triage-verdicts).
+[triage verdicts](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/ARCHITECTURE.md#triage-verdicts).
 
 ### fail-on
 
@@ -507,7 +520,7 @@ Each miss gets a cause, from evidence the server already has:
 | `no_link` | the change is known and nothing in it links to the test (the report lists what changed) |
 | `unknown` | the run's change links weren't recorded, or the test was linked but not selected (the report warns: possibly a selector bug) |
 
-[action-e2e.yml](.github/workflows/action-e2e.yml) runs all three actions against a real server
+[action-e2e.yml](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/.github/workflows/action-e2e.yml) runs all three actions against a real server
 on every push and PR of this repo: verdicts, `fail-on`, a shadow run with a miss,
 `known_flaky` and `rerun-unknown`.
 
@@ -531,13 +544,12 @@ state: each call computes the change in the agent's checkout, with the same code
 - **Compact output.** Each result stays under 8,000 characters. The API token never appears
   in a result.
 
-**Install** the CLI with the `mcp` extra ([Install](#install)), from a siftwise checkout for
-now:
+**Install** the CLI with the `mcp` extra ([Install](#install)):
 
 ```sh
-uv tool install ".[mcp]"     # siftwise lands in ~/.local/bin (Windows: %USERPROFILE%\.local\bin)
-uv tool update-shell         # once, if that directory isn't on your PATH; then restart the agent
-uv tool dir --bin            # prints the directory, for a full path in the configs below
+uv tool install 'siftwise[mcp]'  # siftwise lands in ~/.local/bin (Windows: %USERPROFILE%\.local\bin)
+uv tool update-shell             # once, if that directory isn't on your PATH; then restart the agent
+uv tool dir --bin                # prints the directory, for a full path in the configs below
 ```
 
 The agent starts the server in its working directory: open the agent in the repository. It
@@ -639,8 +651,8 @@ on = ["**/*.go", "!**/*_test.go"]         # ! excludes
 ## Results on real repos
 
 Replays of real CI history with no peeking at the future, with the current code except where
-noted. How they measure, and what they don't prove: [eval methodology](docs/eval-methodology.md);
-full numbers: [eval results](docs/eval-results.md).
+noted. How they measure, and what they don't prove: [eval methodology](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-methodology.md);
+full numbers: [eval results](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-results.md).
 
 | Repo | Failures caught | Test time skipped |
 |---|---|---|
@@ -661,7 +673,7 @@ full numbers: [eval results](docs/eval-results.md).
   [`rerun-unknown`](#flaky-tests) is for.
 
 **Triage** (a verdict per failure, scored against what happened next;
-[details](docs/eval-results.md#triage-eval)):
+[details](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-results.md#triage-eval)):
 
 - **The worst error, a regression called flaky:** 0 on rdflib. On substrate, 5 of 406
   labelled regressions, all on tests with earlier same-commit flakes; 4 are likely label noise
@@ -673,7 +685,7 @@ full numbers: [eval results](docs/eval-results.md).
   same commit seen before the failure, which is also the flaky label's evidence.
 
 **Performance** (rdflib history; results identical before and after;
-[details](docs/eval-results.md#performance)): triage of a 22-variant CI run 1,032 → 220 ms
+[details](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-results.md#performance)): triage of a 22-variant CI run 1,032 → 220 ms
 (180 → 12 queries, no longer growing with variants); the selection inside `/select` 605 → 237
 ms; ingesting a 9,891-result upload about 2.2 → 1.25 s.
 
@@ -695,7 +707,7 @@ the fallbacks and `.siftwise.toml` cover it.
 
 ## Security and limits
 
-Found a vulnerability? Report it privately, as [SECURITY.md](SECURITY.md) describes, not in a
+Found a vulnerability? Report it privately, as [SECURITY.md](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/SECURITY.md) describes, not in a
 public issue.
 
 - **One token per server, with full access.** `SIFTWISE_API_TOKEN` is a single shared secret:
@@ -724,17 +736,17 @@ public issue.
   GitHub Action, failure triage with verdicts in the PR comment and `fail-on`, the MCP server,
   the triage eval, [shadow mode](#shadow-mode) with `siftwise report`, miss causes,
   [flaky handling](#flaky-tests) (`known_flaky`, `rerun-unknown`), performance (batched
-  triage, faster select and ingest) and packaging (a light CLI, a server image, the
-  quickstart).
-- **Next:** a `v0.1.0` release on PyPI and GHCR, docs and launch; an arm64 server image.
+  triage, faster select and ingest), packaging (a light CLI, a server image, the quickstart)
+  and the `v0.1.0` release on PyPI and GHCR ([changelog](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CHANGELOG.md)).
+- **Next:** a demo and the launch write-up; an arm64 server image.
 - **After launch:** live dogfooding: shadow mode on siftwise's own CI with a hosted server,
   with published live recall numbers.
 
 ## Contributing
 
-Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) for the dev
-setup, the checks and the PR checklist, and [ARCHITECTURE.md](ARCHITECTURE.md) for
-how the pieces fit. Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+Issues and pull requests are welcome: see [CONTRIBUTING.md](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CONTRIBUTING.md) for the dev
+setup, the checks and the PR checklist, and [ARCHITECTURE.md](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/ARCHITECTURE.md) for
+how the pieces fit. Everyone taking part follows the [Code of Conduct](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CODE_OF_CONDUCT.md).
 
 ## License
 

@@ -28,5 +28,5 @@ def missing(modules: tuple[str, ...]) -> list[str]:
 def install_hint(extra: str) -> str:
     return (
         f"pip install 'siftwise[{extra}]' "
-        f'(from a siftwise checkout: uv tool install ".[{extra}]")'
+        f"(installed as a uv tool: uv tool install 'siftwise[{extra}]')"
     )

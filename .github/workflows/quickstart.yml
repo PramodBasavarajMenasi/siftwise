@@ -1,7 +1,9 @@
 name: Quickstart
 
-# Runs the README Quickstart exactly as written (scripts/run_quickstart.py): the compose stack
-# from scratch, the light CLI, the example project's first run and selection.
+# Runs the README Quickstart (scripts/run_quickstart.py): the compose stack from scratch, the
+# light CLI, the example project's first run and selection. Against THIS checkout: the server
+# image is built (`--build`) and the CLI installed from `.`, where the README uses the released
+# image and PyPI; every other command runs as written.
 on:
   push:
     branches: [main]

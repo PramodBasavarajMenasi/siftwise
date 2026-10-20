@@ -97,7 +97,7 @@ runs:
         enable-cache: false  # the cache key would come from the caller's repo, not this action
     - name: Install siftwise
       shell: bash
-      # siftwise isn't on PyPI yet: install the CLI from this action's own checkout.
+      # From this action's own checkout, not PyPI: the CLI always matches the action's ref.
       run: uv tool install --quiet --force --python 3.12 "$GITHUB_ACTION_PATH/../.."
     - id: select
       name: Select tests

@@ -1,6 +1,6 @@
-"""Run the README Quickstart exactly as written, then check its result.
+"""Run the README Quickstart, then check its result.
 
-    python scripts/run_quickstart.py [--port N] [--keep] [--bash PATH]
+    python scripts/run_quickstart.py [--published] [--port N] [--keep] [--bash PATH]
 
 Takes the README's ```` ```sh quickstart ```` blocks in order and runs them in ONE bash (a
 block's ``cd`` and ``export`` carry on), from the repo root, with ``set -euo pipefail``. Then
@@ -8,6 +8,12 @@ checks the selection the last block wrote (``selected.sh``) and prints each bloc
 time and the total. On failure it prints the server's logs; ``docker compose down -v`` at the
 end, unless ``--keep``. CI runs it in a fresh checkout (.github/workflows/quickstart.yml).
 Needs bash, Docker, git, uv, curl, openssl.
+
+The README installs the RELEASED siftwise: the published server image and the CLI from PyPI.
+By default the run tests THIS checkout instead, so a pull request's code is what runs: two
+exact rewrites (``FROM_CHECKOUT``: the image is built, ``--build``, under its own name,
+``CHECKOUT_IMAGE``; the CLI is installed from ``.``), each of which must match its blocks once.
+``--published`` runs the blocks unchanged (after a release, to check what users get).
 
 Only the setup a reader already has is added: a git identity, and uv's tool directory on PATH.
 The server runs as its own compose project with its own volume (``ISOLATED``), so a run in a
@@ -37,6 +43,13 @@ ISOLATED = {
     "COMPOSE_PROJECT_NAME": "siftwise-quickstart",
     "SIFTWISE_PG_VOLUME": "siftwise_quickstart_pgdata",
 }
+# Default runs: the README's published install -> this checkout's code.
+FROM_CHECKOUT = {
+    "docker compose up -d --wait": "docker compose up -d --build --wait",
+    "uv tool install siftwise ": "uv tool install . ",
+}
+# The local build's name, so it never replaces the published image's tag (docker-compose.yml).
+CHECKOUT_IMAGE = "siftwise-quickstart:checkout"
 
 PRELUDE = """\
 set -euo pipefail
@@ -64,6 +77,16 @@ def blocks(readme: str) -> list[str]:
     return found
 
 
+def from_checkout(found: list[str]) -> list[str]:
+    """The blocks with ``FROM_CHECKOUT``'s rewrites; each must match exactly once."""
+    rewritten = list(found)
+    for old, new in FROM_CHECKOUT.items():
+        if sum(block.count(old) for block in rewritten) != 1:
+            raise SystemExit(f"run_quickstart: expected {old!r} once in the quickstart blocks")
+        rewritten = [block.replace(old, new) for block in rewritten]
+    return rewritten
+
+
 def script(found: list[str], port: int | None) -> str:
     parts = [PRELUDE, "__total=$SECONDS\n"]
     for n, block in enumerate(found, 1):
@@ -84,6 +107,11 @@ def script(found: list[str], port: int | None) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--published",
+        action="store_true",
+        help="run the blocks as written: the published image and the CLI from PyPI",
+    )
     parser.add_argument("--port", type=int, help="publish the server on this port, not 8000")
     parser.add_argument("--keep", action="store_true", help="leave the server running")
     parser.add_argument("--bash", default="bash", help="the bash to run the blocks with")
@@ -91,6 +119,9 @@ def main() -> None:
 
     found = blocks((ROOT / "README.md").read_text(encoding="utf-8"))
     env = {**os.environ, **ISOLATED}
+    if not args.published:
+        found = from_checkout(found)
+        env["SIFTWISE_IMAGE"] = CHECKOUT_IMAGE
     if args.port is not None:
         env["SIFTWISE_PORT"] = str(args.port)
         env["SIFTWISE_SERVER"] = f"http://localhost:{args.port}"
@@ -109,8 +140,9 @@ def main() -> None:
             subprocess.run([*compose, "logs", "--tail", "200"], cwd=ROOT, env=env, check=False)
         if not args.keep:
             subprocess.run([*compose, "down", "-v"], cwd=ROOT, env=env, check=False)
-    print(f"run_quickstart: {len(found)} blocks, {time.monotonic() - started:.0f} s in all, "
-          f"exit {returncode}")  # fmt: skip
+    source = "published" if args.published else "this checkout"
+    print(f"run_quickstart: {len(found)} blocks ({source}), "
+          f"{time.monotonic() - started:.0f} s in all, exit {returncode}")  # fmt: skip
     sys.exit(returncode)
 
 
