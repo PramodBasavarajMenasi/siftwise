@@ -582,6 +582,9 @@ or a project `.mcp.json`, which expands `${VAR}` from your environment:
 }
 ```
 
+> Tested with Claude Code. The Codex and Cursor configs follow each tool's MCP format but
+> haven't been tested yet. Reports welcome.
+
 **Codex** (`~/.codex/config.toml`):
 
 ```toml
