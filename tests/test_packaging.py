@@ -3,6 +3,7 @@ say how to install it. CI's package job checks the same against real wheels."""
 
 import importlib
 import importlib.resources
+import re
 import subprocess
 import sys
 import textwrap
@@ -89,7 +90,7 @@ def test_server_commands_without_the_extra_say_how_to_install_it(command: str) -
     assert int(code) == EXIT_USAGE
     assert "`siftwise server` needs the server dependencies" in output
     assert "pip install 'siftwise[server]'" in output
-    assert 'uv tool install ".[server]"' in output
+    assert "uv tool install 'siftwise[server]'" in output
 
 
 def test_importing_the_api_without_the_extra_says_how_to_install_it() -> None:
@@ -182,6 +183,30 @@ def test_version_flag_in_the_light_install() -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"{siftwise.__version__}\n"
+
+
+def test_the_quickstart_uses_the_released_image() -> None:
+    # The quickstart (docker-compose.yml) and the README name one published image; a release
+    # (not a dev or pre-release version) must point them at its own version.
+    image = re.compile(r"ghcr\.io/pramodbasavarajmenasi/siftwise:([\w.\-]+)")
+    compose = image.findall((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    readme = image.findall((ROOT / "README.md").read_text(encoding="utf-8"))
+
+    assert len(compose) == 1 and readme
+    assert set(readme) == set(compose)
+    if not Version(siftwise.__version__).is_prerelease:
+        assert compose == [siftwise.__version__]
+
+
+def test_the_readme_links_are_absolute_for_pypi() -> None:
+    # README.md is the PyPI project page, where relative links and images break.
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    prose = re.sub(r"^```.*?^```", "", readme, flags=re.MULTILINE | re.DOTALL)
+    links = re.findall(r"\]\(([^)\s]+)\)", prose)
+    links += re.findall(r'(?:src|href|srcset)="([^"]+)"', prose)
+
+    relative = [link for link in links if not link.startswith(("https://", "#", "mailto:"))]
+    assert links and not relative
 
 
 def test_the_light_dependencies_are_only_the_cli_ones() -> None:

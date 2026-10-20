@@ -13,6 +13,12 @@ dependencies = [
     "defusedxml>=0.7.1",
 ]
 
+[project.urls]
+Homepage = "https://github.com/PramodBasavarajMenasi/siftwise"
+Documentation = "https://github.com/PramodBasavarajMenasi/siftwise#readme"
+Changelog = "https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CHANGELOG.md"
+Issues = "https://github.com/PramodBasavarajMenasi/siftwise/issues"
+
 [project.optional-dependencies]
 # The API server: `siftwise server start|migrate`.
 server = [

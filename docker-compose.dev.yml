@@ -1,8 +1,11 @@
 # Development, on top of the quickstart file:
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 # Publishes Postgres on 5432 (the tests' SIFTWISE_TEST_DATABASE_URL) and creates the
-# siftwise_test database when the volume is first created (docker/initdb).
+# siftwise_test database when the volume is first created (docker/initdb). The API is built from
+# the checkout as siftwise:dev, so it never replaces the published image's tag.
 services:
+  api:
+    image: siftwise:dev
   postgres:
     ports:
       - "5432:5432"

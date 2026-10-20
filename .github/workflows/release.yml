@@ -1,8 +1,10 @@
 name: Release
 
 # On a version tag (v0.1.0.dev0, v0.1.0, ...): check the tag matches __version__, build and check
-# the distributions, publish them to TestPyPI with trusted publishing (no stored token; the
-# `testpypi` environment), and push the server image to GHCR (linux/amd64).
+# the distributions, publish them with trusted publishing (no stored token), and push the server
+# image to GHCR (linux/amd64) once the distributions passed their checks.
+# Dev and pre-release versions (.devN, aN, bN, rcN) go to TestPyPI (environment `testpypi`),
+# every other version to PyPI (environment `pypi`). Only X.Y.Z moves the image's `latest`.
 on:
   push:
     tags: ["v*"]
@@ -21,6 +23,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       stable: ${{ steps.version.outputs.stable }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
       image: ${{ steps.version.outputs.image }}
     steps:
       - uses: actions/checkout@v7
@@ -34,9 +37,17 @@ jobs:
           fi
           # Only a final release (X.Y.Z) moves `latest`; dev, alpha, beta and rc versions don't.
           if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then stable=true; else stable=false; fi
+          # Dev and pre-releases go to TestPyPI, never PyPI (post-releases go to PyPI).
+          if [[ "$version" =~ (\.dev|a|b|rc)[0-9]+ ]]; then prerelease=true; else prerelease=false; fi
           # GHCR image names must be lower-case.
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/siftwise"
-          { echo "version=$version"; echo "stable=$stable"; echo "image=$image"; } >> "$GITHUB_OUTPUT"
+          echo "$version: stable=$stable prerelease=$prerelease"
+          {
+            echo "version=$version"
+            echo "stable=$stable"
+            echo "prerelease=$prerelease"
+            echo "image=$image"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     name: build and check the distributions
@@ -63,6 +74,7 @@ jobs:
   testpypi:
     name: publish to TestPyPI
     needs: [check, build]
+    if: needs.check.outputs.prerelease == 'true'
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -79,9 +91,28 @@ jobs:
         with:
           repository-url: https://test.pypi.org/legacy/
 
+  pypi:
+    name: publish to PyPI
+    needs: [check, build]
+    if: needs.check.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/siftwise/${{ needs.check.outputs.version }}/
+    permissions:
+      id-token: write  # trusted publishing: PyPI trusts this workflow + environment
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
   image:
     name: push the server image to GHCR
-    needs: check
+    # After the distributions passed check_dist: a broken build publishes nothing.
+    needs: [check, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read

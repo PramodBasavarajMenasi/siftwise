@@ -1,9 +1,8 @@
-# The quickstart: the siftwise server plus Postgres, `docker compose up -d --build --wait`.
+# The quickstart: the siftwise server plus Postgres, `docker compose up -d --wait`.
 # Reads SIFTWISE_API_TOKEN (required) from .env next to this file; see the README Quickstart.
 # Only the API is published, on 127.0.0.1 (SIFTWISE_PORT, default 8000); Postgres stays inside.
+# The API is the published image; `--build` builds it from this checkout instead.
 # Development adds docker-compose.dev.yml (Postgres on 5432 and the test database).
-# TODO(after the first release): use ghcr.io/pramodbasavarajmenasi/siftwise:<version> instead
-# of building locally.
 name: siftwise
 
 services:
@@ -24,6 +23,10 @@ services:
     restart: unless-stopped
 
   api:
+    # The release's image (keep the tag = __version__ at release: tests/test_packaging.py).
+    # Compose pulls it, and builds from this checkout only if the pull fails or with --build.
+    # SIFTWISE_IMAGE names a local build instead (scripts/run_quickstart.py, the dev file).
+    image: ${SIFTWISE_IMAGE:-ghcr.io/pramodbasavarajmenasi/siftwise:0.1.0}
     build: .
     environment:
       SIFTWISE_DATABASE_URL: postgresql+psycopg://siftwise:${POSTGRES_PASSWORD:-siftwise}@postgres:5432/siftwise

@@ -45,8 +45,11 @@ To run the whole stack in Docker instead (the API image too):
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 ```
 
-Rebuild with `--build` after pulling: an old API image can't find newer migrations, fails
-with `Can't locate revision ...` and restarts in a loop.
+The dev file builds the API image from your checkout as `siftwise:dev`, so it never replaces
+the published image the quickstart uses. Rebuild with `--build` after pulling: an old API image
+can't find newer migrations, fails with `Can't locate revision ...` and restarts in a loop. For
+the same reason, don't point plain `docker compose up` (the released image) at a dev database
+that has newer migrations.
 
 ## Checks
 
@@ -82,14 +85,19 @@ runs them in one bash, and checks the selection the last block wrote. Change the
 commands, and this script and `tests/test_run_quickstart.py` check them.
 
 ```sh
-python scripts/run_quickstart.py              # CI's run
+python scripts/run_quickstart.py              # CI's run: this checkout's code
 python scripts/run_quickstart.py --port 8001  # locally, when port 8000 is taken
+python scripts/run_quickstart.py --published  # the blocks as written: the released image + PyPI
 ```
 
+- The README installs the release: the published image and `uv tool install siftwise`. By
+  default the script tests the checkout instead, with two exact rewrites: `docker compose up
+  -d --wait` gets `--build` (the image is tagged `siftwise-quickstart:checkout`) and the CLI is
+  installed with `uv tool install .`. If the README stops matching either, the script stops.
 - It always runs as its own compose project (`siftwise-quickstart`) with its own volume, and
   ends with `docker compose down -v`, so it never touches your dev stack's data.
-- It installs the CLI with `uv tool install .`: run it with `UV_TOOL_DIR` and
-  `UV_TOOL_BIN_DIR` pointing elsewhere if you don't want your installed `siftwise` replaced.
+- It installs the CLI as a uv tool: run it with `UV_TOOL_DIR` and `UV_TOOL_BIN_DIR` pointing
+  elsewhere if you don't want your installed `siftwise` replaced.
 - On Windows, pass Git Bash: `--bash "C:/Program Files/Git/bin/bash.exe"` (plain `bash` may
   be WSL's).
 
@@ -140,6 +148,23 @@ uv run python -m scripts.eval.run_eval --repo RDFLib/rdflib --language python --
 
 Each repo's exact commands are in its "Reproducing" section of
 [docs/eval-results.md](docs/eval-results.md).
+
+## Releasing
+
+For maintainers. [release.yml](.github/workflows/release.yml) runs on a `v*` tag: it checks the
+tag is `v` + `__version__`, builds and checks the distributions, publishes them with trusted
+publishing (dev and pre-releases to TestPyPI, other versions to PyPI), then pushes the server
+image to GHCR.
+
+1. Set `__version__` in `src/siftwise/__init__.py`, the image tag in `docker-compose.yml` and
+   the README (`tests/test_packaging.py` checks they agree), and add the version to
+   [CHANGELOG.md](CHANGELOG.md).
+2. Merge, then tag the merge commit: `git tag -a vX.Y.Z -m "siftwise X.Y.Z"` and
+   `git push origin vX.Y.Z`.
+3. If the `pypi` (or `testpypi`) environment has required reviewers, approve the deployment
+   when the run waits for it.
+4. Afterwards: `python scripts/run_quickstart.py --published`, and a GitHub Release with the
+   changelog's notes.
 
 ## Conventions
 

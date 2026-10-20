@@ -402,7 +402,7 @@ def test_mcp_command_without_the_extra_exits_2(monkeypatch: pytest.MonkeyPatch) 
 
     assert result.exit_code == EXIT_USAGE
     assert "pip install 'siftwise[mcp]'" in result.output
-    assert 'uv tool install ".[mcp]"' in result.output
+    assert "uv tool install 'siftwise[mcp]'" in result.output
 
 
 def test_mcp_serves_over_stdio(tmp_path: Path) -> None:
