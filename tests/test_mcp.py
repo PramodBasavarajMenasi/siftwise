@@ -11,11 +11,13 @@ from typing import Any
 import httpx
 import pytest
 import respx
-from mcp import Client, StdioServerParameters
+from mcp import Client, StdioServerParameters, types
 from typer.testing import CliRunner
 
+import siftwise
 from siftwise.cli.main import EXIT_USAGE, app
-from siftwise.mcp.server import MAX_OUTPUT_CHARS, build_server
+from siftwise.mcp import server as mcp_server
+from siftwise.mcp.server import MAX_OUTPUT_CHARS, TIMEOUT, build_server
 
 SERVER = "http://siftwise.test"
 TOKEN = "s3cret-token-value"
@@ -388,6 +390,284 @@ def test_explain_fails_open(api: respx.MockRouter) -> None:
 
     assert out["available"] is False
     assert "siftwise unavailable" in out["message"]
+
+
+# --- clients: schemas, where the server runs ----------------------------------------------
+
+
+def test_the_server_reports_its_version() -> None:
+    # Clients show it in their server lists; bug reports need it.
+    async def go() -> Any:
+        async with Client(build_server(ENV)) as client:
+            return client.server_info
+
+    info = asyncio.run(go())
+
+    assert (info.name, info.version) == ("siftwise", siftwise.__version__)
+
+
+def test_tool_schemas_are_plain_for_every_client() -> None:
+    # Every parameter described (clients show and send only the schema); no anyOf/null, which
+    # some clients' schema converters (Codex, Gemini for Vertex AI) mishandle.
+    async def go() -> Any:
+        async with Client(build_server(ENV)) as client:
+            return {t.name: t.input_schema for t in (await client.list_tools()).tools}
+
+    schemas = asyncio.run(go())
+
+    for name, schema in schemas.items():
+        text = json.dumps(schema)
+        assert "anyOf" not in text and "null" not in text, name
+        for param, prop in schema["properties"].items():
+            assert prop.get("description") and prop.get("type"), (name, param)
+        assert "repo_path" in schema["properties"], name
+    assert schemas["explain"]["required"] == ["test_id"]
+    failure = schemas["triage_failure"]["properties"]["failures"]["items"]
+    assert (failure["type"], failure["required"]) == ("object", ["test_id"])
+
+
+@pytest.mark.usefixtures("checkout")
+def test_optional_arguments_accept_null(api: respx.MockRouter) -> None:
+    # Some clients send null for every optional argument they don't fill in.
+    route = api.post(f"{SERVER}/triage").respond(json=triage_response())
+    args = {"junit_paths": None, "base": None, "variant": None, "repo_path": None}
+
+    call("triage_failure", {**args, "failures": [{"test_id": "a::b", "message": None}]})
+
+    assert sent(route)["failures"] == [{"test_id": "a::b", "message": None}]
+
+
+@pytest.fixture
+def elsewhere(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A working directory outside any git repository (as when a client starts the server in
+    the home directory)."""
+    outside = tmp_path_factory.mktemp("home")
+    monkeypatch.chdir(outside)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(outside.parent))  # no parent repo either
+    return outside
+
+
+@pytest.mark.usefixtures("elsewhere")
+def test_outside_a_repository_every_tool_says_how_to_fix_it(api: respx.MockRouter) -> None:
+    select = call("select_tests")
+    triage = call("triage_failure", {"failures": [{"test_id": "a::b"}]})
+    explained = call("explain", {"test_id": "a::b"})
+    reports = call("triage_failure", {"junit_paths": ["junit.xml"]})
+
+    assert (select["mode"], select["command"]) == ("full", "")
+    for message in (select["reason"], triage["message"], explained["message"], reports["message"]):
+        assert "is not inside a git repository" in message
+        assert "repo_path" in message and "SIFTWISE_REPO_PATH" in message
+    assert triage["verdicts_available"] is False and triage["failures"] == ["a::b"]
+    assert explained["available"] is False
+    assert reports["verdicts_available"] is False  # not a confusing "file not found"
+    assert not api.calls  # nothing sent
+
+
+def test_repo_path_from_the_environment(
+    checkout: Path, elsewhere: Path, api: respx.MockRouter
+) -> None:
+    select_route = api.post(f"{SERVER}/select").respond(json=selection())
+    triage_route = api.post(f"{SERVER}/triage").respond(json=triage_response())
+    env = {**ENV, "SIFTWISE_REPO_PATH": str(checkout)}
+
+    out = call("select_tests", env=env)
+    call("triage_failure", {"junit_paths": ["junit.xml"]}, env=env)  # relative to the repo
+
+    body = sent(select_route)
+    assert out["mode"] == "selective"
+    assert body["repo"] == "acme/shop"
+    assert body["changed_files"] == ["src/cart.py", "src/db.py", "junit.xml", "src/new.py"]
+    assert [f["test_id"] for f in sent(triage_route)["failures"]] == ["tests.test_cart::test_total"]
+
+
+def test_the_repo_path_argument_wins(
+    checkout: Path, elsewhere: Path, api: respx.MockRouter
+) -> None:
+    route = api.post(f"{SERVER}/explain").mock(side_effect=[httpx.ConnectError("refused")])
+    env = {**ENV, "SIFTWISE_REPO_PATH": str(elsewhere)}  # not a repository
+
+    out = call("explain", {"test_id": "a::b", "repo_path": str(checkout / "src")}, env=env)
+
+    assert route.called  # got as far as the API: the checkout was found from a subdirectory
+    assert "could not reach siftwise" in out["message"]
+
+
+@pytest.mark.usefixtures("elsewhere")
+def test_a_repo_path_that_is_not_a_directory(tmp_path: Path, api: respx.MockRouter) -> None:
+    out = call("select_tests", {"repo_path": str(tmp_path / "nope")})
+
+    assert out["mode"] == "full"
+    assert f"repo_path {tmp_path / 'nope'} is not a directory" in out["reason"]
+
+
+# The order: repo_path, SIFTWISE_REPO_PATH, CLAUDE_PROJECT_DIR, the client's roots, the working
+# directory. Each repo below has its own origin, so the repo sent to /select tells which won.
+
+
+def make_repo(path: Path, name: str) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    git(path, "init", "-q", "-b", "main")
+    git(path, "remote", "add", "origin", f"git@github.com:acme/{name}.git")
+    return path
+
+
+@pytest.fixture
+def repos(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Four repos, the working directory in the "cwd" one."""
+    base = tmp_path_factory.mktemp("repos")
+    made = {name: make_repo(base / name, name) for name in ("arg", "env", "claude", "root", "cwd")}
+    monkeypatch.chdir(made["cwd"])
+    return made
+
+
+class Roots:
+    """A client's roots/list handler that records whether it was asked."""
+
+    def __init__(self, *paths: Path | str, error: bool = False, delay: float = 0) -> None:
+        self.uris = [p if isinstance(p, str) else p.as_uri() for p in paths]
+        self.error, self.delay, self.asked = error, delay, 0
+
+    async def __call__(self, context: Any) -> Any:
+        self.asked += 1
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error:
+            return types.ErrorData(code=-32601, message="no roots here")
+        return types.ListRootsResult(roots=[types.Root(uri=u) for u in self.uris])
+
+
+def call_client(
+    tool: str, args: dict[str, Any], env: dict[str, str], roots: Roots | None = None
+) -> Any:
+    """Like ``call``, over the handshake protocol real clients use, optionally with roots."""
+
+    async def go() -> Any:
+        # No callback: the client doesn't declare the roots capability.
+        async with Client(build_server(env), mode="legacy", list_roots_callback=roots) as client:
+            result = await client.call_tool(tool, args)
+            assert not result.is_error, result.content
+            return result.structured_content
+
+    return asyncio.run(go())
+
+
+def selected_repo(api: respx.MockRouter, env: dict[str, str], roots: Roots | None = None,
+                  args: dict[str, Any] | None = None) -> str:  # fmt: skip
+    route = api.post(f"{SERVER}/select").respond(json=selection())
+    out = call_client("select_tests", args or {}, env, roots)
+    assert route.called, out
+    return str(sent(route)["repo"])
+
+
+def test_order_the_repo_path_argument_first(repos: dict[str, Path], api: respx.MockRouter) -> None:
+    env = {
+        **ENV,
+        "SIFTWISE_REPO_PATH": str(repos["env"]),
+        "CLAUDE_PROJECT_DIR": str(repos["claude"]),
+    }
+    roots = Roots(repos["root"])
+
+    repo = selected_repo(api, env, roots, {"repo_path": str(repos["arg"])})
+
+    assert repo == "acme/arg"
+    assert roots.asked == 0
+
+
+def test_order_then_siftwise_repo_path(repos: dict[str, Path], api: respx.MockRouter) -> None:
+    env = {
+        **ENV,
+        "SIFTWISE_REPO_PATH": str(repos["env"]),
+        "CLAUDE_PROJECT_DIR": str(repos["claude"]),
+    }
+    roots = Roots(repos["root"])
+
+    assert selected_repo(api, env, roots) == "acme/env"
+    assert roots.asked == 0
+
+
+def test_order_then_claude_project_dir(repos: dict[str, Path], api: respx.MockRouter) -> None:
+    roots = Roots(repos["root"])
+
+    assert selected_repo(api, {**ENV, "CLAUDE_PROJECT_DIR": str(repos["claude"])}, roots) == (
+        "acme/claude"
+    )
+    assert roots.asked == 0  # an explicit location: the client is never asked
+
+
+def test_order_then_the_first_root_in_a_git_repository(
+    repos: dict[str, Path], tmp_path: Path, api: respx.MockRouter
+) -> None:
+    not_a_repo = tmp_path / "docs"
+    not_a_repo.mkdir()
+    roots = Roots(not_a_repo, repos["root"] / "sub", repos["env"])  # (the spec: file:// only)
+    (repos["root"] / "sub").mkdir()
+
+    assert selected_repo(api, ENV, roots) == "acme/root"  # a subdirectory finds its repo
+    assert roots.asked == 1
+
+
+def test_order_then_the_working_directory(repos: dict[str, Path], api: respx.MockRouter) -> None:
+    assert selected_repo(api, ENV) == "acme/cwd"  # a client without roots: as before
+    assert selected_repo(api, ENV, Roots()) == "acme/cwd"  # roots, but none
+
+
+@pytest.mark.parametrize("roots", [Roots(error=True), Roots(delay=1.0)], ids=["error", "timeout"])
+def test_roots_that_fail_fall_back_to_the_working_directory(
+    repos: dict[str, Path], api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, roots: Roots
+) -> None:
+    monkeypatch.setattr(mcp_server, "ROOTS_TIMEOUT", 0.2)
+
+    assert selected_repo(api, ENV, roots) == "acme/cwd"
+    assert roots.asked == 1
+
+
+@pytest.mark.usefixtures("elsewhere")
+def test_roots_outside_any_repository_are_named(tmp_path: Path, api: respx.MockRouter) -> None:
+    docs = tmp_path / "docs"
+    docs.mkdir()
+
+    out = call_client("select_tests", {}, ENV, Roots(docs))
+
+    assert out["mode"] == "full"
+    assert f"none of the client's roots ({docs}) is in a git repository" in out["reason"]
+    assert "repo_path" in out["reason"] and not api.calls
+
+
+def test_the_handshake_without_roots_never_asks(
+    repos: dict[str, Path], api: respx.MockRouter
+) -> None:
+    # The SDK refuses a server request the client didn't declare; it must never get that far.
+    route = api.post(f"{SERVER}/explain").respond(json={"detail": "x"}, status_code=404)
+
+    out = call_client("explain", {"test_id": "a::b"}, ENV)
+
+    assert route.called and out["available"] is False
+
+
+@pytest.mark.parametrize(
+    ("uri", "expected"),
+    [
+        ("file:///home/me/my%20repo", "/home/me/my repo"),
+        ("file:///C:/Users/me/repo", "C:/Users/me/repo" if sys.platform == "win32" else None),
+        ("https://example.com/repo", None),
+    ],
+)
+def test_root_uris_become_local_paths(uri: str, expected: str | None) -> None:
+    path = mcp_server._root_path(uri)
+
+    if expected is None and uri.startswith("file:"):
+        assert path is not None  # a POSIX reading of a Windows URI: some path, no crash
+    elif expected is None:
+        assert path is None
+    else:
+        assert path == Path(expected)
+
+
+def test_api_calls_end_before_the_clients_tool_timeouts() -> None:
+    # Codex gives a tool call 60 s by default: a hung server must still get the agent the
+    # fail-open answer, not a client-side timeout.
+    assert TIMEOUT <= 30
 
 
 # --- the command --------------------------------------------------------------------------

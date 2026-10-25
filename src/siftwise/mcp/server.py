@@ -7,8 +7,19 @@ records runs.
 
 Configuration comes from the environment, read on every call: ``SIFTWISE_SERVER`` (default
 ``http://localhost:8000``), ``SIFTWISE_API_TOKEN``, and optionally ``SIFTWISE_REPO`` (else
-``owner/name`` from the ``origin`` remote) and ``SIFTWISE_BASE_REF`` (else the branch
-``origin/HEAD`` points to, else ``main``).
+``owner/name`` from the ``origin`` remote), ``SIFTWISE_BASE_REF`` (else the branch
+``origin/HEAD`` points to, else ``main``) and ``SIFTWISE_REPO_PATH``.
+
+The repository, first that applies: the tool's ``repo_path`` argument, ``SIFTWISE_REPO_PATH``,
+``CLAUDE_PROJECT_DIR`` (set by Claude Code), the first of the client's MCP roots that is in a
+git repository (asked only when the client declared the roots capability), else the server's
+working directory. Clients start stdio servers where they like (VS Code in the workspace,
+others in the home directory), so outside a git repository every tool says how to point
+siftwise at one. Git runs in that directory; nothing changes the process's directory (the
+blocking work runs in worker threads, in parallel).
+
+Schemas are kept plain for every client: each parameter has a description, and optional ones
+are plain JSON types (no ``anyOf`` with null), which some clients' converters mishandle.
 
 By default the change includes uncommitted work (``include_uncommitted``): the diff runs from
 the merge base of the base branch and HEAD to the working tree, untracked files included.
@@ -24,14 +35,22 @@ from __future__ import annotations
 import json
 import logging
 import os
+import urllib.parse
+import urllib.request
+import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
+import anyio
+import anyio.to_thread
 import httpx
-from mcp.server.mcpserver import MCPServer
+from mcp import MCPDeprecationWarning
+from mcp.server.mcpserver import Context, MCPServer
+from pydantic import Field
 
+from siftwise import __version__
 from siftwise.cli import main as cli
 from siftwise.cli.repoconfig import RepoConfigError
 from siftwise.core.junit import JUnitParseError
@@ -40,7 +59,19 @@ from siftwise.core.junit import JUnitParseError
 MAX_OUTPUT_CHARS = 8000
 MAX_REASON_CHARS = 200
 DEFAULT_SERVER = "http://localhost:8000"
-TIMEOUT = 60.0
+# API calls: under the clients' own tool-call timeouts (Codex: 60 s by default), so a
+# hung server still gets the fail-open answer back to the agent.
+TIMEOUT = 30.0
+# Asking the client for its roots: a client that declares roots but never answers must not
+# hold up the tool.
+ROOTS_TIMEOUT = 5.0
+NOT_A_REPO = (
+    "is not inside a git repository: call again with repo_path set to the repository's "
+    "absolute path, or set SIFTWISE_REPO_PATH (or the client's working directory for the "
+    "server) to it"
+)
+
+logger = logging.getLogger(__name__)
 
 # Work first: what the agent should fix, then what to look at, then what to leave alone.
 VERDICT_ORDER = ("new_regression", "unknown", "flaky", "pre_existing")
@@ -79,6 +110,10 @@ class Config:
     token: str
     repo: str | None
     base: str | None
+    # The checkout, when the client starts the server elsewhere (SIFTWISE_REPO_PATH).
+    repo_path: str | None = None
+    # The project Claude Code started the server for (it sets CLAUDE_PROJECT_DIR).
+    project_dir: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Config:
@@ -87,58 +122,150 @@ class Config:
             token=env.get("SIFTWISE_API_TOKEN") or "",
             repo=env.get("SIFTWISE_REPO") or None,
             base=env.get("SIFTWISE_BASE_REF") or None,
+            repo_path=env.get("SIFTWISE_REPO_PATH") or None,
+            project_dir=env.get("CLAUDE_PROJECT_DIR") or None,
         )
+
+
+@dataclass(frozen=True)
+class Where:
+    """What a tool call knows about where the repository is: the ``repo_path`` argument and
+    the client's roots (MCP roots, asked only when nothing before them in the order applies)."""
+
+    repo_path: str | None = None
+    roots: tuple[Path, ...] = ()
 
 
 class Unavailable(Exception):
     """siftwise can't answer: no token, no repo, the server is down or errors."""
 
 
+def _plain(**schema: Any) -> Callable[[dict[str, Any]], None]:
+    """``json_schema_extra`` for an optional parameter: the plain JSON type, no ``anyOf`` with
+    null and no null default. Codex's converter gives a schema without ``type`` the type
+    string (openai/codex#1975, test_mcp_tool_anyof_defaults_to_string); Gemini CLI edits
+    ``anyOf`` entries for Vertex AI (its MCP docs). The Python side still accepts null."""
+
+    def edit(field: dict[str, Any]) -> None:
+        field.pop("anyOf", None)
+        if field.get("default", "") is None:
+            del field["default"]
+        field.update(schema)
+
+    return edit
+
+
+STRING = _plain(type="string")
+# Parameters every tool takes, described in the schema: clients show and send only that.
+Base = Annotated[
+    str | None,
+    Field(
+        description="Branch or ref the change is diffed against (default: SIFTWISE_BASE_REF, "
+        "else the branch origin/HEAD points to, else main).",
+        json_schema_extra=STRING,
+    ),
+]
+Uncommitted = Annotated[
+    bool, Field(description="Include staged, unstaged and untracked changes in the change.")
+]
+Variant = Annotated[
+    str | None,
+    Field(
+        description="CI matrix leg to compare with (e.g. ubuntu-py3.12), if the repo has several.",
+        json_schema_extra=STRING,
+    ),
+]
+RepoPath = Annotated[
+    str | None,
+    Field(
+        description="Absolute path of the repository. Only needed when siftwise says it isn't "
+        "running in a git repository (default: SIFTWISE_REPO_PATH, CLAUDE_PROJECT_DIR, the "
+        "client's workspace roots, else the server's working directory).",
+        json_schema_extra=STRING,
+    ),
+]
+FAILURE_ITEM = {
+    "type": "object",
+    "properties": {
+        "test_id": {"type": "string", "description": "classname::name, e.g. tests.test_x::test_y"},
+        "message": {"type": "string", "description": "the failure message (optional)"},
+    },
+    "required": ["test_id"],
+}
+
+
 def build_server(env: Mapping[str, str] | None = None) -> MCPServer:
     """The MCP server. ``env`` (default: the process environment, read on every call)."""
-    server = MCPServer("siftwise", instructions=INSTRUCTIONS)
+    # The version shows in clients' server lists (and in bug reports).
+    server = MCPServer("siftwise", instructions=INSTRUCTIONS, version=__version__)
 
     def config() -> Config:
         return Config.from_env(os.environ if env is None else env)
 
     @server.tool(description=SELECT_DESCRIPTION)
-    def select_tests(
-        base: str | None = None, include_uncommitted: bool = True, max_tests: int = 50
+    async def select_tests(
+        ctx: Context,
+        base: Base = None,
+        include_uncommitted: Uncommitted = True,
+        max_tests: Annotated[
+            int,
+            Field(
+                description="List at most this many tests (the command still runs all of them).",
+                ge=0,
+            ),
+        ] = 50,
+        repo_path: RepoPath = None,
     ) -> dict[str, Any]:
-        """base: branch or ref to diff against (default: the repo's main branch).
-        include_uncommitted: include staged, unstaged and untracked changes.
-        max_tests: at most this many tests listed (the command still runs all of them)."""
-        return _guarded(config(), lambda c: _select(c, base, include_uncommitted, max_tests))
+        c = config()
+        where = await _where(c, repo_path, ctx)
+        return await _run(c, lambda c: _select(c, where, base, include_uncommitted, max_tests))
 
     @server.tool(description=TRIAGE_DESCRIPTION)
-    def triage_failure(
-        junit_paths: list[str] | None = None,
-        failures: list[dict[str, str]] | None = None,
-        base: str | None = None,
-        variant: str | None = None,
-        include_uncommitted: bool = True,
+    async def triage_failure(
+        ctx: Context,
+        junit_paths: Annotated[
+            list[str] | None,
+            Field(
+                description="JUnit XML reports written by the test run: absolute paths, or "
+                "relative to the repository root.",
+                json_schema_extra=_plain(type="array", items={"type": "string"}),
+            ),
+        ] = None,
+        failures: Annotated[
+            list[dict[str, str | None]] | None,
+            Field(
+                description='Failing tests, if there is no JUnit report: [{"test_id": ..., '
+                '"message": ...}], message optional.',
+                json_schema_extra=_plain(type="array", items=FAILURE_ITEM),
+            ),
+        ] = None,
+        base: Base = None,
+        variant: Variant = None,
+        include_uncommitted: Uncommitted = True,
+        repo_path: RepoPath = None,
     ) -> dict[str, Any]:
-        """junit_paths: JUnit XML files written by the test run.
-        failures: failing tests as {"test_id": ..., "message": ...} (message optional).
-        base: branch or ref the change is diffed against (default: the repo's main branch).
-        variant: CI matrix leg to compare with (e.g. ubuntu-py3.12), if the repo has several."""
-        return _guarded(
-            config(),
-            lambda c: _triage(c, junit_paths, failures, base, variant, include_uncommitted),
+        c = config()
+        where = await _where(c, repo_path, ctx)
+        return await _run(
+            c,
+            lambda c: _triage(c, where, junit_paths, failures, base, variant, include_uncommitted),
         )
 
     @server.tool(description=EXPLAIN_DESCRIPTION)
-    def explain(
-        test_id: str,
-        base: str | None = None,
-        variant: str | None = None,
-        include_uncommitted: bool = True,
+    async def explain(
+        ctx: Context,
+        test_id: Annotated[
+            str, Field(description="The test, as siftwise names it: classname::name.")
+        ],
+        base: Base = None,
+        variant: Variant = None,
+        include_uncommitted: Uncommitted = True,
+        repo_path: RepoPath = None,
     ) -> dict[str, Any]:
-        """test_id: the test, as siftwise names it (classname::name).
-        base: branch or ref the change is diffed against (default: the repo's main branch).
-        variant: CI matrix leg for the broken-on-main evidence."""
-        return _guarded(
-            config(), lambda c: _explain(c, test_id, base, variant, include_uncommitted)
+        c = config()
+        where = await _where(c, repo_path, ctx)
+        return await _run(
+            c, lambda c: _explain(c, where, test_id, base, variant, include_uncommitted)
         )
 
     return server
@@ -147,11 +274,14 @@ def build_server(env: Mapping[str, str] | None = None) -> MCPServer:
 # --- tools --------------------------------------------------------------------------------
 
 
-def _select(config: Config, base: str | None, uncommitted: bool, max_tests: int) -> dict[str, Any]:
-    base = base or config.base or cli.default_base()
+def _select(
+    config: Config, where: Where, base: str | None, uncommitted: bool, max_tests: int
+) -> dict[str, Any]:
     try:
-        repo = _repo(config)
-        change = cli.local_change(base, "HEAD", working_tree=uncommitted)
+        root = _checkout(config, where)
+        base = base or config.base or cli.default_base(root)
+        repo = _repo(config, root)
+        change = cli.local_change(base, "HEAD", working_tree=uncommitted, cwd=root)
     except Unavailable as exc:
         return _run_full(str(exc))
     except RepoConfigError as exc:
@@ -188,22 +318,35 @@ def _select(config: Config, base: str | None, uncommitted: bool, max_tests: int)
 
 def _triage(
     config: Config,
+    where: Where,
     junit_paths: list[str] | None,
-    failures: list[dict[str, str]] | None,
+    failures: list[dict[str, str | None]] | None,
     base: str | None,
     variant: str | None,
     uncommitted: bool,
 ) -> dict[str, Any]:
-    found = []
-    try:
-        if junit_paths:
-            found.extend(cli.junit_failures([Path(p) for p in junit_paths]))
-    except (JUnitParseError, OSError) as exc:
-        return {"error": f"could not read the JUnit reports: {exc}"}
+    given = []
     for item in failures or []:
         if not isinstance(item, dict) or not str(item.get("test_id") or "").strip():
             return {"error": 'each failure needs a "test_id"'}
-        found.append({"test_id": str(item["test_id"]).strip(), "message": item.get("message")})
+        given.append({"test_id": str(item["test_id"]).strip(), "message": item.get("message")})
+    found: list[dict[str, Any]] = []
+    root: Path | None = None
+    problem: Unavailable | None = None
+    try:
+        root = _checkout(config, where)
+    except Unavailable as exc:
+        problem = exc
+    try:
+        if junit_paths:
+            # Relative paths are the repository's (the server may run elsewhere).
+            paths = [root / p if root else Path(p) for p in junit_paths]
+            found.extend(cli.junit_failures(paths))
+    except (JUnitParseError, OSError) as exc:
+        if problem is not None:  # most likely why: say how to point siftwise at the repo
+            return {"verdicts_available": False, "message": f"siftwise unavailable ({problem})"}
+        return {"error": f"could not read the JUnit reports: {exc}"}
+    found.extend(given)  # after the reports' failures, as before
     if not found:
         return {
             "verdicts_available": True,
@@ -213,21 +356,23 @@ def _triage(
     ids = list(dict.fromkeys(f["test_id"] for f in found))
 
     try:
-        repo, base = _repo(config), base or config.base or cli.default_base()
+        if root is None:
+            raise problem or Unavailable("no repository")
+        repo, base = _repo(config, root), base or config.base or cli.default_base(root)
         try:
-            change = cli.local_change(base, "HEAD", working_tree=uncommitted)
+            change = cli.local_change(base, "HEAD", working_tree=uncommitted, cwd=root)
         except RepoConfigError as exc:
             raise Unavailable(f"invalid .siftwise.toml ({exc})") from exc
-        dirty = cli.git_is_dirty()
+        dirty = cli.git_is_dirty(root)
         # Tests ran on the working tree: with uncommitted changes, no earlier run tested it.
-        commit = None if dirty or dirty is None else cli.git_head()
+        commit = None if dirty or dirty is None else cli.git_head(root)
         body = {
             "repo": repo,
             **change.fields,
             "commit_sha": commit,
             "variant": variant,
             # The base's list: an agent's own edit to known_flaky must not excuse its failures.
-            "known_flaky": list(cli.known_flaky(change.config, base).globs),
+            "known_flaky": list(cli.known_flaky(change.config, base, cwd=root).globs),
             "failures": found,
         }
         result = _post(config, "/triage", body)
@@ -254,19 +399,25 @@ def _triage(
 
 
 def _explain(
-    config: Config, test_id: str, base: str | None, variant: str | None, uncommitted: bool
+    config: Config,
+    where: Where,
+    test_id: str,
+    base: str | None,
+    variant: str | None,
+    uncommitted: bool,
 ) -> dict[str, Any]:
     try:
-        repo, base = _repo(config), base or config.base or cli.default_base()
+        root = _checkout(config, where)
+        repo, base = _repo(config, root), base or config.base or cli.default_base(root)
         try:
-            change = cli.local_change(base, "HEAD", working_tree=uncommitted)
+            change = cli.local_change(base, "HEAD", working_tree=uncommitted, cwd=root)
         except RepoConfigError as exc:
             raise Unavailable(f"invalid .siftwise.toml ({exc})") from exc
         body = {
             "repo": repo,
             **change.fields,
             "always_run": list(change.config.always_run),
-            "known_flaky": list(cli.known_flaky(change.config, base).globs),
+            "known_flaky": list(cli.known_flaky(change.config, base, cwd=root).globs),
             "test_id": test_id,
             "variant": variant,
         }
@@ -329,10 +480,102 @@ def _guarded(config: Config, tool: Callable[[Config], dict[str, Any]]) -> dict[s
     return _fit(_redact(result, config.token))
 
 
-def _repo(config: Config) -> str:
-    repo = config.repo or cli.origin_repo()
+async def _run(config: Config, tool: Callable[[Config], dict[str, Any]]) -> dict[str, Any]:
+    """``_guarded`` in a worker thread: git, the graphs and the API call block."""
+    return await anyio.to_thread.run_sync(_guarded, config, tool)
+
+
+def _given(config: Config, where: Where) -> tuple[str, str] | None:
+    """The first explicit location, as (its name, its value): the ``repo_path`` argument,
+    SIFTWISE_REPO_PATH, then CLAUDE_PROJECT_DIR."""
+    for source, value in (
+        ("repo_path", where.repo_path),
+        ("SIFTWISE_REPO_PATH", config.repo_path),
+        ("CLAUDE_PROJECT_DIR", config.project_dir),
+    ):
+        if value:
+            return source, value
+    return None
+
+
+async def _where(config: Config, repo_path: str | None, ctx: Context) -> Where:
+    """The call's ``Where``: the client's roots are asked for only when no explicit location
+    applies (so a client that doesn't support roots is never asked anything)."""
+    if _given(config, Where(repo_path)):
+        return Where(repo_path)
+    return Where(repo_path, await _client_roots(ctx))
+
+
+async def _client_roots(ctx: Context) -> tuple[Path, ...]:
+    """The client's roots (MCP roots) as local paths, or () when the client didn't declare the
+    roots capability, the connection can't carry a server request (the 2026-07-28 protocol
+    has none), or asking fails or takes longer than ``ROOTS_TIMEOUT``."""
+    session = ctx.session
+    capabilities = session.client_capabilities
+    if capabilities is None or capabilities.roots is None or not session.can_send_request:
+        return ()
+    try:
+        with anyio.fail_after(ROOTS_TIMEOUT), warnings.catch_warnings():
+            # Deprecated in 2026-07-28 (SEP-2577); handshake-era clients still use roots.
+            warnings.simplefilter("ignore", MCPDeprecationWarning)
+            result = await session.list_roots()
+    except Exception as exc:  # noqa: BLE001 - no roots: the working directory, as before
+        logger.warning("siftwise: could not get the client's roots (%s)", exc)
+        return ()
+    paths = (_root_path(str(root.uri)) for root in result.roots)
+    return tuple(path for path in paths if path is not None)
+
+
+def _root_path(uri: str) -> Path | None:
+    """A ``file://`` root as a local path (``file:///C:/x`` -> ``C:\\x`` on Windows)."""
+    parsed = urllib.parse.urlparse(uri)
+    if parsed.scheme != "file":
+        return None
+    path = urllib.request.url2pathname(parsed.path)
+    if parsed.netloc and parsed.netloc != "localhost":  # a UNC share: //server/share/...
+        path = f"//{parsed.netloc}{path}"
+    return Path(path)
+
+
+def _checkout(config: Config, where: Where) -> Path:
+    """The git checkout the tools work on, first that applies: the ``repo_path`` argument,
+    SIFTWISE_REPO_PATH, CLAUDE_PROJECT_DIR (Claude Code), the first of the client's roots that
+    is in a git repository, else the server's working directory. Clients start stdio servers
+    wherever they like (some in the home directory), so say how to point siftwise at it."""
+    given = _given(config, where)
+    if given:
+        source, value = given
+        start = Path(value).expanduser()
+        if not start.is_dir():
+            raise Unavailable(f"{source} {start} is not a directory")
+        root = cli.git_toplevel(start)
+        if root is None:
+            raise Unavailable(f"{source} {start} {NOT_A_REPO}")
+        return root
+    for path in where.roots:
+        root = cli.git_toplevel(path) if path.is_dir() else None
+        if root is not None:
+            return root
+    start = Path.cwd()
+    root = cli.git_toplevel(start)
+    if root is None:
+        tried = ", ".join(str(path) for path in where.roots)
+        if tried:
+            raise Unavailable(
+                f"none of the client's roots ({tried}) is in a git repository, and the "
+                f"server's working directory, {start}, {NOT_A_REPO}"
+            )
+        raise Unavailable(f"the server's working directory, {start}, {NOT_A_REPO}")
+    return root
+
+
+def _repo(config: Config, root: Path) -> str:
+    repo = config.repo or cli.origin_repo(root)
     if not repo:
-        raise Unavailable("can't tell the repository: set SIFTWISE_REPO, e.g. owner/name")
+        raise Unavailable(
+            "can't tell the repository's name (no origin remote): set SIFTWISE_REPO, "
+            "e.g. owner/name"
+        )
     return repo
 
 

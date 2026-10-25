@@ -552,11 +552,17 @@ uv tool update-shell             # once, if that directory isn't on your PATH; t
 uv tool dir --bin                # prints the directory, for a full path in the configs below
 ```
 
-The agent starts the server in its working directory: open the agent in the repository. It
-reads `SIFTWISE_SERVER` and `SIFTWISE_API_TOKEN`, and optionally `SIFTWISE_REPO` (default:
-`owner/name` from the `origin` remote) and `SIFTWISE_BASE_REF` (default: the branch
-`origin/HEAD` points to, else `main`). Keep the token out of files you commit: use your
-user-level config, or environment-variable expansion where the client has it.
+The server reads `SIFTWISE_SERVER` and `SIFTWISE_API_TOKEN`, and optionally `SIFTWISE_REPO`
+(default: `owner/name` from the `origin` remote), `SIFTWISE_BASE_REF` (default: the branch
+`origin/HEAD` points to, else `main`) and `SIFTWISE_REPO_PATH`. Keep the token out of files
+you commit: use your user-level config, or environment-variable expansion where the client has
+it.
+
+**Which repository:** the first that applies of the tool's `repo_path` argument (an absolute
+path the agent can pass), `SIFTWISE_REPO_PATH`, `CLAUDE_PROJECT_DIR` (set by Claude Code), the
+client's workspace folders if it supports MCP roots, and the server's working directory.
+Clients start servers in different places; outside a git repository, every tool says so and
+how to fix it. Per-client setup: [MCP clients](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/mcp-clients.md).
 
 **Claude Code:**
 
@@ -637,6 +643,7 @@ on = ["**/*.go", "!**/*_test.go"]         # ! excludes
 |---|---|---|
 | `SIFTWISE_API_TOKEN` | server (required: if unset, every endpoint but `/healthz` returns 503) and clients | none |
 | `SIFTWISE_SERVER` | clients: the CLI's `--server`, MCP, the Action's steps | `http://localhost:8000` |
+| `SIFTWISE_REPO_PATH` | MCP: the repository, when the client starts the server elsewhere ([which repository](#coding-agents-mcp)) | none |
 | `SIFTWISE_DATABASE_URL` | server | `postgresql+psycopg://siftwise:siftwise@localhost:5432/siftwise` |
 | `SIFTWISE_STATS_WINDOW_DAYS` | server: per-test stats window (0 = all history) | `90` |
 | `SIFTWISE_MAX_UPLOAD_BYTES` | server: request body limit | 50 MB |

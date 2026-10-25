@@ -520,21 +520,23 @@ def local_change(
     go_list: bool = True,
     py_imports: bool = True,
     working_tree: bool = False,
+    cwd: Path | None = None,
 ) -> LocalChange:
     """The change BASE...HEAD with its import graphs and .siftwise.toml. ``base`` None (or a
     failing git diff) means the changed files are unknown. ``working_tree``: the change from
     the merge base of BASE and HEAD to the working tree instead, so uncommitted (staged,
-    unstaged and untracked) changes count too; ``head`` is then unused.
+    unstaged and untracked) changes count too; ``head`` is then unused. ``cwd``: the
+    checkout (default: the current directory).
 
     Raises RepoConfigError for an invalid .siftwise.toml.
     """
-    root = git_toplevel() or Path.cwd()
+    root = git_toplevel(cwd) or cwd or Path.cwd()
     config = local_config(root)
 
     if not base:
         diff = None
     else:
-        diff = git_worktree_diff(base, root) if working_tree else git_diff(base, head)
+        diff = git_worktree_diff(base, root) if working_tree else git_diff(base, head, cwd=root)
     changed = diff[0] if diff else None
     fields: dict[str, Any] = {
         "changed_files": changed or [],
@@ -577,7 +579,10 @@ class KnownFlaky:
 
 
 def known_flaky(
-    config: RepoConfig, base: str | None, source: str = KnownFlakySource.BASE
+    config: RepoConfig,
+    base: str | None,
+    source: str = KnownFlakySource.BASE,
+    cwd: Path | None = None,
 ) -> KnownFlaky:
     """The ``known_flaky`` globs triage applies. From BASE's .siftwise.toml by default, so a
     change (a PR, an agent's edit) can't mark its own failures flaky. Without a base the diff
@@ -586,7 +591,7 @@ def known_flaky(
     head = config.known_flaky
     if source == KnownFlakySource.HEAD or not base:
         return KnownFlaky(head, False)
-    content = git_output("show", f"{base}:{FILE_NAME}")
+    content = git_output("show", f"{base}:{FILE_NAME}", cwd=cwd)
     globs: tuple[str, ...] = ()
     if content is not None:
         try:
@@ -757,10 +762,16 @@ def git_rev_parse(ref: str) -> str:
     return proc.stdout.decode().strip()
 
 
-def git_toplevel() -> Path | None:
+def git_toplevel(cwd: Path | None = None) -> Path | None:
+    """The checkout's root, or None outside a git repository (``cwd``: default the current
+    directory)."""
     try:
         proc = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"], capture_output=True, timeout=30, check=False
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            capture_output=True,
+            timeout=30,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -825,43 +836,43 @@ def git_worktree_diff(base: str, root: Path) -> tuple[list[str], list[str]] | No
     return list(dict.fromkeys([*parse_name_status(diff), *added])), parse_deleted(diff)
 
 
-def git_is_dirty() -> bool | None:
+def git_is_dirty(cwd: Path | None = None) -> bool | None:
     """Whether the working tree differs from HEAD (untracked files included); None if git
     fails."""
-    status = git_output("status", "--porcelain", "-z", "--untracked-files=normal")
+    status = git_output("status", "--porcelain", "-z", "--untracked-files=normal", cwd=cwd)
     return None if status is None else bool(status.strip(b"\0"))
 
 
-def git_head() -> str | None:
+def git_head(cwd: Path | None = None) -> str | None:
     """HEAD's full SHA, or None."""
-    out = git_output("rev-parse", "--verify", "HEAD^{commit}")
+    out = git_output("rev-parse", "--verify", "HEAD^{commit}", cwd=cwd)
     return out.decode().strip() if out else None
 
 
 _REMOTE_REPO = re.compile(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/*$")
 
 
-def origin_repo() -> str | None:
+def origin_repo(cwd: Path | None = None) -> str | None:
     """``owner/name`` from the ``origin`` remote's URL (https or ssh), or None."""
-    out = git_output("remote", "get-url", "origin")
+    out = git_output("remote", "get-url", "origin", cwd=cwd)
     match = _REMOTE_REPO.search(out.decode().strip()) if out else None
     return match.group(1) if match else None
 
 
-def default_base() -> str:
+def default_base(cwd: Path | None = None) -> str:
     """The branch ``origin/HEAD`` points to (e.g. ``origin/main``), else ``main``."""
-    out = git_output("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    out = git_output("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", cwd=cwd)
     return out.decode().strip() if out and out.strip() else "main"
 
 
-def git_diff(base: str, head: str) -> tuple[list[str], list[str]] | None:
+def git_diff(base: str, head: str, cwd: Path | None = None) -> tuple[list[str], list[str]] | None:
     """``(changed, deleted)`` files in ``base...head``, or None if git fails.
 
     Renames give both paths in ``changed``, and the old path in ``deleted``.
     """
     args = ["git", "diff", "--name-status", "-z", "-M", f"{base}...{head}"]
     try:
-        proc = subprocess.run(args, capture_output=True, timeout=120, check=False)
+        proc = subprocess.run(args, cwd=cwd, capture_output=True, timeout=120, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         _err(f"warning: could not run git diff ({exc}); asking for the full suite")
         return None
