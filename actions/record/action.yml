@@ -76,8 +76,8 @@ inputs:
   rerun-unknown:
     description: >-
       Re-run this leg's failures whose verdict is in rerun-verdicts up to this many times
-      (0-3; 0 = off), with pytest node IDs, and record each re-run: a test that passes on one
-      becomes flaky ("passed on re-run"). pytest only. Never fails the step.
+      (0-3; 0 = off) with their own runner (pytest, Go, Jest, Maven or Gradle), and record each
+      re-run: a test that passes on one becomes flaky ("passed on re-run"). Never fails the step.
     required: false
     default: "0"
   rerun-verdicts:
@@ -94,8 +94,9 @@ inputs:
     default: "10"
   rerun-prefix:
     description: >-
-      Command prefix for pytest, e.g. 'uv run' or 'poetry run' (split like a shell would,
-      run without a shell).
+      Command prefix for pytest and Jest, e.g. 'uv run', 'poetry run' or 'npx' (split like a
+      shell would, run without a shell). Go, Maven and Gradle don't use it: siftwise runs
+      gotestsum (if on PATH) or go test -json, and ./mvnw or ./gradlew if present.
     required: false
     default: ""
 outputs:

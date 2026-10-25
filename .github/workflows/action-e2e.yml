@@ -5,7 +5,10 @@ name: Action e2e
 # the rollup's failure verdicts in the job summary and PR comment, fail-on, a second selection
 # that sees the history, the fail-open paths (server down, no token, shallow clone), a shadow
 # run (full suite, the stored selection's caught and missed failures), known_flaky from the
-# checkout or the PR base, and rerun-unknown (a test that fails once, then passes: flaky).
+# checkout or the PR base, and rerun-unknown with pytest, Go and Jest (a test that fails once,
+# then passes: flaky; one that always fails keeps its verdict). No Maven/Gradle case: their
+# first run downloads plugins and dependencies (~1-2 min each); tests/test_reruns.py runs both
+# for real wherever mvn or gradle is installed.
 
 on:
   push:
@@ -529,6 +532,130 @@ jobs:
               and (.reasons[0] | startswith("passed on re-run 1 of this commit and variant"))'
           echo "$triage" | jq -e '.results[]
             | select(.test_id == "test_e2e_failing::test_e2e_always_fails") | .verdict == "unknown"'
+
+      # rerun-unknown for Go and Jest: each project (untracked, inside the checkout) has a test
+      # that fails once, then passes (a marker in RUNNER_TEMP), and one that always fails. Both
+      # are new, so unknown; record re-runs both: the first becomes flaky (high, "passed on re-run
+      # 1"), the second keeps its verdict. Go's first run is recorded through gotestsum (as many
+      # repos do); the re-run uses `go test -json` (gotestsum isn't on PATH), converted to JUnit
+      # by siftwise: the test IDs must match across the two. jest-junit's file paths are
+      # relative to the Jest project (e2e_jest/), as in a monorepo package.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Re-run Go - a test that fails the first time only
+        run: |
+          junit="$RUNNER_TEMP/rerun-go-junit"
+          mkdir -p "$junit" e2e_go
+          printf 'module example.com/e2e\n\ngo 1.22\n' > go.mod
+          cat > e2e_go/flaky_test.go <<'EOF'
+          package e2ego
+
+          import (
+          	"os"
+          	"path/filepath"
+          	"testing"
+          )
+
+          func TestE2EFailsOnce(t *testing.T) {
+          	marker := filepath.Join(os.Getenv("RUNNER_TEMP"), "e2e-go-ran")
+          	if _, err := os.Stat(marker); err != nil {
+          		os.WriteFile(marker, nil, 0o644)
+          		t.Fatal("fails the first time only")
+          	}
+          }
+
+          func TestE2EAlwaysFails(t *testing.T) { t.Fatal("always fails") }
+          EOF
+          if go run gotest.tools/gotestsum@v1.13.0 --junitfile "$junit/go.xml" -- ./e2e_go/; then
+            echo "the Go tests passed the first time"; exit 1
+          fi
+          # The re-run must take the go test -json path (`! cmd` would never fail under set -e).
+          if command -v gotestsum; then echo "gotestsum is on PATH"; exit 1; fi
+
+      - name: Re-run Go - record (rerun-unknown)
+        id: rerun-go
+        uses: ./actions/record
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          variant: rerun-go-e2e
+          junit-dir: ${{ runner.temp }}/rerun-go-junit
+          rerun-unknown: 1
+
+      - name: Re-run Jest - a test that fails the first time only
+        run: |
+          junit="$RUNNER_TEMP/rerun-jest-junit"
+          mkdir -p "$junit" e2e_jest/src
+          cat > e2e_jest/package.json <<'EOF'
+          {
+            "private": true,
+            "devDependencies": {"jest": "29.7.0", "jest-junit": "16.0.0"},
+            "jest-junit": {"addFileAttribute": "true"}
+          }
+          EOF
+          cat > e2e_jest/src/e2e.test.js <<'EOF'
+          const fs = require("fs");
+          const path = require("path");
+          const marker = path.join(process.env.RUNNER_TEMP, "e2e-jest-ran");
+
+          describe("e2e", () => {
+            test("fails once (then passes)", () => {
+              const first = !fs.existsSync(marker);
+              fs.writeFileSync(marker, "");
+              expect(first).toBe(false);
+            });
+            test("always fails", () => { expect(1).toBe(2); });
+          });
+          EOF
+          (cd e2e_jest && npm install --no-audit --no-fund --silent)
+          if (cd e2e_jest && JEST_JUNIT_OUTPUT_DIR="$junit" JEST_JUNIT_OUTPUT_NAME=jest.xml \
+              npx jest --ci --reporters=default --reporters=jest-junit); then
+            echo "the Jest tests passed the first time"; exit 1
+          fi
+
+      - name: Re-run Jest - record (rerun-unknown)
+        id: rerun-jest
+        uses: ./actions/record
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          variant: rerun-jest-e2e
+          junit-dir: ${{ runner.temp }}/rerun-jest-junit
+          rerun-unknown: 1
+          rerun-prefix: npx
+
+      - name: Check the Go and Jest re-runs
+        env:
+          GO_TESTS: ${{ steps.rerun-go.outputs.rerun-tests }}
+          GO_PASSED: ${{ steps.rerun-go.outputs.rerun-passed }}
+          JEST_TESTS: ${{ steps.rerun-jest.outputs.rerun-tests }}
+          JEST_PASSED: ${{ steps.rerun-jest.outputs.rerun-passed }}
+        run: |
+          rm -r e2e_go e2e_jest go.mod
+          git status --porcelain
+          test -z "$(git status --porcelain)"
+          echo "Go: re-ran $GO_TESTS, $GO_PASSED passed; Jest: re-ran $JEST_TESTS, $JEST_PASSED passed"
+          test "$GO_TESTS" = 2 && test "$GO_PASSED" = 1
+          test "$JEST_TESTS" = 2 && test "$JEST_PASSED" = 1
+          check() {  # variant, flaky test ID, always-failing test ID
+            triage=$(curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+              -d "{\"ci_run_id\": \"$GITHUB_RUN_ID\", \"run_attempt\": $GITHUB_RUN_ATTEMPT, \"variants\": [\"$1\"]}" \
+              "$SERVER/repos/$GITHUB_REPOSITORY/triage")
+            echo "$triage" | jq .
+            echo "$triage" | jq -e '.variants[0].reruns == 1'
+            echo "$triage" | jq -e --arg id "$2" '.results[] | select(.test_id == $id)
+              | .verdict == "flaky" and .confidence == "high"
+                and (.reasons[0] | startswith("passed on re-run 1 of this commit and variant"))'
+            echo "$triage" | jq -e --arg id "$3" '.results[] | select(.test_id == $id)
+              | .verdict == "unknown"'
+          }
+          check rerun-go-e2e "example.com/e2e/e2e_go::TestE2EFailsOnce" \
+            "example.com/e2e/e2e_go::TestE2EAlwaysFails"
+          check rerun-jest-e2e "e2e fails once (then passes)::e2e fails once (then passes)" \
+            "e2e always fails::e2e always fails"
 
       - name: Server log
         if: failure()

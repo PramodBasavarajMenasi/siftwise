@@ -14,7 +14,7 @@ import pytest
 import respx
 from typer.testing import CliRunner, Result
 
-from siftwise.cli import gha
+from siftwise.cli import gha, reruns
 from siftwise.cli.main import app
 
 SERVER = "http://siftwise.test"
@@ -1174,7 +1174,7 @@ def test_a_matrix_leg_re_runs_its_unknown_failures(
         api, monkeypatch, fake,
         failure(CART, "unknown"),
         failure("tests.test_gone::test_x", "unknown"),  # its file isn't in the checkout
-        failure("github.com/acme/shop/pay::TestA", "unknown"),  # Go: not re-run in v1
+        failure("github.com/acme/shop/pay::TestA", "unknown"),  # Go, but no go.mod here
         failure(PAY, "new_regression"),  # not in rerun-verdicts
     )  # fmt: skip
 
@@ -1195,8 +1195,8 @@ def test_a_matrix_leg_re_runs_its_unknown_failures(
     assert upload.calls.last.request.url.params["defer_rollup"] == "true"
     assert gh.outputs()["rerun-tests"] == "1" and gh.outputs()["rerun-passed"] == "1"
     line = ("siftwise: re-ran 1 failure (unknown) in 1 round: 1 passed on a re-run (now flaky); "
-            "2 not re-run (its file isn't in the checkout; not a pytest test (only pytest is "
-            "re-run))")  # fmt: skip
+            "2 not re-run (a Go test, but there's no go.mod at the checkout's root; its file "
+            "isn't in the checkout)")  # fmt: skip
     assert line in result.output and line in gh.summary.read_text()
 
 
@@ -1366,6 +1366,153 @@ def test_a_real_pytest_re_run_reports_the_same_test_id(
     assert gh.outputs()["rerun-passed"] == "1", result.output
     assert [m.get("rerun") for m in recorded_runs(upload)] == [None, 1]
     assert not Path(".pytest_cache").exists()  # -p no:cacheprovider: the checkout stays clean
+
+
+class FakeTools:
+    """Stands in for every runner's tool: writes each command's report the way the real tool
+    would (gotestsum/jest-junit/pytest: the file named in the command or environment; go test
+    -json: JSON on stdout; Maven/Gradle: TEST-*.xml in the checkout), with these outcomes."""
+
+    def __init__(self, *rounds: dict[str, str]) -> None:
+        self.rounds = list(rounds)  # per round: test ID -> "passed" | "failed"
+        self.calls: list[tuple[list[str], dict[str, Any]]] = []
+        self.round: dict[str, str] = {}
+
+    def __call__(self, argv: list[str], timeout: float, **options: Any) -> None:
+        self.calls.append((argv, options))
+        outcomes = self.round
+        if "go" in Path(argv[0]).name and "-json" in argv:
+            events = [json.dumps({"Action": "pass" if outcome == "passed" else "fail",
+                                  "Package": t.partition("::")[0], "Test": t.partition("::")[2]})
+                      for t, outcome in outcomes.items() if "::Test" in t]  # fmt: skip
+            options["stdout"].write_text("\n".join(events))
+            return
+        if "jest" in argv:
+            env = options["env"]
+            report = Path(env["JEST_JUNIT_OUTPUT_DIR"]) / env["JEST_JUNIT_OUTPUT_NAME"]
+            self._write(report, {t: o for t, o in outcomes.items() if " " in t})
+            return
+        if argv[0] == "mvn":
+            for classname in {t.partition("::")[0] for t in outcomes if t.startswith("com.")}:
+                mine = {t: o for t, o in outcomes.items() if t.startswith(classname + "::")}
+                self._write(Path("target/surefire-reports") / f"TEST-{classname}.xml", mine)
+            return
+        raise AssertionError(f"unexpected command {argv}")
+
+    @staticmethod
+    def _write(report: Path, outcomes: dict[str, str]) -> None:
+        cases = []
+        for test_id, outcome in outcomes.items():
+            classname, _, name = test_id.partition("::")
+            body = "<failure message='boom'/>" if outcome == "failed" else ""
+            cases.append(f'<testcase classname="{classname}" name="{name}">{body}</testcase>')
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(f"<testsuite>{''.join(cases)}</testsuite>")
+
+
+def uploaded_files(route: respx.Route) -> list[list[bytes]]:
+    """The JUnit file names of every ``POST /runs`` call, in order."""
+    return [re.findall(rb'name="files"; filename="([^"]+)"', call.request.content)
+            for call in route.calls]  # fmt: skip
+
+
+GO_TEST, JEST_TEST = "github.com/acme/shop/cart::TestTotal", "cart adds::cart adds"
+JAVA_TEST = "com.acme.CartTest::computesTotal()"
+
+
+def test_go_jest_and_maven_failures_are_re_run_in_one_round(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    Path("go.mod").write_text("module github.com/acme/shop\n")
+    Path("pom.xml").write_text("<project/>")
+    Path("web/src").mkdir(parents=True)
+    Path("web/src/cart.test.js").write_text("test('adds', () => {})\n")
+    Path("web/package.json").write_text('{"devDependencies": {"jest": "^30"}}')
+    monkeypatch.setattr(reruns, "which", lambda name: None)  # no gotestsum: go test -json
+    fake = FakeTools()
+    fake.round = {GO_TEST: "passed", JEST_TEST: "failed", JAVA_TEST: "passed"}
+    upload, _ = rerun_setup(
+        api, monkeypatch, fake,
+        failure(GO_TEST, "unknown"), failure(JEST_TEST, "unknown"), failure(JAVA_TEST, "unknown"),
+        failure("Some suite::a thing", "unknown"),  # no runner: warned, not re-run
+    )  # fmt: skip
+    # The leg's own report names the Jest test's file (the triage response doesn't).
+    Path("junit.xml").write_text(
+        '<testsuite><testcase classname="cart adds" name="cart adds" file="web/src/cart.test.js">'
+        "<failure/></testcase></testsuite>"
+    )
+
+    result = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux",
+                    SIFTWISE_RERUN_UNKNOWN="1", SIFTWISE_RERUN_PREFIX="npx")  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    commands = {argv[0]: (argv, options) for argv, options in fake.calls}
+    go, _ = commands["go"]
+    assert go == ["go", "test", "-json", "-count=1", "-run", "^(TestTotal)$",
+                  "github.com/acme/shop/cart"]  # fmt: skip
+    jest, jest_options = commands["npx"]
+    assert jest[:5] == ["npx", "jest", "--ci", "--runTestsByPath", "src/cart.test.js"]
+    assert Path(jest_options["cwd"]).resolve() == Path("web").resolve()
+    maven, _ = commands["mvn"]
+    assert "-Dtest=com.acme.CartTest#computesTotal" in maven
+    # One upload for the round: every runner's report.
+    _, rerun_files = uploaded_files(upload)
+    assert sorted(rerun_files) == sorted([b"rerun-1-go-1.xml", b"rerun-1-jest-1.xml",
+                                          b"0-TEST-com.acme.CartTest.xml"])  # fmt: skip
+    assert not Path("target/surefire-reports/TEST-com.acme.CartTest.xml").exists()  # a copy
+    assert [m.get("rerun") for m in recorded_runs(upload)] == [None, 1]
+    assert gh.outputs()["rerun-tests"] == "3" and gh.outputs()["rerun-passed"] == "2"
+    assert "::warning::siftwise: not re-run, no runner found for: Some suite::a thing" in (
+        result.output
+    )
+    line = ("re-ran 3 failures (unknown) in 1 round: 2 passed on a re-run (now flaky); 1 not "
+            "re-run (no runner found for it (pytest, Go, Jest, Maven or Gradle))")  # fmt: skip
+    assert line in result.output
+
+
+def test_a_missing_tool_stops_the_re_runs_with_a_warning(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    Path("go.mod").write_text("module github.com/acme/shop\n")
+    monkeypatch.setattr(reruns, "which", lambda name: None)
+
+    def missing(argv: list[str], timeout: float, **options: Any) -> None:
+        raise FileNotFoundError(argv[0])
+
+    upload, _ = rerun_setup(api, monkeypatch, missing, failure(GO_TEST, "unknown"))
+
+    result = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux",
+                    SIFTWISE_RERUN_UNKNOWN="1")  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    assert "::warning::siftwise: re-runs stopped: couldn't run go (go)" in result.output
+    assert [m.get("rerun") for m in recorded_runs(upload)] == [None]
+
+
+def test_a_timed_out_maven_re_run_leaves_the_ci_runs_reports(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    Path("pom.xml").write_text("<project/>")
+    reports = Path("target/surefire-reports")
+    reports.mkdir(parents=True)
+    ci = reports / "TEST-com.acme.CartTest.xml"
+    ci.write_text("the CI run's report")
+
+    def slow_maven(argv: list[str], timeout: float, **options: Any) -> None:
+        ci.write_text("half a re-run")
+        (reports / "TEST-com.acme.Other.xml").write_text("new")
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    upload, _ = rerun_setup(api, monkeypatch, slow_maven, failure(JAVA_TEST, "unknown"))
+
+    result = gh.run("record", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux",
+                    SIFTWISE_RERUN_UNKNOWN="1")  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    assert "re-run 1 hit the rerun-timeout-minutes limit" in result.output
+    assert ci.read_text() == "the CI run's report"
+    assert sorted(p.name for p in reports.iterdir()) == ["TEST-com.acme.CartTest.xml"]
+    assert [m.get("rerun") for m in recorded_runs(upload)] == [None]
 
 
 def test_the_comment_says_when_a_pr_changes_known_flaky() -> None:

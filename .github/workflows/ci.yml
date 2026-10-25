@@ -59,6 +59,67 @@ jobs:
       - name: pytest
         run: uv run pytest
 
+  # rerun-unknown's runners against the real tools (tests/test_reruns.py's *_for_real tests,
+  # skipped by the job above): minutes of downloads, so one job, Python 3.12 only. With
+  # SIFTWISE_REAL_TOOL_TESTS=1 a missing tool fails the test instead of skipping it. Maven and
+  # Gradle are the runner image's own.
+  real-tools:
+    name: re-run runners (Go, gotestsum, Jest, Maven, Gradle)
+    runs-on: ubuntu-latest
+    env:
+      SIFTWISE_REAL_TOOL_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false  # no go.sum here
+
+      - name: Install gotestsum
+        run: |
+          go install gotest.tools/gotestsum@v1.13.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Install Jest and jest-junit
+        run: |
+          mkdir -p "$RUNNER_TEMP/jest"
+          cd "$RUNNER_TEMP/jest"
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund --silent jest@29.7.0 jest-junit@16.0.0
+          echo "SIFTWISE_TEST_JEST_HOME=$RUNNER_TEMP/jest" >> "$GITHUB_ENV"
+
+      # setup-java caches one build tool per call. The test projects (POM, build.gradle) are
+      # in tests/test_reruns.py, so it keys both caches.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: tests/test_reruns.py
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: tests/test_reruns.py
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Real-tool tests
+        run: uv run pytest tests/test_reruns.py -k for_real --durations=0
+
   package:
     name: package (build, twine check, light/server/mcp installs)
     runs-on: ubuntu-latest

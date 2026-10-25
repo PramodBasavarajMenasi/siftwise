@@ -443,7 +443,7 @@ Two ways to keep known flakes from reading as regressions, both in `record`:
           server-url: ${{ secrets.SIFTWISE_URL }}
           token: ${{ secrets.SIFTWISE_TOKEN }}
           rerun-unknown: 2         # re-run unknown failures up to twice
-          rerun-prefix: uv run     # how pytest runs in your job (e.g. poetry run)
+          rerun-prefix: uv run     # how pytest or Jest runs in your job (poetry run, npx)
 ```
 
 - **`known_flaky`** in [`.siftwise.toml`](#configuration): a failing listed test not linked to
@@ -454,11 +454,42 @@ Two ways to keep known flakes from reading as regressions, both in `record`:
   PR's own list instead. A push always applies its own.
 - **`rerun-unknown: N`** (0 to 3, default 0): after uploading, `record` triages its own leg,
   re-runs failures whose verdict is in `rerun-verdicts` (`unknown`, or
-  `unknown,new_regression`) with pytest node IDs, and records each re-run. A test that passes
-  on one is **flaky**, high; one that fails again keeps its verdict, with a note.
+  `unknown,new_regression`) with the test's own runner, and records each re-run (all of a
+  round's reports in one upload). A test that passes on one is **flaky**, high; one that fails
+  again keeps its verdict, with a note.
+- **Runners**, chosen per failing test from its ID and file and the checkout:
+
+  | Runner | When | Re-run command | Report |
+  |---|---|---|---|
+  | pytest | a test ID that maps to a file in the checkout | `[prefix] pytest -p no:cacheprovider <node IDs>` | `--junitxml` in the runner's temp dir |
+  | Go | an import path in the root `go.mod`'s module | per package: `gotestsum ... -- -count=1 -run '^(TestA\|TestB)$' <package>`, or `go test -json` with the same flags when gotestsum isn't on PATH | gotestsum's JUnit, or `go test -json` converted by siftwise |
+  | Jest | a JS/TS test file (the JUnit must name it: jest-junit's `addFileAttribute`) under a `package.json` or `jest.config.*` with Jest | per file, from that package: `[prefix] jest --ci --runTestsByPath <file> -t '^(<full name>\|...)$'` | jest-junit (it must be installed, as for the CI run) |
+  | Maven | a Java class and method, `pom.xml` at the root | `mvn -B -Dtest=Class#m1+m2,Other#m3 test` (`./mvnw` when present) | the `target/surefire-reports` files the re-run wrote, copied out (then put back as they were) |
+  | Gradle | a Java class and method, `build.gradle[.kts]` or `settings.gradle[.kts]` at the root | `gradle test --continue --tests Class.method ...` (`./gradlew` when present) | the `build/test-results` files the re-run wrote, copied out (then put back as they were) |
+
+  Go subtests re-run through their top-level test; Java parameter lists and `[n]` indexes are
+  dropped (all of a method's cases run). Names that reach a regex are escaped; Java class and
+  method names must be plain identifiers, else the test isn't re-run. A test whose runner can't
+  be told isn't re-run, with a warning.
+- **`rerun-prefix`** goes in front of the pytest and Jest commands, split like a shell would,
+  e.g. `uv run`, `poetry run`, `npx`, `yarn`. Go, Maven and Gradle never get it (a prefix for
+  one language would break another in a mixed repo): siftwise uses gotestsum if it's on PATH
+  (`go install gotest.tools/gotestsum@latest` before `record`), else `go test -json`, and the
+  repo's `./mvnw` or `./gradlew` if present, else `mvn` or `gradle`.
 - **Limits:** at most `rerun-max-tests` tests (20) within `rerun-timeout-minutes` (10) for all
-  rounds. pytest only; tests whose file isn't in the checkout aren't re-run. `rerun-prefix` is
-  split like a shell would, and the command runs without a shell.
+  rounds and runners. Tests whose file isn't in the checkout aren't re-run. Every command runs
+  without a shell. A re-run's report must name the test as the CI run did: with custom
+  jest-junit name templates (or settings only the test step had), the re-run may not match,
+  and the test keeps its verdict.
+- **Maven and Gradle reports:** both write a re-run's reports where the CI run's are (Surefire
+  can't be pointed elsewhere from the command line, and Gradle empties its results directory,
+  leaving only the re-run classes'). So `record` backs up every `TEST-*.xml` under
+  `target/surefire-reports` and `build/test-results` before a re-run, copies the re-run's out,
+  and puts the CI run's back afterwards, also when the re-run fails or times out (a file it
+  can't put back is a warning). Other output isn't restored: Surefire's `.txt` summaries,
+  Gradle's HTML report (`build/reports/tests`) and binary results, compiled classes. A Gradle
+  daemon can keep writing after a timeout. A build that puts its reports elsewhere (its own
+  `reportsDirectory`) gets no re-runs: no report is found, and the re-runs stop with a warning.
 - **Fail open:** any problem is a warning and the verdicts stay what they were. Re-runs never
   turn a red job green; the PR comment and `fail-on` use the verdicts after them. Outputs:
   `rerun-tests`, `rerun-passed`.
@@ -765,7 +796,8 @@ public issue.
   (90) days before the repo's newest run; older raw results stay, but no longer feed stats.
 - **Limits to know:** merge-queue (`merge_group`), scheduled and manual runs always run the
   full suite (no diff base); the Action is tested on Linux runners only; Java tests are
-  recorded but always run in full; `rerun-unknown` re-runs pytest only.
+  recorded but always run in full (`rerun-unknown` re-runs pytest, Go, Jest, Maven and Gradle
+  tests).
 
 ## Roadmap
 

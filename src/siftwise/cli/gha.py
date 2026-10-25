@@ -26,8 +26,9 @@ recall. Shadow mode never fails or shortens a run; problems are warnings.
 
 Flaky handling in ``record``: ``known_flaky`` from ``.siftwise.toml`` is recorded with the run
 (a PR's from its BASE commit by default, so a PR can't mark its own failures flaky and get past
-``fail-on``). ``rerun-unknown: N`` re-runs this leg's failures with an ``unknown`` verdict (pytest
-node IDs, no shell) up to N times, capped in tests and time, and uploads each round as a re-run
+``fail-on``). ``rerun-unknown: N`` re-runs this leg's failures with an ``unknown`` verdict (with
+their own runner: pytest, Go, Jest, Maven or Gradle, see ``cli/reruns.py``; no shell) up to N
+times, capped in tests and time, and uploads each round as a re-run
 of the run (``rerun = n``); triage then calls a test that passed on a re-run flaky. Fail open:
 any problem is a warning, and the verdicts stay what they were.
 """
@@ -40,11 +41,12 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,9 +55,9 @@ from typing import Annotated, Any
 import httpx
 import typer
 
+from siftwise.cli import reruns
 from siftwise.cli.repoconfig import RepoConfig, RepoConfigError
 from siftwise.core.junit import JUnitParseError, Status, parse_junit
-from siftwise.core.selector import pytest_node
 
 app = typer.Typer(help="GitHub Actions steps (used by actions/select, record and rollup).")
 
@@ -359,7 +361,8 @@ def record_step(
     problem, metadata = _record(ctx, server, token, repo, junit, junit_dir, variant, defer,
                                 github_token, source)  # fmt: skip
     if metadata is not None and rerun.rounds:
-        report = rerun_failures(ctx, server, token, repo, variant, metadata, defer, rerun)
+        report = rerun_failures(ctx, server, token, repo, variant, metadata, defer, rerun,
+                                find_junit(junit, junit_dir))  # fmt: skip
         _append(env, "GITHUB_OUTPUT", {"rerun-tests": str(len(report.tests)),
                                        "rerun-passed": str(len(report.passed))})  # fmt: skip
         line = report.line(rerun)
@@ -901,12 +904,15 @@ def rerun_failures(
     metadata: Mapping[str, Any],
     defer: bool,
     rerun: Rerun,
+    reported: Sequence[Path] = (),
 ) -> RerunReport:
     """Re-run this leg's failures whose verdict is in ``rerun.verdicts``: triage only this
-    variant (the other legs may not be recorded yet), run the failing pytest node IDs again (no
-    shell; tests still failing go round again, up to ``rerun.rounds`` times, within
-    ``rerun.timeout_s`` in all), and upload each round as ``rerun = n`` of this run. Fail open:
-    a problem stops the re-runs with a warning, and what was uploaded stands."""
+    variant (the other legs may not be recorded yet), run the failing tests again with their
+    runners (``reruns.classify`` / ``reruns.invocations``; no shell; ``reported``: this leg's
+    JUnit files, for the test files Jest needs), tests still failing go round again, up to
+    ``rerun.rounds`` times, within ``rerun.timeout_s`` in all, and upload each round's reports
+    together as ``rerun = n`` of this run. Fail open: a problem stops the re-runs with a
+    warning, and what was uploaded stands."""
     from siftwise.cli import main as cli
 
     report = RerunReport()
@@ -919,20 +925,27 @@ def rerun_failures(
         report.problem = f"verdicts unavailable ({exc})"
         _annotate("warning", f"siftwise: re-runs skipped: {report.problem}")
         return report
-    nodes: dict[str, str] = {}
+    checkout = reruns.Checkout(Path.cwd())
+    paths = _reported_paths(reported)
+    targets: dict[str, reruns.Target] = {}
+    no_runner: list[str] = []
     for result in response["results"]:
         test_id = result["test_id"]
-        if result["verdict"] not in rerun.verdicts or test_id in nodes:
+        if result["verdict"] not in rerun.verdicts or test_id in targets:
             continue
-        node = pytest_node(test_id)
-        if node is None:
-            report.skipped.append((test_id, "not a pytest test (only pytest is re-run)"))
-        elif not Path(node.partition("::")[0]).is_file():
-            report.skipped.append((test_id, "its file isn't in the checkout"))
+        if any(test_id == skipped for skipped, _ in report.skipped):
+            continue
+        target = reruns.classify(test_id, paths().get(test_id), checkout)
+        if isinstance(target, str):
+            report.skipped.append((test_id, target))
+            if target.startswith("no runner found"):
+                no_runner.append(test_id)
         else:
-            nodes[test_id] = node
-    report.tests = list(nodes)[: rerun.max_tests]
-    report.over_cap = len(nodes) - len(report.tests)
+            targets[test_id] = target
+    if no_runner:
+        _annotate("warning", f"siftwise: not re-run, no runner found for: {', '.join(no_runner)}")
+    report.tests = list(targets)[: rerun.max_tests]
+    report.over_cap = len(targets) - len(report.tests)
 
     out = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir())
     out = out / f"siftwise-rerun-{uuid.uuid4().hex[:8]}"  # outside the checkout's JUnit globs
@@ -941,29 +954,28 @@ def rerun_failures(
     for n in range(1, rerun.rounds + 1):
         if not remaining:
             break
-        left = deadline - time.monotonic()
-        if left <= 0:
+        if deadline - time.monotonic() <= 0:
             report.problem = "the rerun-timeout-minutes limit was reached"
             break
-        xml = out / f"rerun-{n}.xml"
-        argv = [*rerun.prefix, "pytest", f"--junitxml={xml}", "-p", "no:cacheprovider",
-                *(nodes[t] for t in remaining)]  # fmt: skip
-        typer.echo(f"siftwise: re-run {n}: {shlex.join(argv)}")
         try:
-            run_command(argv, left)
-        except subprocess.TimeoutExpired:
-            report.problem = f"re-run {n} hit the rerun-timeout-minutes limit (results discarded)"
+            out.mkdir(parents=True, exist_ok=True)
+            commands = reruns.invocations([targets[t] for t in remaining], out, n,
+                                          rerun.prefix, checkout.root)  # fmt: skip
+        except OSError as exc:  # backing up Maven/Gradle's reports
+            report.problem = f"re-run {n} couldn't start ({exc})"
             break
-        except OSError as exc:
-            report.problem = f"couldn't run pytest ({exc})"
+        files, report.problem = _run_round(n, commands, deadline)
+        if report.problem:
             break
         try:
-            final = {r.test_id: r.status for r in parse_junit(xml.read_bytes())}  # last attempt
+            final: dict[str, Status] = {}
+            for xml in files:  # last attempt, each runner's tests in its own report
+                final.update((r.test_id, r.status) for r in parse_junit(xml.read_bytes()))
         except (OSError, JUnitParseError) as exc:
             report.problem = f"re-run {n} wrote no JUnit report ({exc})"
             break
         try:
-            cli.upload_run(server, token, [xml], {**metadata, "rerun": n, "started_at": _now()},
+            cli.upload_run(server, token, files, {**metadata, "rerun": n, "started_at": _now()},
                            defer_rollup=defer, timeout=RECORD_TIMEOUT)  # fmt: skip
         except cli.SiftwiseError as exc:
             report.problem = f"re-run {n} not recorded ({exc})"
@@ -978,10 +990,88 @@ def rerun_failures(
     return report
 
 
-def run_command(argv: list[str], timeout: float) -> None:
-    """Run a re-run's command (no shell); its output goes to the step's log. Raises
-    TimeoutExpired or OSError."""
-    subprocess.run(argv, timeout=timeout, check=False)
+def _run_round(
+    n: int, commands: list[reruns.Invocation], deadline: float
+) -> tuple[list[Path], str]:
+    """Run round ``n``'s commands in turn, within the deadline: (their JUnit reports, "") or
+    ([], what went wrong). Then, whatever happened, Maven/Gradle's reports in the checkout are
+    put back as the CI run left them (a failure to is only a warning)."""
+    try:
+        return _run_commands(n, commands, deadline)
+    finally:
+        for command in commands:
+            try:
+                command.restore()
+            except OSError as exc:
+                _annotate("warning", f"siftwise: re-run {n} changed {command.tool}'s reports "
+                                     f"in the checkout ({exc})")  # fmt: skip
+
+
+def _run_commands(
+    n: int, commands: list[reruns.Invocation], deadline: float
+) -> tuple[list[Path], str]:
+    files: list[Path] = []
+    for command in commands:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return [], f"re-run {n} hit the rerun-timeout-minutes limit (results discarded)"
+        typer.echo(f"siftwise: re-run {n}: {shlex.join(command.argv)}")
+        try:
+            run_command(command.argv, left, **command.options())
+        except subprocess.TimeoutExpired:
+            return [], f"re-run {n} hit the rerun-timeout-minutes limit (results discarded)"
+        except OSError as exc:
+            return [], f"couldn't run {command.tool} ({exc})"
+        try:
+            files += command.reports()
+        except OSError as exc:
+            return [], f"re-run {n} wrote no JUnit report ({exc})"
+    return files, ""
+
+
+def _reported_paths(reports: Sequence[Path]) -> Callable[[], dict[str, str]]:
+    """Test ID -> file from this leg's own JUnit reports (Jest's re-runs need the file; the
+    triage response doesn't carry it). Read once, when first needed."""
+    cache: dict[str, str] = {}
+    done = False
+
+    def paths() -> dict[str, str]:
+        nonlocal done
+        if not done:
+            done = True
+            for path in reports:
+                try:
+                    results = parse_junit(path.read_bytes())
+                except (OSError, JUnitParseError):
+                    continue
+                for r in results:
+                    if r.file_path:
+                        cache.setdefault(r.test_id, r.file_path)
+        return cache
+
+    return paths
+
+
+def run_command(
+    argv: list[str],
+    timeout: float,
+    *,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    stdout: Path | None = None,
+) -> None:
+    """Run a re-run's command (no shell); its output goes to the step's log (or ``stdout``, a
+    file: ``go test -json``). ``env`` adds to the environment. The program is looked up on
+    PATH first, so ``npx``/``mvn``'s Windows ``.cmd`` shims are found. Raises TimeoutExpired or
+    OSError."""
+    program = shutil.which(argv[0]) or argv[0]
+    full_env = {**os.environ, **env} if env else None
+    if stdout is None:
+        subprocess.run([program, *argv[1:]], timeout=timeout, check=False, cwd=cwd, env=full_env)
+        return
+    with stdout.open("wb") as sink:
+        subprocess.run([program, *argv[1:]], timeout=timeout, check=False, cwd=cwd, env=full_env,
+                       stdout=sink)  # fmt: skip
 
 
 # --- shadow mode ----------------------------------------------------------------------------

@@ -63,6 +63,15 @@ uv run mypy src tests scripts             # strict
 uv run pytest                             # with SIFTWISE_TEST_DATABASE_URL set
 ```
 
+**The real-tool tests** (CI's `real-tools` job) run `rerun-unknown`'s runners against Go,
+gotestsum, Jest, Maven and Gradle, a few minutes with downloads. They're skipped unless
+`SIFTWISE_REAL_TOOL_TESTS=1`; then a missing tool fails. Jest also needs
+`SIFTWISE_TEST_JEST_HOME`, a folder whose `node_modules` has jest and jest-junit:
+
+```sh
+SIFTWISE_REAL_TOOL_TESTS=1 SIFTWISE_TEST_JEST_HOME=/path/to/jest-home   uv run pytest tests/test_reruns.py -k for_real
+```
+
 **The package checks** (CI's `package` job) build the sdist and wheel, run `twine check`,
 check the sdist's file list, and install the wheel in fresh venvs: the light install must
 import none of the server's or MCP's dependencies, and `[server]` and `[mcp]` must work.
