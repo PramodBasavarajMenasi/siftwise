@@ -175,6 +175,15 @@ The first rule that applies decides:
   token, checked before the body is read; an unset `SIFTWISE_API_TOKEN` returns 503.
 - **Migrations at start, once.** `siftwise server start` migrates under a Postgres advisory
   lock, so replicas starting together migrate once.
+- **Re-runs through each test's own runner.** `record`'s `rerun-unknown` (`cli/reruns.py`)
+  picks a runner per failing test from its recorded ID and file and the checkout (pytest, Go,
+  Jest, Maven, Gradle), builds commands that run exactly those tests (escaped regexes, Java
+  names restricted to identifiers, no shell), and reads back JUnit reports that must name the
+  tests as the CI run did; `go test -json` output is converted to JUnit by siftwise. Each
+  round's reports are one upload (`rerun = n`); triage rule 1 then reads a pass as flaky.
+  Maven's and Gradle's re-runs write into the CI run's report directories, so those reports
+  are backed up first and put back after, whatever happened. A test that can't be matched (no runner, a different name in the re-run's report) keeps its
+  verdict.
 
 ## Performance
 

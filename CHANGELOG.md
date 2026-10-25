@@ -23,6 +23,16 @@ Codex and Gemini Code Assist VS Code extensions and macOS and Linux.
 - MCP: the server reports siftwise's version to clients (it was empty).
 - `scripts/mcp_smoke.py`: checks `siftwise mcp` over stdio like a client, against a real
   server, including the fail-open cases.
+- Action: `rerun-unknown` re-runs Go, Jest, Maven and Gradle failures, not only pytest's. Each
+  failing test gets its own runner, from its ID and file and the checkout: Go per package
+  (`-run '^(TestA|TestB)$'`, through gotestsum when it's on PATH, else `go test -json`
+  converted to JUnit by siftwise), Jest per file (`-t` with the anchored full name, jest-junit
+  reports), Maven (`-Dtest=Class#m1+m2`) and Gradle (`--tests Class.method`), with `./mvnw` and
+  `./gradlew` when present. `rerun-prefix` applies to pytest and Jest (e.g. `npx`). A test
+  whose runner can't be told isn't re-run, with a warning. The limits and fail-open behaviour
+  are unchanged, and a round's reports are one upload. Maven and Gradle re-runs leave the CI
+  run's `TEST-*.xml` reports as they were: they're backed up before the re-run and put back
+  after it, also when it fails or times out.
 
 ### Changed
 
