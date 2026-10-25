@@ -2,17 +2,25 @@
 
 How to connect `siftwise mcp` to each coding agent, and how to check it works. Every config
 format below comes from the client's official docs (linked in a comment above each snippet,
-checked 2026-10-25). Only Claude Code has been tested end to end; every other client is
-**untested** until someone runs the checks in [Test it](#test-it) and reports back.
+checked 2026-10-25).
+
+Tested on Windows with Claude Code, GitHub Copilot in VS Code, Cursor, Codex CLI and Gemini
+CLI. Windsurf and Cline configs follow their docs but are untested.
+
+The tests (2026-10-25, siftwise built from this repository, a local server, the
+`mcp-smoke/shop` demo repo): `select_tests`, `triage_failure` and `explain` worked in each
+tested client, and fail-open with the server down was checked in Cursor. Not tested: Windsurf,
+Cline, the Codex VS Code extension, the Gemini Code Assist VS Code extension (Google sign-in
+failed with "The caller does not have permission", unrelated to siftwise), and macOS or Linux.
 
 | Client | Status | Config file | How siftwise finds your repository |
 |---|---|---|---|
-| [Claude Code](#claude-code) | tested | `~/.claude.json` (`claude mcp add`) or `.mcp.json` | `CLAUDE_PROJECT_DIR` (Claude Code sets it) |
-| [Cursor](#cursor) | untested | `.cursor/mcp.json` or `~/.cursor/mcp.json` | MCP roots (Cursor's docs: supported) |
-| [Codex CLI](#codex-cli) | untested | `~/.codex/config.toml` | the working directory: its `cwd` setting |
-| [GitHub Copilot in VS Code](#github-copilot-in-vs-code) | untested | `.vscode/mcp.json` | MCP roots (VS Code's docs: supported), else the workspace folder it starts in |
+| [Claude Code](#claude-code) | tested (Windows) | `~/.claude.json` (`claude mcp add`) or `.mcp.json` | `CLAUDE_PROJECT_DIR` (Claude Code sets it) |
+| [GitHub Copilot in VS Code](#github-copilot-in-vs-code) | tested (Windows) | `.vscode/mcp.json` | MCP roots, else the workspace folder it starts in |
+| [Cursor](#cursor) | tested (Windows) | `.cursor/mcp.json` or `~/.cursor/mcp.json` | MCP roots: no path to configure |
+| [Codex CLI](#codex-cli) | tested (Windows) | `~/.codex/config.toml` | the working directory: its `cwd` setting |
+| [Gemini CLI](#gemini-cli) | tested (Windows) | `.gemini/settings.json` or `~/.gemini/settings.json` | the working directory: its `cwd` setting |
 | [Windsurf](#windsurf-devin-desktop) | untested | `mcp_config.json` (global) | `SIFTWISE_REPO_PATH`, or the `repo_path` argument |
-| [Gemini CLI](#gemini-cli) | untested | `.gemini/settings.json` or `~/.gemini/settings.json` | the working directory: its `cwd` setting |
 | [Cline](#cline) | untested | `cline_mcp_settings.json` (global) | `SIFTWISE_REPO_PATH`, or the `repo_path` argument |
 
 ## What every client needs
@@ -48,10 +56,17 @@ siftwise. Gemini CLI's docs say it removes inherited variables whose names conta
    capability, and gives up after 5 s;
 5. the server's working directory.
 
-A subdirectory of a repository works too (siftwise uses its top level). Clients start stdio
-servers in different places. Outside a git repository, every tool answers with a message like
+A subdirectory of a repository works too (siftwise uses its top level). The client's own
+folders (3 and 4) are forgiving: one that isn't in a git repository but holds exactly one
+directly inside (a workspace one level above the checkout) means that one, and the result
+says so in `repository_note`; anything else moves on to the next step. The folders you set
+(1 and 2) are taken as meant: outside a git repository they're an error.
+
+Clients start stdio servers in different places. When nothing gives a repository, every tool
+answers with a message like
 `the server's working directory, C:\Users\you, is not inside a git repository: call again with
-repo_path set to the repository's absolute path, or set SIFTWISE_REPO_PATH ...`, and
+repo_path set to the repository's absolute path, or set SIFTWISE_REPO_PATH ... Git
+repositories one level down: ...`, and
 `select_tests` says to run the full suite. Whether a given agent then retries with `repo_path`
 on its own is untested.
 
@@ -93,7 +108,7 @@ path), and configure siftwise as in the client's section with `SIFTWISE_REPO=mcp
 |---|---|
 | `Which tests should I run for my change? Use siftwise.` | `select_tests`: mode `selective`, command `pytest tests/test_cart.py`, 2 of 4 known tests |
 | `The tests failed and wrote junit-failing.xml. Ask siftwise before fixing anything.` | `triage_failure` with `junit_paths: ["junit-failing.xml"]`: `tests.test_cart::test_total` is `new_regression`; next step "Fix the 1 new_regression failure(s) first." |
-| `Why does siftwise select tests.test_cart::test_total?` | `explain`: known, selected, linked through `shop/cart.py` |
+| `Why does siftwise select tests.test_cart::test_total?` | `explain`: known, selected, linked through `shop/cart.py`, `file_path` `tests/test_cart.py` |
 | Stop the API (`docker compose stop api`), then the first prompt again | `select_tests`: mode `full`, "could not reach siftwise ...": run the full suite |
 
 Also check: the client lists three tools (`select_tests`, `triage_failure`, `explain`) and
@@ -102,7 +117,7 @@ the OS and any server output (each section says where to find it).
 
 ## Claude Code
 
-Status: **tested** (the agent called `select_tests` on its own after a change).
+Status: **tested** on Windows (the agent called `select_tests` on its own after a change).
 
 ```sh
 # https://code.claude.com/docs/en/mcp: options before the name, the server command after --
@@ -136,82 +151,9 @@ environment:
 - **Windows:** if `siftwise` isn't found, use the full path
   (`"C:\\Users\\you\\.local\\bin\\siftwise.exe"` in JSON).
 
-## Cursor
-
-Status: **untested**.
-
-`.cursor/mcp.json` in the project (or `~/.cursor/mcp.json` for every project):
-
-```json
-// https://cursor.com/docs/context/mcp: mcpServers, type stdio, ${workspaceFolder}, ${env:NAME}
-{
-  "mcpServers": {
-    "siftwise": {
-      "type": "stdio",
-      "command": "siftwise",
-      "args": ["mcp"],
-      "env": {
-        "SIFTWISE_SERVER": "https://siftwise.example.com",
-        "SIFTWISE_API_TOKEN": "${env:SIFTWISE_API_TOKEN}"
-      }
-    }
-  }
-}
-```
-
-(Leave the `//` comment line out of the real file.)
-
-- **Repository:** MCP roots. Cursor's docs list Roots as supported, so siftwise asks Cursor
-  for its workspace folders and uses the first one in a git repository; no setting needed
-  (untested). Cursor's docs don't say where stdio servers start. If roots don't arrive (the
-  tools say "not inside a git repository"), add `"SIFTWISE_REPO_PATH": "${workspaceFolder}"`
-  to `env` in the project file (`${workspaceFolder}` is the folder that holds
-  `.cursor/mcp.json`; in the global file it may not be your project).
-- **The token:** `${env:SIFTWISE_API_TOKEN}` reads Cursor's own environment. An app started
-  from the dock or Start menu may not have your shell's variables, so start Cursor from a
-  shell that has it, or use `"envFile"` with a file outside the repository.
-- **Check it:** Cursor's MCP settings list the server and its tools; tool calls need your
-  approval by default.
-- **Windows:** `command` must be on the PATH Cursor sees, or a full path.
-
-## Codex CLI
-
-Status: **untested**.
-
-`~/.codex/config.toml` (or `.codex/config.toml` in a trusted project):
-
-```toml
-# https://learn.chatgpt.com/docs/extend/mcp?surface=cli (was developers.openai.com/codex/mcp):
-# [mcp_servers.<name>], cwd, env, env_vars,
-# startup_timeout_sec (default 10), tool_timeout_sec (default 60)
-[mcp_servers.siftwise]
-command = "siftwise"
-args = ["mcp"]
-cwd = "/path/to/your/repo"            # Windows: 'C:\Users\you\code\repo' (single quotes)
-env_vars = ["SIFTWISE_API_TOKEN"]     # forwarded from the environment you start codex in
-
-[mcp_servers.siftwise.env]
-SIFTWISE_SERVER = "https://siftwise.example.com"
-```
-
-Or `codex mcp add siftwise --env SIFTWISE_SERVER=https://siftwise.example.com
---env SIFTWISE_API_TOKEN=your-token -- siftwise mcp` (that writes the token into the file).
-
-- **Repository:** the working directory, from `cwd`. Codex's MCP docs don't mention roots,
-  so siftwise doesn't expect them (if Codex does declare them, they're used before the working
-  directory). The docs don't say what the default directory is. In the global file one fixed
-  `cwd` means one repository; for several, leave it out and run `codex` from the repository
-  (untested), or let the agent pass `repo_path`.
-- **Environment:** list the token in `env_vars` (or set it in `env`). Don't rely on Codex
-  passing your whole environment through.
-- **Timeouts:** startup has 10 s by default; raise `startup_timeout_sec` if a cold start on
-  Windows is slower.
-- **Check it:** `codex mcp list`, and `/mcp` in a session.
-- **Windows:** TOML single-quoted strings keep backslashes as they are.
-
 ## GitHub Copilot in VS Code
 
-Status: **untested**. Use Copilot Chat in agent mode.
+Status: **tested** on Windows. Use Copilot Chat in agent mode.
 
 `.vscode/mcp.json` in the workspace:
 
@@ -244,11 +186,12 @@ Status: **untested**. Use Copilot Chat in agent mode.
 VS Code asks for the token on first start and stores it securely, so the file can be
 committed. (Leave the `//` comment lines out of the real file.)
 
-- **Repository:** MCP roots. VS Code "provides the MCP server with the user's workspace root
-  folder information" ([its MCP developer guide](https://code.visualstudio.com/api/extension-guides/ai/mcp)),
-  so siftwise uses the first workspace folder in a git repository. If none is (or roots don't
-  arrive), the server's working directory is the workspace folder by default (`cwd`). No
-  setting needed.
+- **Repository:** MCP roots, else the workspace folder it starts in (both worked in testing).
+  VS Code "provides the MCP server with the user's workspace root folder information"
+  ([its MCP developer guide](https://code.visualstudio.com/api/extension-guides/ai/mcp)), so
+  siftwise uses the first workspace folder in a git repository (or the only repository
+  directly inside one); otherwise the server's working directory is the workspace folder by
+  default (`cwd`). No setting needed.
 - **Newer config locations:** VS Code's guided flow now prefers a portable format
   (`.mcp.json` with `mcpServers`, or `~/.copilot/mcp-config.json`) and labels
   `.vscode/mcp.json` as kept for compatibility. The portable format has no `${input:...}`
@@ -257,6 +200,123 @@ committed. (Leave the `//` comment lines out of the real file.)
 - **Check it / logs:** Command Palette, **MCP: List Servers**, select siftwise, **Show
   Output**. **MCP: Reset Trust** resets MCP trust decisions.
 - **Windows:** the sandbox options (`sandboxEnabled`) are macOS and Linux only.
+
+## Cursor
+
+Status: **tested** on Windows, fail-open with the server down included.
+
+`.cursor/mcp.json` in the project (or `~/.cursor/mcp.json` for every project):
+
+```json
+// https://cursor.com/docs/context/mcp: mcpServers, type stdio, ${workspaceFolder}, ${env:NAME}
+{
+  "mcpServers": {
+    "siftwise": {
+      "type": "stdio",
+      "command": "siftwise",
+      "args": ["mcp"],
+      "env": {
+        "SIFTWISE_SERVER": "https://siftwise.example.com",
+        "SIFTWISE_API_TOKEN": "${env:SIFTWISE_API_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+(Leave the `//` comment line out of the real file.)
+
+- **Repository:** MCP roots, with no path configured (that's what testing used). Cursor's
+  docs list Roots as supported, so siftwise asks Cursor for its workspace folders and uses
+  the first one in a git repository (or the only repository directly inside one). Cursor's
+  docs don't say where stdio servers start. If roots don't arrive (the
+  tools say "not inside a git repository"), add `"SIFTWISE_REPO_PATH": "${workspaceFolder}"`
+  to `env` in the project file (`${workspaceFolder}` is the folder that holds
+  `.cursor/mcp.json`; in the global file it may not be your project).
+- **The token:** `${env:SIFTWISE_API_TOKEN}` reads Cursor's own environment. An app started
+  from the dock or Start menu may not have your shell's variables, so start Cursor from a
+  shell that has it, or use `"envFile"` with a file outside the repository.
+- **Check it:** Cursor's MCP settings list the server and its tools; tool calls need your
+  approval by default.
+- **Windows:** `command` must be on the PATH Cursor sees, or a full path.
+
+## Codex CLI
+
+Status: **tested** on Windows (the CLI; the Codex VS Code extension is untested).
+
+`~/.codex/config.toml` (or `.codex/config.toml` in a trusted project):
+
+```toml
+# https://learn.chatgpt.com/docs/extend/mcp?surface=cli (was developers.openai.com/codex/mcp):
+# [mcp_servers.<name>], cwd, env, env_vars,
+# startup_timeout_sec (default 10), tool_timeout_sec (default 60)
+[mcp_servers.siftwise]
+command = "siftwise"
+args = ["mcp"]
+cwd = "/path/to/your/repo"            # Windows: 'C:\Users\you\code\repo' (single quotes)
+env_vars = ["SIFTWISE_API_TOKEN"]     # forwarded from the environment you start codex in
+
+[mcp_servers.siftwise.env]
+SIFTWISE_SERVER = "https://siftwise.example.com"
+```
+
+Or `codex mcp add siftwise --env SIFTWISE_SERVER=https://siftwise.example.com
+--env SIFTWISE_API_TOKEN=your-token -- siftwise mcp` (that writes the token into the file).
+
+- **Repository:** the working directory, from `cwd` in `config.toml` (that's what testing
+  used). Codex's MCP docs don't mention roots (if Codex does declare them, they're used before
+  the working directory), and don't say what the default directory is. In the global file one
+  fixed `cwd` means one repository; for several, leave it out and run `codex` from the
+  repository (untested), or let the agent pass `repo_path`.
+- **"Model not supported":** if Codex says the model isn't supported with a ChatGPT account,
+  pick another model with `/model`. That's Codex's account check, not siftwise.
+- **Environment:** list the token in `env_vars` (or set it in `env`). Don't rely on Codex
+  passing your whole environment through.
+- **Timeouts:** startup has 10 s by default; raise `startup_timeout_sec` if a cold start on
+  Windows is slower.
+- **Check it:** `codex mcp list`, and `/mcp` in a session.
+- **Windows:** TOML single-quoted strings keep backslashes as they are.
+
+## Gemini CLI
+
+Status: **tested** on Windows (the CLI; the Gemini Code Assist VS Code extension is untested).
+
+`.gemini/settings.json` in the project (or `~/.gemini/settings.json`):
+
+```json
+// https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md:
+// mcpServers, cwd, env ($VAR, ${VAR}, %VAR% on Windows), timeout in ms (default 600000)
+{
+  "mcpServers": {
+    "siftwise": {
+      "command": "siftwise",
+      "args": ["mcp"],
+      "cwd": "/path/to/your/repo",
+      "env": {
+        "SIFTWISE_SERVER": "https://siftwise.example.com",
+        "SIFTWISE_API_TOKEN": "$SIFTWISE_API_TOKEN"
+      },
+      "timeout": 60000
+    }
+  }
+}
+```
+
+(Leave the `//` comment lines out of the real file.) Or:
+`gemini mcp add -s project -e SIFTWISE_SERVER=https://siftwise.example.com
+-e SIFTWISE_API_TOKEN=your-token siftwise siftwise mcp`.
+
+- **The token must be in `env`.** Gemini CLI removes inherited variables whose names match
+  `*TOKEN*` (and `*KEY*`, `*SECRET*` ...) before starting a server; variables listed in `env`
+  are kept. `$SIFTWISE_API_TOKEN` expands from the environment you start `gemini` in.
+- **Repository:** the working directory, from `cwd` in `settings.json` (that's what testing
+  used). Gemini CLI's MCP docs don't mention roots (if it does declare them, they're used
+  first) and don't say what the default directory is. Without `cwd`, starting `gemini` in the
+  repository probably works (untested); the agent can also pass `repo_path`.
+- **Schemas:** Gemini CLI strips `additionalProperties` and `$schema`; siftwise's schemas
+  don't depend on either.
+- **Check it:** `/mcp` lists servers, their status and tools.
+- **Windows:** `%SIFTWISE_API_TOKEN%` works there too.
 
 ## Windsurf (Devin Desktop)
 
@@ -295,47 +355,6 @@ Open the config from the Cascade panel: the `...` (Actions) menu, then **Open MC
 - **Limits:** Cascade sees at most 100 tools in total across servers.
 - **Check it:** the MCPs section of the `...` menu shows each server's enabled tool count.
 - **Windows:** use forward slashes or doubled backslashes in JSON paths.
-
-## Gemini CLI
-
-Status: **untested**.
-
-`.gemini/settings.json` in the project (or `~/.gemini/settings.json`):
-
-```json
-// https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md:
-// mcpServers, cwd, env ($VAR, ${VAR}, %VAR% on Windows), timeout in ms (default 600000)
-{
-  "mcpServers": {
-    "siftwise": {
-      "command": "siftwise",
-      "args": ["mcp"],
-      "cwd": "/path/to/your/repo",
-      "env": {
-        "SIFTWISE_SERVER": "https://siftwise.example.com",
-        "SIFTWISE_API_TOKEN": "$SIFTWISE_API_TOKEN"
-      },
-      "timeout": 60000
-    }
-  }
-}
-```
-
-(Leave the `//` comment lines out of the real file.) Or:
-`gemini mcp add -s project -e SIFTWISE_SERVER=https://siftwise.example.com
--e SIFTWISE_API_TOKEN=your-token siftwise siftwise mcp`.
-
-- **The token must be in `env`.** Gemini CLI removes inherited variables whose names match
-  `*TOKEN*` (and `*KEY*`, `*SECRET*` ...) before starting a server; variables listed in `env`
-  are kept. `$SIFTWISE_API_TOKEN` expands from the environment you start `gemini` in.
-- **Repository:** the working directory, from `cwd`. Gemini CLI's MCP docs don't mention
-  roots (if it does declare them, they're used first) and don't say what the default
-  directory is. Without `cwd`, starting `gemini` in the repository probably works (untested);
-  the agent can also pass `repo_path`.
-- **Schemas:** Gemini CLI strips `additionalProperties` and `$schema`; siftwise's schemas
-  don't depend on either.
-- **Check it:** `/mcp` lists servers, their status and tools.
-- **Windows:** `%SIFTWISE_API_TOKEN%` works there too.
 
 ## Cline
 

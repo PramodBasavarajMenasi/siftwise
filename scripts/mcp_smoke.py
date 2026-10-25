@@ -16,7 +16,7 @@ Checks: the handshake (server name and version, startup time vs Codex's 10 s def
 tool list and its schemas, select_tests (selects tests/test_cart.py), triage_failure (the
 JUnit report: one new_regression), explain; then fail-open: server down, no token, started
 outside a repository (and fixed by SIFTWISE_REPO_PATH, the repo_path argument and the
-client's MCP roots).
+client's MCP roots), and a CLAUDE_PROJECT_DIR that holds the repository one level down.
 
 Needs a running server (the dev stack: ``docker compose -f docker-compose.yml -f
 docker-compose.dev.yml up -d``) and its token: ``SIFTWISE_API_TOKEN`` in the environment, else
@@ -225,11 +225,14 @@ def run(args: argparse.Namespace) -> int:
                 out = await call(client, "explain", {"test_id": FAILING_TEST})
                 selection = out.get("selection") or {}
                 report.check(
-                    "explain: known and selected",
+                    "explain: known, selected, with its file",
                     out.get("available") is True
                     and out.get("known") is True
-                    and selection.get("selected") is True,
-                    f"known={out.get('known')} selected={selection.get('selected')}",
+                    and selection.get("selected") is True
+                    # pytest's JUnit names no file: derived from the test ID.
+                    and out.get("file_path") == "tests/test_cart.py",
+                    f"known={out.get('known')} selected={selection.get('selected')} "
+                    f"file_path={out.get('file_path')!r}",
                 )
 
             async def fail_open(client: ClientSession, init: Any, startup: float) -> Any:
@@ -302,6 +305,17 @@ def run(args: argparse.Namespace) -> int:
                     )
 
                 await session(command, env, outside, log, with_roots, roots=[demo])
+
+                # A client-set folder that isn't a repository but holds exactly one (the
+                # workdir holds the demo repo, a plain folder and files): that one, with a note.
+                select, _, _ = await scenario({**env, "CLAUDE_PROJECT_DIR": str(workdir)}, outside)
+                report.check(
+                    "CLAUDE_PROJECT_DIR holding one repository: selects it, with a note",
+                    select.get("command") == EXPECTED_SELECTION
+                    and str(demo) in select.get("repository_note", ""),
+                    f"command={select.get('command')!r} "
+                    f"note={select.get('repository_note', '')[:120]!r}",
+                )
 
             try:
                 anyio.run(all_checks)

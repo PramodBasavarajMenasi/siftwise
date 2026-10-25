@@ -561,8 +561,23 @@ it.
 **Which repository:** the first that applies of the tool's `repo_path` argument (an absolute
 path the agent can pass), `SIFTWISE_REPO_PATH`, `CLAUDE_PROJECT_DIR` (set by Claude Code), the
 client's workspace folders if it supports MCP roots, and the server's working directory.
-Clients start servers in different places; outside a git repository, every tool says so and
-how to fix it. Per-client setup: [MCP clients](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/mcp-clients.md).
+A folder the client sets (`CLAUDE_PROJECT_DIR`, a root) that isn't a repository but holds
+exactly one directly inside means that one, and the result says so. Outside a git repository,
+every tool says so and how to fix it, listing the repositories one level down.
+
+Tested on Windows with Claude Code, GitHub Copilot in VS Code, Cursor, Codex CLI and Gemini
+CLI. Windsurf and Cline configs follow their docs but are untested. Setup for each, with
+snippets: [MCP clients](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/mcp-clients.md).
+
+| Client | Config | How it finds the repository |
+|---|---|---|
+| Claude Code (tested) | `claude mcp add`, or `.mcp.json` | `CLAUDE_PROJECT_DIR`, which Claude Code sets |
+| GitHub Copilot in VS Code (tested) | `.vscode/mcp.json` | MCP roots, else the workspace folder it starts in |
+| Cursor (tested) | `.cursor/mcp.json` or `~/.cursor/mcp.json` | MCP roots: no path to configure |
+| Codex CLI (tested) | `~/.codex/config.toml` | the working directory: set `cwd` |
+| Gemini CLI (tested) | `.gemini/settings.json` | the working directory: set `cwd` |
+| Windsurf (untested) | `mcp_config.json` | `SIFTWISE_REPO_PATH`, or the `repo_path` argument |
+| Cline (untested) | `cline_mcp_settings.json` | `SIFTWISE_REPO_PATH`, or the `repo_path` argument |
 
 **Claude Code:**
 
@@ -588,20 +603,30 @@ or a project `.mcp.json`, which expands `${VAR}` from your environment:
 }
 ```
 
-> Tested with Claude Code. The Codex and Cursor configs follow each tool's MCP format but
-> haven't been tested yet. Reports welcome.
-
-**Codex** (`~/.codex/config.toml`):
+**Codex CLI** (`~/.codex/config.toml`):
 
 ```toml
 [mcp_servers.siftwise]
 command = "siftwise"
 args = ["mcp"]
+cwd = '/path/to/your/repo'   # the repository: Codex starts the server there
 env = { SIFTWISE_SERVER = "https://siftwise.example.com", SIFTWISE_API_TOKEN = "your-token" }
 ```
 
+If Codex says the model isn't supported with a ChatGPT account, pick another model with
+`/model`.
+
 **Cursor** (`~/.cursor/mcp.json` for every project, or `.cursor/mcp.json` in one): the same
-JSON as `.mcp.json` above, with the token value written in.
+JSON as `.mcp.json` above, with the token value written in. No repository path: Cursor sends
+its workspace folders as MCP roots.
+
+**Gemini CLI** (`.gemini/settings.json`): the same JSON with `"cwd": "/path/to/your/repo"`
+added. Put the token in the server's `env` block (as above): Gemini CLI strips inherited
+variables whose names contain `TOKEN`, so one set only in your shell never reaches siftwise.
+
+**GitHub Copilot in VS Code** (`.vscode/mcp.json`): servers go under `"servers"` with
+`"type": "stdio"`; see [MCP clients](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/mcp-clients.md#github-copilot-in-vs-code)
+for a config that prompts for the token.
 
 **If the agent can't find `siftwise`** (it doesn't see your shell's PATH, common on Windows),
 give the full path from `uv tool dir --bin` as the command. In JSON, double the backslashes
@@ -635,7 +660,9 @@ on = ["**/*.go", "!**/*_test.go"]         # ! excludes
   package's import path, so match them with `**::TestName` or `<import path>::*`.
 - **Generated files** never count as changed code, even untracked or committed by mistake:
   `junit*.xml`, `coverage.xml`, `.coverage`, `.coverage.*`, `htmlcov/`, `*.log`,
-  `.pytest_cache/` and `__pycache__/`, at any depth. `generated` adds to that list.
+  `.pytest_cache/` and `__pycache__/`, plus editor and coding-agent settings: `.vscode/`,
+  `.cursor/`, `.idea/`, `.mcp.json`, `.codex/` and `.gemini/`, all at any depth. `generated`
+  adds to that list.
 - **`known_flaky`** is for triage only (selection still runs listed tests); CI applies a pull
   request's base list ([Flaky tests](#flaky-tests)).
 

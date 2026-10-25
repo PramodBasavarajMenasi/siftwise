@@ -6,8 +6,11 @@ All notable changes to siftwise. The format follows
 
 ## [Unreleased]
 
-Preparing `siftwise mcp` for more MCP clients
-([per-client setup](docs/mcp-clients.md); still tested with Claude Code only).
+`siftwise mcp` for more MCP clients ([per-client setup](docs/mcp-clients.md)). Tested on
+Windows with Claude Code, GitHub Copilot in VS Code, Cursor, Codex CLI and Gemini CLI:
+`select_tests`, `triage_failure` and `explain` worked in each, and fail-open with the server
+down in Cursor. Windsurf and Cline configs follow their docs but are untested, as are the
+Codex and Gemini Code Assist VS Code extensions and macOS and Linux.
 
 ### Added
 
@@ -29,6 +32,20 @@ Preparing `siftwise mcp` for more MCP clients
   that send null still work.
 - MCP: API calls give up after 30 s (was 60 s), inside Codex's 60 s default tool timeout, so
   the agent gets the fail-open answer instead of a client error.
+- Selection: editor and coding-agent settings (`.vscode/`, `.cursor/`, `.idea/`, `.mcp.json`,
+  `.codex/`, `.gemini/`, at any depth) are generated files by default, never changed code: an
+  agent's MCP config written mid-change no longer forces the full suite.
+
+### Fixed
+
+- MCP: a folder the client sets (`CLAUDE_PROJECT_DIR`, a root) that isn't in a git repository
+  but holds exactly one directly inside now means that repository, with a `repository_note`
+  in the result; otherwise the next step is tried instead of failing. `repo_path` and
+  `SIFTWISE_REPO_PATH` (set by the user) still fail when they're not in a repository. When
+  nothing works, the error lists the git repositories found one level down.
+- MCP: `explain` returned `file_path: null` for pytest tests whose JUnit names no file (e.g.
+  `tests.test_cart::test_bulk_discount`); the file now comes from the test ID, through the
+  selector's mapping, when it exists in the checkout.
 
 ## [0.1.0] - 2026-10-20
 

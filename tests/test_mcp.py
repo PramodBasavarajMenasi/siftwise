@@ -630,8 +630,141 @@ def test_roots_outside_any_repository_are_named(tmp_path: Path, api: respx.MockR
     out = call_client("select_tests", {}, ENV, Roots(docs))
 
     assert out["mode"] == "full"
-    assert f"none of the client's roots ({docs}) is in a git repository" in out["reason"]
+    assert f"the client's roots ({docs}) gave no git repository" in out["reason"]
     assert "repo_path" in out["reason"] and not api.calls
+
+
+# Folders the CLIENT sets (CLAUDE_PROJECT_DIR, roots) that hold exactly one repository directly
+# inside mean that one; the user's own settings (repo_path, SIFTWISE_REPO_PATH) never guess.
+
+
+@pytest.fixture
+def holders(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, Path]:
+    """Folders that aren't repositories: one holding a single repo, one holding two, one
+    holding none (but a plain subdirectory)."""
+    base = tmp_path_factory.mktemp("holders")
+    one, two, none = base / "one", base / "two", base / "none"
+    make_repo(one / "only", "only")
+    make_repo(two / "first", "first")
+    make_repo(two / "second", "second")
+    (none / "notes").mkdir(parents=True)
+    # Never find a repository above them.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(base))
+    return {"one": one, "two": two, "none": none}
+
+
+def selected(
+    api: respx.MockRouter, env: dict[str, str], roots: Roots | None = None, **args: Any
+) -> dict[str, Any]:
+    route = api.post(f"{SERVER}/select").respond(json=selection())
+    out = call_client("select_tests", args, env, roots)
+    assert route.called, out
+    return {"repo": sent(route)["repo"], **out}
+
+
+def test_claude_project_dir_holding_one_repository_uses_it_and_says_so(
+    repos: dict[str, Path], holders: dict[str, Path], api: respx.MockRouter
+) -> None:
+    roots = Roots(repos["root"])
+
+    out = selected(api, {**ENV, "CLAUDE_PROJECT_DIR": str(holders["one"])}, roots)
+
+    assert out["repo"] == "acme/only"
+    assert out["repository_note"] == (
+        f"CLAUDE_PROJECT_DIR {holders['one']} isn't in a git repository; using the only one "
+        f"directly inside it, {holders['one'] / 'only'} (pass repo_path for another)"
+    )
+    assert roots.asked == 0
+
+
+def test_claude_project_dir_holding_two_repositories_falls_through(
+    repos: dict[str, Path], holders: dict[str, Path], api: respx.MockRouter
+) -> None:
+    env = {**ENV, "CLAUDE_PROJECT_DIR": str(holders["two"])}
+    roots = Roots(repos["root"])
+
+    out = selected(api, env, roots)
+    assert (out["repo"], "repository_note" in out) == ("acme/root", False)  # to the roots
+    assert roots.asked == 1
+    assert selected(api, env)["repo"] == "acme/cwd"  # no roots: the working directory
+
+
+def test_a_root_holding_one_repository_is_used(
+    repos: dict[str, Path], holders: dict[str, Path], api: respx.MockRouter
+) -> None:
+    out = selected(api, ENV, Roots(holders["none"], holders["one"]))
+
+    assert out["repo"] == "acme/only"
+    assert out["repository_note"].startswith(f"the client's root {holders['one']} isn't in")
+
+
+def test_a_root_in_a_repository_wins_over_one_holding_a_repository(
+    repos: dict[str, Path], holders: dict[str, Path], api: respx.MockRouter
+) -> None:
+    out = selected(api, ENV, Roots(holders["one"], repos["root"]))
+
+    assert (out["repo"], "repository_note" in out) == ("acme/root", False)
+
+
+@pytest.mark.parametrize("setting", ["argument", "env"])
+def test_the_users_own_setting_never_guesses(
+    repos: dict[str, Path], holders: dict[str, Path], api: respx.MockRouter, setting: str
+) -> None:
+    folder = str(holders["one"])
+    args = {"repo_path": folder} if setting == "argument" else {}
+    env = {**ENV, "SIFTWISE_REPO_PATH": folder} if setting == "env" else ENV
+
+    out = call_client("select_tests", args, env)
+
+    assert out["mode"] == "full"
+    assert f"{folder} is not inside a git repository" in out["reason"]
+    assert f"Git repositories one level down: {holders['one'] / 'only'}" in out["reason"]
+    assert not api.calls
+
+
+def test_when_nothing_works_the_error_lists_repositories_one_level_down(
+    holders: dict[str, Path], monkeypatch: pytest.MonkeyPatch, api: respx.MockRouter
+) -> None:
+    monkeypatch.chdir(holders["none"])
+    env = {**ENV, "CLAUDE_PROJECT_DIR": str(holders["two"])}
+
+    out = call_client("select_tests", {}, env, Roots(holders["none"] / "notes"))
+
+    reason = out["reason"]
+    assert out["mode"] == "full" and not api.calls
+    assert reason.startswith(
+        f"CLAUDE_PROJECT_DIR {holders['two']} and the client's roots "
+        f"({holders['none'] / 'notes'}) gave no git repository, and the server's working "
+        f"directory, {holders['none']}, is not inside a git repository"
+    )
+    assert reason.endswith(
+        f"Git repositories one level down: {holders['two'] / 'first'}, {holders['two'] / 'second'}"
+    )
+
+
+# --- explain: the test's file -------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("checkout")
+@pytest.mark.parametrize(
+    ("stored", "test_id", "expected"),
+    [
+        (None, "tests.test_cart::test_bulk_discount", "tests/test_cart.py"),  # derived
+        (None, "tests.test_gone::test_x", None),  # derived, but not in the checkout
+        (None, "github.com/acme/shop/cart::TestTotal", None),  # not a pytest test
+        ("tests/other.py", "tests.test_cart::test_total", "tests/other.py"),  # stored wins
+    ],
+)
+def test_explain_derives_a_missing_file_path(
+    checkout: Path, api: respx.MockRouter, stored: str | None, test_id: str, expected: str | None
+) -> None:
+    (checkout / "tests").mkdir()
+    (checkout / "tests" / "test_cart.py").write_text("def test_bulk_discount(): pass\n")
+    api.post(f"{SERVER}/explain").respond(json=explanation(test_id=test_id, file_path=stored))
+
+    assert call("explain", {"test_id": test_id})["file_path"] == expected
 
 
 def test_the_handshake_without_roots_never_asks(

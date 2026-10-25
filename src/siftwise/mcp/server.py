@@ -53,6 +53,7 @@ from pydantic import Field
 from siftwise import __version__
 from siftwise.cli import main as cli
 from siftwise.cli.repoconfig import RepoConfigError
+from siftwise.core import selector
 from siftwise.core.junit import JUnitParseError
 
 # Every tool result, as JSON text, stays within this many characters.
@@ -65,6 +66,8 @@ TIMEOUT = 30.0
 # Asking the client for its roots: a client that declares roots but never answers must not
 # hold up the tool.
 ROOTS_TIMEOUT = 5.0
+# Repositories one level down listed in the "not a repository" error.
+MAX_FOUND = 10
 NOT_A_REPO = (
     "is not inside a git repository: call again with repo_path set to the repository's "
     "absolute path, or set SIFTWISE_REPO_PATH (or the client's working directory for the "
@@ -278,7 +281,8 @@ def _select(
     config: Config, where: Where, base: str | None, uncommitted: bool, max_tests: int
 ) -> dict[str, Any]:
     try:
-        root = _checkout(config, where)
+        checkout = _checkout(config, where)
+        root = checkout.root
         base = base or config.base or cli.default_base(root)
         repo = _repo(config, root)
         change = cli.local_change(base, "HEAD", working_tree=uncommitted, cwd=root)
@@ -304,6 +308,7 @@ def _select(
         "total_known": result["total_known"],
         "base": base,
         "uncommitted_included": uncommitted,
+        **checkout.noted(),
     }
     if total > 0:
         out["estimated_test_time_skipped"] = f"{100 * (total - would_run) / total:.0f}%"
@@ -333,8 +338,10 @@ def _triage(
     found: list[dict[str, Any]] = []
     root: Path | None = None
     problem: Unavailable | None = None
+    noted: dict[str, str] = {}
     try:
-        root = _checkout(config, where)
+        checkout = _checkout(config, where)
+        root, noted = checkout.root, checkout.noted()
     except Unavailable as exc:
         problem = exc
     try:
@@ -391,6 +398,7 @@ def _triage(
         "counts": result["counts"],
         "next_step": _triage_next_step(result["counts"]),
         "tested_code": "uncommitted changes" if commit is None else f"commit {commit[:7]}",
+        **noted,
         "results": [_compact_result(r) for r in results[:MAX_TRIAGE_RESULTS]],
     }
     if len(results) > MAX_TRIAGE_RESULTS:
@@ -407,7 +415,8 @@ def _explain(
     uncommitted: bool,
 ) -> dict[str, Any]:
     try:
-        root = _checkout(config, where)
+        checkout = _checkout(config, where)
+        root = checkout.root
         repo, base = _repo(config, root), base or config.base or cli.default_base(root)
         try:
             change = cli.local_change(base, "HEAD", working_tree=uncommitted, cwd=root)
@@ -431,7 +440,8 @@ def _explain(
         "available": True,
         "test_id": result["test_id"],
         "known": result["known"],
-        "file_path": result["file_path"],
+        "file_path": result["file_path"] or _derived_file(result["test_id"], root),
+        **checkout.noted(),
         "selection": {
             "selected": selection["selected"],
             "mode": selection["mode"],
@@ -485,24 +495,39 @@ async def _run(config: Config, tool: Callable[[Config], dict[str, Any]]) -> dict
     return await anyio.to_thread.run_sync(_guarded, config, tool)
 
 
-def _given(config: Config, where: Where) -> tuple[str, str] | None:
-    """The first explicit location, as (its name, its value): the ``repo_path`` argument,
-    SIFTWISE_REPO_PATH, then CLAUDE_PROJECT_DIR."""
-    for source, value in (
-        ("repo_path", where.repo_path),
-        ("SIFTWISE_REPO_PATH", config.repo_path),
-        ("CLAUDE_PROJECT_DIR", config.project_dir),
-    ):
+@dataclass(frozen=True)
+class Checkout:
+    """The repository a tool works on, and a note when siftwise had to look inside the folder
+    the client gave (the agent should know which repository it got)."""
+
+    root: Path
+    note: str | None = None
+
+    def noted(self) -> dict[str, str]:
+        return {"repository_note": self.note} if self.note else {}
+
+
+def _user_given(config: Config, where: Where) -> tuple[str, str] | None:
+    """The location the user set, as (its name, its value): the ``repo_path`` argument, else
+    SIFTWISE_REPO_PATH. Wrong is an error: the user meant it."""
+    for source, value in (("repo_path", where.repo_path), ("SIFTWISE_REPO_PATH", config.repo_path)):
         if value:
             return source, value
     return None
 
 
 async def _where(config: Config, repo_path: str | None, ctx: Context) -> Where:
-    """The call's ``Where``: the client's roots are asked for only when no explicit location
-    applies (so a client that doesn't support roots is never asked anything)."""
-    if _given(config, Where(repo_path)):
+    """The call's ``Where``: the client's roots are asked for only when no user-set location
+    applies and CLAUDE_PROJECT_DIR doesn't give a repository (so a client that doesn't
+    support roots is never asked anything)."""
+    if _user_given(config, Where(repo_path)):
         return Where(repo_path)
+    if config.project_dir:
+        found, _ = await anyio.to_thread.run_sync(
+            _client_folder, "CLAUDE_PROJECT_DIR", Path(config.project_dir).expanduser()
+        )
+        if found is not None:
+            return Where(repo_path)
     return Where(repo_path, await _client_roots(ctx))
 
 
@@ -537,12 +562,50 @@ def _root_path(uri: str) -> Path | None:
     return Path(path)
 
 
-def _checkout(config: Config, where: Where) -> Path:
-    """The git checkout the tools work on, first that applies: the ``repo_path`` argument,
-    SIFTWISE_REPO_PATH, CLAUDE_PROJECT_DIR (Claude Code), the first of the client's roots that
-    is in a git repository, else the server's working directory. Clients start stdio servers
-    wherever they like (some in the home directory), so say how to point siftwise at it."""
-    given = _given(config, where)
+def _repos_inside(folder: Path) -> list[Path]:
+    """Git repositories directly inside ``folder`` (a subdirectory with a ``.git`` entry: a
+    directory, or a file for worktrees and submodules), sorted."""
+    try:
+        return sorted(p for p in folder.iterdir() if p.is_dir() and (p / ".git").exists())
+    except OSError:
+        return []
+
+
+def _client_folder(source: str, folder: Path) -> tuple[Checkout | None, list[Path]]:
+    """A folder the client set (CLAUDE_PROJECT_DIR, a root): its repository, else the only
+    repository directly inside it (with a note), else None. Also the repositories found
+    inside, for the error when nothing works."""
+    if not folder.is_dir():
+        return None, []
+    root = cli.git_toplevel(folder)
+    if root is not None:
+        return Checkout(root), []
+    inside = _repos_inside(folder)
+    if len(inside) == 1:
+        root = cli.git_toplevel(inside[0])
+        if root is not None:
+            note = (
+                f"{source} {folder} isn't in a git repository; using the only one directly "
+                f"inside it, {root} (pass repo_path for another)"
+            )
+            return Checkout(root, note), inside
+    return None, inside
+
+
+def _checkout(config: Config, where: Where) -> Checkout:
+    """The git checkout the tools work on, first that applies:
+
+    1. the ``repo_path`` argument, 2. SIFTWISE_REPO_PATH: set by the user, so a folder outside
+       a git repository is an error;
+    3. CLAUDE_PROJECT_DIR (Claude Code), 4. the client's roots (the first one in a git
+       repository, else the first holding exactly one repository): set by the client, so a
+       folder that isn't a repository but holds exactly one directly inside means that one,
+       and anything else falls through;
+    5. the server's working directory.
+
+    Clients start stdio servers wherever they like (some in the home directory), so the error
+    says how to point siftwise at a repository and lists those found one level down."""
+    given = _user_given(config, where)
     if given:
         source, value = given
         start = Path(value).expanduser()
@@ -550,23 +613,57 @@ def _checkout(config: Config, where: Where) -> Path:
             raise Unavailable(f"{source} {start} is not a directory")
         root = cli.git_toplevel(start)
         if root is None:
-            raise Unavailable(f"{source} {start} {NOT_A_REPO}")
-        return root
+            raise Unavailable(f"{source} {start} {NOT_A_REPO}{_found(_repos_inside(start))}")
+        return Checkout(root)
+
+    tried: list[str] = []
+    found: list[Path] = []
+    if config.project_dir:
+        project = Path(config.project_dir).expanduser()
+        checkout, inside = _client_folder("CLAUDE_PROJECT_DIR", project)
+        if checkout is not None:
+            return checkout
+        tried.append(f"CLAUDE_PROJECT_DIR {project}")
+        found += inside
+    # A root inside a repository wins over one that only holds a repository.
     for path in where.roots:
         root = cli.git_toplevel(path) if path.is_dir() else None
         if root is not None:
-            return root
+            return Checkout(root)
+    for path in where.roots:
+        checkout, inside = _client_folder("the client's root", path)
+        if checkout is not None:
+            return checkout
+        found += inside
+    if where.roots:
+        tried.append(f"the client's roots ({', '.join(str(path) for path in where.roots)})")
+
     start = Path.cwd()
     root = cli.git_toplevel(start)
-    if root is None:
-        tried = ", ".join(str(path) for path in where.roots)
-        if tried:
-            raise Unavailable(
-                f"none of the client's roots ({tried}) is in a git repository, and the "
-                f"server's working directory, {start}, {NOT_A_REPO}"
-            )
-        raise Unavailable(f"the server's working directory, {start}, {NOT_A_REPO}")
-    return root
+    if root is not None:
+        return Checkout(root)
+    found += _repos_inside(start)
+    where_ = f"the server's working directory, {start}, {NOT_A_REPO}"
+    if tried:
+        where_ = f"{' and '.join(tried)} gave no git repository, and {where_}"
+    raise Unavailable(where_ + _found(found))
+
+
+def _found(repos: list[Path]) -> str:
+    """The repositories found one level down, for an error message."""
+    unique = list(dict.fromkeys(repos))
+    if not unique:
+        return ""
+    listed = ", ".join(str(path) for path in unique[:MAX_FOUND])
+    more = f" and {len(unique) - MAX_FOUND} more" if len(unique) > MAX_FOUND else ""
+    return f". Git repositories one level down: {listed}{more}"
+
+
+def _derived_file(test_id: str, root: Path) -> str | None:
+    """A pytest test's file from its ID (the selector's mapping: ``tests.test_cart::test_x`` ->
+    ``tests/test_cart.py``), when nothing reported one; only if it exists in the checkout."""
+    path = selector.pytest_file(test_id)
+    return path if path and (root / path).is_file() else None
 
 
 def _repo(config: Config, root: Path) -> str:
