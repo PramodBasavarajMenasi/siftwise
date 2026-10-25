@@ -163,6 +163,10 @@ _IGNORABLE_DIRS = ("docs/",)
 GENERATED_GLOBS = (
     "**/junit*.xml", "**/coverage.xml", "**/.coverage", "**/.coverage.*", "**/htmlcov/**",
     "**/*.log", "**/.pytest_cache/**", "**/__pycache__/**",
+    # Editor and coding-agent settings (an agent's MCP config, workspace files): never code
+    # under test, though agents and editors write them in the middle of a change.
+    "**/.vscode/**", "**/.cursor/**", "**/.idea/**", "**/.mcp.json", "**/.codex/**",
+    "**/.gemini/**",
 )  # fmt: skip
 
 _PY_IDENTIFIER = re.compile(r"[A-Za-z_]\w*\Z")

@@ -4,6 +4,49 @@ All notable changes to siftwise. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor version may break things).
 
+## [Unreleased]
+
+`siftwise mcp` for more MCP clients ([per-client setup](docs/mcp-clients.md)). Tested on
+Windows with Claude Code, GitHub Copilot in VS Code, Cursor, Codex CLI and Gemini CLI:
+`select_tests`, `triage_failure` and `explain` worked in each, and fail-open with the server
+down in Cursor. Windsurf and Cline configs follow their docs but are untested, as are the
+Codex and Gemini Code Assist VS Code extensions and macOS and Linux.
+
+### Added
+
+- MCP: the `repo_path` tool argument and `SIFTWISE_REPO_PATH`, for clients that start the
+  server outside the repository. The repository is the first of: `repo_path`,
+  `SIFTWISE_REPO_PATH`, `CLAUDE_PROJECT_DIR` (set by Claude Code), the client's workspace
+  folders over MCP roots (asked only when the client supports roots), and the working
+  directory. Outside a git repository every tool says so and how to fix it, instead of
+  "set SIFTWISE_REPO". Relative `junit_paths` are read from the repository root.
+- MCP: the server reports siftwise's version to clients (it was empty).
+- `scripts/mcp_smoke.py`: checks `siftwise mcp` over stdio like a client, against a real
+  server, including the fail-open cases.
+
+### Changed
+
+- MCP: tool schemas work across clients: every parameter has a description, and optional
+  parameters are plain JSON types instead of `anyOf` with null, which Codex's schema converter
+  reads as a string ([openai/codex#1975](https://github.com/openai/codex/pull/1975)). Clients
+  that send null still work.
+- MCP: API calls give up after 30 s (was 60 s), inside Codex's 60 s default tool timeout, so
+  the agent gets the fail-open answer instead of a client error.
+- Selection: editor and coding-agent settings (`.vscode/`, `.cursor/`, `.idea/`, `.mcp.json`,
+  `.codex/`, `.gemini/`, at any depth) are generated files by default, never changed code: an
+  agent's MCP config written mid-change no longer forces the full suite.
+
+### Fixed
+
+- MCP: a folder the client sets (`CLAUDE_PROJECT_DIR`, a root) that isn't in a git repository
+  but holds exactly one directly inside now means that repository, with a `repository_note`
+  in the result; otherwise the next step is tried instead of failing. `repo_path` and
+  `SIFTWISE_REPO_PATH` (set by the user) still fail when they're not in a repository. When
+  nothing works, the error lists the git repositories found one level down.
+- MCP: `explain` returned `file_path: null` for pytest tests whose JUnit names no file (e.g.
+  `tests.test_cart::test_bulk_discount`); the file now comes from the test ID, through the
+  selector's mapping, when it exists in the checkout.
+
 ## [0.1.0] - 2026-10-20
 
 The first release: a self-hosted server, a CLI, three GitHub Actions and an MCP server for

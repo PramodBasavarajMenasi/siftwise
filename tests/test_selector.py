@@ -31,6 +31,7 @@ from siftwise.core.selector import (
     build_file_scope,
     glob_match,
     is_build_file,
+    is_generated,
     load_history,
     pytest_file,
     select_for_repo,
@@ -576,6 +577,14 @@ def test_lint_and_format_configs_never_force_the_full_suite(path: str) -> None:
         "logs/server/run.log",
         ".pytest_cache/v/cache/nodeids",
         "src/shop/__pycache__/cart.cpython-312.pyc",
+        # Editor and coding-agent settings, at the root or in a package.
+        ".vscode/mcp.json",
+        ".cursor/mcp.json",
+        ".idea/workspace.xml",
+        ".mcp.json",
+        ".codex/config.toml",
+        ".gemini/settings.json",
+        "packages/web/.vscode/settings.json",
     ],
 )
 def test_generated_files_never_count_as_changed_source(path: str) -> None:
@@ -587,6 +596,11 @@ def test_generated_files_never_count_as_changed_source(path: str) -> None:
     with_code = select(PY, path, "src/shop/cart.py")
     assert with_code.mode is Mode.SELECTIVE
     assert set(ids(with_code)) == set(ids(select(PY, "src/shop/cart.py")))
+
+
+@pytest.mark.parametrize("path", ["src/vscode.py", ".vscodex/run.py", "mcp.json"])
+def test_lookalikes_of_editor_settings_are_still_code(path: str) -> None:
+    assert not is_generated(path)
 
 
 def test_generated_globs_extend_from_the_repo_config() -> None:
