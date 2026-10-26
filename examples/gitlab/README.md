@@ -41,7 +41,9 @@ server instead.
 
    This first pipeline records history: `siftwise-select` runs the full suite (no history
    yet), `test` passes, `siftwise-rollup` passes. Check that `siftwise-rollup`'s artifacts
-   have `.siftwise-history/`.
+   have `.siftwise-history/`. **Wait until this pipeline has passed before step 4:** a
+   pipeline that starts earlier finds no successful `main` pipeline to read history from and
+   starts empty (see [The history log line](#the-history-log-line)).
 
 3. **The note's token.** On GitLab.com Free, create a fine-grained personal access token
    (avatar > Edit profile > Access > Personal access tokens > Generate token > Fine-grained
@@ -95,6 +97,33 @@ server instead.
     YAML's): the test job runs the full suite, with warnings. `siftwise-rollup` fails,
     because with `fail-on` set, unavailable verdicts fail closed. Delete the variable
     afterwards.
+
+## The history log line
+
+Every job's log has a `history:` line from `ci/history.py restore`. In a merge request
+pipeline it reads `main`'s history with the job's own `CI_JOB_TOKEN`, from
+`GET /projects/:id/jobs/artifacts/main/download?job=siftwise-rollup&search_recent_successful_pipelines=true`
+([Download job artifacts by reference name](https://docs.gitlab.com/api/job_artifacts/#download-job-artifacts-by-reference-name)).
+The job token can call this endpoint for its own project on every tier, Free included: the
+job artifacts download endpoints are on its list of
+[allowed endpoints](https://docs.gitlab.com/ci/jobs/ci_job_token/), and a project's job
+token allowlist always includes the project itself. No other token is needed.
+
+- `HTTP 200, N bytes: the default branch's history`: it worked.
+- `HTTP 404 '{"message":"404 Not found"}'`: GitLab found no successful `main` pipeline whose
+  `siftwise-rollup` job kept artifacts. Usually `main`'s pipeline hadn't finished when this
+  pipeline started. Expiry is unlikely: GitLab keeps the most recent successful pipeline's
+  artifacts of each branch whatever their `expire_in`, unless **Keep artifacts from most
+  recent successful jobs** is turned off
+  ([docs](https://docs.gitlab.com/ci/jobs/job_artifacts/#keep-artifacts-from-most-recent-successful-jobs)). Let
+  `main`'s pipeline pass, then run the merge request's pipeline again (**Run pipeline** on
+  its Pipelines tab; retrying one job isn't enough, since each job restores on its own).
+- `HTTP 404 '{"message":"404 Project Not Found"}'`: the token's user can't see the project.
+- `HTTP 401`: the job token was refused. It is valid only while its job runs.
+- `HTTP 403`: the job token was refused for this project (Settings > CI/CD > Job token
+  permissions).
+
+The token is sent in the `JOB-TOKEN` header, never in the URL, and never logged.
 
 ## Clean up
 
