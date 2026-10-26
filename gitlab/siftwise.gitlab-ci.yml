@@ -1,0 +1,89 @@
+# siftwise for GitLab CI: hidden jobs to `extends:` from your .gitlab-ci.yml.
+# Setup, variables and security: https://github.com/PramodBasavarajMenasi/siftwise#gitlab-ci
+#
+#   .siftwise-select  a job of its own (stage .pre): picks the tests and passes SIFTWISE_MODE,
+#                     SIFTWISE_COMMAND_FILE and the rest to later jobs (artifacts:reports:dotenv)
+#   .siftwise-record  extend your test job with it: its after_script uploads the job's JUnit
+#                     reports (the job's image needs Python 3.11+)
+#   .siftwise-rollup  a job of its own (stage .post, when: always): failure verdicts, the merge
+#                     request note, fail-on, then the test stats
+#
+# Include this file by a release tag and its hash, never a branch: the tag pins what runs in
+# your pipelines with your tokens, and the hash makes GitLab refuse a changed file.
+#
+#   include:
+#     - remote: https://raw.githubusercontent.com/PramodBasavarajMenasi/siftwise/v0.1.0/gitlab/siftwise.gitlab-ci.yml
+#       integrity: sha256-<base64 SHA-256 of that file>
+#
+# CI/CD variables (Settings > CI/CD > Variables): SIFTWISE_SERVER, SIFTWISE_TOKEN (masked) and,
+# for the merge request note, SIFTWISE_GITLAB_TOKEN (masked). siftwise reads tokens from the
+# environment only. Never echo them, and never add `set -x` or CI_DEBUG_TRACE to these jobs:
+# a traced shell prints variables.
+
+.siftwise-base:
+  variables:
+    # The siftwise this file installs: its own release (a test keeps the two in step).
+    SIFTWISE_PIP_SPEC: "siftwise==0.1.0"
+
+.siftwise-install:
+  script:
+    - python3 -m venv /tmp/siftwise-venv
+    - /tmp/siftwise-venv/bin/python -m pip install --quiet --disable-pip-version-check "$SIFTWISE_PIP_SPEC"
+
+.siftwise-select:
+  extends: .siftwise-base
+  stage: .pre
+  # git (for the diff) and Python. For Go import graphs, use an image with go too.
+  image: python:3.12-bookworm
+  variables:
+    GIT_DEPTH: "0"  # the diff needs the history; new projects clone 20 commits
+  script:
+    - !reference [.siftwise-install, script]
+    - /tmp/siftwise-venv/bin/siftwise gitlab select
+  # Never blocks the pipeline: if this job fails (a shallow clone, siftwise down), later jobs
+  # find no SIFTWISE_MODE and run the full suite.
+  allow_failure: true
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - .siftwise-ci/
+    reports:
+      dotenv: .siftwise-ci/select.env
+
+.siftwise-record:
+  extends: .siftwise-base
+  variables:
+    GIT_DEPTH: "0"  # the recorded change links need the history
+    # The rollup job triages and updates stats once, after every test job.
+    SIFTWISE_DEFER_ROLLUP: "true"
+    SIFTWISE_TRIAGE: "false"
+  # after_script runs whether the tests passed or failed, and can't fail the job. Its default
+  # time limit is 5 minutes (RUNNER_AFTER_SCRIPT_TIMEOUT).
+  after_script:
+    - !reference [.siftwise-install, script]
+    - /tmp/siftwise-venv/bin/siftwise gitlab record
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - .siftwise-ci/
+
+.siftwise-rollup:
+  extends: .siftwise-base
+  stage: .post
+  image: python:3.12-slim-bookworm
+  when: always
+  dependencies: []  # no artifacts needed: the server has what each job recorded
+  variables:
+    GIT_STRATEGY: empty  # no checkout needed
+  script:
+    - !reference [.siftwise-install, script]
+    - /tmp/siftwise-venv/bin/siftwise gitlab rollup
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - .siftwise-ci/
+    reports:
+      dotenv: .siftwise-ci/rollup.env

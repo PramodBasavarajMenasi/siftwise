@@ -35,6 +35,9 @@ LIGHT_COMMANDS = [
     ["gha", "select"],
     ["gha", "record"],
     ["gha", "rollup"],
+    ["gitlab", "select"],
+    ["gitlab", "record"],
+    ["gitlab", "rollup"],
 ]
 
 

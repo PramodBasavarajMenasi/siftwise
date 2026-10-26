@@ -31,10 +31,15 @@ their own runner: pytest, Go, Jest, Maven or Gradle, see ``cli/reruns.py``; no s
 times, capped in tests and time, and uploads each round as a re-run
 of the run (``rerun = n``); triage then calls a test that passed on a re-run flaky. Fail open:
 any problem is a warning, and the verdicts stay what they were.
+
+The select/record/rollup flows (``run_select``, ``run_record``, ``run_rollup``) are shared with
+GitLab CI (``cli/gitlab.py``): how a step reports back (outputs, logs, summaries, the comment,
+Markdown escaping) goes through a ``Provider``, GitHub's by default.
 """
 
 from __future__ import annotations
 
+import contextvars
 import glob
 import hashlib
 import json
@@ -47,6 +52,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -68,6 +74,7 @@ SELECTION_MARKER = "<!-- siftwise:selection -->"
 FAILURES_MARKER = re.compile(r"<!-- siftwise:failures sha=([0-9a-fA-F]*) attempt=(\d+) -->")
 COMMENT_FOOTER = "<sub>Updated on each push.</sub>"
 PULL_REQUEST_EVENTS = frozenset({"pull_request", "pull_request_target"})
+MERGE_REQUEST_EVENT = "merge_request_event"  # GitLab's CI_PIPELINE_SOURCE for MR pipelines
 ZERO_SHA = "0" * 40
 # Directories a recursive JUnit glob never needs to look into.
 SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "venv", ".tox", "__pycache__"})
@@ -129,12 +136,22 @@ class Context:
     fork: bool
     api_url: str
     server_url: str = "https://github.com"
+    # GitLab: the merge request's (target) project, for the API, and the pipeline's page.
+    project_id: str = ""
+    pipeline_url: str = ""
 
     @property
     def run_url(self) -> str:
         """This run attempt's page, where the job summaries are."""
+        if self.pipeline_url:
+            return self.pipeline_url
         run = f"{self.server_url}/{self.repo}/actions/runs/{self.run_id}"
         return f"{run}/attempts/{self.run_attempt}"
+
+    @property
+    def change_request(self) -> bool:
+        """A pull request (GitHub) or merge request (GitLab) run."""
+        return self.event_name in PULL_REQUEST_EVENTS or self.event_name == MERGE_REQUEST_EVENT
 
 
 def load_context(
@@ -215,22 +232,39 @@ def select_step(
 ) -> None:
     """Select tests for this run and set the step's outputs. In a shadow run the outputs say
     run the full suite, and the server stores the selection to measure recall."""
+    if git_is_shallow():
+        _annotate("error", "siftwise needs the full git history to diff against the base: "
+                  f"{_ci().shallow_fix}")  # fmt: skip
+        raise typer.Exit(1)
+    ctx = load_context(os.environ, base_ref)
+    if ctx.event_name == "pull_request_target":
+        _annotate("warning", "siftwise doesn't support pull_request_target: full suite.")
+    run_select(ctx, server=server, token=token, repo=repo, junit_dir=junit_dir,
+               comment=comment, scm_token=github_token, shadow=shadow, variant=variant)  # fmt: skip
+
+
+def run_select(
+    ctx: Context,
+    *,
+    server: str,
+    token: str,
+    repo: str,
+    junit_dir: str,
+    comment: bool,
+    scm_token: str,
+    shadow: str,
+    variant: str,
+) -> None:
+    """The select step, for any CI provider (``scm_token``: the one that writes the comment)."""
     from siftwise.cli import main as cli  # main registers this app: import it lazily
 
     env = os.environ
-    if git_is_shallow():
-        _annotate("error", "siftwise needs the full git history to diff against the base: set "
-                  "`fetch-depth: 0` on actions/checkout.")  # fmt: skip
-        raise typer.Exit(1)
-    ctx = load_context(env, base_ref)
+    ci = _ci()
     repo = repo or ctx.repo
-    if ctx.event_name == "pull_request_target":
-        _annotate("warning", "siftwise doesn't support pull_request_target: full suite.")
-    junit_dir = junit_dir or str(Path(env.get("RUNNER_TEMP", ".")) / "siftwise-junit")
+    junit_dir = junit_dir or ci.default_junit_dir(env)
     Path(junit_dir).mkdir(parents=True, exist_ok=True)
     # For the record step later in the job: where the reports are, and when the job started.
-    _append(env, "GITHUB_ENV", {"SIFTWISE_JUNIT_DIR": junit_dir,
-                                "SIFTWISE_SELECT_STARTED_AT": _now()})  # fmt: skip
+    ci.export(env, {"SIFTWISE_JUNIT_DIR": junit_dir, "SIFTWISE_SELECT_STARTED_AT": _now()})
     rate = parse_shadow(shadow)
     if rate is None:
         _annotate("warning", f"siftwise: invalid shadow value {shadow!r} (use off, always or a "
@@ -240,11 +274,11 @@ def select_step(
     in_shadow = bool(token and ctx.run_id and ctx.head_sha) and sampled(repo, ctx.run_id, rate)
     if in_shadow:
         # Decided before any server call can fail: whatever happens next, the full suite runs.
-        _append(env, "GITHUB_OUTPUT", {"mode": "full", "command": "", "shadow": "true"})
+        ci.outputs(env, {"mode": "full", "command": "", "shadow": "true"})
 
     result: dict[str, Any] | None = None
     if not token:
-        problem = "no siftwise token (secrets aren't available to pull requests from forks)"
+        problem = ci.no_token
     else:
         try:
             body = cli.selection_request(repo, ctx.base, ctx.head_sha or "HEAD",
@@ -284,7 +318,7 @@ def select_step(
         result = shadow_result(result)
 
     estimated = result.get("estimated_ms") or {}
-    _append(env, "GITHUB_OUTPUT", {
+    ci.outputs(env, {
         "mode": result["mode"],
         "command": result["command"],
         "selected": str(result["selected_count"]),
@@ -302,19 +336,14 @@ def select_step(
                                not_counted=not_counted)  # fmt: skip
     notes = []
     if comment and ctx.pr_number is not None:
-        if ctx.fork:
-            notes.append("Pull request from a fork: no PR comment (its token is read-only).")
-        elif not github_token:
-            notes.append("No GitHub token: no PR comment.")
-        else:
-            notes.extend(upsert_comment(ctx, github_token, selection=table))
+        notes.extend(ci.comment(ctx, scm_token, selection=table))
     # Leading newline: several steps append to the same summary.
     _append_summary(env, "\n" + table + "".join(f"\n> {note}\n" for note in notes))
-    typer.echo(f"siftwise: {result['mode']} ({result['selected_count']} of "
-               f"{result['total_known']} known tests): {result['reason']}")  # fmt: skip
+    ci.echo(f"siftwise: {result['mode']} ({result['selected_count']} of "
+            f"{result['total_known']} known tests): {result['reason']}")  # fmt: skip
     if would_have:
-        typer.echo(f"siftwise: shadow run: would have run {would_have['selected_count']} of "
-                   f"{would_have['total_known']} ({would_have['mode']})")  # fmt: skip
+        ci.echo(f"siftwise: shadow run: would have run {would_have['selected_count']} of "
+                f"{would_have['total_known']} ({would_have['mode']})")  # fmt: skip
 
 
 @app.command("record")
@@ -342,12 +371,36 @@ def record_step(
 ) -> None:
     """Upload this run's JUnit reports, re-run its unknown failures if asked, then (in a
     single job) triage its failures. Never fails the job, unless ``fail_on`` is set."""
-    env = os.environ
     gate = parse_fail_on(fail_on)
     source = parse_known_flaky_source(known_flaky_source)
     rerun = parse_rerun(rerun_unknown, rerun_verdicts, rerun_max_tests, rerun_timeout_minutes,
                         rerun_prefix)  # fmt: skip
-    ctx = load_context(env, base_ref)
+    ctx = load_context(os.environ, base_ref)
+    run_record(ctx, server=server, token=token, repo=repo, junit=junit, junit_dir=junit_dir,
+               variant=variant, defer_rollup=defer_rollup, scm_token=github_token,
+               triage=triage, comment=comment, gate=gate, source=source, rerun=rerun)  # fmt: skip
+
+
+def run_record(
+    ctx: Context,
+    *,
+    server: str,
+    token: str,
+    repo: str,
+    junit: str,
+    junit_dir: str,
+    variant: str,
+    defer_rollup: str,
+    scm_token: str,
+    triage: str,
+    comment: bool,
+    gate: frozenset[str],
+    source: str,
+    rerun: Rerun,
+) -> None:
+    """The record step, for any CI provider. Raises typer.Exit for ``fail-on``."""
+    env = os.environ
+    ci = _ci()
     repo = repo or ctx.repo
     # A matrix leg defers the rollup to one `actions/rollup` job: the per-upload rollup costs
     # about as much as the whole-repo one on a big repo (~75 s on rdflib), once per leg.
@@ -357,17 +410,17 @@ def record_step(
     do_triage = not defer if triage == "auto" else triage == "true"
     if gate and not do_triage:
         _annotate("warning", "siftwise: fail-on has no effect where verdicts aren't computed "
-                  "(a matrix leg): set it on actions/rollup")  # fmt: skip
+                  f"(a matrix leg): set it on {ci.rollup_step}")  # fmt: skip
     problem, metadata = _record(ctx, server, token, repo, junit, junit_dir, variant, defer,
-                                github_token, source)  # fmt: skip
+                                scm_token, source)  # fmt: skip
     if metadata is not None and rerun.rounds:
         report = rerun_failures(ctx, server, token, repo, variant, metadata, defer, rerun,
                                 find_junit(junit, junit_dir))  # fmt: skip
-        _append(env, "GITHUB_OUTPUT", {"rerun-tests": str(len(report.tests)),
-                                       "rerun-passed": str(len(report.passed))})  # fmt: skip
+        ci.outputs(env, {"rerun-tests": str(len(report.tests)),
+                         "rerun-passed": str(len(report.passed))})  # fmt: skip
         line = report.line(rerun)
         if line:
-            typer.echo(line)
+            ci.echo(line)
             _append_summary(env, f"\n{line}\n")
     if do_triage:
         response = None
@@ -376,7 +429,7 @@ def record_step(
         shadow = fetch_shadow(server, token, repo, ctx)
         _shadow_outputs(env, shadow)
         code = report_failures(ctx, response, problem, comment=comment,
-                               github_token=github_token, fail_on=gate, shadow=shadow)  # fmt: skip
+                               github_token=scm_token, fail_on=gate, shadow=shadow)  # fmt: skip
         if code:
             raise typer.Exit(code)
 
@@ -398,9 +451,10 @@ def _record(
     from siftwise.cli import main as cli
 
     env = os.environ
+    ci = _ci()
     if not token:
-        _annotate("warning", "siftwise: no token (fork pull request?); results not recorded")
-        return NO_TOKEN, None
+        _annotate("warning", f"siftwise: no token ({ci.no_token_hint}); results not recorded")
+        return ci.no_token, None
     files = find_junit(junit, junit_dir)
     if not files:
         _annotate("warning", f"siftwise: no JUnit files match {junit!r}"
@@ -417,7 +471,7 @@ def _record(
         "ci_run_id": ctx.run_id or None,
         "run_attempt": ctx.run_attempt,
         "variant": variant or None,
-        "started_at": run_started_at(ctx, github_token, env),
+        "started_at": ci.started_at(ctx, github_token, env),
         **cli.recorded_change(ctx.base, ctx.head_sha or "HEAD"),
         "known_flaky": known_flaky,
         "known_flaky_changed": changed,
@@ -432,10 +486,10 @@ def _record(
     line = (f"siftwise: run {result.get('run_id')} {state}: {len(files)} file(s), "
             f"{result.get('counts', {}).get('total', '?')} results"
             f"{' (stats update deferred to the rollup job)' if defer else ''}")  # fmt: skip
-    typer.echo(line)
+    ci.echo(line)
     _append_summary(env, f"\n{line}\n")
     if changed:
-        typer.echo(f"siftwise: {KNOWN_FLAKY_AFTER_MERGE}")
+        ci.echo(f"siftwise: {KNOWN_FLAKY_AFTER_MERGE}")
     return "", metadata
 
 
@@ -452,12 +506,29 @@ def rollup_step(
     """After every matrix leg recorded: triage the run's failures (all variants, one PR
     comment section), then recompute the repo's test stats once. Never fails, unless
     ``fail_on`` is set."""
+    gate = parse_fail_on(fail_on)
+    # No checkout needed: the event payload says which run and PR, the server the rest.
+    ctx = load_context(os.environ, has_commit=lambda _ref: False)
+    run_rollup(ctx, server=server, token=token, repo=repo, scm_token=github_token,
+               triage=triage, comment=comment, gate=gate)  # fmt: skip
+
+
+def run_rollup(
+    ctx: Context,
+    *,
+    server: str,
+    token: str,
+    repo: str,
+    scm_token: str,
+    triage: bool,
+    comment: bool,
+    gate: frozenset[str],
+) -> None:
+    """The rollup step, for any CI provider. Raises typer.Exit for ``fail-on``."""
     from siftwise.cli import main as cli
 
     env = os.environ
-    gate = parse_fail_on(fail_on)
-    # No checkout needed: the event payload says which run and PR, the server the rest.
-    ctx = load_context(env, has_commit=lambda _ref: False)
+    ci = _ci()
     repo = repo or ctx.repo
     code = 0
     # A shadow run's comparison, after every leg recorded (a no-op answer otherwise).
@@ -466,20 +537,20 @@ def rollup_step(
     if triage:
         response, problem = fetch_triage(server, token, repo, ctx)
         code = report_failures(ctx, response, problem, comment=comment,
-                               github_token=github_token, fail_on=gate, shadow=shadow)  # fmt: skip
+                               github_token=scm_token, fail_on=gate, shadow=shadow)  # fmt: skip
     else:
         if gate:
             _annotate("warning", "siftwise: fail-on has no effect with triage turned off")
         if shadow is not None:
             _append_summary(env, "\n" + shadow_markdown(shadow))
     if not token:
-        _annotate("warning", "siftwise: no token (fork pull request?); stats not updated")
+        _annotate("warning", f"siftwise: no token ({ci.no_token_hint}); stats not updated")
     else:
         try:
             result = cli.rollup_repo(server, token, repo)
             line = (f"siftwise: {result.get('tests_updated')} test stats updated in "
                     f"{result.get('seconds')}s")  # fmt: skip
-            typer.echo(line)
+            ci.echo(line)
             _append_summary(env, f"\n{line}\n")
         except cli.SiftwiseError as exc:
             _annotate("warning", f"siftwise: stats not updated: {exc}")
@@ -546,7 +617,7 @@ def selection_markdown(
         rows.append(("Estimated test time", f"{_duration(would_run)} of {_duration(total)} "
                      f"({100 * saved / total:.0f}% saved)"))  # fmt: skip
     if mode == "full":
-        rows.append(("Why the full suite", _cell(result["reason"])))
+        rows.append(("Why the full suite", _prose(result["reason"])))
     return _selection_list(rows, head_sha)
 
 
@@ -562,14 +633,14 @@ def _shadow_selection_markdown(
         rows.append(("Would have run", _would_have_run(would_have)))
     rows.append(("Why the full suite", SHADOW_REASON))
     if not_counted:
-        rows.append(("Recall", f"this run won't be counted: {_cell(not_counted)}"))
+        rows.append(("Recall", f"this run won't be counted: {_prose(not_counted)}"))
     return _selection_list(rows, head_sha)
 
 
 def _would_have_run(selection: dict[str, Any]) -> str:
     total_known = selection["total_known"]
     if selection["mode"] == "full":
-        return f"all ({_cell(selection['reason'])})"
+        return f"all ({_prose(selection['reason'])})"
     if not selection["command"]:
         return f"none of {total_known:,} known tests (none affected)"
     ran = f"{selection['selected_count']:,} of {total_known:,} known tests"
@@ -614,6 +685,24 @@ def failures_marker(ctx: Context) -> str:
     return f"<!-- siftwise:failures sha={ctx.head_sha} attempt={ctx.run_attempt} -->"
 
 
+def merged_comment(
+    old_body: str, ctx: Context, selection: str | None, failures: str | None
+) -> str | None:
+    """The comment with only the given section replaced (``old_body``: the current one, or
+    ""). ``selection`` also drops a failures section from another commit (stale after a
+    push). None: skip, a newer attempt of this commit already wrote the failures."""
+    old_selection, old_failures = split_comment(old_body)
+    old = FAILURES_MARKER.search(old_failures or "")
+    same_commit = old is not None and old[1].lower() == ctx.head_sha.lower()
+    if failures is not None and same_commit and old and int(old[2]) > ctx.run_attempt:
+        return None
+    if selection is None:
+        selection = old_selection
+    if failures is None:
+        failures = old_failures if same_commit else None
+    return compose_comment(selection, failures)
+
+
 def upsert_comment(
     ctx: Context,
     github_token: str,
@@ -638,16 +727,9 @@ def upsert_comment(
                 existing = next((c for c in page.json() if COMMENT_MARKER in c.get("body", "")),
                                 None)  # fmt: skip
                 url = page.links.get("next", {}).get("url")
-            old_selection, old_failures = split_comment(existing["body"] if existing else "")
-            old = FAILURES_MARKER.search(old_failures or "")
-            same_commit = old is not None and old[1].lower() == ctx.head_sha.lower()
-            if failures is not None and same_commit and old and int(old[2]) > ctx.run_attempt:
+            text = merged_comment(existing["body"] if existing else "", ctx, selection, failures)
+            if text is None:
                 return ["A newer attempt of this run already updated the PR comment."]
-            if selection is None:
-                selection = old_selection
-            if failures is None:
-                failures = old_failures if same_commit else None
-            text = compose_comment(selection, failures)
             if existing is None:
                 gh.post(f"{issue}/comments", json={"body": text}).raise_for_status()
             else:
@@ -698,9 +780,9 @@ def fetch_triage(
     from siftwise.cli import main as cli
 
     if not token:
-        return None, NO_TOKEN
+        return None, _ci().no_token
     if not ctx.run_id:
-        return None, "no CI run ID (GITHUB_RUN_ID is not set)"
+        return None, f"no CI run ID ({_ci().run_id_name} is not set)"
     body = {"ci_run_id": ctx.run_id, "run_attempt": ctx.run_attempt, "limit": TRIAGE_LIMIT}
     try:
         return cli.post_json(server, token, f"/repos/{repo}/triage", body,
@@ -725,35 +807,27 @@ def report_failures(
     and the PR comment, and set the outputs. Returns the exit code: 1 only for ``fail_on`` (a
     match, or no verdicts); the shadow comparison never affects it."""
     env = os.environ
+    ci = _ci()
     if response is None:
         _annotate("warning", f"siftwise: failure verdicts unavailable: {problem}")
         in_comment = in_summary = unavailable_markdown(problem)
     else:
-        in_comment = failures_markdown(response, ctx.run_url, max_rows=COMMENT_ROWS)
+        in_comment = failures_markdown(response, ci.full_list_url(ctx), max_rows=COMMENT_ROWS,
+                                       full_list=ci.full_list)  # fmt: skip
         in_summary = failures_markdown(response, ctx.run_url)
     if shadow is not None:
         in_comment += "\n" + shadow_markdown(shadow)
         in_summary += "\n" + shadow_markdown(shadow)
     notes = []
     if comment and ctx.pr_number is not None:
-        if ctx.fork:
-            notes.append("Pull request from a fork: no PR comment (its token is read-only).")
-        elif not github_token:
-            notes.append("No GitHub token: no PR comment.")
-        else:
-            head = pr_head_sha(ctx, github_token)
-            if head and head.lower() != ctx.head_sha.lower():
-                # A push since this run started: its own run owns the comment now.
-                notes.append("The pull request has newer commits: PR comment not updated.")
-            else:
-                section = f"{failures_marker(ctx)}\n{in_comment}"
-                notes.extend(upsert_comment(ctx, github_token, failures=section))
+        section = f"{failures_marker(ctx)}\n{in_comment}"
+        notes.extend(ci.comment(ctx, github_token, failures=section))
     markdown = "\n" + in_summary + "".join(f"\n> {note}\n" for note in notes)
     _append_summary(env, markdown)
     # The summary file is per step; this copy is for later steps (and the e2e check).
-    report = Path(env.get("RUNNER_TEMP", ".")) / f"siftwise-failures-{uuid.uuid4().hex[:8]}.md"
-    report.write_text(markdown, encoding="utf-8")
-    _append(env, "GITHUB_OUTPUT", {
+    report = ci.report_file(env)
+    report.write_text(ci.redact(markdown), encoding="utf-8")
+    ci.outputs(env, {
         "verdicts-available": "true" if response is not None else "false",
         "counts": json.dumps(response["counts"] if response is not None else {}),
         "report": str(report),
@@ -761,14 +835,14 @@ def report_failures(
     if response is not None:
         failing = response["failing_tests"]
         detail = f": {counts_line(response['counts'])}" if failing else ""
-        typer.echo(f"siftwise: {failing} failing test(s){detail}")
+        ci.echo(f"siftwise: {failing} failing test(s){detail}")
 
     if not fail_on:
         return 0
-    if response is None and problem == NO_TOKEN:
+    if response is None and ci.gate_skipped(ctx, problem):
         # Fork PRs get no secrets: failing them all would block every outside contribution.
         # Only a missing token skips the gate; server errors, timeouts and 404s fail closed.
-        _annotate("warning", "fail-on skipped: no siftwise token (fork PR?); this run is not gated")
+        _annotate("warning", ci.gate_skip_warning)
         return 0
     if response is None:
         _annotate("error", f"siftwise verdicts unavailable ({problem}); failing because "
@@ -813,7 +887,7 @@ def recorded_known_flaky(ctx: Context, source: str = "base") -> tuple[list[str],
         config = cli.local_config()
     except RepoConfigError:
         config = RepoConfig()
-    if ctx.event_name not in PULL_REQUEST_EVENTS:
+    if not ctx.change_request:
         return list(config.known_flaky), False
     flaky = cli.known_flaky(config, ctx.base, source)
     return list(flaky.globs), flaky.changed
@@ -1015,7 +1089,7 @@ def _run_commands(
         left = deadline - time.monotonic()
         if left <= 0:
             return [], f"re-run {n} hit the rerun-timeout-minutes limit (results discarded)"
-        typer.echo(f"siftwise: re-run {n}: {shlex.join(command.argv)}")
+        _ci().echo(f"siftwise: re-run {n}: {shlex.join(command.argv)}")
         try:
             run_command(command.argv, left, **command.options())
         except subprocess.TimeoutExpired:
@@ -1167,17 +1241,19 @@ _CAUSE_LABELS = {
 
 def _missed_line(miss: Mapping[str, Any]) -> str:
     """A missed test with its cause and verdict (just the verdict from an older server)."""
-    verdict = _LABELS.get(miss["verdict"], (miss["verdict"],))[0]
-    test = f"<code>{_md(miss['test_id'])}</code>"
+    # Our own labels as they are; a value this client doesn't know, as untrusted text.
+    verdict = _LABELS[miss["verdict"]][0] if miss["verdict"] in _LABELS else _text(miss["verdict"])
+    test = _code(miss["test_id"])
     cause = miss.get("cause")
     if not cause:
-        return f"- {test} ({_md(verdict)})"
-    return f"- {test}: {_md(_CAUSE_LABELS.get(cause, cause))} (verdict: {_md(verdict)})"
+        return f"- {test} ({verdict})"
+    label = _CAUSE_LABELS[cause] if cause in _CAUSE_LABELS else _text(cause)
+    return f"- {test}: {label} (verdict: {verdict})"
 
 
 def _shadow_outputs(env: Env, response: dict[str, Any] | None) -> None:
     counted = response is not None and response["counted"]
-    _append(env, "GITHUB_OUTPUT", {
+    _ci().outputs(env, {
         "shadow": "true" if response is not None else "false",
         "shadow-mode": (response or {}).get("mode") or "",
         "shadow-caught": str(response["caught"]) if counted and response else "",
@@ -1214,11 +1290,16 @@ def failure_rows(response: dict[str, Any]) -> list[FailureRow]:
 
 
 def failures_markdown(
-    response: dict[str, Any], run_url: str, *, max_rows: int | None = None
+    response: dict[str, Any],
+    run_url: str,
+    *,
+    max_rows: int | None = None,
+    full_list: str = "full list in the job summary",
 ) -> str:
     """The Failures section: a summary line, the new regressions and unknowns in a table, and
     the flaky and pre-existing ones collapsed. ``max_rows`` caps each table (the comment); the
-    job summary gets everything the server returned."""
+    job summary gets everything the server returned (``run_url`` links to it, as
+    ``full_list``)."""
     variants = [v.get("variant") for v in response["variants"]]
     total = response["failing_tests"]
     # The PR edits known_flaky: this run used the base branch's list.
@@ -1236,7 +1317,7 @@ def failures_markdown(
     lines = [f"### Failures: {counts_line(response['counts'])}", "", *note]
     for v in response["variants"]:
         if v.get("failing") and not v.get("links_known"):
-            where = f"<code>{_md(v['variant'])}</code>" if v.get("variant") else "this run"
+            where = _code(v["variant"]) if v.get("variant") else "this run"
             lines += [
                 f"> Change links weren't recorded for {where} (an import graph failed or was "
                 "skipped), so its failures can't be tied to this change.",
@@ -1251,14 +1332,14 @@ def failures_markdown(
     more = total - len({r.test_id for r in shown + collapsed})
     if more > 0:
         if max_rows is not None:
-            lines.append(f"+{more} more: [full list in the job summary]({run_url})")
+            lines.append(f"+{more} more: [{full_list}]({run_url})")
         else:
             lines.append(f"+{more} more not listed (siftwise returns at most {TRIAGE_LIMIT}).")
     return "\n".join(lines).rstrip() + "\n"
 
 
 def unavailable_markdown(problem: str) -> str:
-    return f"### Failures\n\nFailure verdicts unavailable: {_md(problem)}.\n"
+    return f"### Failures\n\nFailure verdicts unavailable: {_text(problem)}.\n"
 
 
 def counts_line(counts: Mapping[str, int]) -> str:
@@ -1279,12 +1360,12 @@ def _failure_table(rows: list[FailureRow], variants: list[str | None]) -> list[s
         label = _LABELS[row.verdict][0]
         if row.verdict == "new_regression":
             label = f"**{label}**"
-        cells = [f"<code>{_md(row.test_id)}</code>", label, row.confidence]
+        cells = [_code(row.test_id, table=True), label, row.confidence]
         if with_variants:
             cells.append(_variants_cell(row.variants, variants))
         reason = row.reason if len(row.reason) <= REASON_CHARS else \
             row.reason[: REASON_CHARS - 1] + "…"  # fmt: skip
-        cells.append(_md(reason))
+        cells.append(_text(reason, table=True))
         lines.append("| " + " | ".join(cells) + " |")
     return lines
 
@@ -1294,20 +1375,28 @@ def _variants_cell(failed: list[str | None], recorded: list[str | None]) -> str:
     on some legs and passed on others lists just the legs where it failed."""
     if set(failed) == set(recorded):
         return "all"
-    return ", ".join(_md(v) if v else "(no variant)" for v in failed)
+    return ", ".join(_text(v, table=True) if v else "(no variant)" for v in failed)
 
 
-# Markdown and HTML that a test ID or reason could contain: table pipes, code and emphasis
-# markers, link brackets, tags. Newlines would end the table row.
-_MD_ESCAPES = str.maketrans({
-    "\\": "\\\\", "`": "\\`", "*": "\\*", "_": "\\_", "[": "\\[", "]": "\\]", "|": "\\|",
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\r": " ", "\n": " ",
-})  # fmt: skip
+# Control characters (newlines, ANSI escapes): they'd end a table row, or fake a log line.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
-def _md(text: str) -> str:
-    """Text safe inside a Markdown table cell (and inside <code>)."""
-    return text.translate(_MD_ESCAPES)
+def code_span(text: str, *, table: bool = False) -> str:
+    """Untrusted text (test IDs, file paths, reasons, variants: they come from the change's
+    code) as a Markdown code span, which GitHub and GitLab show literally: no formatting,
+    HTML, links or autolinks, images, ``@`` mentions or references
+    (https://github.github.com/gfm/#code-spans, https://docs.gitlab.com/user/markdown/).
+    The fence is one backtick longer than any run of backticks inside, with a space on each
+    side (one is stripped). Newlines and control characters become spaces; in a table, every
+    ``|`` is escaped (``\\|``, which GFM tables unescape even inside code) so it can't end the
+    cell; ``<!--`` is broken up so the comment's own section markers can't be forged."""
+    text = _CONTROL.sub(" ", text).replace("<!--", "<! --")
+    if table:
+        text = text.replace("|", "\\|")
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * (longest + 1)
+    return f"{fence} {text} {fence}"
 
 
 def _rank(order: tuple[str, ...], value: str) -> int:
@@ -1414,20 +1503,26 @@ def _append(env: Env, file_var: str, values: Mapping[str, str]) -> None:
 
 
 def _append_summary(env: Env, markdown: str) -> None:
-    path = env.get("GITHUB_STEP_SUMMARY")
-    if path:
-        with open(path, "a", encoding="utf-8") as out:
-            out.write(markdown)
+    _ci().summary(env, markdown)
 
 
 def _annotate(level: str, message: str) -> None:
-    # Workflow commands are line-based: escape what would end or alter the command.
-    escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-    typer.echo(f"::{level}::{escaped}")
+    _ci().annotate(level, message)
 
 
-def _cell(text: str) -> str:
-    return text.replace("|", "\\|").replace("\n", " ")
+def _code(text: str, *, table: bool = False) -> str:
+    """Untrusted text (a test ID, a variant) shown as code in the comment and summaries."""
+    return _ci().code(text, table=table)
+
+
+def _text(text: str, *, table: bool = False) -> str:
+    """Untrusted text (a reason, a problem) in the comment and summaries."""
+    return _ci().text(text, table=table)
+
+
+def _prose(text: str) -> str:
+    """A selection reason in the comment's list."""
+    return _ci().prose(text)
 
 
 def _duration(ms: float) -> str:
@@ -1441,3 +1536,115 @@ def _duration(ms: float) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+# --- CI providers ---------------------------------------------------------------------------
+
+
+class Provider:
+    """How the select/record/rollup steps report back to the CI system: GitHub Actions here.
+    GitLab CI's (``cli/gitlab.py``) overrides what differs; the flows themselves are shared.
+    The active one is ``_PROVIDER``'s (``use_provider``)."""
+
+    no_token = NO_TOKEN
+    no_token_hint = "fork pull request?"
+    gate_skip_warning = "fail-on skipped: no siftwise token (fork PR?); this run is not gated"
+    shallow_fix = "set `fetch-depth: 0` on actions/checkout."
+    run_id_name = "GITHUB_RUN_ID"
+    rollup_step = "actions/rollup"
+    full_list = "full list in the job summary"
+
+    def annotate(self, level: str, message: str) -> None:
+        # Workflow commands are line-based: escape what would end or alter the command.
+        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        typer.echo(f"::{level}::{escaped}")
+
+    def echo(self, line: str) -> None:
+        typer.echo(line)
+
+    def outputs(self, env: Env, values: Mapping[str, str]) -> None:
+        """The step's outputs (``outputs.mode`` ...)."""
+        _append(env, "GITHUB_OUTPUT", values)
+
+    def export(self, env: Env, values: Mapping[str, str]) -> None:
+        """Environment variables for the job's later steps."""
+        _append(env, "GITHUB_ENV", values)
+
+    def summary(self, env: Env, markdown: str) -> None:
+        path = env.get("GITHUB_STEP_SUMMARY")
+        if path:
+            with open(path, "a", encoding="utf-8") as out:
+                out.write(markdown)
+
+    def report_file(self, env: Env) -> Path:
+        """Where the failures report goes (the summary file is per step)."""
+        return Path(env.get("RUNNER_TEMP", ".")) / f"siftwise-failures-{uuid.uuid4().hex[:8]}.md"
+
+    def default_junit_dir(self, env: Env) -> str:
+        return str(Path(env.get("RUNNER_TEMP", ".")) / "siftwise-junit")
+
+    def full_list_url(self, ctx: Context) -> str:
+        """The comment's "+N more" link: where the full failures list is."""
+        return ctx.run_url
+
+    def redact(self, text: str) -> str:
+        """Secrets out of text written to a file (GitHub masks secrets in its own logs)."""
+        return text
+
+    # Untrusted text: code spans only (both providers).
+
+    def code(self, text: str, *, table: bool = False) -> str:
+        return code_span(text, table=table)
+
+    def text(self, text: str, *, table: bool = False) -> str:
+        return code_span(text, table=table)
+
+    def prose(self, text: str) -> str:
+        return code_span(text)
+
+    def started_at(self, ctx: Context, scm_token: str, env: Env) -> str:
+        return run_started_at(ctx, scm_token, env)
+
+    def comment(
+        self,
+        ctx: Context,
+        scm_token: str,
+        *,
+        selection: str | None = None,
+        failures: str | None = None,
+    ) -> list[str]:
+        """Replace one section of the PR's sticky comment. Returns notes for the summary;
+        never raises."""
+        if ctx.fork:
+            return ["Pull request from a fork: no PR comment (its token is read-only)."]
+        if not scm_token:
+            return ["No GitHub token: no PR comment."]
+        if failures is not None:
+            head = pr_head_sha(ctx, scm_token)
+            if head and head.lower() != ctx.head_sha.lower():
+                # A push since this run started: its own run owns the comment now.
+                return ["The pull request has newer commits: PR comment not updated."]
+        return upsert_comment(ctx, scm_token, selection=selection, failures=failures)
+
+    def gate_skipped(self, ctx: Context, problem: str) -> bool:
+        """Whether unavailable verdicts skip fail-on instead of failing closed."""
+        return problem == self.no_token
+
+
+GITHUB = Provider()
+_PROVIDER: contextvars.ContextVar[Provider] = contextvars.ContextVar("siftwise_ci",
+                                                                     default=GITHUB)  # fmt: skip
+
+
+def _ci() -> Provider:
+    return _PROVIDER.get()
+
+
+@contextmanager
+def use_provider(provider: Provider) -> Iterator[None]:
+    """Run the shared flows with ``provider`` reporting."""
+    reset = _PROVIDER.set(provider)
+    try:
+        yield
+    finally:
+        _PROVIDER.reset(reset)

@@ -143,8 +143,11 @@ jobs:
           cat "$REPORT"
           test "$AVAILABLE" = true
           echo "$COUNTS" | jq -e '.unknown == 1 and .new_regression == 0'
-          # The report is what went to the job summary; Markdown-escaped, one variant.
-          grep -F '<code>test\_e2e\_failing::test\_e2e\_always\_fails</code> | unknown | low |' "$REPORT"
+          # The report is what went to the job summary, one variant. Checked by meaning (test,
+          # verdict, confidence), not Markdown punctuation: scripts/e2e_report.py, whose checks
+          # tests/test_e2e_report.py runs on reports rendered by siftwise itself.
+          uv run python scripts/e2e_report.py verdict "$REPORT" \
+            test_e2e_failing::test_e2e_always_fails unknown low
           grep -F '### Failures: 1 unknown' "$REPORT"
 
       - name: Check the recorded run
@@ -191,7 +194,8 @@ jobs:
           test "$(grep -c -F '<!-- siftwise -->' <<< "$body")" = 1
           grep -F '<!-- siftwise:selection -->' <<< "$body"
           grep -F "<!-- siftwise:failures sha=$HEAD_SHA attempt=$GITHUB_RUN_ATTEMPT -->" <<< "$body"
-          grep -F '<code>test\_e2e\_failing::test\_e2e\_always\_fails</code> | unknown | low |' <<< "$body"
+          uv run python scripts/e2e_report.py verdict - \
+            test_e2e_failing::test_e2e_always_fails unknown low <<< "$body"
 
       # fail-on: the opt-in way the actions fail a step on purpose (comment: false keeps the
       # real failures section in the PR comment).
@@ -273,7 +277,8 @@ jobs:
           test "$NOTOKEN_MODE" = full
           test "$DOWN_RECORD_AVAILABLE" = false  # single-job record triages: nothing recorded
           test "$DOWN_AVAILABLE" = false
-          grep -F 'Failure verdicts unavailable: could not reach siftwise' "$DOWN_REPORT"
+          uv run python scripts/e2e_report.py text "$DOWN_REPORT" \
+            'Failure verdicts unavailable: could not reach siftwise'
           echo "fail-on: hit=$FAILON_HIT miss=$FAILON_MISS down=$DOWN_FAILON"
           test "$FAILON_HIT" = failure
           test "$FAILON_MISS" = success
@@ -368,7 +373,8 @@ jobs:
               test "$CAUGHT" = 1
               test "$MISSED" = 1
               grep -F 'and caught 1 of 2 failures' "$REPORT"
-              grep -F -- '- <code>test\_e2e\_shadow\_new::test\_e2e\_shadow\_new</code>: new test (verdict: unknown)' "$REPORT"
+              uv run python scripts/e2e_report.py missed "$REPORT" \
+                test_e2e_shadow_new::test_e2e_shadow_new 'new test' unknown
               echo "$recall" | jq -e '.selective_runs == 1 and .selective.caught == 1
                 and .selective.missed == 1 and .all.missed_by_verdict.unknown == 1
                 and .all.missed_by_cause.new_test == 1

@@ -1,0 +1,127 @@
+# siftwise on GitLab CI, self-contained: each job runs its own siftwise server on a Postgres
+# service, with a random token made in the job. No hosted server, no siftwise secret. The only
+# CI/CD variable to add is SIFTWISE_GITLAB_TOKEN (masked), for the merge request note.
+#
+# History moves only between the jobs of one pipeline (.siftwise-history/ in artifacts): each
+# job restores the database from the job before it. A default-branch pipeline starts empty and
+# records its own run. A merge request pipeline starts with siftwise-base, which runs the full
+# suite at the MR's base commit and records it as a main run, so siftwise has main's results
+# to select and triage against.
+#
+# A real project runs one siftwise server that keeps its history between pipelines: no
+# siftwise-base job, no ci/history.py. It includes the template by a release tag (see the
+# README). This folder carries a copy of the template so it works when pushed on its own.
+
+include:
+  - local: siftwise.gitlab-ci.yml
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+stages:
+  - base
+  - select
+  - test
+
+# The siftwise server, inside the job. Not part of the template: you'd run one server instead.
+.example-server:
+  image: python:3.12-bookworm
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+  variables:
+    # Until a siftwise release with `siftwise gitlab` is on PyPI, build a wheel from the
+    # siftwise checkout (uv build --wheel), copy it to wheels/ here, and use its path in both:
+    #   SIFTWISE_PIP_SPEC: "./wheels/siftwise-0.1.0-py3-none-any.whl"
+    #   EXAMPLE_SERVER_PIP_SPEC: "./wheels/siftwise-0.1.0-py3-none-any.whl[server]"
+    SIFTWISE_PIP_SPEC: "siftwise==0.1.0"
+    EXAMPLE_SERVER_PIP_SPEC: "siftwise[server]==0.1.0"
+    # The database is reachable only inside this job's network: not a secret.
+    POSTGRES_USER: siftwise
+    POSTGRES_PASSWORD: siftwise
+    POSTGRES_DB: siftwise
+    SIFTWISE_DATABASE_URL: postgresql+psycopg://siftwise:siftwise@postgres:5432/siftwise
+    SIFTWISE_SERVER: http://127.0.0.1:8000
+  before_script:
+    - python3 -m venv /tmp/siftwise-venv
+    - export PATH="/tmp/siftwise-venv/bin:$PATH"
+    - pip install --quiet --disable-pip-version-check "$EXAMPLE_SERVER_PIP_SPEC" pytest
+    # A new random token for this job's server; never printed.
+    - export SIFTWISE_API_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+    - python ci/history.py restore
+    - siftwise server start --no-migrate --host 127.0.0.1 --port 8000 > /tmp/siftwise-server.log 2>&1 &
+    - python ci/history.py wait
+
+# Merge request pipelines only: main's results at the MR's base commit, for the later jobs.
+siftwise-base:
+  extends: .example-server
+  stage: base
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_DIFF_BASE_SHA
+  variables:
+    GIT_DEPTH: "0"  # the base commit
+  script:
+    - git worktree add --detach /tmp/siftwise-base "$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+    # The full suite, as the test job runs it; failures are main's, so they don't fail the job.
+    - (cd /tmp/siftwise-base && pytest --junitxml=/tmp/siftwise-base-junit/full.xml) || true
+    - python ci/history.py record-base /tmp/siftwise-base-junit/full.xml
+    - python ci/history.py dump
+  # If it fails, the later jobs start empty and run the full suite.
+  allow_failure: true
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - .siftwise-history/  # only the history: the base's JUnit stays out of this run's
+
+siftwise-select:
+  extends: [.siftwise-select, .example-server]
+  stage: select  # after siftwise-base: its history comes in its artifacts
+
+test:
+  extends: .example-server
+  stage: test
+  variables:
+    GIT_DEPTH: "0"
+    SIFTWISE_DEFER_ROLLUP: "true"
+    SIFTWISE_TRIAGE: "false"
+  # `siftwise gitlab record` runs in script, not after_script as in .siftwise-record: this
+  # job's server only lives as long as the script.
+  script:
+    - status=0
+    - |
+      if [ "$SIFTWISE_MODE" = selective ]; then
+        if [ -s "$SIFTWISE_COMMAND_FILE" ]; then sh "$SIFTWISE_COMMAND_FILE" || status=$?; else echo "No tests affected."; fi
+      else
+        pytest --junitxml=.siftwise-ci/junit/full.xml || status=$?
+      fi
+    - siftwise gitlab record
+    - python ci/history.py dump
+    - exit "$status"
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - .siftwise-ci/
+      - .siftwise-history/
+    reports:
+      junit: .siftwise-ci/junit/*.xml
+
+siftwise-rollup:
+  extends: [.siftwise-rollup, .example-server]
+  dependencies: [test]  # this pipeline's history, from the test job
+  variables:
+    GIT_STRATEGY: clone  # ci/history.py
+    SIFTWISE_FAIL_ON: new_regression,unknown
+  script:
+    - status=0
+    - siftwise gitlab rollup || status=$?
+    - python ci/history.py dump
+    - exit "$status"
+  artifacts:
+    paths:
+      - .siftwise-ci/
+      - .siftwise-history/
