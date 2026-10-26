@@ -145,6 +145,45 @@ checked against that selection (see [architecture](../ARCHITECTURE.md#shadow-com
   95%), never a bare percentage.
 - **Sampling** by a hash of the run ID is uniform over runs, not over changes or failures.
 
+## Dogfooding (live, on siftwise itself)
+
+[dogfood.yml](../.github/workflows/dogfood.yml) makes every siftwise PR and push to `main` a
+shadow run, with no hosted server:
+
+- **What runs:** the job starts a siftwise server from its own checkout, with a random token
+  made in the job, on the runner's Postgres. It loads the history, runs `actions/select` with
+  `shadow: always`, the full test suite with JUnit, then `actions/record` and `actions/rollup`.
+  It gates nothing and comments nothing: no `fail-on`, and every siftwise step fails open.
+- **History:** the database moves between runs through the Actions cache. It is dumped and
+  loaded by `examples/gitlab/ci/history.py`, which keeps the dump's migration revision. Only
+  runs on `main` build `main`'s history. A PR run starts from `main`'s newest entry, and what it
+  saves stays with the PR: GitHub scopes a PR's cache entries to its merge ref, so neither `main`
+  nor other PRs can read them. Fork PRs need no secrets, so they run too.
+- **What's measured:** each run uploads `dogfood-summary.json` (90 days, the most a public repo
+  keeps). It holds the server's own shadow comparison for the run (caught, missed with causes,
+  flaky, measured time), the failure verdicts, the would-be selection and which steps failed.
+  `python -m scripts.dogfood_report report [--since DATE] [--by week]` downloads the
+  summaries, keeps each workflow run's first attempt, and prints `siftwise report`'s text.
+  The numbers are exactly what `/recall` adds up (a test checks this against the real server).
+  `--save DIR` keeps copies past 90 days, and `--from DIR` reads them back.
+
+### Limits
+
+- **A small sample at first:** a handful of PRs a week, and few real failures. Report raw
+  counts, as for any shadow mode.
+- **Our own PRs only:** one Python repo, mostly changed by one person with coding agents. The
+  numbers say how siftwise does on siftwise, not on other repos.
+- **PR history isn't shared:** a PR sees `main`'s history plus its own earlier runs, never
+  other PRs' (cache scope). A hosted server would see every run, so the co-change and
+  recently-failed signals see a little less here.
+- **History can reset:** if `main`'s cache entries are evicted (unused for 7 days, despite a
+  twice-weekly keep-alive, or over the 10 GB repo limit), the history starts again and selection
+  falls back to the full suite until it rebuilds. Those runs count as full runs, not as misses.
+- **Fork summaries are untrusted:** fork code builds them. The report counts them apart, and
+  `--exclude-forks` leaves them out.
+- **Runs on `main` are serialised:** each starts from the previous run's database. A third run
+  queued behind a second is cancelled by GitHub's concurrency rules, and its data is lost.
+
 ## What the numbers prove, and what they don't
 
 They show that, on these four repos' past CI:
@@ -162,7 +201,8 @@ They don't show:
   outside the repo, data-driven tests), beyond what `[[depends]]` covers;
 - behaviour on languages other than Python and Go (Jest selection is implemented but not
   evaluated; Java always runs in full);
-- live recall: no shadow-mode numbers are published yet (live dogfooding comes after launch);
+- live recall: no shadow-mode numbers are published yet (dogfooding runs since 2026-10-26;
+  numbers with v0.3);
 - that flaky verdicts generalise: most are rule 1, which re-reads the label's own evidence.
 
 ## Reproducing

@@ -122,11 +122,11 @@ haven't verified why, so the example no longer depends on it.
 
 Every job's log has `history:` lines from `ci/history.py`:
 
-- `history: no .siftwise-history/ from an earlier job of this pipeline: starting empty`: the
+- `history: no .siftwise-history/ to load: starting empty`: the
   first job of a `main` pipeline, and `siftwise-base`. Anywhere else in a merge request
   pipeline it means `siftwise-base` failed (it's allowed to fail, so the later jobs run the
   full suite): see its log.
-- `history: restored N tables from .siftwise-history/ (this pipeline's artifacts): R runs, M
+- `history: restored N tables from .siftwise-history/ (migration X): R runs, M
   on main, T tests`: what the job starts from. In a merge request pipeline, the one run on
   `main` is the base commit's, from `siftwise-base`; `test` adds the MR's own run.
 - `history: not in .siftwise-history/, left empty: ...`: tables the earlier job didn't save
