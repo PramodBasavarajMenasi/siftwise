@@ -14,6 +14,13 @@ Codex and Gemini Code Assist VS Code extensions and macOS and Linux.
 
 ### Added
 
+- Live dogfooding: `.github/workflows/dogfood.yml` runs every siftwise PR and push to main as a
+  shadow run.
+  - A siftwise server inside the job, with a random per-job token, and the history in the
+    Actions cache. A PR's cache entries stay with the PR.
+  - It gates nothing and posts no comment.
+  - Each run uploads a summary artifact. `python -m scripts.dogfood_report report` turns the
+    summaries into recall, time saved and misses with causes, in total or per week.
 - GitLab CI: a template, `gitlab/siftwise.gitlab-ci.yml`, with the hidden jobs
   `.siftwise-select`, `.siftwise-record` and `.siftwise-rollup`, around new
   `siftwise gitlab select|record|rollup` commands. They run the same steps as the GitHub
@@ -70,6 +77,10 @@ Codex and Gemini Code Assist VS Code extensions and macOS and Linux.
 
 ### Fixed
 
+- `examples/gitlab/ci/history.py` stores the dump's migration revision and restores into that
+  schema before migrating on, so a dump from an older siftwise loads. Before, it migrated to the
+  newest schema first, and a binary dump with fewer columns failed to load. A dump from a newer
+  siftwise is now skipped (the job starts empty).
 - Action: the PR comment and job summary show untrusted text (test IDs, file paths in reasons,
   variants, error messages) as code spans, as the GitLab note does. A file name in a pull
   request could add a link, an `@` mention (`pkgs/@scope/...`) or an autolink (`www.` names)

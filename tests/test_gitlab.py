@@ -4,6 +4,7 @@ note (Notes API mocked with respx), fail-open, and the security requirements (no
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -755,9 +756,13 @@ def test_the_example_carries_the_template_unchanged() -> None:
 def test_the_examples_history_survives_a_dump_and_restore(
     db_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """examples/gitlab/ci/history.py against real Postgres: dump a migrated database with a
-    run in it, restore it into another, and new rows don't collide with the restored ones."""
+    """examples/gitlab/ci/history.py (also the dogfood workflow's) against real Postgres: a
+    dump made at an OLDER migration loads into this siftwise's schema (its own schema first,
+    then the newer migrations), new rows don't collide with the restored ones, a dump from a
+    newer siftwise is skipped, and no secret from the environment reaches the log."""
     from sqlalchemy import create_engine, make_url, text
+
+    from siftwise.migrate import upgrade
 
     admin = create_engine(db_url, isolation_level="AUTOCOMMIT")
     names = ("siftwise_history_a", "siftwise_history_b")
@@ -767,43 +772,53 @@ def test_the_examples_history_survives_a_dump_and_restore(
             conn.execute(text(f"DROP DATABASE IF EXISTS {name}"))
             conn.execute(text(f"CREATE DATABASE {name}"))
     script = ROOT / "examples" / "gitlab" / "ci" / "history.py"
-    bin_dir = Path(sys.executable).parent
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     # A job's secrets are in its environment: none may reach the log.
     for name, secret in (("SIFTWISE_API_TOKEN", SIFT_TOKEN), ("SIFTWISE_GITLAB_TOKEN", GL_TOKEN),
                          ("CI_JOB_TOKEN", JOB_TOKEN)):  # fmt: skip
         monkeypatch.setenv(name, secret)
 
-    def history(command: str) -> str:
+    def history(command: str, url: str) -> str:
+        env = {**os.environ, "SIFTWISE_DATABASE_URL": url}
         proc = subprocess.run([sys.executable, str(script), command], check=True,
-                              capture_output=True, text=True)  # fmt: skip
+                              capture_output=True, text=True, env=env)  # fmt: skip
         assert_no_secrets(proc.stdout, proc.stderr)
         return proc.stdout
 
     try:
-        for url in urls:
-            monkeypatch.setenv("SIFTWISE_DATABASE_URL", url)
-            out = history("restore")  # migrates
-            assert "from an earlier job of this pipeline: starting empty" in out
+        # The source: an older siftwise's schema (before 0010 added runs.rerun), with a run.
+        upgrade(urls[0], "0009")
         source = create_engine(urls[0])
         with source.begin() as conn:
             conn.execute(text("INSERT INTO repos (name) VALUES ('acme/shop')"))
+            conn.execute(text("INSERT INTO runs (repo_id, commit_sha, branch, is_main) "
+                              "SELECT id, repeat('a', 40), 'main', true FROM repos"))  # fmt: skip
         source.dispose()
-        monkeypatch.setenv("SIFTWISE_DATABASE_URL", urls[0])
-        assert "0 runs, 0 on main, 0 tests" in history("dump")
-        monkeypatch.setenv("SIFTWISE_DATABASE_URL", urls[1])
-        out = history("restore")
-        restored = r"restored \d+ tables from \.siftwise-history/ \(this pipeline's artifacts\)"
-        assert re.search(restored + ": 0 runs, 0 on main, 0 tests", out), out
-        assert "left empty" not in out
+        assert "1 runs, 1 on main, 0 tests" in history("dump", urls[0])
+        assert (Path(".siftwise-history") / "alembic_version").read_text().strip() == "0009"
 
+        out = history("restore", urls[1])
+        assert re.search(r"restored \d+ tables from \.siftwise-history/ \(migration 0009\): "
+                         r"1 runs, 1 on main, 0 tests", out), out  # fmt: skip
+        assert "left empty" not in out
         target = create_engine(urls[1])
         with target.begin() as conn:
-            assert conn.execute(text("SELECT name FROM repos")).scalars().all() == ["acme/shop"]
+            assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == (
+                "0010"
+            )  # then migrated on
+            assert conn.execute(text("SELECT rerun FROM runs")).scalars().all() == [0]
             conn.execute(text("INSERT INTO repos (name) VALUES ('acme/other')"))  # a new ID
             assert conn.execute(text("SELECT count(*) FROM repos")).scalar() == 2
         target.dispose()
+
+        # A dump from a siftwise newer than this one: not loaded.
+        (Path(".siftwise-history") / "alembic_version").write_text("9999")
+        out = history("restore", urls[1])
+        assert "at migration 9999, which this siftwise doesn't have" in out
+        assert "restored" not in out
+
+        shutil.rmtree(".siftwise-history")
+        assert "no .siftwise-history/ to load: starting empty" in history("restore", urls[1])
     finally:
         with admin.connect() as conn:
             for name in names:

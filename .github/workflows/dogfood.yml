@@ -1,0 +1,220 @@
+name: Dogfood
+
+# siftwise on its own CI, as a shadow run, with no hosted server: every PR and push to main runs
+# the FULL suite, and a siftwise server inside the job (this checkout, a random per-job token)
+# records what siftwise would have selected and which failures that selection would have
+# missed. Measures live recall and time saved; gates nothing (no fail-on, every siftwise step
+# fails open) and writes no PR comment (CI's results are the ones that count).
+#
+# History: the server's database moves between runs through the Actions cache (dumped and
+# loaded by examples/gitlab/ci/history.py, which keeps a dump's migration revision). Each run
+# restores the newest entry it may read and saves a new one. A PR run may read main's entries,
+# but what it saves is scoped to the PR's merge ref: neither main nor other PRs can read it
+# (https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching). So
+# PR runs, forks' included, never reach main's database. Only main's own runs build it.
+#
+# Numbers: every run uploads dogfood-summary.json (its shadow comparison and verdicts, from the
+# server's API); `python -m scripts.dogfood_report report` adds them up (docs/eval-methodology.md).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Cache entries nobody reads for 7 days are removed: keep main's newest one in use when
+    # nothing is pushed for a while.
+    - cron: "23 4 * * 1,4"
+
+permissions:
+  contents: read
+  actions: read  # record reads the run's start time
+
+concurrency:
+  # main's runs one at a time: two at once would each restore the same database and the later
+  # save would drop the other's run. A newer push to a PR cancels its older run.
+  group: dogfood-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CACHE_PREFIX: siftwise-dogfood-db-v1-
+  SIFTWISE_SERVER: http://127.0.0.1:8000
+  SIFTWISE_DATABASE_URL: postgresql+psycopg://siftwise:siftwise@127.0.0.1:5432/siftwise
+  # The repo's own test suite uses a separate database on the same server.
+  SIFTWISE_TEST_DATABASE_URL: postgresql+psycopg://siftwise:siftwise@127.0.0.1:5432/siftwise_test
+  VARIANT: py3.12
+
+jobs:
+  dogfood:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Start time
+        run: echo "DOGFOOD_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        id: checkout
+        with:
+          fetch-depth: 0  # select diffs against the PR base
+
+      # The runner's preinstalled Postgres, not a service container: image pulls from Docker
+      # Hub hit rate limits on shared runners (see ci.yml).
+      - name: Start PostgreSQL
+        run: |
+          sudo systemctl start postgresql.service
+          for _ in $(seq 30); do pg_isready -h localhost -q && break; sleep 1; done
+          sudo -u postgres psql -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE siftwise LOGIN SUPERUSER PASSWORD 'siftwise'"
+          sudo -u postgres createdb -O siftwise siftwise
+          sudo -u postgres createdb -O siftwise siftwise_test
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # A new random token for this job's server: masked in the log, gone with the job.
+      - name: Token
+        run: |
+          token="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+          echo "::add-mask::$token"
+          echo "SIFTWISE_API_TOKEN=$token" >> "$GITHUB_ENV"
+
+      - name: Restore the history (newest cache entry this run may read)
+        id: cache
+        uses: actions/cache/restore@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/siftwise-history
+          key: ${{ env.CACHE_PREFIX }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ env.CACHE_PREFIX }}
+
+      # No cache entry: starts empty (exit 0). A dump that fails to load fails this step: the
+      # run starts empty and saves nothing, so a broken load never replaces main's history.
+      - name: Load the history
+        id: history
+        continue-on-error: true
+        env:
+          SIFTWISE_HISTORY_DIR: ${{ runner.temp }}/siftwise-history
+        run: .venv/bin/python examples/gitlab/ci/history.py restore
+
+      - name: Start a siftwise server
+        id: server
+        continue-on-error: true
+        run: |
+          if [ "${{ steps.history.outcome }}" != success ]; then
+            sudo -u postgres dropdb --force siftwise
+            sudo -u postgres createdb -O siftwise siftwise
+          fi
+          # The venv's siftwise, not `uv run` (see action-e2e.yml). It migrates, then serves.
+          nohup .venv/bin/siftwise server start --port 8000 > "$RUNNER_TEMP/server.log" 2>&1 &
+          for _ in $(seq 60); do curl -sf "$SIFTWISE_SERVER/healthz" > /dev/null && exit 0; sleep 1; done
+          cat "$RUNNER_TEMP/server.log"
+          exit 1
+
+      - name: Select (shadow run)
+        id: select
+        uses: ./actions/select
+        continue-on-error: true
+        with:
+          server-url: ${{ env.SIFTWISE_SERVER }}
+          token: ${{ env.SIFTWISE_API_TOKEN }}
+          shadow: always
+          variant: ${{ env.VARIANT }}
+          comment: false
+
+      # A shadow run always runs everything. Test failures are CI's to report, not this job's.
+      - name: Tests (full suite)
+        id: tests
+        continue-on-error: true
+        env:
+          JUNIT_DIR: ${{ steps.select.outputs.junit-dir || format('{0}/siftwise-junit', runner.temp) }}
+        run: uv run --no-sync pytest --junitxml="$JUNIT_DIR/full.xml"
+
+      - name: Record
+        id: record
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        uses: ./actions/record
+        continue-on-error: true
+        with:
+          server-url: ${{ env.SIFTWISE_SERVER }}
+          token: ${{ env.SIFTWISE_API_TOKEN }}
+          variant: ${{ env.VARIANT }}
+          # Only this run's report: never the sample JUnit files under tests/fixtures.
+          junit: ${{ steps.select.outputs.junit-dir || format('{0}/siftwise-junit', runner.temp) }}/*.xml
+          defer-rollup: "true"
+          comment: false
+
+      # Triage, the shadow comparison, the stats. No fail-on: this job never gates.
+      - name: Rollup
+        id: rollup
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        uses: ./actions/rollup
+        continue-on-error: true
+        with:
+          server-url: ${{ env.SIFTWISE_SERVER }}
+          token: ${{ env.SIFTWISE_API_TOKEN }}
+          comment: false
+
+      - name: Summary
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          DOGFOOD_SHADOW: ${{ steps.select.outputs.shadow }}
+          DOGFOOD_SHADOW_MODE: ${{ steps.select.outputs.shadow-mode }}
+          DOGFOOD_SHADOW_SELECTED: ${{ steps.select.outputs.shadow-selected }}
+          DOGFOOD_SHADOW_TOTAL: ${{ steps.select.outputs.shadow-total }}
+          DOGFOOD_HISTORY_FROM: ${{ steps.cache.outputs.cache-matched-key }}
+          DOGFOOD_TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          DOGFOOD_STEPS: >-
+            cache=${{ steps.cache.outcome }} history=${{ steps.history.outcome }}
+            server=${{ steps.server.outcome }} select=${{ steps.select.outcome }}
+            record=${{ steps.record.outcome }} rollup=${{ steps.rollup.outcome }}
+        run: |
+          uv run --no-sync python -m scripts.dogfood_report summary \
+            --out "$RUNNER_TEMP/dogfood/dogfood-summary.json"
+
+      - name: Upload the summary
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          # One per attempt: names are unique within a workflow run.
+          name: dogfood-summary-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dogfood/dogfood-summary.json
+          # Public repos keep artifacts at most 90 days (the repo setting can lower it).
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Dump the history
+        id: dump
+        if: ${{ !cancelled() && steps.history.outcome == 'success' && steps.server.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          SIFTWISE_HISTORY_DIR: ${{ runner.temp }}/siftwise-history
+        run: |
+          rm -rf "$SIFTWISE_HISTORY_DIR"
+          .venv/bin/python examples/gitlab/ci/history.py dump
+
+      # Cache entries can't be overwritten: a new key per run attempt, found by the prefix.
+      - name: Save the history
+        if: ${{ !cancelled() && steps.dump.outcome == 'success' }}
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/siftwise-history
+          key: ${{ env.CACHE_PREFIX }}${{ github.run_id }}-${{ github.run_attempt }}
+
+  # Reads main's newest history entry, so it stays in use between pushes.
+  keep-alive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/siftwise-history
+          key: ${{ env.CACHE_PREFIX }}keep-alive
+          restore-keys: ${{ env.CACHE_PREFIX }}

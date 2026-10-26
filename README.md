@@ -996,8 +996,9 @@ public issue.
   triage, faster select and ingest), packaging (a light CLI, a server image, the quickstart)
   and the `v0.1.0` release on PyPI and GHCR ([changelog](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CHANGELOG.md)).
 - **Next:** a demo and the launch write-up; an arm64 server image.
-- **After launch:** live dogfooding: shadow mode on siftwise's own CI with a hosted server,
-  with published live recall numbers.
+- **v0.3:** live dogfooding: every siftwise PR and push to main runs as a shadow run, with a
+  server inside the CI job ([dogfood.yml](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/.github/workflows/dogfood.yml)).
+  Running since 2026-10-26; recall and time-saved numbers with v0.3.
 
 ## Contributing
 

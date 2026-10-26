@@ -80,12 +80,16 @@ import none of the server's or MCP's dependencies, and `[server]` and `[mcp]` mu
 uv build && uv run --no-project python scripts/check_dist.py dist
 ```
 
-Two more workflows run on PRs:
+Three more workflows run on PRs:
 
 - [quickstart.yml](.github/workflows/quickstart.yml) runs the README Quickstart as written
   (below).
 - [action-e2e.yml](.github/workflows/action-e2e.yml) runs the three GitHub Actions against a
   real server: verdicts, `fail-on`, shadow mode, `known_flaky` and re-runs.
+- [dogfood.yml](.github/workflows/dogfood.yml) runs siftwise on itself as a shadow run (a
+  server inside the job, history in the Actions cache). It never fails for siftwise reasons and
+  never comments; `python -m scripts.dogfood_report report` adds up its summaries
+  ([methodology](docs/eval-methodology.md#dogfooding-live-on-siftwise-itself)).
 
 ## The quickstart script
 

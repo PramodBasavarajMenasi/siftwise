@@ -12,6 +12,12 @@ history, and a merge request pipeline's first job (siftwise-base) runs the full 
 MR's base commit and records it with record-base, so the later jobs have main's results to
 compare with. Not part of siftwise: a real project runs one server that keeps its history, and
 its jobs need none of this.
+
+The dump records its migration revision (alembic_version), and restore loads it into that
+schema before migrating on, so a dump from an older siftwise still loads; one from a newer
+siftwise (a revision this one doesn't have) is skipped. siftwise's own dogfood workflow
+(.github/workflows/dogfood.yml) uses restore and dump too, with SIFTWISE_HISTORY_DIR set:
+keep them free of GitLab specifics.
 """
 
 from __future__ import annotations
@@ -28,7 +34,8 @@ from pathlib import Path
 import psycopg
 from psycopg import sql
 
-HISTORY = Path(".siftwise-history")
+HISTORY = Path(os.environ.get("SIFTWISE_HISTORY_DIR") or ".siftwise-history")
+REVISION = "alembic_version"  # the dump's migration revision, a file in HISTORY
 SERVER = "http://127.0.0.1:8000"
 SERVER_LOG = Path("/tmp/siftwise-server.log")
 
@@ -47,8 +54,11 @@ def tables(conn: psycopg.Connection[tuple[object, ...]]) -> list[str]:
 
 
 def dump() -> None:
-    HISTORY.mkdir(exist_ok=True)
+    HISTORY.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
+        version = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+        assert version is not None
+        (HISTORY / REVISION).write_text(str(version[0]), encoding="utf-8")
         names = tables(conn)
         for table in names:
             query = sql.SQL("COPY {} TO STDOUT (FORMAT binary)").format(sql.Identifier(table))
@@ -65,12 +75,37 @@ def counts(conn: psycopg.Connection[tuple[object, ...]]) -> str:
     return f"{runs[0]} runs, {runs[1]} on main, {tests[0]} tests"
 
 
+def known_revision(revision: str) -> bool:
+    from alembic.script import ScriptDirectory
+    from alembic.script.revision import ResolutionError
+    from alembic.util import CommandError
+
+    from siftwise.migrate import alembic_config
+
+    try:
+        return ScriptDirectory.from_config(alembic_config()).get_revision(revision) is not None
+    except (ResolutionError, CommandError):
+        return False
+
+
 def restore() -> None:
+    from siftwise.migrate import upgrade
+
     wait_for_postgres()
-    subprocess.run(["siftwise", "server", "migrate"], check=True)
+    url = os.environ["SIFTWISE_DATABASE_URL"]
+    saved = HISTORY / REVISION
+    revision = saved.read_text(encoding="utf-8").strip() if saved.is_file() else None
     if not HISTORY.is_dir():
-        print(f"history: no {HISTORY}/ from an earlier job of this pipeline: starting empty")
+        print(f"history: no {HISTORY}/ to load: starting empty")
+        upgrade(url)
         return
+    if revision is not None and not known_revision(revision):
+        print(f"history: {HISTORY}/ is at migration {revision}, which this siftwise doesn't "
+              "have (a newer one dumped it): starting empty")  # fmt: skip
+        upgrade(url)
+        return
+    # The dump's own schema first (an older dump has older tables), then this siftwise's.
+    upgrade(url, revision or "head")
     with connect() as conn:
         names = tables(conn)
         missing = [name for name in names if not (HISTORY / f"{name}.copy").is_file()]
@@ -100,11 +135,16 @@ def restore() -> None:
             if sequence:
                 ids = setval.format(sql.Identifier(str(column)), sql.Identifier(str(owner)))
                 conn.execute(ids, [sequence])
-        restored = len(names) - len(missing)
-        print(f"history: restored {restored} tables from {HISTORY}/ (this pipeline's artifacts):"
-              f" {counts(conn)}")  # fmt: skip
         if missing:
             print(f"history: not in {HISTORY}/, left empty: {', '.join(missing)}")
+    if revision is not None:
+        upgrade(url)
+    with connect() as conn:
+        at = f"migration {revision}" if revision else "an unrecorded migration"
+        print(
+            f"history: restored {len(names) - len(missing)} tables from {HISTORY}/ ({at}): "
+            f"{counts(conn)}"
+        )
 
 
 def wait_for_postgres() -> None:
