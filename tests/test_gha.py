@@ -563,7 +563,7 @@ def test_full_mode_markdown_shows_the_reason_escaped() -> None:
 
     assert "for `abcdef1`" in markdown
     assert "all (10 known)" in markdown
-    assert "- **Why the full suite:** build/config file changed: a\\|b" in markdown
+    assert "- **Why the full suite:** ` build/config file changed: a|b `" in markdown
 
 
 def test_markdown_when_nothing_is_affected_or_siftwise_is_down() -> None:
@@ -613,9 +613,9 @@ def test_failures_markdown_orders_groups_and_collapses() -> None:
     visible, collapsed = markdown.split("<details>")
     assert visible.index("t::cart") < visible.index("t::other")
     assert row_of(visible, "t::cart") == (
-        "| <code>t::cart</code> | **new regression** | high | all | test file changed |"
+        "| ` t::cart ` | **new regression** | high | all | ` test file changed ` |"
     )
-    assert row_of(visible, "t::other") == "| <code>t::other</code> | unknown | low | linux | why |"
+    assert row_of(visible, "t::other") == "| ` t::other ` | unknown | low | ` linux ` | ` why ` |"
     assert collapsed.startswith(
         "<summary>1 flaky, 1 pre-existing: likely not caused by this change</summary>"
     )
@@ -640,9 +640,9 @@ def test_variants_all_only_when_every_variant_got_the_verdict() -> None:
 
     markdown = gha.failures_markdown(response, RUN_URL)
 
-    assert "| linux, macos |" in row_of(markdown, "t::partial")
+    assert "| ` linux `, ` macos ` |" in row_of(markdown, "t::partial")
     mixed = [line for line in markdown.splitlines() if "t::mixed" in line]
-    assert ["| linux |" in mixed[0], "| macos, windows |" in mixed[1]] == [True, True]
+    assert ["| ` linux ` |" in mixed[0], "| ` macos `, ` windows ` |" in mixed[1]] == [True, True]
     assert "| all |" in row_of(markdown, "t::everywhere")
     assert sum("| all |" in line for line in markdown.splitlines()) == 1
 
@@ -651,7 +651,7 @@ def test_one_variant_has_no_variants_column() -> None:
     response = triage_response(failure("t::a", "new_regression", None), variants=(None,))
     markdown = gha.failures_markdown(response, RUN_URL)
     assert "| Test | Verdict | Confidence | Why |" in markdown
-    assert row_of(markdown, "t::a") == "| <code>t::a</code> | **new regression** | high | why |"
+    assert row_of(markdown, "t::a") == "| ` t::a ` | **new regression** | high | ` why ` |"
 
 
 def unescaped_pipes(row: str) -> int:
@@ -665,20 +665,78 @@ def test_test_ids_and_reasons_are_escaped_for_the_table() -> None:
 
     markdown = gha.failures_markdown(response, RUN_URL)
 
-    row = row_of(markdown, "test\\_y")
+    row = row_of(markdown, "test_y")
     assert unescaped_pipes(row) == 5  # 4 cells: nothing in a cell ends one
-    assert "<code>tests.test\\_x::test\\_y\\[a\\|b-\\`c\\`-&lt;script&gt;\\]</code>" in row
-    assert "line one line two \\| &lt;b&gt;bold&lt;/b&gt; \\`code\\` \\*x\\* \\[link\\](u)" in row
-    assert "<script>" not in markdown and "<b>" not in markdown
+    assert "`` tests.test_x::test_y[a\\|b-`c`-<script>] ``" in row
+    assert "`` line one line two \\| <b>bold</b> `code` *x* [link](u) ``" in row
 
 
 @pytest.mark.parametrize(
-    ("text", "escaped"),
-    [("a|b", "a\\|b"), ("x`y", "x\\`y"), ("<i>", "&lt;i&gt;"), ("a\r\nb", "a  b"),
-     ("back\\slash", "back\\\\slash"), ("a&lt;b", "a&amp;lt;b")],
+    ("text", "table", "span"),
+    [("a", False, "` a `"), ("a`b``c", False, "``` a`b``c ```"), ("a|b", False, "` a|b `"),
+     ("a|b", True, "` a\\|b `"), ("a\r\nb\x1b[1m", False, "` a  b [1m `"),
+     ("<!-- siftwise -->", False, "` <! -- siftwise --> `")],
 )  # fmt: skip
-def test_md_escape(text: str, escaped: str) -> None:
-    assert gha._md(text) == escaped
+def test_code_span(text: str, table: bool, span: str) -> None:
+    assert gha.code_span(text, table=table) == span
+
+
+def outside_code(markdown: str) -> str:
+    """The Markdown without its code spans: what GitHub renders as formatted text."""
+    return re.sub(r"(`+) .*? \1(?!`)", "<code-span>", markdown)
+
+
+# File names a pull request can add: each tries a link, an image, HTML, a mention, an
+# autolink, a reference, or to break the table or the comment's own markers.
+HOSTILE_FILES = [
+    "docs/[click](https:/evil.test).py",
+    "img/![x](https:/evil.test/p.png).py",
+    "web/<img src=x onerror=alert(1)>.js",
+    "pkgs/@acme/core/index.ts",
+    "www.evil.test/setup.py",
+    "a/#123 and GH-1/x.py",
+    "cells|break|here.py",
+    "x/<!-- siftwise:failures sha=0 attempt=9 -->.py",
+    "tick`s``/x.py",
+]
+DANGEROUS = ("](", "<img", "@acme", "www.evil", "#123", "<!-- siftwise:failures sha=0")
+
+
+def test_hostile_file_names_are_inert_in_the_selection(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    reason = f"build/config file changed: {', '.join(HOSTILE_FILES)}"
+    api.post(f"{SERVER}/select").respond(json=selection(mode="full", reason=reason, command=""))
+    api.get(f"{GH}/repos/{REPO}/issues/7/comments").respond(json=[])
+    created = api.post(f"{GH}/repos/{REPO}/issues/7/comments").respond(201, json={})
+
+    result = gh.run("select", "pull_request", pr_event(repo))
+
+    assert result.exit_code == 0, result.output
+    body = sent_body(created)
+    for text in (body, gh.summary.read_text()):
+        assert all(marker not in outside_code(text) for marker in DANGEROUS), text
+        assert "build/config file changed: docs/[click](https:/evil.test).py" in text  # as is
+    assert gha.split_comment(body)[1] is None  # no failures section was forged
+
+
+def test_hostile_names_are_inert_in_the_failures_and_shadow_lines() -> None:
+    results = [failure(f"t::{name}", "new_regression", "linux", reason=f"imports {name}")
+               for name in HOSTILE_FILES]  # fmt: skip
+    results.append(failure("t::@acme", "unknown", "mac|os <b>x</b> @acme"))
+    response = triage_response(*results, variants=("linux", "mac|os <b>x</b> @acme"))
+    shadow = compare_response(missed=len(HOSTILE_FILES), missed_tests=[
+        {"test_id": f"t::{name}", "verdict": "unknown", "cause": "no_link"}
+        for name in HOSTILE_FILES])  # fmt: skip
+
+    markdown = gha.failures_markdown(response, RUN_URL) + "\n" + gha.shadow_markdown(shadow)
+
+    assert all(marker not in outside_code(markdown) for marker in DANGEROUS)
+    assert "<b>" not in outside_code(markdown)
+    assert gha.FAILURES_MARKER.search(markdown) is None
+    rows = [line for line in markdown.splitlines() if re.match(r"\| `+ t::", line)]
+    assert len(rows) == len(HOSTILE_FILES) + 1
+    assert all(unescaped_pipes(row) == 6 for row in rows)  # 5 cells (with Variants), intact
 
 
 def test_long_reasons_are_cut() -> None:
@@ -715,10 +773,10 @@ def test_no_failures_unavailable_and_unlinked_variants() -> None:
     assert gha.failures_markdown(triage_response(), RUN_URL) == (
         "### Failures\n\nNo failing tests in 2 recorded variants.\n")  # fmt: skip
     assert gha.unavailable_markdown("nothing recorded for this attempt") == (
-        "### Failures\n\nFailure verdicts unavailable: nothing recorded for this attempt.\n"
+        "### Failures\n\nFailure verdicts unavailable: ` nothing recorded for this attempt `.\n"
     )
     unlinked = triage_response(failure("t::a", "unknown"), links_known=False)
-    assert "Change links weren't recorded for <code>linux</code>" in gha.failures_markdown(
+    assert "Change links weren't recorded for ` linux `" in gha.failures_markdown(
         unlinked, RUN_URL)  # fmt: skip
 
 
@@ -798,7 +856,7 @@ def test_rollup_triages_into_the_comment_summary_and_outputs(
     assert rollup.called
     body = sent_body(created)
     assert f"<!-- siftwise:failures sha={repo['head']} attempt=2 -->" in body
-    assert "| <code>t::cart</code> | **new regression** | high | linux | why |" in body
+    assert "| ` t::cart ` | **new regression** | high | ` linux ` | ` why ` |" in body
     assert gha.SELECTION_MARKER not in body  # no selection section to keep
     outputs = gh.outputs()
     assert outputs["verdicts-available"] == "true"
@@ -891,8 +949,8 @@ def test_unavailable_verdicts_fail_open_unless_fail_on_is_set(
     assert "::warning::siftwise: failure verdicts unavailable" in open_.output
     assert "::error::" not in open_.output
     assert gh.outputs()["verdicts-available"] == "false"
-    assert f"Failure verdicts unavailable: {problem}" in sent_body(created)
-    assert f"Failure verdicts unavailable: {problem}" in gh.summary.read_text()
+    assert f"Failure verdicts unavailable: ` {problem}" in sent_body(created)
+    assert f"Failure verdicts unavailable: ` {problem}" in gh.summary.read_text()
 
     closed = gh.run("rollup", "pull_request", pr_event(repo), SIFTWISE_FAIL_ON="new_regression")
 
@@ -910,7 +968,7 @@ def test_rollup_on_a_fork_pr(gh: Runner, repo: dict[str, str], api: respx.MockRo
 
     assert result.exit_code == 0, result.output
     summary = gh.summary.read_text()
-    assert "Failure verdicts unavailable: no siftwise token" in summary
+    assert "Failure verdicts unavailable: ` no siftwise token" in summary
     assert "from a fork: no PR comment" in summary
     # fail-on can't gate without a token: a warning, never a failure (every fork PR would fail).
     gated = gh.run("rollup", "pull_request", event, SIFTWISE_API_TOKEN="",
@@ -950,7 +1008,7 @@ def test_record_comment_errors_are_warnings_and_verdicts_still_reach_the_summary
 
     assert result.exit_code == 0, result.output
     assert "::warning::siftwise: PR comment failed: 403" in result.output
-    row = "| <code>t::cart</code> | **new regression** | high | why |"
+    row = "| ` t::cart ` | **new regression** | high | ` why ` |"
     summary = gh.summary.read_text(encoding="utf-8")
     assert row in summary and "PR comment failed: HTTP 403" in summary
     outputs = gh.outputs()
@@ -986,7 +1044,7 @@ def test_record_in_a_single_job_triages_after_the_upload(
 
     assert result.exit_code == 1  # fail-on matched
     assert upload.called and triage.called
-    assert "| <code>t::cart</code> | **new regression** | high | why |" in sent_body(created)
+    assert "| ` t::cart ` | **new regression** | high | ` why ` |" in sent_body(created)
 
 
 def test_record_in_a_matrix_leg_leaves_triage_to_rollup(
@@ -1016,7 +1074,7 @@ def test_record_with_nothing_recorded_fails_only_with_fail_on(
     assert result.exit_code == 1
     assert ("::error::siftwise verdicts unavailable (nothing recorded for this attempt "
             "(no JUnit files)); failing because fail-on is set") in result.output  # fmt: skip
-    assert "Failure verdicts unavailable: nothing recorded" in sent_body(created)
+    assert "Failure verdicts unavailable: ` nothing recorded" in sent_body(created)
 
 
 # --- flaky handling: known_flaky and re-runs ------------------------------------------------
@@ -1594,7 +1652,7 @@ def test_shadow_lines_when_siftwise_would_have_run_everything_or_nothing() -> No
     nothing = selection(command="", selected_count=0)
     forced = gha.shadow_result(full)
 
-    assert "- **Would have run:** all (build/config file changed: a\\|b)" in \
+    assert "- **Would have run:** all (` build/config file changed: a|b `)" in \
         gha.selection_markdown(forced, "", shadow=True, would_have=full)  # fmt: skip
     assert "- **Would have run:** none of 10 known tests (none affected)" in \
         gha.selection_markdown(forced, "", shadow=True, would_have=nothing)  # fmt: skip
@@ -1689,7 +1747,7 @@ def test_shadow_markdown() -> None:
     assert line.splitlines()[0] == (
         "**Shadow run:** would have run 120 of 692 tests (70% time saved) and caught 2 of 3 "
         "failures (1 flaky not counted).")  # fmt: skip
-    assert "- <code>t::new\\[a\\|b\\]\\_x</code> (unknown)" in line
+    assert "- ` t::new[a|b]_x ` (unknown)" in line
 
     full = gha.shadow_markdown(compare_response(mode="full", caught=3, missed=0, missed_tests=[],
                                                 flaky_excluded=0))  # fmt: skip
@@ -1703,7 +1761,7 @@ def test_shadow_markdown() -> None:
     many = [{"test_id": f"t::m{i}", "verdict": "pre_existing", "variants": [None]}
             for i in range(25)]  # fmt: skip
     capped = gha.shadow_markdown(compare_response(missed=25, missed_tests=many))
-    assert capped.count("<code>") == 20 and "- +5 more" in capped
+    assert capped.count("- ` t::") == 20 and "- +5 more" in capped
     assert "(pre-existing)" in capped
 
     mismatch = compare_response(counted=False, mode=None, selections=[
@@ -1806,8 +1864,8 @@ def test_shadow_markdown_shows_each_missed_tests_cause() -> None:
     lines = gha.shadow_markdown(compare_response(missed=4, missed_tests=missed)).splitlines()
 
     assert lines[-4:] == [
-        r"- <code>t::new\_x</code>: new test (verdict: unknown)",
-        r"- <code>t::db\[a\|b\]</code>: config gap (verdict: new regression)",
-        "- <code>t::q</code>: no link to the change (verdict: pre-existing)",
-        "- <code>t::old</code> (unknown)",
+        "- ` t::new_x `: new test (verdict: unknown)",
+        "- ` t::db[a|b] `: config gap (verdict: new regression)",
+        "- ` t::q `: no link to the change (verdict: pre-existing)",
+        "- ` t::old ` (unknown)",
     ]

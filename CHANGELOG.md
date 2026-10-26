@@ -14,6 +14,27 @@ Codex and Gemini Code Assist VS Code extensions and macOS and Linux.
 
 ### Added
 
+- GitLab CI: a template, `gitlab/siftwise.gitlab-ci.yml`, with the hidden jobs
+  `.siftwise-select`, `.siftwise-record` and `.siftwise-rollup`, around new
+  `siftwise gitlab select|record|rollup` commands. They run the same steps as the GitHub
+  Action:
+  - selection, with the outputs passed to later jobs as a dotenv report (the command in a
+    file);
+  - uploads, recording a merge request's source commit, never a merged results commit;
+  - verdicts and shadow runs in one sticky merge request note, through the Notes API;
+  - `fail-on`, `known_flaky` from the merge request's base commit, and `rerun-unknown`.
+
+  Security:
+  - tokens come from environment variables only and are redacted from every log line, file
+    and note;
+  - test IDs and reasons appear in the note as code spans, so they can't add links,
+    mentions, HTML or quick actions;
+  - forks' pipelines get no tokens, and `fail-on` skips them with a warning;
+  - plain-http server URLs warn.
+
+  The template pins its siftwise version. `examples/gitlab` is a project to try it on
+  gitlab.com, with the server running inside the pipeline. Tested with mocks only, not yet
+  on a real GitLab instance.
 - MCP: the `repo_path` tool argument and `SIFTWISE_REPO_PATH`, for clients that start the
   server outside the repository. The repository is the first of: `repo_path`,
   `SIFTWISE_REPO_PATH`, `CLAUDE_PROJECT_DIR` (set by Claude Code), the client's workspace
@@ -48,6 +69,11 @@ Codex and Gemini Code Assist VS Code extensions and macOS and Linux.
 
 ### Fixed
 
+- Action: the PR comment and job summary show untrusted text (test IDs, file paths in reasons,
+  variants, error messages) as code spans, as the GitLab note does. A file name in a pull
+  request could add a link, an `@` mention (`pkgs/@scope/...`) or an autolink (`www.` names)
+  to the comment; the selection reason was escaped for table pipes only. Test IDs look the
+  same; reasons and variants are now shown as code.
 - MCP: a folder the client sets (`CLAUDE_PROJECT_DIR`, a root) that isn't in a git repository
   but holds exactly one directly inside now means that repository, with a `repository_note`
   in the result; otherwise the next step is tried instead of failing. `repo_path` and

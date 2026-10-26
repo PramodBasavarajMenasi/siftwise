@@ -10,6 +10,7 @@ how the evals measure, [eval methodology](docs/eval-methodology.md).
 |---|---|---|---|
 | **CLI** (`siftwise`) | on a laptop or a CI runner, in the checkout | `select`, `record`, `triage`, `report`, `rollup`: computes the git diff and the Go/Python import graphs, then calls the API | `pip install siftwise` (typer, httpx, defusedxml) |
 | **GitHub Action** (`actions/select`, `record`, `rollup`) | in GitHub Actions jobs | composite actions around `siftwise gha ...` (`cli/gha.py`): run metadata, the sticky PR comment, job summaries, re-runs, `fail-on` | installs the light CLI from the action's checkout |
+| **GitLab CI template** (`gitlab/siftwise.gitlab-ci.yml`) | in GitLab CI jobs | hidden jobs around `siftwise gitlab ...` (`cli/gitlab.py`): the same steps, with dotenv outputs, `.siftwise-ci/` reports and the sticky merge request note | `pip install siftwise==<the template's release>` |
 | **MCP server** (`siftwise mcp`) | started by a coding agent, over stdio | `select_tests`, `triage_failure`, `explain`: the same change computation as the CLI, including uncommitted work | `siftwise[mcp]` |
 | **API server** (FastAPI) | one or more stateless workers | ingest, rollups, selection, triage, shadow comparison, recall | `siftwise[server]`, or the Docker image |
 | **Postgres** | one database | every raw result and every derived table; the only state | Postgres 16 in the compose file |
@@ -175,6 +176,18 @@ The first rule that applies decides:
   token, checked before the body is read; an unset `SIFTWISE_API_TOKEN` returns 503.
 - **Migrations at start, once.** `siftwise server start` migrates under a Postgres advisory
   lock, so replicas starting together migrate once.
+- **One CI flow, two providers.** `select`, `record` and `rollup` are the same code for GitHub
+  Actions and GitLab CI (`gha.run_select`, `run_record`, `run_rollup`). A `Provider` decides only
+  how a step reports: outputs (`$GITHUB_OUTPUT`, or a dotenv file for later GitLab jobs), logs,
+  summaries, the comment (issue comments, or merge request notes) and Markdown escaping. GitLab
+  reads the pipeline from its predefined variables. A merge request records its source commit,
+  never a merged results commit, as GitHub records the PR head.
+- **Secrets from the environment only; untrusted text inert.** The GitLab jobs take no token
+  options and redact every token value from logs, files and the note. Test IDs, paths and
+  reasons come from the change's code. Both the GitHub comment and the GitLab note show them as
+  code spans only (no links, HTML, mentions or autolinks), and the GitLab note lets no line
+  start a quick action. A fork merge
+  request's pipeline has no tokens; elsewhere, a missing token makes `fail-on` fail closed.
 - **Re-runs through each test's own runner.** `record`'s `rerun-unknown` (`cli/reruns.py`)
   picks a runner per failing test from its recorded ID and file and the checkout (pytest, Go,
   Jest, Maven, Gradle), builds commands that run exactly those tests (escaped regexes, Java

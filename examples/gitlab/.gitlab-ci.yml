@@ -1,0 +1,101 @@
+# siftwise on GitLab CI, self-contained: each job runs its own siftwise server on a Postgres
+# service, with a random token made in the job. No hosted server, no siftwise secret. The only
+# CI/CD variable to add is SIFTWISE_GITLAB_TOKEN (masked), for the merge request note.
+#
+# History: each job restores the database from the job before it in this pipeline
+# (.siftwise-history/ in artifacts), else from the latest successful pipeline of the default
+# branch (its siftwise-rollup job's artifacts, read with CI_JOB_TOKEN). So the main pipeline
+# records history and merge request pipelines read it, but never write main's.
+#
+# A real project runs one siftwise server and includes the template by a release tag (see the
+# README). This folder carries a copy of the template so it works when pushed on its own.
+
+include:
+  - local: siftwise.gitlab-ci.yml
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+stages:
+  - test
+
+# The siftwise server, inside the job. Not part of the template: you'd run one server instead.
+.example-server:
+  image: python:3.12-bookworm
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+  variables:
+    # Until a siftwise release with `siftwise gitlab` is on PyPI, build a wheel from the
+    # siftwise checkout (uv build --wheel), copy it to wheels/ here, and use its path in both:
+    #   SIFTWISE_PIP_SPEC: "./wheels/siftwise-0.1.0-py3-none-any.whl"
+    #   EXAMPLE_SERVER_PIP_SPEC: "./wheels/siftwise-0.1.0-py3-none-any.whl[server]"
+    SIFTWISE_PIP_SPEC: "siftwise==0.1.0"
+    EXAMPLE_SERVER_PIP_SPEC: "siftwise[server]==0.1.0"
+    # The database is reachable only inside this job's network: not a secret.
+    POSTGRES_USER: siftwise
+    POSTGRES_PASSWORD: siftwise
+    POSTGRES_DB: siftwise
+    SIFTWISE_DATABASE_URL: postgresql+psycopg://siftwise:siftwise@postgres:5432/siftwise
+    SIFTWISE_SERVER: http://127.0.0.1:8000
+  before_script:
+    - python3 -m venv /tmp/siftwise-venv
+    - export PATH="/tmp/siftwise-venv/bin:$PATH"
+    - pip install --quiet --disable-pip-version-check "$EXAMPLE_SERVER_PIP_SPEC" pytest
+    # A new random token for this job's server; never printed.
+    - export SIFTWISE_API_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+    - python ci/history.py restore
+    - siftwise server start --no-migrate --host 127.0.0.1 --port 8000 > /tmp/siftwise-server.log 2>&1 &
+    - python ci/history.py wait
+
+siftwise-select:
+  extends: [.siftwise-select, .example-server]
+
+test:
+  extends: .example-server
+  stage: test
+  variables:
+    GIT_DEPTH: "0"
+    SIFTWISE_DEFER_ROLLUP: "true"
+    SIFTWISE_TRIAGE: "false"
+  # `siftwise gitlab record` runs in script, not after_script as in .siftwise-record: this
+  # job's server only lives as long as the script.
+  script:
+    - status=0
+    - |
+      if [ "$SIFTWISE_MODE" = selective ]; then
+        if [ -s "$SIFTWISE_COMMAND_FILE" ]; then sh "$SIFTWISE_COMMAND_FILE" || status=$?; else echo "No tests affected."; fi
+      else
+        pytest --junitxml=.siftwise-ci/junit/full.xml || status=$?
+      fi
+    - siftwise gitlab record
+    - python ci/history.py dump
+    - exit "$status"
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - .siftwise-ci/
+      - .siftwise-history/
+    reports:
+      junit: .siftwise-ci/junit/*.xml
+
+siftwise-rollup:
+  extends: [.siftwise-rollup, .example-server]
+  dependencies: [test]  # this pipeline's history, from the test job
+  variables:
+    GIT_STRATEGY: clone  # ci/history.py
+    SIFTWISE_FAIL_ON: new_regression,unknown
+  script:
+    - status=0
+    - siftwise gitlab rollup || status=$?
+    - python ci/history.py dump
+    - exit "$status"
+  artifacts:
+    paths:
+      - .siftwise-ci/
+      - .siftwise-history/

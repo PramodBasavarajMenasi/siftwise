@@ -167,7 +167,9 @@ image to GHCR.
 
 1. Set `__version__` in `src/siftwise/__init__.py`, the image tag in `docker-compose.yml` and
    the README (`tests/test_packaging.py` checks they agree), and add the version to
-   [CHANGELOG.md](CHANGELOG.md).
+   [CHANGELOG.md](CHANGELOG.md). Also set the GitLab template's `SIFTWISE_PIP_SPEC`
+   (`gitlab/siftwise.gitlab-ci.yml`), then copy the template over
+   `examples/gitlab/siftwise.gitlab-ci.yml` (`tests/test_gitlab.py` checks both).
 2. Merge, then tag the merge commit: `git tag -a vX.Y.Z -m "siftwise X.Y.Z"` and
    `git push origin vX.Y.Z`.
 3. If the `pypi` (or `testpypi`) environment has required reviewers, approve the deployment

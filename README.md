@@ -214,8 +214,8 @@ uv run python scripts/backfill.py --repo RDFLib/rdflib --workflow validate.yaml 
 
 ### Record results from other CI systems
 
-On GitHub, use the [GitHub Action](#github-action). Elsewhere, upload JUnit XML after each test
-run:
+On GitHub, use the [GitHub Action](#github-action); on GitLab, the [CI template](#gitlab-ci).
+Elsewhere, upload JUnit XML after each test run:
 
 ```sh
 siftwise record junit.xml --repo acme/shop --branch feature-x --ci-run-id 1234 \
@@ -555,6 +555,187 @@ Each miss gets a cause, from evidence the server already has:
 on every push and PR of this repo: verdicts, `fail-on`, a shadow run with a miss,
 `known_flaky` and `rerun-unknown`.
 
+## GitLab CI
+
+A CI template, [`gitlab/siftwise.gitlab-ci.yml`](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/gitlab/siftwise.gitlab-ci.yml),
+with three hidden jobs around `siftwise gitlab select|record|rollup`. They run the same steps
+as the GitHub Action, with the same rules: they fail open, use the merge request's base for
+`known_flaky`, support shadow mode and `rerun-unknown`, and fail only through `fail-on`.
+
+| Your job | `extends:` | What it does |
+|---|---|---|
+| `siftwise-select` | `.siftwise-select` (stage `.pre`) | picks the tests; passes `SIFTWISE_MODE`, `SIFTWISE_COMMAND_FILE`, `SIFTWISE_SELECTED`, `SIFTWISE_TOTAL`, `SIFTWISE_REASON` and `SIFTWISE_JUNIT_DIR` (plus the shadow outputs) to later jobs as a dotenv report; writes the selection into one sticky merge request note |
+| your test jobs | `.siftwise-record` | its `after_script` uploads the job's JUnit (`**/junit*.xml` and `.siftwise-ci/junit/`) with the pipeline ID, the merge request's source commit (never a merged results commit), the branch, the variant, the changed files and the base commit's `known_flaky`; optionally re-runs unknown failures |
+| `siftwise-rollup` | `.siftwise-rollup` (stage `.post`, `when: always`) | triages every test job's failures into the note, applies `fail-on`, reports a shadow run, then updates the test stats once |
+
+Each job writes its reports under `.siftwise-ci/` (artifacts, kept 1 week): `select.md`,
+`failures.md`, and the dotenv files. GitLab has no job summary, so these files are where to
+look.
+
+**Setup:**
+1. **Include the template by a release tag and its hash**, never a branch. The tag fixes what
+   runs in your pipelines with your tokens; GitLab rejects the file if it changes
+   ([`include:integrity`](https://docs.gitlab.com/ci/yaml/#includeintegrity), GitLab 17.9+). Get the hash
+   with `curl -sL <url> | openssl dgst -sha256 -binary | openssl base64 -A`. Each template
+   installs its own release (`pip install siftwise==<version>`). Or copy the file into your
+   repository and `include: local:` it.
+2. **CI/CD variables** (Settings > CI/CD > Variables): `SIFTWISE_SERVER` (your server, https),
+   `SIFTWISE_TOKEN` (its `SIFTWISE_API_TOKEN`; Masked and hidden) and, for the note,
+   `SIFTWISE_GITLAB_TOKEN` (Masked and hidden). Choosing between protected and not:
+   [protected or unprotected](#protected-or-unprotected-variables).
+3. **Full history:** the select and test jobs set `GIT_DEPTH: "0"`; new GitLab projects clone
+   20 commits. On a shallow clone, `select` fails with that fix and the pipeline runs the full
+   suite (the select job has `allow_failure: true`).
+4. **Images:** the select job uses `python:3.12-bookworm`, which has git. For Go import graphs,
+   give it an image with Go and Python 3.11+. The record step runs in your test job's image,
+   which needs Python 3.11+ (`python3 -m venv`).
+
+```yaml
+include:
+  - remote: https://raw.githubusercontent.com/PramodBasavarajMenasi/siftwise/vX.Y.Z/gitlab/siftwise.gitlab-ci.yml
+    integrity: sha256-<base64 SHA-256 of that file>
+
+workflow:  # merge request pipelines for open MRs, branch pipelines otherwise
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+siftwise-select:
+  extends: .siftwise-select
+
+test:
+  extends: .siftwise-record
+  image: python:3.12
+  script:
+    - pip install -r requirements.txt
+    - |
+      if [ "$SIFTWISE_MODE" = selective ]; then
+        # Shell-quoted by siftwise; each pytest command writes its report to .siftwise-ci/junit.
+        if [ -s "$SIFTWISE_COMMAND_FILE" ]; then sh "$SIFTWISE_COMMAND_FILE"; else echo "No tests affected."; fi
+      else
+        pytest --junitxml=.siftwise-ci/junit/full.xml   # your full suite
+      fi
+  artifacts:
+    reports:
+      junit: .siftwise-ci/junit/*.xml
+
+siftwise-rollup:
+  extends: .siftwise-rollup
+  variables:
+    SIFTWISE_FAIL_ON: new_regression,unknown   # optional: see fail-on
+```
+
+If `siftwise-select` failed or didn't run, `SIFTWISE_MODE` is empty and the test job runs the
+full suite. Test jobs that use `needs:` must list `siftwise-select` to get its variables. If
+your test job has its own `after_script` or artifact `paths`, add
+`!reference [.siftwise-record, after_script]` and `.siftwise-ci/` to them.
+
+**Matrix:** give each leg a `SIFTWISE_VARIANT`. The template's record step defers the stats
+and the verdicts to `siftwise-rollup`, which runs once after every leg:
+
+```yaml
+test:
+  extends: .siftwise-record
+  image: python:$PY
+  parallel:
+    matrix:
+      - PY: ["3.11", "3.12"]
+  variables:
+    SIFTWISE_VARIANT: py$PY
+  script:
+    - ...   # as above
+```
+
+**Inputs** are the GitHub Action's, as variables: `SIFTWISE_REPO`, `SIFTWISE_BASE_REF`,
+`SIFTWISE_SHADOW`, `SIFTWISE_COMMENT`, `SIFTWISE_VARIANT`, `SIFTWISE_JUNIT_GLOB`,
+`SIFTWISE_FAIL_ON`, `SIFTWISE_KNOWN_FLAKY_SOURCE`, the `SIFTWISE_RERUN_*` ones. The rollup's
+outputs are `SIFTWISE_VERDICTS_AVAILABLE`, `SIFTWISE_COUNT_<VERDICT>`, `SIFTWISE_REPORT` and
+the shadow ones.
+
+**Try it on gitlab.com** with [examples/gitlab](https://github.com/PramodBasavarajMenasi/siftwise/tree/main/examples/gitlab): a small project whose
+pipeline runs its own siftwise server and Postgres inside each job, with a random token, so
+the only variable it needs is `SIFTWISE_GITLAB_TOKEN`.
+
+### The GitLab token
+
+The note goes through the [Notes API](https://docs.gitlab.com/api/notes/). Give it the least
+that works:
+
+- **Premium or Ultimate, or Self-Managed:** a [project access token](https://docs.gitlab.com/user/project/settings/project_access_tokens/)
+  with the **Reporter** role, the **`api`** scope (`read_api` can't write notes) and an expiry
+  date. Its bot user writes the note. Planner is the lowest role that can comment, but not when
+  merge requests are set to "Only Project Members" ([permissions](https://docs.gitlab.com/user/permissions/)).
+- **GitLab.com Free** (no project access tokens): a dedicated user (a bot account, a project
+  member with the Reporter role) with a [fine-grained personal access token](https://docs.gitlab.com/auth/tokens/fine_grained_access_tokens/)
+  limited to this project: **Work Item** create, read and update (merge request notes are part
+  of it), **Merge Request** read, and **User** read (siftwise looks up its own user so it only
+  edits its own note). Set an expiry date. A classic token with the `api` scope also works, but
+  it can do anything its user can, everywhere.
+- **`CI_JOB_TOKEN` can't do it:** its allowlist has only `GET` endpoints for merge requests
+  and notes ([job token](https://docs.gitlab.com/ci/jobs/ci_job_token/)), so it can read notes
+  but not write them.
+
+The role should stay below Maintainer: Maintainers can edit other users' comments. A token
+without access just warns (`merge request comment failed: HTTP 403`), and the pipeline goes on.
+
+### Protected or unprotected variables
+
+- **Protected** variables reach only pipelines on protected branches and tags. A merge request
+  from an unprotected branch (most of them) gets no token: siftwise runs the full suite, posts
+  no note and records nothing. With `fail-on` set, `siftwise-rollup` then **fails closed**: only
+  forks skip the gate, so don't combine protected variables and `fail-on`. GitLab 18.1+ can pass
+  protected variables to merge request pipelines, but only when both the source and target
+  branches are protected
+  ([details](https://docs.gitlab.com/ci/pipelines/merge_request_pipelines/#control-access-to-protected-variables-and-runners)).
+- **Unprotected** (masked and hidden) variables reach every branch pipeline. Anyone who can
+  push a branch (the Developer role) can change `.gitlab-ci.yml` on it and read both tokens.
+  Masking hides a value in logs, not from the job's code.
+- **Recommended:** unprotected, masked and hidden, when everyone with the Developer role may read
+  and write siftwise history. The siftwise token reads and writes **every repo on its server**:
+  run a separate siftwise server per trust boundary, so that a leaked token exposes only one
+  team's repos. Otherwise use protected variables: siftwise then helps only protected branches.
+
+### Forks
+
+By default a fork's merge request pipeline runs **in the fork, without this project's
+variables**: the full suite, no note, no upload, and `fail-on` skipped with a warning (as for
+fork PRs on GitHub). Keep another required check on them. **Never run untrusted forks'
+pipelines in the parent project** (Run pipeline on the merge request's Pipelines tab): that
+runs the fork's code with this project's variables, so it could read both tokens. siftwise
+warns when it sees one. Like GitHub's `pull_request_target`, only do it for code you've read.
+
+### GitLab security
+
+- **Tokens come from the environment only.** No `--token` option exists, and siftwise redacts
+  every value of `SIFTWISE_TOKEN`, `SIFTWISE_API_TOKEN`, `SIFTWISE_GITLAB_TOKEN` and
+  `CI_JOB_TOKEN` from its log lines, dotenv files, reports and the note, even when an error
+  message echoes one. Never add `set -x` or `CI_DEBUG_TRACE` to these jobs.
+- **Untrusted text is inert in the note.** Test IDs, file paths, reasons and variant names come
+  from the merge request's code, so siftwise writes them as code spans, which GitLab shows
+  literally: no links, images, HTML, `@` mentions, references or placeholders. No line can
+  start with `/`, so none can run a quick action. Raw failure messages are never shown.
+- **A merge request can't excuse its own failures:** `record` applies the `known_flaky` list
+  of the MR's base commit.
+- **Plain http warns:** `SIFTWISE_SERVER` with `http://` and a host other than `localhost` or a
+  one-word service name (the token travels in a header) gives a warning.
+- **Protect `.gitlab-ci.yml`:** a merge request that edits it can change any gate. Protect the
+  default branch and, with Premium or Ultimate, require code owner approval for the file
+  ([CODEOWNERS](https://docs.gitlab.com/user/project/codeowners/)).
+
+**Limits:**
+- **Retried jobs:** a retried job keeps its pipeline ID, so only the pipeline's first upload of
+  each leg is stored (`record` warns). Run a new pipeline to record again.
+- **No diff base:** merge trains, scheduled, manual (web), API and trigger pipelines run the
+  full suite.
+- **`after_script` limits:** it runs with a 5-minute limit by default (`RUNNER_AFTER_SCRIPT_TIMEOUT`),
+  which caps `rerun-unknown`, and, depending on the executor, without software the `script`
+  section installed. Re-runs need the test dependencies inside the project directory (a
+  virtualenv there, `node_modules`), or call `siftwise gitlab record` at the end of `script`.
+- **Tested only with mocks:** the GitLab support is tested against GitLab's documented variables
+  and API, with mocks, not yet on a real GitLab instance.
+
 ## Coding agents (MCP)
 
 `siftwise mcp` is an MCP server (stdio) that gives a coding agent three tools. It keeps no
@@ -784,10 +965,13 @@ public issue.
   separate server for repos whose owners shouldn't see each other's history, and rotate the
   token by changing it on the server and in each secret.
 - **Keep the token out of fork PRs.** Use `pull_request`, never `pull_request_target`: a
-  fork's code must never run with the token.
+  fork's code must never run with the token. On GitLab, never run untrusted forks' merge
+  request pipelines in the parent project ([Forks](#forks)).
 - **Protect your workflows.** The base-branch `known_flaky` rule assumes the workflow itself
-  is protected. A PR that edits `.github/workflows/` can change any gate, so protect workflows
-  with CODEOWNERS or a ruleset.
+  is protected. A PR that edits `.github/workflows/` (or `.gitlab-ci.yml`) can change any gate,
+  so protect workflows with CODEOWNERS or a ruleset (on GitLab: protected branches, and code
+  owner approval with Premium or Ultimate). GitLab's token choices:
+  [protected or unprotected variables](#protected-or-unprotected-variables).
 - **What the server stores:** test IDs, outcomes, durations, failure messages (truncated to 4
   KB), changed file paths, branch names and commit SHAs. Failure messages can contain whatever
   your tests print, so treat the database as you treat CI logs. Public PR comments show test
@@ -795,14 +979,15 @@ public issue.
 - **Stats cover the window only.** Per-test stats use the last `SIFTWISE_STATS_WINDOW_DAYS`
   (90) days before the repo's newest run; older raw results stay, but no longer feed stats.
 - **Limits to know:** merge-queue (`merge_group`), scheduled and manual runs always run the
-  full suite (no diff base); the Action is tested on Linux runners only; Java tests are
+  full suite (no diff base); the Action is tested on Linux runners only, and the GitLab
+  template with mocks only (not yet on a real GitLab instance); Java tests are
   recorded but always run in full (`rerun-unknown` re-runs pytest, Go, Jest, Maven and Gradle
   tests).
 
 ## Roadmap
 
 - **Done:** recording and history, test selection with import graphs and safe fallbacks, the
-  GitHub Action, failure triage with verdicts in the PR comment and `fail-on`, the MCP server,
+  GitHub Action, the GitLab CI template (unreleased), failure triage with verdicts in the PR comment and `fail-on`, the MCP server,
   the triage eval, [shadow mode](#shadow-mode) with `siftwise report`, miss causes,
   [flaky handling](#flaky-tests) (`known_flaky`, `rerun-unknown`), performance (batched
   triage, faster select and ingest), packaging (a light CLI, a server image, the quickstart)
