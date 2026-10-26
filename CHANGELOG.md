@@ -33,8 +33,9 @@ Codex and Gemini Code Assist VS Code extensions and macOS and Linux.
   - plain-http server URLs warn.
 
   The template pins its siftwise version. `examples/gitlab` is a project to try it on
-  gitlab.com, with the server running inside the pipeline. Tested with mocks only, not yet
-  on a real GitLab instance.
+  gitlab.com, with the server running inside the pipeline: history stays within a pipeline,
+  and a merge request pipeline first records its base commit's full test run as a main run.
+  Tested with mocks, plus a first run of the example on gitlab.com Free.
 - MCP: the `repo_path` tool argument and `SIFTWISE_REPO_PATH`, for clients that start the
   server outside the repository. The repository is the first of: `repo_path`,
   `SIFTWISE_REPO_PATH`, `CLAUDE_PROJECT_DIR` (set by Claude Code), the client's workspace

@@ -656,7 +656,10 @@ the shadow ones.
 
 **Try it on gitlab.com** with [examples/gitlab](https://github.com/PramodBasavarajMenasi/siftwise/tree/main/examples/gitlab): a small project whose
 pipeline runs its own siftwise server and Postgres inside each job, with a random token, so
-the only variable it needs is `SIFTWISE_GITLAB_TOKEN`.
+the only variable it needs is `SIFTWISE_GITLAB_TOKEN`. With no server between pipelines, it
+keeps history only within a pipeline: a merge request pipeline first runs the full suite at
+the MR's base commit and records it as a main run. A real setup runs one persistent server
+and needs neither.
 
 ### The GitLab token
 

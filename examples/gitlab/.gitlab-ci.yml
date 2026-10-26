@@ -2,12 +2,14 @@
 # service, with a random token made in the job. No hosted server, no siftwise secret. The only
 # CI/CD variable to add is SIFTWISE_GITLAB_TOKEN (masked), for the merge request note.
 #
-# History: each job restores the database from the job before it in this pipeline
-# (.siftwise-history/ in artifacts), else from the latest successful pipeline of the default
-# branch (its siftwise-rollup job's artifacts, read with CI_JOB_TOKEN). So the main pipeline
-# records history and merge request pipelines read it, but never write main's.
+# History moves only between the jobs of one pipeline (.siftwise-history/ in artifacts): each
+# job restores the database from the job before it. A default-branch pipeline starts empty and
+# records its own run. A merge request pipeline starts with siftwise-base, which runs the full
+# suite at the MR's base commit and records it as a main run, so siftwise has main's results
+# to select and triage against.
 #
-# A real project runs one siftwise server and includes the template by a release tag (see the
+# A real project runs one siftwise server that keeps its history between pipelines: no
+# siftwise-base job, no ci/history.py. It includes the template by a release tag (see the
 # README). This folder carries a copy of the template so it works when pushed on its own.
 
 include:
@@ -21,6 +23,8 @@ workflow:
     - if: $CI_COMMIT_BRANCH
 
 stages:
+  - base
+  - select
   - test
 
 # The siftwise server, inside the job. Not part of the template: you'd run one server instead.
@@ -52,8 +56,30 @@ stages:
     - siftwise server start --no-migrate --host 127.0.0.1 --port 8000 > /tmp/siftwise-server.log 2>&1 &
     - python ci/history.py wait
 
+# Merge request pipelines only: main's results at the MR's base commit, for the later jobs.
+siftwise-base:
+  extends: .example-server
+  stage: base
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_DIFF_BASE_SHA
+  variables:
+    GIT_DEPTH: "0"  # the base commit
+  script:
+    - git worktree add --detach /tmp/siftwise-base "$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+    # The full suite, as the test job runs it; failures are main's, so they don't fail the job.
+    - (cd /tmp/siftwise-base && pytest --junitxml=/tmp/siftwise-base-junit/full.xml) || true
+    - python ci/history.py record-base /tmp/siftwise-base-junit/full.xml
+    - python ci/history.py dump
+  # If it fails, the later jobs start empty and run the full suite.
+  allow_failure: true
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - .siftwise-history/  # only the history: the base's JUnit stays out of this run's
+
 siftwise-select:
   extends: [.siftwise-select, .example-server]
+  stage: select  # after siftwise-base: its history comes in its artifacts
 
 test:
   extends: .example-server

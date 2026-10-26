@@ -6,11 +6,28 @@ server and Postgres (a `services:` container), with a random token made in the j
 need no hosted server and no siftwise secret. The only CI/CD variable is
 `SIFTWISE_GITLAB_TOKEN`, for the merge request note.
 
-History moves between jobs as artifacts (`.siftwise-history/`, written by `ci/history.py`). A
-merge request pipeline starts from the latest successful pipeline of the default branch: it
-reads the `siftwise-rollup` job's artifacts with `CI_JOB_TOKEN`. So the main pipeline records
-history, and merge requests read it without writing it. A real project runs one siftwise
-server instead.
+**A real setup runs one persistent siftwise server** (see the main README), which keeps
+every pipeline's results: the default branch's runs are there when a merge request pipeline
+asks what to run, with nothing to move around. This example has no server between
+pipelines, so it does two things a real setup doesn't:
+
+- **History moves between the jobs of one pipeline** as artifacts (`.siftwise-history/`,
+  written by `ci/history.py dump`, loaded by `ci/history.py restore`). Nothing moves between
+  pipelines: a `main` pipeline starts empty and records its own run.
+- **A merge request pipeline seeds its history from the MR's base commit.** Its first job,
+  `siftwise-base`, checks out `CI_MERGE_REQUEST_DIFF_BASE_SHA` in a worktree, runs the full
+  suite there and records it as a `main` run of that commit (`ci/history.py record-base`,
+  with plain `siftwise record` and its own run ID: `siftwise gitlab record` would use this
+  pipeline's ID, which the MR's own upload in the `test` job needs). So `siftwise-select` and the triage in `siftwise-rollup` have main's
+  results to compare with. It costs one full test run per merge request pipeline.
+
+What we learned on gitlab.com: an earlier version read the default branch's history from its
+latest `siftwise-rollup` job's artifacts with `CI_JOB_TOKEN`
+(`GET /projects/:id/jobs/artifacts/main/download?job=siftwise-rollup&search_recent_successful_pipelines=true`). On a private Free
+project (2026-10-26) that request got `404 {"message":"404 Project Not Found"}` from a merge
+request pipeline, although the artifacts existed and the docs list the artifact downloads among
+the job token's [allowed endpoints](https://docs.gitlab.com/ci/jobs/ci_job_token/). We
+haven't verified why, so the example no longer depends on it.
 
 ## Run it on gitlab.com
 
@@ -39,11 +56,9 @@ server instead.
    git push -u origin main
    ```
 
-   This first pipeline records history: `siftwise-select` runs the full suite (no history
-   yet), `test` passes, `siftwise-rollup` passes. Check that `siftwise-rollup`'s artifacts
-   have `.siftwise-history/`. **Wait until this pipeline has passed before step 4:** a
-   pipeline that starts earlier finds no successful `main` pipeline to read history from and
-   starts empty (see [The history log line](#the-history-log-line)).
+   This first pipeline has no history: `siftwise-select` runs the full suite, `test` passes
+   and records the run, `siftwise-rollup` passes. Every `main` pipeline is like this one,
+   since nothing carries over between pipelines.
 
 3. **The note's token.** On GitLab.com Free, create a fine-grained personal access token
    (avatar > Edit profile > Access > Personal access tokens > Generate token > Fine-grained
@@ -69,13 +84,18 @@ server instead.
    ```
 
    Open a merge request from `break-discount`. Its pipeline:
-   - **`siftwise-select`** is selective: `tests/test_cart.py` only, because it imports the
+   - **`siftwise-base`** runs the four tests at the MR's base commit (all pass) and records
+     them as a `main` run. Its log ends with `history: recording <sha> (main) as a main run`,
+     `siftwise: run 1 stored (4 results)` and `history: saved ... (1 runs, 1 on main, 4 tests)`.
+   - **`siftwise-select`** logs `history: restored ... 1 runs, 1 on main, 4 tests`, and is
+     selective: `tests/test_cart.py` only, because it imports the
      changed `shop.cart`. `test_prices.py` is skipped. The MR gets a siftwise note with the
      selection.
    - **`test`** runs `tests/test_cart.py`; `test_bulk_discount` fails.
    - **`siftwise-rollup`** adds a Failures section to the note:
-     `tests.test_cart::test_bulk_discount`, **new regression**, because the change links to it
-     through the import. It then fails the job, because of
+     `tests.test_cart::test_bulk_discount`, **new regression** (high), because `main` passed it
+     at the base commit and the change links to it (`tests/test_cart.py` maps to the changed
+     `shop/cart.py`). It then fails the job, because of
      `SIFTWISE_FAIL_ON: new_regression,unknown`.
 
 ## What to check
@@ -98,32 +118,23 @@ server instead.
     because with `fail-on` set, unavailable verdicts fail closed. Delete the variable
     afterwards.
 
-## The history log line
+## The history log lines
 
-Every job's log has a `history:` line from `ci/history.py restore`. In a merge request
-pipeline it reads `main`'s history with the job's own `CI_JOB_TOKEN`, from
-`GET /projects/:id/jobs/artifacts/main/download?job=siftwise-rollup&search_recent_successful_pipelines=true`
-([Download job artifacts by reference name](https://docs.gitlab.com/api/job_artifacts/#download-job-artifacts-by-reference-name)).
-The job token can call this endpoint for its own project on every tier, Free included: the
-job artifacts download endpoints are on its list of
-[allowed endpoints](https://docs.gitlab.com/ci/jobs/ci_job_token/), and a project's job
-token allowlist always includes the project itself. No other token is needed.
+Every job's log has `history:` lines from `ci/history.py`:
 
-- `HTTP 200, N bytes: the default branch's history`: it worked.
-- `HTTP 404 '{"message":"404 Not found"}'`: GitLab found no successful `main` pipeline whose
-  `siftwise-rollup` job kept artifacts. Usually `main`'s pipeline hadn't finished when this
-  pipeline started. Expiry is unlikely: GitLab keeps the most recent successful pipeline's
-  artifacts of each branch whatever their `expire_in`, unless **Keep artifacts from most
-  recent successful jobs** is turned off
-  ([docs](https://docs.gitlab.com/ci/jobs/job_artifacts/#keep-artifacts-from-most-recent-successful-jobs)). Let
-  `main`'s pipeline pass, then run the merge request's pipeline again (**Run pipeline** on
-  its Pipelines tab; retrying one job isn't enough, since each job restores on its own).
-- `HTTP 404 '{"message":"404 Project Not Found"}'`: the token's user can't see the project.
-- `HTTP 401`: the job token was refused. It is valid only while its job runs.
-- `HTTP 403`: the job token was refused for this project (Settings > CI/CD > Job token
-  permissions).
+- `history: no .siftwise-history/ from an earlier job of this pipeline: starting empty`: the
+  first job of a `main` pipeline, and `siftwise-base`. Anywhere else in a merge request
+  pipeline it means `siftwise-base` failed (it's allowed to fail, so the later jobs run the
+  full suite): see its log.
+- `history: restored N tables from .siftwise-history/ (this pipeline's artifacts): R runs, M
+  on main, T tests`: what the job starts from. In a merge request pipeline, the one run on
+  `main` is the base commit's, from `siftwise-base`; `test` adds the MR's own run.
+- `history: not in .siftwise-history/, left empty: ...`: tables the earlier job didn't save
+  (an artifact from an older siftwise).
+- `history: saved N tables to .siftwise-history/ (...)`: what the job passes on.
 
-The token is sent in the `JOB-TOKEN` header, never in the URL, and never logged.
+No job uses `CI_JOB_TOKEN` or any other GitLab token for the history, and `ci/history.py`
+never prints a token: each job's siftwise token is random, made in the job and never printed.
 
 ## Clean up
 

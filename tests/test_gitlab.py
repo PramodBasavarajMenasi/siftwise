@@ -770,18 +770,33 @@ def test_the_examples_history_survives_a_dump_and_restore(
     bin_dir = Path(sys.executable).parent
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    # A job's secrets are in its environment: none may reach the log.
+    for name, secret in (("SIFTWISE_API_TOKEN", SIFT_TOKEN), ("SIFTWISE_GITLAB_TOKEN", GL_TOKEN),
+                         ("CI_JOB_TOKEN", JOB_TOKEN)):  # fmt: skip
+        monkeypatch.setenv(name, secret)
+
+    def history(command: str) -> str:
+        proc = subprocess.run([sys.executable, str(script), command], check=True,
+                              capture_output=True, text=True)  # fmt: skip
+        assert_no_secrets(proc.stdout, proc.stderr)
+        return proc.stdout
+
     try:
         for url in urls:
             monkeypatch.setenv("SIFTWISE_DATABASE_URL", url)
-            subprocess.run([sys.executable, str(script), "restore"], check=True)  # migrates
+            out = history("restore")  # migrates
+            assert "from an earlier job of this pipeline: starting empty" in out
         source = create_engine(urls[0])
         with source.begin() as conn:
             conn.execute(text("INSERT INTO repos (name) VALUES ('acme/shop')"))
         source.dispose()
         monkeypatch.setenv("SIFTWISE_DATABASE_URL", urls[0])
-        subprocess.run([sys.executable, str(script), "dump"], check=True)
+        assert "0 runs, 0 on main, 0 tests" in history("dump")
         monkeypatch.setenv("SIFTWISE_DATABASE_URL", urls[1])
-        subprocess.run([sys.executable, str(script), "restore"], check=True)
+        out = history("restore")
+        restored = r"restored \d+ tables from \.siftwise-history/ \(this pipeline's artifacts\)"
+        assert re.search(restored + ": 0 runs, 0 on main, 0 tests", out), out
+        assert "left empty" not in out
 
         target = create_engine(urls[1])
         with target.begin() as conn:
