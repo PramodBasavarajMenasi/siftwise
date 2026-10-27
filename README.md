@@ -44,7 +44,7 @@ and Linear found that as development accelerates, CI becomes a bottleneck, becau
 still has to pass through it
 ([AI coding has made CI a bottleneck](https://linear.app/now/ci-bottleneck-reworked)).
 
-> **Status: alpha** (`0.1.0`). Evaluated on four real repos' CI history. APIs and the
+> **Status: alpha** (`0.2.0`). Evaluated on four real repos' CI history. APIs and the
 > database schema may change before 1.0.
 
 <p align="center">
@@ -98,7 +98,7 @@ cd siftwise
 ```
 
 **1. Start the server** with Postgres, from the published image
-(`ghcr.io/pramodbasavarajmenasi/siftwise:0.1.0`). The API token is a shared secret you choose;
+(`ghcr.io/pramodbasavarajmenasi/siftwise:0.2.0`). The API token is a shared secret you choose;
 it goes in `.env`, which `docker compose` reads:
 
 ```sh quickstart
@@ -177,7 +177,7 @@ With Docker, from the published image:
 ```sh
 docker run -d -p 8000:8000 -e SIFTWISE_API_TOKEN=... \
     -e SIFTWISE_DATABASE_URL=postgresql+psycopg://user:password@db-host:5432/siftwise \
-    ghcr.io/pramodbasavarajmenasi/siftwise:0.1.0
+    ghcr.io/pramodbasavarajmenasi/siftwise:0.2.0
 ```
 
 To build the image from a checkout instead: `docker build -t siftwise .`, then run `siftwise`
@@ -273,7 +273,7 @@ checkout and never block CI: if the server is unreachable, times out or returns 
   `pull-requests: write` (the comment).
 - **Full history:** check out with `fetch-depth: 0`. `select` fails with a clear message on a
   shallow clone, the only way it fails.
-- **Version:** the examples use `@main`; pin a release tag (`@v0.1.0`) or a commit SHA for
+- **Version:** the examples use `@main`; pin a release tag (`@v0.2.0`) or a commit SHA for
   reproducible CI. The actions install the CLI from their own checkout, so the CLI's version
   always matches the tag.
 
@@ -592,7 +592,7 @@ look.
 
 ```yaml
 include:
-  - remote: https://raw.githubusercontent.com/PramodBasavarajMenasi/siftwise/vX.Y.Z/gitlab/siftwise.gitlab-ci.yml
+  - remote: https://raw.githubusercontent.com/PramodBasavarajMenasi/siftwise/v0.2.0/gitlab/siftwise.gitlab-ci.yml
     integrity: sha256-<base64 SHA-256 of that file>
 
 workflow:  # merge request pipelines for open MRs, branch pipelines otherwise
@@ -736,8 +736,9 @@ warns when it sees one. Like GitHub's `pull_request_target`, only do it for code
   which caps `rerun-unknown`, and, depending on the executor, without software the `script`
   section installed. Re-runs need the test dependencies inside the project directory (a
   virtualenv there, `node_modules`), or call `siftwise gitlab record` at the end of `script`.
-- **Tested only with mocks:** the GitLab support is tested against GitLab's documented variables
-  and API, with mocks, not yet on a real GitLab instance.
+- **Tested mostly with mocks:** the GitLab support is tested against GitLab's documented
+  variables and API, with mocks, plus the [example project](https://github.com/PramodBasavarajMenasi/siftwise/tree/main/examples/gitlab)
+  on gitlab.com (Free tier). Self-Managed instances and Premium features are untested.
 
 ## Coding agents (MCP)
 
@@ -983,18 +984,21 @@ public issue.
   (90) days before the repo's newest run; older raw results stay, but no longer feed stats.
 - **Limits to know:** merge-queue (`merge_group`), scheduled and manual runs always run the
   full suite (no diff base); the Action is tested on Linux runners only, and the GitLab
-  template with mocks only (not yet on a real GitLab instance); Java tests are
+  template with mocks and one example project on gitlab.com (Free); Java tests are
   recorded but always run in full (`rerun-unknown` re-runs pytest, Go, Jest, Maven and Gradle
   tests).
 
 ## Roadmap
 
-- **Done:** recording and history, test selection with import graphs and safe fallbacks, the
-  GitHub Action, the GitLab CI template (unreleased), failure triage with verdicts in the PR comment and `fail-on`, the MCP server,
-  the triage eval, [shadow mode](#shadow-mode) with `siftwise report`, miss causes,
-  [flaky handling](#flaky-tests) (`known_flaky`, `rerun-unknown`), performance (batched
-  triage, faster select and ingest), packaging (a light CLI, a server image, the quickstart)
-  and the `v0.1.0` release on PyPI and GHCR ([changelog](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CHANGELOG.md)).
+- **Done (v0.1):** recording and history, test selection with import graphs and safe
+  fallbacks, the GitHub Action, failure triage with verdicts in the PR comment and `fail-on`,
+  the MCP server, the triage eval, [shadow mode](#shadow-mode) with `siftwise report`, miss
+  causes, [flaky handling](#flaky-tests) (`known_flaky`, `rerun-unknown`), performance
+  (batched triage, faster select and ingest), packaging (a light CLI, a server image, the
+  quickstart) and the `v0.1.0` release on PyPI and GHCR.
+- **Done (v0.2):** MCP support for more clients (tested with Claude Code, GitHub Copilot in
+  VS Code, Cursor, Codex CLI and Gemini CLI), `rerun-unknown` for Go, Jest, Maven and Gradle,
+  and GitLab CI support ([changelog](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CHANGELOG.md)).
 - **Next:** a demo and the launch write-up; an arm64 server image.
 - **v0.3:** live dogfooding: every siftwise PR and push to main runs as a shadow run, with a
   server inside the CI job ([dogfood.yml](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/.github/workflows/dogfood.yml)).

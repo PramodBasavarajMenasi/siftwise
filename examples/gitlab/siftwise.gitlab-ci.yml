@@ -12,7 +12,7 @@
 # your pipelines with your tokens, and the hash makes GitLab refuse a changed file.
 #
 #   include:
-#     - remote: https://raw.githubusercontent.com/PramodBasavarajMenasi/siftwise/v0.1.0/gitlab/siftwise.gitlab-ci.yml
+#     - remote: https://raw.githubusercontent.com/PramodBasavarajMenasi/siftwise/v0.2.0/gitlab/siftwise.gitlab-ci.yml
 #       integrity: sha256-<base64 SHA-256 of that file>
 #
 # CI/CD variables (Settings > CI/CD > Variables): SIFTWISE_SERVER, SIFTWISE_TOKEN (masked) and,
@@ -23,7 +23,7 @@
 .siftwise-base:
   variables:
     # The siftwise this file installs: its own release (a test keeps the two in step).
-    SIFTWISE_PIP_SPEC: "siftwise==0.1.0"
+    SIFTWISE_PIP_SPEC: "siftwise==0.2.0"
 
 .siftwise-install:
   script:
