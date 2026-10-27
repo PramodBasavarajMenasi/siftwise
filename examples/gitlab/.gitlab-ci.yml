@@ -34,12 +34,10 @@ stages:
     - name: postgres:16-alpine
       alias: postgres
   variables:
-    # Until a siftwise release with `siftwise gitlab` is on PyPI, build a wheel from the
-    # siftwise checkout (uv build --wheel), copy it to wheels/ here, and use its path in both:
-    #   SIFTWISE_PIP_SPEC: "./wheels/siftwise-0.1.0-py3-none-any.whl"
-    #   EXAMPLE_SERVER_PIP_SPEC: "./wheels/siftwise-0.1.0-py3-none-any.whl[server]"
-    SIFTWISE_PIP_SPEC: "siftwise==0.1.0"
-    EXAMPLE_SERVER_PIP_SPEC: "siftwise[server]==0.1.0"
+    # To test unreleased changes, build a wheel (uv build --wheel in the siftwise checkout),
+    # copy it to wheels/ and point both specs at it (see README.md).
+    SIFTWISE_PIP_SPEC: "siftwise==0.2.0"
+    EXAMPLE_SERVER_PIP_SPEC: "siftwise[server]==0.2.0"
     # The database is reachable only inside this job's network: not a secret.
     POSTGRES_USER: siftwise
     POSTGRES_PASSWORD: siftwise

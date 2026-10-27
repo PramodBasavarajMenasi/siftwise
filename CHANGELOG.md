@@ -6,21 +6,16 @@ All notable changes to siftwise. The format follows
 
 ## [Unreleased]
 
-`siftwise mcp` for more MCP clients ([per-client setup](docs/mcp-clients.md)). Tested on
-Windows with Claude Code, GitHub Copilot in VS Code, Cursor, Codex CLI and Gemini CLI:
-`select_tests`, `triage_failure` and `explain` worked in each, and fail-open with the server
-down in Cursor. Windsurf and Cline configs follow their docs but are untested, as are the
-Codex and Gemini Code Assist VS Code extensions and macOS and Linux.
+## [0.2.0] - 2026-10-27
+
+MCP for more coding agents, GitLab CI support, and `rerun-unknown` beyond pytest. `siftwise
+mcp` was tested on Windows with Claude Code, GitHub Copilot in VS Code, Cursor, Codex CLI and
+Gemini CLI: `select_tests`, `triage_failure` and `explain` worked in each, and fail-open with
+the server down in Cursor ([per-client setup](docs/mcp-clients.md)). No database migration
+since 0.1.0.
 
 ### Added
 
-- Live dogfooding: `.github/workflows/dogfood.yml` runs every siftwise PR and push to main as a
-  shadow run.
-  - A siftwise server inside the job, with a random per-job token, and the history in the
-    Actions cache. A PR's cache entries stay with the PR.
-  - It gates nothing and posts no comment.
-  - Each run uploads a summary artifact. `python -m scripts.dogfood_report report` turns the
-    summaries into recall, time saved and misses with causes, in total or per week.
 - GitLab CI: a template, `gitlab/siftwise.gitlab-ci.yml`, with the hidden jobs
   `.siftwise-select`, `.siftwise-record` and `.siftwise-rollup`, around new
   `siftwise gitlab select|record|rollup` commands. They run the same steps as the GitHub
@@ -31,69 +26,99 @@ Codex and Gemini Code Assist VS Code extensions and macOS and Linux.
   - verdicts and shadow runs in one sticky merge request note, through the Notes API;
   - `fail-on`, `known_flaky` from the merge request's base commit, and `rerun-unknown`.
 
-  Security:
-  - tokens come from environment variables only and are redacted from every log line, file
-    and note;
-  - test IDs and reasons appear in the note as code spans, so they can't add links,
-    mentions, HTML or quick actions;
-  - forks' pipelines get no tokens, and `fail-on` skips them with a warning;
-  - plain-http server URLs warn.
+  The template pins its siftwise version (`siftwise==0.2.0`). `examples/gitlab` is a project
+  to try it on gitlab.com, with the server running inside the pipeline. History stays within a
+  pipeline, and a merge request pipeline first records its base commit's full test run as a
+  main run.
+- Action: `rerun-unknown` re-runs Go, Jest, Maven and Gradle failures, not only pytest's. Each
+  failing test gets its own runner, chosen from its ID, its file and the checkout:
+  - Go, per package: `-run '^(TestA|TestB)$'`, through gotestsum when it's on PATH, else
+    `go test -json` converted to JUnit by siftwise;
+  - Jest, per file: `-t` with the anchored full name, and jest-junit reports;
+  - Maven (`-Dtest=Class#m1+m2`) and Gradle (`--tests Class.method`), with `./mvnw` and
+    `./gradlew` when present.
 
-  The template pins its siftwise version. `examples/gitlab` is a project to try it on
-  gitlab.com, with the server running inside the pipeline: history stays within a pipeline,
-  and a merge request pipeline first records its base commit's full test run as a main run.
-  Tested with mocks, plus a first run of the example on gitlab.com Free.
+  `rerun-prefix` applies to pytest and Jest (e.g. `npx`). A test whose runner can't be
+  determined isn't re-run, with a warning. The limits and fail-open behaviour are unchanged,
+  and a round's reports go up in one upload. Maven and Gradle re-runs leave the CI run's
+  `TEST-*.xml` reports as they were: they're backed up before the re-run and put back after
+  it, also when it fails or times out.
 - MCP: the `repo_path` tool argument and `SIFTWISE_REPO_PATH`, for clients that start the
-  server outside the repository. The repository is the first of: `repo_path`,
-  `SIFTWISE_REPO_PATH`, `CLAUDE_PROJECT_DIR` (set by Claude Code), the client's workspace
-  folders over MCP roots (asked only when the client supports roots), and the working
-  directory. Outside a git repository every tool says so and how to fix it, instead of
+  server outside the repository. The repository is the first of:
+  - `repo_path`;
+  - `SIFTWISE_REPO_PATH`;
+  - `CLAUDE_PROJECT_DIR` (set by Claude Code);
+  - the client's workspace folders over MCP roots (asked only when the client supports roots);
+  - the working directory.
+
+  Outside a git repository, every tool says so and how to fix it, instead of
   "set SIFTWISE_REPO". Relative `junit_paths` are read from the repository root.
 - MCP: the server reports siftwise's version to clients (it was empty).
 - `scripts/mcp_smoke.py`: checks `siftwise mcp` over stdio like a client, against a real
   server, including the fail-open cases.
-- Action: `rerun-unknown` re-runs Go, Jest, Maven and Gradle failures, not only pytest's. Each
-  failing test gets its own runner, from its ID and file and the checkout: Go per package
-  (`-run '^(TestA|TestB)$'`, through gotestsum when it's on PATH, else `go test -json`
-  converted to JUnit by siftwise), Jest per file (`-t` with the anchored full name, jest-junit
-  reports), Maven (`-Dtest=Class#m1+m2`) and Gradle (`--tests Class.method`), with `./mvnw` and
-  `./gradlew` when present. `rerun-prefix` applies to pytest and Jest (e.g. `npx`). A test
-  whose runner can't be told isn't re-run, with a warning. The limits and fail-open behaviour
-  are unchanged, and a round's reports are one upload. Maven and Gradle re-runs leave the CI
-  run's `TEST-*.xml` reports as they were: they're backed up before the re-run and put back
-  after it, also when it fails or times out.
+- Live dogfooding: `.github/workflows/dogfood.yml` runs every siftwise PR and push to main as a
+  shadow run.
+  - A siftwise server runs inside the job, with a random per-job token, and the history lives
+    in the Actions cache. A PR's cache entries stay with the PR.
+  - It gates nothing and posts no comment.
+  - Each run uploads a summary artifact. `python -m scripts.dogfood_report report` turns the
+    summaries into recall, time saved and misses with causes, in total or per week.
 
 ### Changed
 
-- MCP: tool schemas work across clients: every parameter has a description, and optional
+- MCP: tool schemas work across clients. Every parameter has a description, and optional
   parameters are plain JSON types instead of `anyOf` with null, which Codex's schema converter
   reads as a string ([openai/codex#1975](https://github.com/openai/codex/pull/1975)). Clients
   that send null still work.
 - MCP: API calls give up after 30 s (was 60 s), inside Codex's 60 s default tool timeout, so
   the agent gets the fail-open answer instead of a client error.
 - Selection: editor and coding-agent settings (`.vscode/`, `.cursor/`, `.idea/`, `.mcp.json`,
-  `.codex/`, `.gemini/`, at any depth) are generated files by default, never changed code: an
-  agent's MCP config written mid-change no longer forces the full suite.
+  `.codex/`, `.gemini/`, at any depth) are treated as generated files by default, never as
+  changed code. An agent's MCP config written mid-change no longer forces the full suite.
 
 ### Fixed
 
-- `examples/gitlab/ci/history.py` stores the dump's migration revision and restores into that
-  schema before migrating on, so a dump from an older siftwise loads. Before, it migrated to the
-  newest schema first, and a binary dump with fewer columns failed to load. A dump from a newer
-  siftwise is now skipped (the job starts empty).
-- Action: the PR comment and job summary show untrusted text (test IDs, file paths in reasons,
-  variants, error messages) as code spans, as the GitLab note does. A file name in a pull
-  request could add a link, an `@` mention (`pkgs/@scope/...`) or an autolink (`www.` names)
-  to the comment; the selection reason was escaped for table pipes only. Test IDs look the
-  same; reasons and variants are now shown as code.
-- MCP: a folder the client sets (`CLAUDE_PROJECT_DIR`, a root) that isn't in a git repository
-  but holds exactly one directly inside now means that repository, with a `repository_note`
-  in the result; otherwise the next step is tried instead of failing. `repo_path` and
-  `SIFTWISE_REPO_PATH` (set by the user) still fail when they're not in a repository. When
-  nothing works, the error lists the git repositories found one level down.
+- `examples/gitlab/ci/history.py` (also used by the dogfood workflow) now stores the dump's
+  migration revision and restores into that schema before migrating on, so a dump from an older
+  siftwise loads. Before, it migrated to the newest schema first, and a binary dump with fewer
+  columns failed to load. A dump from a newer siftwise is now skipped, and the job starts
+  empty.
+- MCP: a folder the client sets (`CLAUDE_PROJECT_DIR`, or a root) that isn't in a git
+  repository, but holds exactly one directly inside, now means that repository, with a
+  `repository_note` in the result. Otherwise the next option is tried instead of failing.
+  `repo_path` and `SIFTWISE_REPO_PATH`, which the user sets, still fail when they're not in a
+  repository. When nothing works, the error lists the git repositories found one level down.
 - MCP: `explain` returned `file_path: null` for pytest tests whose JUnit names no file (e.g.
-  `tests.test_cart::test_bulk_discount`); the file now comes from the test ID, through the
+  `tests.test_cart::test_bulk_discount`). The file now comes from the test ID, through the
   selector's mapping, when it exists in the checkout.
+
+### Security
+
+- Action: the PR comment and job summary show untrusted text (test IDs, file paths in reasons,
+  variants, error messages) as code spans, as the GitLab note does. Before, a file name in a
+  pull request could add a link, an `@` mention (`pkgs/@scope/...`) or an autolink (`www.`
+  names) to the comment, and the selection reason was escaped for table pipes only. Test IDs
+  look the same; reasons and variants are now shown as code.
+- GitLab:
+  - tokens come from environment variables only, and are redacted from every log line, file
+    and note;
+  - test IDs and reasons appear in the note as code spans, so they can't add links, mentions,
+    HTML or quick actions, and no note line can start a quick action;
+  - siftwise only edits a note written by its own token's user;
+  - forks' pipelines get no tokens, and `fail-on` skips them with a warning;
+  - plain-http server URLs outside the job warn.
+
+### Known limits
+
+- The GitLab support is tested with mocks and one example project on gitlab.com (Free);
+  Self-Managed instances and Premium features are untested.
+- `rerun-unknown` doesn't re-run Go modules below the repo root or multi-module Go
+  (`go.work`). It needs the re-run's report to name tests as the CI run did (custom jest-junit
+  templates and JUnit 5 display names don't match).
+- MCP is tested on Windows only. The Windsurf and Cline configs follow their docs but are
+  untested, as are the Codex and Gemini Code Assist VS Code extensions.
+- No live recall numbers yet: dogfooding runs since 2026-10-26, and its numbers come with v0.3.
+- The server image is linux/amd64 only.
 
 ## [0.1.0] - 2026-10-20
 
@@ -189,4 +214,6 @@ test selection and failure triage in CI. Alpha: APIs and the database schema may
 - The server image is linux/amd64 only.
 - Renamed or moved tests start with no history.
 
+[Unreleased]: https://github.com/PramodBasavarajMenasi/siftwise/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/PramodBasavarajMenasi/siftwise/releases/tag/v0.2.0
 [0.1.0]: https://github.com/PramodBasavarajMenasi/siftwise/releases/tag/v0.1.0

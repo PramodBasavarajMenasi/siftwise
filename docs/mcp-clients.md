@@ -112,7 +112,7 @@ path), and configure siftwise as in the client's section with `SIFTWISE_REPO=mcp
 | Stop the API (`docker compose stop api`), then the first prompt again | `select_tests`: mode `full`, "could not reach siftwise ...": run the full suite |
 
 Also check: the client lists three tools (`select_tests`, `triage_failure`, `explain`) and
-shows the server as `siftwise 0.1.0` or later. Record what you see per client, including the client version,
+shows the server as `siftwise 0.2.0` or later. Record what you see per client, including the client version,
 the OS and any server output (each section says where to find it).
 
 ## Claude Code

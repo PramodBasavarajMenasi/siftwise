@@ -18,8 +18,8 @@ pipelines, so it does two things a real setup doesn't:
   `siftwise-base`, checks out `CI_MERGE_REQUEST_DIFF_BASE_SHA` in a worktree, runs the full
   suite there and records it as a `main` run of that commit (`ci/history.py record-base`,
   with plain `siftwise record` and its own run ID: `siftwise gitlab record` would use this
-  pipeline's ID, which the MR's own upload in the `test` job needs). So `siftwise-select` and the triage in `siftwise-rollup` have main's
-  results to compare with. It costs one full test run per merge request pipeline.
+  pipeline's ID, which the MR's own upload in the `test` job needs). So `siftwise-select`
+  and the triage in `siftwise-rollup` have main's results to compare with. It costs one full test run per merge request pipeline.
 
 What we learned on gitlab.com: an earlier version read the default branch's history from its
 latest `siftwise-rollup` job's artifacts with `CI_JOB_TOKEN`
@@ -31,20 +31,12 @@ haven't verified why, so the example no longer depends on it.
 
 ## Run it on gitlab.com
 
-1. **siftwise with `siftwise gitlab`.** Until a release that has it is on PyPI, build a wheel
-   from the siftwise checkout and ship it with the example:
-
-   ```sh
-   uv build --wheel                       # in the siftwise checkout: dist/siftwise-<version>-py3-none-any.whl
-   cp -r examples/gitlab ~/siftwise-gitlab-example
-   mkdir ~/siftwise-gitlab-example/wheels
-   cp dist/siftwise-*-py3-none-any.whl ~/siftwise-gitlab-example/wheels/
-   ```
-
-   Then, in `.gitlab-ci.yml`'s `.example-server` variables, point both specs at it (the
-   comment there shows how):
-   `SIFTWISE_PIP_SPEC: "./wheels/siftwise-<version>-py3-none-any.whl"` and
-   `EXAMPLE_SERVER_PIP_SPEC: "./wheels/siftwise-<version>-py3-none-any.whl[server]"`.
+1. **Copy the example** out of the siftwise checkout: `cp -r examples/gitlab
+   ~/siftwise-gitlab-example`. It installs siftwise 0.2.0 from PyPI. To test unreleased
+   changes, build a wheel in the siftwise checkout (`uv build --wheel`), copy
+   `dist/siftwise-*-py3-none-any.whl` into the example's `wheels/` folder, and set
+   `SIFTWISE_PIP_SPEC: "./wheels/<wheel file>"` and
+   `EXAMPLE_SERVER_PIP_SPEC: "./wheels/<wheel file>[server]"` in `.gitlab-ci.yml`.
 
 2. **A new project:** on gitlab.com, create a blank private project (no README), then push the
    folder as its `main` branch:

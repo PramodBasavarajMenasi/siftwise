@@ -26,7 +26,7 @@ services:
     # The release's image (keep the tag = __version__ at release: tests/test_packaging.py).
     # Compose pulls it, and builds from this checkout only if the pull fails or with --build.
     # SIFTWISE_IMAGE names a local build instead (scripts/run_quickstart.py, the dev file).
-    image: ${SIFTWISE_IMAGE:-ghcr.io/pramodbasavarajmenasi/siftwise:0.1.0}
+    image: ${SIFTWISE_IMAGE:-ghcr.io/pramodbasavarajmenasi/siftwise:0.2.0}
     build: .
     environment:
       SIFTWISE_DATABASE_URL: postgresql+psycopg://siftwise:${POSTGRES_PASSWORD:-siftwise}@postgres:5432/siftwise
