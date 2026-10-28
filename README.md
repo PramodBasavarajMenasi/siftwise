@@ -24,9 +24,11 @@
   <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue">
   <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange">
+  <img alt="Visitors" src="https://visitor-badge.laobi.icu/badge?page_id=PramodBasavarajMenasi.siftwise">
 </p>
 
 <p align="center">
+  
   <b>2,049 / 2,050</b> real failures caught replaying rdflib's CI (the miss: a flaky test) · <b><code>/select</code> in ~0.4 s</b> on 18,000 tests · <b>self-hosted</b>, Apache-2.0
 </p>
 
