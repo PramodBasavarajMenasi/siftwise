@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from siftwise.core.risk import Order
 from siftwise.core.schemas import EstimatedMs, SelectedTestOut, SelectRequest, SelectResponse
 from siftwise.core.selector import (
     DependsRule,
@@ -46,6 +47,7 @@ def post_select(
         affected_files=body.affected_files,
         deleted_files=body.deleted_files,
         junit_dir=body.junit_dir,
+        order=Order(body.order),
     )
     shadow_reason = _store_shadow(session, body, selection) if body.shadow else None
     return SelectResponse(
@@ -68,9 +70,13 @@ def post_select(
                 reason=t.reason,
                 runner=t.runner.value if t.runner else None,
                 file_path=t.file_path,
+                score=t.score,
+                rank=t.rank,
+                rank_reason=t.rank_reason,
             )
             for t in selection.tests
         ],
+        order=selection.order.value,
         shadow_stored=None if body.shadow is None else shadow_reason is None,
         shadow_reason=shadow_reason,
     )

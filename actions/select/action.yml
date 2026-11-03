@@ -47,6 +47,14 @@ inputs:
       invalid value is a warning and turns it off.
     required: false
     default: "off"
+  order:
+    description: >-
+      'risk' (default): the command lists the selected tests most likely to fail first
+      (pytest runs its arguments in order; Go packages run one after another; Jest may still
+      reorder files across its workers). 'default': by path, package and test ID. Never
+      changes which tests run; an invalid value is a warning and means risk.
+    required: false
+    default: risk
   variant:
     description: >-
       Matrix leg, the same value as actions/record's variant. Only matters in shadow runs:
@@ -112,4 +120,5 @@ runs:
         SIFTWISE_GITHUB_TOKEN: ${{ inputs.github-token }}
         SIFTWISE_SHADOW: ${{ inputs.shadow }}
         SIFTWISE_VARIANT: ${{ inputs.variant }}
+        SIFTWISE_ORDER: ${{ inputs.order }}
       run: '"$(uv tool dir --bin)/siftwise" gha select'

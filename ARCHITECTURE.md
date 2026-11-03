@@ -105,6 +105,68 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   a root build or CI file changed, a changed source file no signal covers, or a selected test
   with no known runner. Docs, lint-only configs and generated files never force it.
 
+## Risk order
+
+Every selected test gets a risk score, a rank and a short reason (`core/risk.py`). With
+`order: risk` (the default) the commands list the riskiest tests first, so a likely failure
+shows up early. The score only orders what was already selected: the same tests run either
+way. It's a fixed sum, with no learning, of data siftwise already has (the selection's
+reasons and `test_stats` over the stats window):
+
+```
+score = link + 3 × recency × (1 − flaky) + 2 × failure_rate × (1 − flaky) + new
+```
+
+| Term | Value |
+|---|---|
+| `link` | the test's strongest reason: **6** direct (its own file changed, or path mapping: `test_x.py` for `x.py`, the changed file's Go package, a JS test named after it); **3** indirect (an import of changed code at any depth, a `[[depends]]` rule, a nested build file); **0** history only (co-change, recently failed or broken on main, `always_run`) |
+| `recency` | `0.5 ^ (days / 7)`: days from the test's last failure to the repo's newest run (not to now, so the answer doesn't drift with the clock); 0 if it hasn't failed in the window |
+| `failure_rate` | failures ÷ runs in the window |
+| `flaky` | `test_stats.flaky_score`: recency and rate count only failure evidence that isn't flakiness |
+| `new` | **2** if the test has fewer than 3 runs in the window |
+
+Ties go to the shorter average duration (unknown last), then the test ID. Scores are rounded to
+3 decimals, so the order is the same everywhere.
+
+**Example.** A change to `src/shop/cart.py` selects three tests. `tests/test_cart.py::test_total`
+maps to it by path, has 50 runs and no failures: 6. `tests/test_zip.py::test_zip` imports
+`shop.cart` through another module: 3. `tests/test_tax.py::test_rate` only failed alongside
+`cart.py` before (co-change), most recently 10 days before the newest run, in 10 of its 50
+runs: 0 + 3 × 0.5^(10/7) + 2 × 0.2 = 1.51. So the command is
+`pytest tests/test_cart.py::test_total tests/test_zip.py tests/test_tax.py::test_rate`. Had
+`test_rate` failed a day earlier than the newest run, it would score 3.12 and come before
+`test_zip`. A recent failure can outrank an indirect link, but for a test with 3 or more runs
+never a direct one: failures add at most 5.
+
+**What the order guarantees, per runner:**
+- **pytest:** it runs its arguments in the order given (files, then a file's tests in definition
+  order). Plugins that reorder or parallelise tests (pytest-randomly, pytest-xdist) undo it.
+- **Go:** one `go test` command per package, joined with `&&`, so packages run one after another
+  in risk order. Within a package, Go runs tests in source order. A plain `go test ./a ./b` would
+  build and run packages in parallel, which is why siftwise keeps one command per package.
+- **Jest:** files are listed in risk order, but Jest runs files in parallel across workers and
+  its default sequencer reorders them (failed and slow files first). Use `--runInBand` and a
+  custom `testSequencer` to keep the given order; otherwise treat it as a hint.
+- **Commands** come by their best-ranked test. A pytest argument with no selected test (a changed
+  or added test file, a module run with `--doctest-modules`) ranks first: it is the change
+  itself.
+
+`order: default` (`siftwise select --order default`, the Action's `order` input,
+`SIFTWISE_ORDER` on GitLab, the MCP `order` argument) keeps the old order: by path, package
+and test ID. Clients send `order` only for `default`, so a new client still works with an
+older server.
+
+**Risk per unit of time** (a unit's best score divided by its estimated duration, with
+or without link tiers) was evaluated and not adopted: on the rdflib and substrate replays it
+wasn't clearly faster by time and was slower by test count
+([eval results](docs/eval-results.md#risk-order-time-to-first-failure)). It stays in the
+eval only.
+
+**Limits:** the import graphs say which changed modules a test file imports, not how directly,
+so every import is "indirect". Recency counts failures on any branch: the request doesn't say
+which branch it is on, and other PRs' failures count as well. Measured on rdflib and substrate
+PR runs in [eval results](docs/eval-results.md#risk-order-time-to-first-failure).
+
 ## Triage verdicts
 
 The first rule that applies decides:

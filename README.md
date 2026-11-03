@@ -80,11 +80,32 @@ Full details: [ARCHITECTURE.md](https://github.com/PramodBasavarajMenasi/siftwis
   links to. The server keeps every result and rolls up per-test history.
 - **Select.** The CLI diffs your branch and builds Go or Python import graphs locally; the
   server returns the tests the change can affect, each with a reason, or the full suite when
-  the diff, a build file or the history leaves any doubt.
+  the diff, a build file or the history leaves any doubt. The command runs the riskiest tests
+  first ([risk order](#risk-order)).
 - **Triage.** Each failure gets a verdict (new regression, pre-existing on main, flaky,
   unknown) with a confidence and its evidence, using only history from before the run.
 - **Measure.** Shadow runs run the full suite and report what the selection would have
   caught or missed, and why.
+
+### Risk order
+
+The selected tests come riskiest first, so a likely failure shows up early. Each gets a score
+from how directly the change reaches it, how recently and how often it failed (flaky failures
+discounted), and whether it's new: a fixed, documented formula, no learning
+([details and an example](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/ARCHITECTURE.md#risk-order)).
+The order never changes which tests run.
+
+| Runner | What the order guarantees |
+|---|---|
+| pytest | arguments run in the order given (unless a plugin such as pytest-xdist or pytest-randomly reorders them) |
+| Go | one `go test` per package, joined with `&&`: packages run one after another, riskiest first; tests within a package in source order |
+| Jest | files are listed riskiest first, but Jest runs files in parallel and its sequencer reorders them: a hint, unless you run in band with your own sequencer |
+
+`/select` returns each test's `score`, `rank` and `rank_reason` (`siftwise select --json`
+shows them, MCP `select_tests` lists tests riskiest first). The PR comment and GitLab note
+name the three highest-risk tests. To keep the old order (by path and test ID):
+`siftwise select --order default`, the Action's `order: default`, `SIFTWISE_ORDER: default`
+on GitLab, or the MCP argument `order: "default"`.
 
 ## Quickstart
 
@@ -265,7 +286,7 @@ checkout and never block CI: if the server is unreachable, times out or returns 
 
 | Action | When | What |
 |---|---|---|
-| `actions/select` | before tests | picks tests; outputs `mode`, `command`, `selected`, `total`, `reason`, `junit-dir` (and the [shadow](#shadow-mode) outputs); posts one sticky PR comment and a job summary |
+| `actions/select` | before tests | picks tests, riskiest first ([`order`](#risk-order)); outputs `mode`, `command`, `selected`, `total`, `reason`, `junit-dir` (and the [shadow](#shadow-mode) outputs); posts one sticky PR comment and a job summary |
 | `actions/record` | after tests, `if: always()` | uploads JUnit with the run ID and attempt, the PR head commit (not the merge commit), branch, variant, start time, changed files and [`known_flaky`](#flaky-tests); optionally [re-runs unknown failures](#flaky-tests); in a single job, then [triages the failures](#failure-verdicts) and reports a [shadow run](#shadow-mode) |
 | `actions/rollup` | once after a matrix | [triages the failures](#failure-verdicts) of every leg and reports a [shadow run](#shadow-mode), then updates test stats once for all legs |
 
@@ -651,7 +672,7 @@ test:
 ```
 
 **Inputs** are the GitHub Action's, as variables: `SIFTWISE_REPO`, `SIFTWISE_BASE_REF`,
-`SIFTWISE_SHADOW`, `SIFTWISE_COMMENT`, `SIFTWISE_VARIANT`, `SIFTWISE_JUNIT_GLOB`,
+`SIFTWISE_SHADOW`, `SIFTWISE_ORDER`, `SIFTWISE_COMMENT`, `SIFTWISE_VARIANT`, `SIFTWISE_JUNIT_GLOB`,
 `SIFTWISE_FAIL_ON`, `SIFTWISE_KNOWN_FLAKY_SOURCE`, the `SIFTWISE_RERUN_*` ones. The rollup's
 outputs are `SIFTWISE_VERDICTS_AVAILABLE`, `SIFTWISE_COUNT_<VERDICT>`, `SIFTWISE_REPORT` and
 the shadow ones.
@@ -750,7 +771,7 @@ state: each call computes the change in the agent's checkout, with the same code
 
 | Tool | The agent calls it | Returns |
 |---|---|---|
-| `select_tests` | before running tests after a change | `mode`, the command to run, the selected tests with a reason each |
+| `select_tests` | before running tests after a change | `mode`, the command to run (riskiest tests first), the selected tests with a reason and risk rank each |
 | `triage_failure` | when tests fail, before trying to fix them | a verdict per failure (from JUnit paths or test IDs), with reasons and evidence |
 | `explain` | when a selection or verdict surprises it | one test's recent results, flaky evidence, broken-on-main status, and why it would (not) be selected |
 

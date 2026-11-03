@@ -1276,7 +1276,12 @@ def test_known_tests_keep_the_latest_file_path(db_session: Session) -> None:
     hist = load_history(db_session, REPO)
     assert hist is not None
     assert hist.tests["tests.test_a::test_x"] == KnownTest(
-        "tests.test_a::test_x", "tests/test_a.py", avg_duration_ms=1.0
+        "tests.test_a::test_x",
+        "tests/test_a.py",
+        avg_duration_ms=1.0,
+        runs=3,
+        failures=0,
+        flaky_score=0.0,
     )
 
 

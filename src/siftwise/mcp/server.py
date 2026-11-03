@@ -41,7 +41,7 @@ import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import anyio
 import anyio.to_thread
@@ -91,7 +91,8 @@ SELECT_DESCRIPTION = """\
 Call this before running tests after changing code. It returns the command that runs only the
 tests your change (committed and uncommitted) can affect, with a reason per test. Run that
 command instead of the full test suite. If mode is "full", run the project's full test suite;
-if the command is empty in selective mode, no tests are affected."""
+if the command is empty in selective mode, no tests are affected. Tests are listed, and the
+command runs them, riskiest first: if one fails, you hear about it early."""
 
 TRIAGE_DESCRIPTION = """\
 Call this when tests fail, before trying to fix them. For each failing test it says whether
@@ -218,10 +219,19 @@ def build_server(env: Mapping[str, str] | None = None) -> MCPServer:
             ),
         ] = 50,
         repo_path: RepoPath = None,
+        order: Annotated[
+            Literal["risk", "default"],
+            Field(
+                description="'risk' (default): the command and the list put the tests most "
+                "likely to fail first; 'default': by path and test ID. Same tests either way."
+            ),
+        ] = "risk",
     ) -> dict[str, Any]:
         c = config()
         where = await _where(c, repo_path, ctx)
-        return await _run(c, lambda c: _select(c, where, base, include_uncommitted, max_tests))
+        return await _run(
+            c, lambda c: _select(c, where, base, include_uncommitted, max_tests, order)
+        )
 
     @server.tool(description=TRIAGE_DESCRIPTION)
     async def triage_failure(
@@ -278,7 +288,12 @@ def build_server(env: Mapping[str, str] | None = None) -> MCPServer:
 
 
 def _select(
-    config: Config, where: Where, base: str | None, uncommitted: bool, max_tests: int
+    config: Config,
+    where: Where,
+    base: str | None,
+    uncommitted: bool,
+    max_tests: int,
+    order: str = "risk",
 ) -> dict[str, Any]:
     try:
         checkout = _checkout(config, where)
@@ -291,6 +306,8 @@ def _select(
     except RepoConfigError as exc:
         return _run_full(f"invalid .siftwise.toml ({exc})")
     body = {"repo": repo, **change.fields, "always_run": list(change.config.always_run)}
+    if order != "risk":
+        body["order"] = order  # risk is the server's default: an older server accepts the body
     try:
         result = _post(config, "/select", body)
     except Unavailable as exc:
@@ -312,8 +329,22 @@ def _select(
     }
     if total > 0:
         out["estimated_test_time_skipped"] = f"{100 * (total - would_run) / total:.0f}%"
+    # Riskiest first (servers before risk ordering send no rank: by test ID, as before).
+    tests = sorted(tests, key=lambda t: (t.get("rank") is None, t.get("rank") or 0))
     out["tests"] = [
-        {"test_id": t["test_id"], "reason": _short(t["reasons"][0] if t["reasons"] else "")}
+        {
+            "test_id": t["test_id"],
+            "reason": _short(t["reasons"][0] if t["reasons"] else ""),
+            **(
+                {
+                    "rank": t["rank"],
+                    "risk": t.get("score"),
+                    "why_ranked": _short(t.get("rank_reason") or ""),
+                }
+                if t.get("rank")
+                else {}
+            ),
+        }
         for t in tests[:limit]
     ]
     if len(tests) > limit:

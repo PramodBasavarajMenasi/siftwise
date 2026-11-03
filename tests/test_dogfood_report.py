@@ -646,3 +646,61 @@ def test_a_summary_reports_what_the_servers_recall_reports(db_session: Any) -> N
     ]
     assert [m["test_id"] for m in mine["misses"]] == [b]
     assert mine["all"]["caught"] == 1 and mine["all"]["missed"] == 1
+
+
+# --- risk order: where failures ranked ---------------------------------------------------------
+
+
+@respx.mock
+def test_the_summary_records_each_failures_risk_rank(tmp_path: Path) -> None:
+    respx.post(f"http://localhost:8000/repos/{REPO}/shadow").respond(json=compare("555"))
+    respx.post(f"http://localhost:8000/repos/{REPO}/triage").respond(json={
+        "failing_tests": 2, "counts": {"new_regression": 2},
+        "results": [{"test_id": "t::x", "variant": "py3.12", "verdict": "new_regression"},
+                    {"test_id": "t::x", "variant": "py3.11", "verdict": "new_regression"},
+                    {"test_id": "t::new", "variant": "py3.12", "verdict": "new_regression"}],
+    })  # fmt: skip
+    selection = tmp_path / "selection.json"
+    selection.write_text(json.dumps({"mode": "selective", "selected_count": 40, "tests": [
+        {"test_id": "t::other", "rank": 1}, {"test_id": "t::x", "rank": 3}]}))  # fmt: skip
+    out = tmp_path / "dogfood-summary.json"
+
+    env = job_env(tmp_path, DOGFOOD_SELECTION=str(selection))
+    assert dogfood.main(["summary", "--out", str(out)], env=env) == 0
+
+    # t::new wasn't selected by name (a new test runs as part of its file): no rank.
+    assert json.loads(out.read_text())["failure_ranks"] == {
+        "mode": "selective", "selected": 40,
+        "failures": [{"test_id": "t::x", "verdict": "new_regression", "rank": 3},
+                     {"test_id": "t::new", "verdict": "new_regression", "rank": None}],
+    }  # fmt: skip
+
+
+def test_without_a_saved_selection_there_are_no_ranks(tmp_path: Path) -> None:
+    with respx.mock:
+        respx.post(url__regex=r"/shadow$").respond(json=compare("555"))
+        respx.post(url__regex=r"/triage$").respond(json={"failing_tests": 0, "results": []})
+        out = tmp_path / "dogfood-summary.json"
+        env = job_env(tmp_path, DOGFOOD_SELECTION=str(tmp_path / "missing.json"))
+        assert dogfood.main(["summary", "--out", str(out)], env=env) == 0
+    assert json.loads(out.read_text())["failure_ranks"] is None
+
+
+def test_the_report_shows_where_failures_ranked() -> None:
+    def ranked(run_id: str, mode: str, *ranks: int | None) -> dict[str, Any]:
+        failures = [{"test_id": f"t::{n}", "verdict": "unknown", "rank": r}
+                    for n, r in enumerate(ranks)]  # fmt: skip
+        return {
+            **summary(run_id, shadow=compare(run_id, caught=len(ranks))),
+            "failure_ranks": {"mode": mode, "selected": 100, "failures": failures},
+        }
+
+    runs = [ranked("1", "selective", 1, 30), ranked("2", "selective", 5, None),
+            ranked("3", "full", 90)]  # a full selection has nothing to order  # fmt: skip
+    _, text = report(runs)
+
+    # Shares above each ranked failure: 0%, 4%, 29%; median 4%.
+    assert (
+        "Failure ranks (risk order): 3 failures in selective runs; median 4% of the "
+        "selection ranked above them; ranked first: 1; in the top 10%: 2"
+    ) in text

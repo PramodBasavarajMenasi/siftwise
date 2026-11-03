@@ -42,6 +42,7 @@ Reads SIFTWISE_DATABASE_URL (or .env), and GITHUB_TOKEN for --replay-main. Read-
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import io
 import itertools
 import json
@@ -50,6 +51,7 @@ import os
 import posixpath
 import shutil
 import stat
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -73,18 +75,21 @@ if not __package__:  # run as a file path: make the repo root importable
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.eval import triage_labels as tl
+from scripts.eval.ordering import FirstFailure, RanTest, first_failure
 from siftwise.cli.gograph import GoGraph, build_graph, parse_go_list
 from siftwise.cli.pygraph import PyGraph, build_py_graph, module_of_test
 from siftwise.cli.repoconfig import load_repo_config, read_go_module
 from siftwise.config import get_settings
 from siftwise.core.junit import Status
-from siftwise.core.models import FAILED_CODES_SQL, PASSED_CODE, STATUS_CODES
+from siftwise.core.models import FAILED_CODES_SQL, PASSED_CODE, SKIPPED_CODE, STATUS_CODES
+from siftwise.core.risk import Order
 from siftwise.core.selector import (
     FailedRun,
     KnownTest,
     Mode,
     RepoHistory,
     Selection,
+    SelectionScope,
     SelectorConfig,
     WouldRun,
     build_file_scope,
@@ -98,6 +103,8 @@ from siftwise.db import get_sessionmaker
 FAILED_CODES = (STATUS_CODES[Status.FAILED], STATUS_CODES[Status.ERROR])
 # Main CI runs read to recompute broken-on-main per target (see broken_on_main_before).
 BROKEN_LOOKBACK_CI_RUNS = 20
+# The rollup's stats window (SIFTWISE_STATS_WINDOW_DAYS' default), for the risk inputs.
+STATS_WINDOW_DAYS = 90
 COMPARE_FILE_CAP = 300
 
 
@@ -147,6 +154,9 @@ class Result:
     time_skipped_pct: float
     counterfactual: Counterfactual | None = None
     signal_counts: dict[str, int] = field(default_factory=dict)
+    # Time to first failure in a selective run that caught one: the commands in the default
+    # order (by path / package) and in risk order (scripts/eval/ordering.py).
+    first_failure: dict[str, FirstFailure] | None = None
 
 
 # --- history as of a point in time --------------------------------------------------------
@@ -195,6 +205,12 @@ class HistoryIndex:
 
     File paths are the one exception to "no peeking": results don't keep their own, so every
     target sees each test's latest reported path (``tests.file_path``).
+
+    The risk order's inputs (``test_stats`` in production: runs, failures, last failure, flaky
+    score over the stats window) are rebuilt from the same masks, as of the target, with two
+    approximations: a run counts when the test appears in it (skipped too), and a failure is
+    any failed attempt (a retried test that passed in the end still counts). See
+    ``_risk_stats``.
     """
 
     def __init__(self, session: Session, repo_id: int) -> None:
@@ -222,11 +238,13 @@ class HistoryIndex:
         self._tests: list[str] = []
         self._paths: list[str | None] = []
         bit_of: dict[int, int] = {}
+        self._bit_of: dict[str, int] = {}
         for key, test_id, file_path in session.execute(
             text("SELECT id, test_id, file_path FROM tests WHERE repo_id = :repo_id ORDER BY id"),
             params,
         ):
             bit_of[key] = len(self._tests)
+            self._bit_of[test_id] = len(self._tests)
             self._tests.append(test_id)
             self._paths.append(file_path)
         seen: dict[int, bytearray] = defaultdict(bytearray)
@@ -305,10 +323,11 @@ class HistoryIndex:
         mask = 0
         for r in recent(config.known_test_runs, lambda r: True):
             mask |= self._seen.get(r.id, 0)
+        stats = self._risk_stats(prior, mask)
         tests = {}
         for bit in _bits(mask):
             test_id = self._tests[bit]
-            tests[test_id] = KnownTest(test_id, self._paths[bit])
+            tests[test_id] = KnownTest(test_id, self._paths[bit], None, *stats(bit))
 
         recent_main_failures: dict[str, tuple[int, str]] = {}
         for r in recent(config.recent_main_runs, lambda r: r.is_main):
@@ -329,7 +348,55 @@ class HistoryIndex:
             ),
             recent_main_failures=recent_main_failures,
             failed_runs=failed_runs,
+            newest_run_at=prior[-1].run_at if prior else None,
         )
+
+    def _risk_stats(
+        self, prior: list[IndexedRun], known: int
+    ) -> Callable[[int], tuple[int, int, datetime | None, float]]:
+        """(runs, failures, last failed at, flaky score) of a test bit, over the stats window
+        before the target (``STATS_WINDOW_DAYS`` back from its newest earlier run), like
+        ``test_stats``. Failing tests are few: they get exact counts; every other known test
+        only needs "fewer than 3 runs?" (risk.NEW_RUNS), from saturating bit counters."""
+        if not prior:
+            return lambda bit: (0, 0, None, 0.0)
+        start = prior[-1].run_at - timedelta(days=STATS_WINDOW_DAYS)
+        window = prior[bisect.bisect_left(self._orders, (start, -1)) :]
+        failing: dict[int, list[IndexedRun]] = defaultdict(list)
+        for r in window:
+            for test_id in self._failed.get(r.id, ()):
+                bit = self._bit_of.get(test_id)
+                if bit is not None and known >> bit & 1:
+                    failing[bit].append(r)
+        once = twice = thrice = 0  # tests seen in at least 1, 2, 3 window runs
+        exact: dict[int, tuple[int, int, datetime | None, float]] = {}
+        pairs: dict[int, dict[tuple[str, str], list[bool]]] = {b: {} for b in failing}
+        for r in window:
+            seen = self._seen.get(r.id, 0) & known
+            thrice |= twice & seen
+            twice |= once & seen
+            once |= seen
+            failed = self._failed.get(r.id, set())
+            for bit in failing:
+                if seen >> bit & 1:
+                    pair = pairs[bit].setdefault((r.commit_sha, r.variant), [False, False])
+                    if self._tests[bit] in failed:
+                        pair[0] = True
+                    else:
+                        pair[1] = True
+        for bit, runs_failed in failing.items():
+            ran = pairs[bit]
+            runs = sum(1 for r in window if self._seen.get(r.id, 0) >> bit & 1)
+            flaky = sum(1 for f, ok in ran.values() if f and ok) / len(ran) if ran else 0.0
+            exact[bit] = (runs, len(runs_failed), max(r.run_at for r in runs_failed), flaky)
+
+        def stats(bit: int) -> tuple[int, int, datetime | None, float]:
+            if bit in exact:
+                return exact[bit]
+            runs = 3 if thrice >> bit & 1 else 2 if twice >> bit & 1 else int(once >> bit & 1)
+            return (runs, 0, None, 0.0)
+
+        return stats
 
     def _broken_on_main(self, main_runs: list[IndexedRun]) -> dict[str, str]:
         """Same definition as core/history.py, from ``main_runs`` (newest first) only.
@@ -371,6 +438,65 @@ def changed_files_of(session: Session, run_ids: list[int]) -> dict[int, set[str]
         ).all():
             changed[run_id].add(path)
     return changed
+
+
+# The orders time to first failure compares with the default one.
+EVAL_ORDERS = (Order.RISK, Order.RISK_PER_TIME, Order.RISK_PER_TIME_TIERED)
+# Durations as of a run: the mean over the latest this-many runs before it (uploads, so a few
+# CI runs of a matrix repo). Production uses test_stats' window mean.
+DURATION_RUNS = 50
+
+
+def with_durations(
+    session: Session, index: HistoryIndex, run: TargetRun, history: RepoHistory
+) -> RepoHistory:
+    """``history`` with each known test's mean duration (final attempts, not skipped) over the
+    latest ``DURATION_RUNS`` runs before ``run``: no peeking."""
+    prior = index.runs[: bisect.bisect_left(index._orders, (run.run_at, run.run_id))]
+    run_ids = [r.id for r in prior[-DURATION_RUNS:]]
+    rows = session.execute(
+        text(
+            f"""
+            SELECT t.test_id, avg(final.duration_ms) FROM (
+                SELECT DISTINCT ON (run_id, test_key) test_key, status, duration_ms
+                FROM test_results WHERE run_id = ANY(:run_ids)
+                ORDER BY run_id, test_key, attempt DESC
+            ) final JOIN tests t ON t.id = final.test_key
+            WHERE final.status <> {SKIPPED_CODE} AND final.duration_ms IS NOT NULL
+            GROUP BY t.test_id
+            """
+        ),
+        {"run_ids": run_ids},
+    ).all()
+    means = {test_id: float(ms) for test_id, ms in rows}
+    tests = {
+        test_id: dataclasses.replace(test, avg_duration_ms=means.get(test_id))
+        for test_id, test in history.tests.items()
+    }
+    return dataclasses.replace(history, tests=tests)
+
+
+def ran_tests(session: Session, run_ids: list[int]) -> list[RanTest]:
+    """Every test of the evaluated CI run attempt (all its variants): its final attempt's
+    duration, averaged over the variants, and whether it failed in any of them."""
+    rows = session.execute(
+        text(
+            f"""
+            SELECT t.test_id, t.file_path, avg(final.duration_ms),
+                   bool_or(final.status IN {FAILED_CODES_SQL})
+            FROM (
+                SELECT DISTINCT ON (run_id, test_key) test_key, status, duration_ms
+                FROM test_results WHERE run_id = ANY(:run_ids)
+                ORDER BY run_id, test_key, attempt DESC
+            ) final JOIN tests t ON t.id = final.test_key
+            WHERE final.status <> {SKIPPED_CODE}
+            GROUP BY t.test_id, t.file_path
+            """
+        ),
+        {"run_ids": run_ids},
+    ).all()
+    return [RanTest(test_id, float(ms or 0), bool(failed), path)
+            for test_id, path, ms, failed in rows]  # fmt: skip
 
 
 def actual_failures(session: Session, run_ids: list[int]) -> list[str]:
@@ -1088,9 +1214,23 @@ def evaluate(
         for reason in t.reasons:
             signals[_signal(reason)] += 1
     tests_pct, time_pct = skipped_pcts(selection, history, durations)
+    first: dict[str, FirstFailure] | None = None
+    if caught and selection.mode is Mode.SELECTIVE:
+        # Durations as of the run, for the tie-break and the risk-per-time orders.
+        timed = with_durations(session, index, run, history)
+        ran = ran_tests(session, list(run.run_ids or (run.run_id,)))
+        found = {Order.DEFAULT.value: first_failure(selection.commands, ran, config.go_module)}
+        for order in EVAL_ORDERS:
+            ordered = select_tests(timed, changed, known, config, affected, affected_files,
+                                   deleted, order=order)  # fmt: skip
+            # An order never changes what's selected: only the commands' order.
+            assert ordered.commands and SelectionScope.of(ordered) == SelectionScope.of(selection)
+            found[order.value] = first_failure(ordered.commands, ran, config.go_module)
+        if all(found.values()):
+            first = {name: ff for name, ff in found.items() if ff}
     return Result(
         run, changed, selection, failures, caught, missed, graph_note,
-        tests_pct, time_pct, cf, dict(signals),
+        tests_pct, time_pct, cf, dict(signals), first,
     )  # fmt: skip
 
 
@@ -1138,6 +1278,9 @@ def result_json(r: Result) -> dict[str, Any]:
         "without_fallbacks": None if cf is None else {
             "mapped": bool(cf.selection), "caught": len(cf.caught),
             "missed": [{"test": m.test_id, "signal": m.signal} for m in cf.missed],
+        },
+        "first_failure": None if r.first_failure is None else {
+            order: dataclasses.asdict(ff) for order, ff in r.first_failure.items()
         },
     }  # fmt: skip
 
@@ -1471,6 +1614,12 @@ def print_result(r: Result, verbose: bool) -> None:
         typer.echo(
             f"  failures: {len(r.failures)} ({len(r.caught)} caught, {len(r.missed)} missed)"
         )
+    if r.first_failure:
+        positions = ", ".join(f"{order} test {ff.position} ({_secs(ff.ms)})"
+                              for order, ff in r.first_failure.items())  # fmt: skip
+        total = r.first_failure["default"]
+        typer.echo(f"  first failure, of {total.total} tests ({_secs(total.total_ms)}): "
+                   f"{positions}")  # fmt: skip
     for test_id in r.caught:
         typer.echo(f"    CAUGHT  {test_id}")
     for m in r.missed:
@@ -1544,6 +1693,7 @@ def print_summary(title: str, results: list[Result]) -> None:
             f"  full runs, without fallbacks: caught {recall(cf_caught, cf_failures)}; "
             f"{only_fallback} more failures had nothing but a fallback"
         )
+    print_first_failures([r.first_failure for r in results if r.first_failure])
     _print_miss_signals("missed", [m for r in results for m in r.missed])
     _print_miss_signals(
         "without fallbacks, would miss",
@@ -1553,6 +1703,62 @@ def print_summary(title: str, results: list[Result]) -> None:
     for r in results:
         notes[r.graph_note.split(" at ")[0]] += 1
     typer.echo("  import graph: " + ", ".join(f"{k} ({v})" for k, v in notes.items()))
+
+
+def print_first_failures(pairs: list[dict[str, FirstFailure]]) -> None:
+    """Time to first failure, default vs risk order, over the selective runs that caught a
+    failure: medians of the share of the run (tests, time) before the first failure shows."""
+    if not pairs:
+        return
+    for line in first_failure_lines(pairs):
+        typer.echo(f"  {line}")
+
+
+def first_failure_lines(pairs: list[dict[str, FirstFailure]]) -> list[str]:
+    """Each order against the default one (and every non-risk order against risk): the
+    median and mean share of the run before the first failure shows, by tests and by time,
+    and in how many runs it came earlier, later or the same."""
+
+    def shares(order: str, by_time: bool) -> list[float]:
+        found = []
+        for pair in pairs:
+            ff = pair[order]
+            whole = ff.total_ms if by_time else ff.total
+            if whole:
+                found.append((ff.ms if by_time else ff.position) / whole)
+        return found
+
+    def versus(order: str, other: str, attribute: str) -> str:
+        mine = [getattr(p[order], attribute) for p in pairs]
+        theirs = [getattr(p[other], attribute) for p in pairs]
+        earlier = sum(1 for a, b in zip(mine, theirs, strict=True) if a < b)
+        later = sum(1 for a, b in zip(mine, theirs, strict=True) if a > b)
+        return f"{earlier}/{later}/{len(pairs) - earlier - later}"
+
+    orders = [order for order in pairs[0] if all(order in p for p in pairs)]
+    lines = [
+        f"time to first failure, {len(pairs)} selective runs that caught one "
+        f"(median share of the run before it shows; mean in brackets; earlier/later/same):"
+    ]
+    for order in orders:
+        parts = []
+        for label, by_time, attribute in (("tests", False, "position"), ("time", True, "ms")):
+            values = shares(order, by_time)
+            if not values:
+                continue
+            part = (f"by {label} {statistics.median(values):.1%} "
+                    f"({statistics.mean(values):.1%})")  # fmt: skip
+            if order != "default":
+                part += f", vs default {versus(order, 'default', attribute)}"
+                if order != "risk" and "risk" in orders:
+                    part += f", vs risk {versus(order, 'risk', attribute)}"
+            parts.append(part)
+        lines.append(f"  {order}: " + "; ".join(parts))
+    return lines
+
+
+def _secs(ms: float) -> str:
+    return f"{ms / 1000:.1f} s"
 
 
 def recall(caught: int, total: int) -> str:

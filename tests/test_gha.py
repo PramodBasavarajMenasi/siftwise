@@ -1869,3 +1869,60 @@ def test_shadow_markdown_shows_each_missed_tests_cause() -> None:
         "- ` t::q `: no link to the change (verdict: pre-existing)",
         "- ` t::old ` (unknown)",
     ]
+
+
+# --- risk order -----------------------------------------------------------------------------
+
+
+def ranked(test_id: str, rank: int, why: str = "direct link") -> dict[str, Any]:
+    return {"test_id": test_id, "reasons": ["r"], "reason": "r", "runner": "pytest",
+            "file_path": None, "score": 9.0 - rank, "rank": rank, "rank_reason": why}  # fmt: skip
+
+
+def test_the_comment_names_the_riskiest_tests_safely(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    hostile = "tests.test_x::test_[@octocat](https://evil.example)|`x`"
+    tests = [ranked("tests.test_b::test_b", 2), ranked(hostile, 1, "direct link; <!-- x -->"),
+             ranked("tests.test_c::test_c", 3), ranked("tests.test_d::test_d", 4)]  # fmt: skip
+    api.post(f"{SERVER}/select").respond(json=selection(tests=tests, order="risk"))
+    created = no_comments(api)
+
+    assert gh.run("select", "pull_request", pr_event(repo)).exit_code == 0
+
+    comment = json.loads(created.calls.last.request.content)["body"]
+    section = comment.split("**Highest risk (run first):**", 1)[1]
+    lines = [line.strip() for line in section.splitlines()[1:4]]
+    assert lines[0].startswith("1. `` ") and "tests.test_b::test_b" in lines[1]
+    assert lines[2].startswith("3. ") and "test_d" not in section  # the top 3 only
+    # Untrusted text stays inert: code spans, no link, no mention, no forged marker.
+    assert "](https://evil.example)" not in section.replace(f"`` {hostile} ``", "")
+    assert "<!-- x" not in section
+
+
+def test_no_ranks_no_risk_section(gh: Runner, repo: dict[str, str], api: respx.MockRouter) -> None:
+    """A server from before risk ordering sends no ranks: the comment is as before."""
+    api.post(f"{SERVER}/select").respond(json=selection())
+    created = no_comments(api)
+
+    assert gh.run("select", "pull_request", pr_event(repo)).exit_code == 0
+    assert "Highest risk" not in json.loads(created.calls.last.request.content)["body"]
+
+
+@pytest.mark.parametrize(("order", "sent_order", "warned"), [
+    ("", None, False), ("risk", None, False), ("default", "default", False),
+    ("DEFAULT", "default", False), ("fastest", None, True),
+    ("risk-per-time", None, True),
+])  # fmt: skip
+def test_the_order_input(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, order: str,
+    sent_order: str | None, warned: bool,
+) -> None:  # fmt: skip
+    select = api.post(f"{SERVER}/select").respond(json=selection())
+    no_comments(api)
+
+    result = gh.run("select", "pull_request", pr_event(repo), SIFTWISE_ORDER=order)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(select.calls.last.request.content).get("order") == sent_order
+    assert ("invalid order" in result.output) is warned

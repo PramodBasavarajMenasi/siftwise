@@ -834,6 +834,102 @@ uv run python -m scripts.eval.run_eval --repo agent-substrate/substrate --langua
 rdflib took 47 minutes; substrate about 3½ hours, mostly building Go import graphs (about 3
 minutes per commit on Windows).
 
+## Risk order: time to first failure
+
+How much sooner does a selective run show its first failure when the commands list the
+riskiest tests first (`order: risk`, [ARCHITECTURE](../ARCHITECTURE.md#risk-order)) instead of
+by path and test ID (`order: default`)? And would ordering by risk per unit of time be better?
+Measured 2026-11-04 on the same PR replays as above (`--failing`), for every selective run that
+caught a failure. Every order selects exactly the same tests: the eval checks it on every run,
+and the recall is unchanged (rdflib 2,049 of 2,050, 140 of 141 in selective runs; substrate
+2,043 of 2,044, 38 of 39).
+
+### Results
+
+Share of the selected run that comes before the first failure shows (lower is better): the
+median over the runs, with the mean in brackets. Earlier / later / same counts each run
+against the order named.
+
+| | Order | By test count | By measured time | vs default (count; time) | vs risk (count; time) |
+|---|---|---|---|---|---|
+| RDFLib/rdflib, 17 runs | default | 8.7% (28.9%) | 41.3% (45.8%) | | |
+| | **risk** | **1.8%** (12.5%) | **1.6%** (11.1%) | 10/4/3; 11/3/3 | |
+| | risk-per-time | 4.5% (28.7%) | 0.3% (26.8%) | 8/6/3; 10/4/3 | 3/11/3; 3/11/3 |
+| | risk-per-time, tiered | 4.5% (28.8%) | 0.6% (27.0%) | 8/6/3; 10/4/3 | 3/11/3; 3/11/3 |
+| agent-substrate/substrate, 19 runs | default | 74.8% (66.7%) | 42.0% (49.3%) | | |
+| | **risk** | **23.3%** (30.3%) | 25.6% (34.4%) | 16/2/1; 12/5/2 | |
+| | risk-per-time | 56.6% (52.2%) | 14.9% (27.4%) | 12/7/0; 12/7/0 | 5/13/1; 10/8/1 |
+| | risk-per-time, tiered | 50.1% (51.1%) | 33.5% (45.1%) | 14/4/1; 9/9/1 | 2/13/4; 7/8/4 |
+
+**Risk order** (the default):
+- **rdflib:** in 6 of the 14 timed runs, the first failure came after 230 to 340 s of a 340 to
+  500 s run in the default order, and within 21 s in risk order. In 7 of the 14 it came
+  within the first 5 s of the risk-ordered run. Selective runs select about 93% of the suite,
+  so the order matters most here.
+- **It's not always earlier.** In 4 rdflib runs risk order reached the failure later. In the
+  worst it moved from test 254 to test 2,458 (17 s to 47 s of 99 s). The likely reason is
+  that the failing test ranked below tests the change reaches more directly, but the eval
+  doesn't record each failure's link to confirm it. Three runs selected 22 tests with no
+  recorded durations: the same either way.
+- **substrate, by time:** risk order was slower in 5 runs, although it reached the failure
+  earlier by count in 4 of them. Packages under a declared `[[depends]]` rule (the e2e suites)
+  rank high and run long, so a slow risky package can come before a quick failing one. In one
+  run the first failure moved from 114 s to 1,292 s of a 1,293 s run.
+
+**Risk per unit of time (evaluated, not adopted).** This is the standard cost-aware order: each
+unit of work (a pytest argument, a Go package, a Jest file) by its best score divided by its
+estimated duration. The duration is the sum of its tests' mean durations, with an unknown one
+counted as the selection's median and a floor of 100 ms. The "tiered" variant does this only
+within each link tier, so a direct link still comes before an indirect one. The constants were
+set before the runs and not tuned to them.
+- **It isn't clearly better by time on both repos.** On substrate, its median time is lower
+  (14.9% vs 25.6%), but run for run it beats risk order in only 10 of 19 runs and loses 8. The
+  swings are large both ways: one run went from 909 s to 4 s, another from 278 s to 1,239 s. On
+  rdflib it loses to risk order in 11 of 17 runs, and its mean doubles (26.8% vs 11.1%). In 3
+  runs the failing test went to the very end (test 7,120 of 7,131): a cheap, low-risk unit
+  outranks an expensive, high-risk one once the cost divides the score.
+- **It's clearly worse by count on both repos:** 4.5% vs 1.8% and 56.6% vs 23.3%.
+- **The tiered variant is worse than risk order on both repos.** On rdflib it differs from
+  the untiered one in a single run.
+- **So the default stays `risk`, and risk-per-time isn't offered** as an option: nothing in
+  these runs suggests when someone should pick it. Both variants stay in the eval
+  (`risk.Order.RISK_PER_TIME*`, eval only; the API, CLI, Action, GitLab and MCP reject them),
+  so they can be measured again on new data.
+
+### Method and limits
+
+- **Execution model** (`scripts/eval/ordering.py`): commands run one after another. pytest
+  arguments and Jest files run in the order given, one Go package per command. JUnit doesn't
+  record a file's definition order, so tests within one argument or package are taken by test
+  ID, the same in every order. A Go subtest counts as its parent. Real Jest and pytest-xdist
+  runs parallelise and reorder, so these are upper bounds on the gain for them.
+- **Durations:** what each first failure costs is the evaluated run's own measured durations
+  (mean over its variants), summed serially. Runs with no recorded durations are left out of
+  the time figures. What the orders *estimate* (the tie-break, the risk-per-time cost) is each
+  test's mean over the 50 runs (uploads) before the evaluated one; production uses
+  `test_stats`' window mean. Using these estimates moved rdflib's risk order slightly from an
+  earlier run that broke ties by test ID only (by count 2.5% then, 1.8% now).
+- **Score inputs as of each run** (`HistoryIndex._risk_stats`, no peeking): the failure rate,
+  last failure and flaky share over the 90-day window before the run. A run counts when the
+  test appears in it, and a failure is any failed attempt (production reads `test_stats`, which
+  uses final outcomes and leaves out skips).
+- **"First failure"** is any failing test of the run that the selection runs, whatever its
+  verdict: the eval has no triage verdict per failure in this mode.
+- **Small samples:** 17 and 19 runs, from two repos.
+
+### Reproducing
+
+As the PR-mode commands above. Every order's time to first failure is in each run's line and
+in the summary (`time to first failure, N selective runs that caught one ...`).
+
+```sh
+uv run python -m scripts.eval.run_eval --repo RDFLib/rdflib --language python --source github \
+    --failing --resume rdflib-risk.jsonl
+uv run python -m scripts.eval.run_eval --repo agent-substrate/substrate --language go \
+    --go-module github.com/agent-substrate/substrate --source github --goos linux \
+    --siftwise-toml scripts/eval/substrate.siftwise.toml --failing --resume substrate-risk.jsonl
+```
+
 ## Performance
 
 Measured on 2026-10-19 on a Windows laptop, Postgres 16 in Docker, on the rdflib and substrate

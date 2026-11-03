@@ -26,6 +26,7 @@ from siftwise.cli.repoconfig import (
     read_go_module,
 )
 from siftwise.core.junit import JUnitParseError, Status, parse_junit
+from siftwise.core.risk import OfferedOrder, Order
 
 app = typer.Typer(help="Siftwise: test impact analysis for CI.", no_args_is_help=True)
 app.add_typer(gha.app, name="gha")
@@ -112,6 +113,10 @@ def select_command(
             "that import changed modules."
         ),
     ] = True,
+    order: Annotated[
+        OfferedOrder,
+        typer.Option(help="'risk': likely failures first; 'default': by path and test ID."),
+    ] = OfferedOrder.RISK,
 ) -> None:
     """Print the test command for the changes in BASE...HEAD.
 
@@ -121,7 +126,8 @@ def select_command(
     """
     token = _token()
     try:
-        body = selection_request(repo, base, head, go_list=go_list, py_imports=py_imports)
+        body = selection_request(repo, base, head, go_list=go_list, py_imports=py_imports,
+                                 order=Order(order.value))  # fmt: skip
     except RepoConfigError as exc:
         _err(f"error: {exc}")
         raise typer.Exit(EXIT_USAGE) from exc
@@ -611,9 +617,12 @@ def selection_request(
     go_list: bool = True,
     py_imports: bool = True,
     junit_dir: str | None = None,
+    order: Order = Order.RISK,
 ) -> dict[str, Any]:
     """The ``POST /select`` body for BASE...HEAD in the current checkout. ``base`` None (or a
     failing git diff) means the changed files are unknown, so the server picks the full suite.
+    ``order`` is sent only when it isn't the server's default (risk), so a request still suits
+    a server from before risk ordering.
 
     Raises RepoConfigError for an invalid .siftwise.toml.
     """
@@ -625,6 +634,8 @@ def selection_request(
     }
     if junit_dir:
         body["junit_dir"] = junit_dir
+    if order is not Order.RISK:
+        body["order"] = order.value
     return body
 
 

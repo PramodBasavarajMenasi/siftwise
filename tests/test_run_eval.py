@@ -19,6 +19,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
+from scripts.eval import ordering
 from scripts.eval import run_eval as ev
 from scripts.eval import triage_labels as tl
 from siftwise.cli.pygraph import PyGraph, build_py_graph
@@ -911,3 +912,118 @@ def test_cache_writes_are_atomic(tmp_path: Path) -> None:
 
     assert seen and set(seen) <= {0, 1, 2, 3}  # every read was a whole file
     assert [f.name for f in tmp_path.iterdir()] == ["gograph-x.json"]  # no temp files left
+
+
+# --- risk order: its inputs as of a target, and time to first failure -------------------------
+
+
+def test_history_index_risk_inputs_match_load_history(db_session: Session) -> None:
+    """With no skips or retries, the index's risk inputs are exactly test_stats'."""
+    ingest(db_session, 1, 1, {"t::a": P, "t::b": F}, variant="linux", is_main=True)
+    ingest(db_session, 1, 1, {"t::a": P, "t::b": P}, variant="linux", is_main=True,
+           run_attempt=2)  # fmt: skip
+    ingest(db_session, 2, 5, {"t::a": F, "t::b": P}, variant="linux")
+    ingest(db_session, 3, 9, {"t::a": P, "t::b": P}, variant="linux", is_main=True)
+    repo_id = db_session.execute(
+        text("SELECT id FROM repos WHERE name = :n"), {"n": REPO}
+    ).scalar_one()
+    after_everything = ev.TargetRun(10**9, None, "f" * 40, "x", T0 + timedelta(days=1))
+
+    from_index = ev.HistoryIndex(db_session, repo_id).history_before(
+        after_everything, SelectorConfig()
+    )
+    from_db = load_history(db_session, REPO)
+
+    assert from_db is not None
+    assert from_index.newest_run_at == from_db.newest_run_at == T0 + timedelta(hours=9)
+    for test_id in ("t::a", "t::b"):
+        mine, theirs = from_index.tests[test_id], from_db.tests[test_id]
+        assert (mine.runs, mine.failures, mine.last_failed_at, mine.flaky_score) == (
+            theirs.runs,
+            theirs.failures,
+            theirs.last_failed_at,
+            theirs.flaky_score,
+        ), test_id
+    # b failed and passed on commit 1: flaky in one of its three (commit, variant) pairs.
+    assert from_index.tests["t::b"].flaky_score == pytest.approx(1 / 3)
+    assert from_index.tests["t::a"].last_failed_at == T0 + timedelta(hours=5)
+
+
+def test_risk_inputs_never_peek_at_the_target_or_later(db_session: Session) -> None:
+    ingest(db_session, 1, 1, {"t::a": P}, variant=None, is_main=True)
+    target = ingest(db_session, 2, 2, {"t::a": F}, variant=None)
+    ingest(db_session, 3, 3, {"t::a": F}, variant=None, is_main=True)
+    repo_id = db_session.execute(
+        text("SELECT id FROM repos WHERE name = :n"), {"n": REPO}
+    ).scalar_one()
+
+    before = ev.HistoryIndex(db_session, repo_id).history_before(
+        ev.TargetRun(target, "2", f"{2:040x}", "feature", T0 + timedelta(hours=2)),
+        SelectorConfig(),
+    )
+    a = before.tests["t::a"]
+    assert (a.runs, a.failures, a.last_failed_at) == (1, 0, None)
+    assert before.newest_run_at == T0 + timedelta(hours=1)
+
+
+def test_commands_read_in_run_order() -> None:
+    commands = (
+        "pytest --junitxml=r/siftwise-1.xml tests/test_b.py tests/test_a.py::test_x",
+        "{ pytest --junitxml=r/siftwise-2.xml --doctest-modules src/m.py || test $? -eq 5; }",
+        "go test ./pkg/b -run '^(TestB)$'",
+        "go test .",
+        "jest src/z.test.ts src/a.test.ts",
+    )
+    assert ordering.units(commands, "example.com/m") == [
+        ("py", "tests/test_b.py"), ("py", "tests/test_a.py::test_x"), ("py", "src/m.py"),
+        ("go", "example.com/m/pkg/b"), ("go", "example.com/m"),
+        ("js", "src/z.test.ts"), ("js", "src/a.test.ts"),
+    ]  # fmt: skip
+
+
+def test_time_to_first_failure() -> None:
+    ran = [
+        ordering.RanTest("tests.test_a::test_1", 100.0, False),
+        ordering.RanTest("tests.test_a::test_2", 300.0, True),
+        ordering.RanTest("tests.test_b::test_1", 50.0, False),
+        ordering.RanTest("tests.test_c::test_1", 999.0, True),  # not run by the commands
+    ]
+    default = ordering.first_failure(["pytest tests/test_a.py tests/test_b.py"], ran)
+    risk = ordering.first_failure(["pytest tests/test_b.py tests/test_a.py::test_2"], ran)
+
+    # In a file, tests by test ID: test_1 (100 ms), then test_2 fails.
+    assert default == ordering.FirstFailure(position=2, total=3, ms=400.0, total_ms=450.0)
+    assert risk == ordering.FirstFailure(position=2, total=2, ms=350.0, total_ms=350.0)
+    assert ordering.first_failure(["pytest tests/test_b.py"], ran) is None
+
+
+def test_go_subtests_count_as_their_parent() -> None:
+    ran = [
+        ordering.RanTest("example.com/m/a::TestA", 500.0, False),
+        ordering.RanTest("example.com/m/a::TestA/sub", 200.0, True),
+        ordering.RanTest("example.com/m/b::TestB", 40.0, False),
+    ]
+    first = ordering.first_failure(["go test ./b", "go test ./a"], ran, "example.com/m")
+    # TestB, then TestA (its subtest failed: so did it); the subtest's time is inside TestA's.
+    assert first == ordering.FirstFailure(position=2, total=2, ms=540.0, total_ms=540.0)
+
+
+def test_first_failure_lines_compare_the_orders() -> None:
+    def ff(position: int, ms: float) -> ordering.FirstFailure:
+        return ordering.FirstFailure(position, 10, ms, 1000.0)
+
+    pairs = [
+        {"default": ff(8, 800.0), "risk": ff(1, 100.0), "risk-per-time": ff(2, 50.0)},
+        {"default": ff(2, 200.0), "risk": ff(4, 400.0), "risk-per-time": ff(4, 400.0)},
+        {"default": ff(5, 500.0), "risk": ff(5, 500.0), "risk-per-time": ff(6, 900.0)},
+    ]
+    lines = ev.first_failure_lines(pairs)
+    assert "3 selective runs" in lines[0]
+    assert lines[1] == "  default: by tests 50.0% (50.0%); by time 50.0% (50.0%)"
+    assert lines[2] == (
+        "  risk: by tests 40.0% (33.3%), vs default 1/1/1; by time 40.0% (33.3%), vs default 1/1/1"
+    )
+    assert lines[3] == (
+        "  risk-per-time: by tests 40.0% (40.0%), vs default 1/2/0, vs risk 0/2/1; "
+        "by time 40.0% (45.0%), vs default 1/2/0, vs risk 1/1/1"
+    )
