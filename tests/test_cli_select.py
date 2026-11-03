@@ -490,3 +490,29 @@ def test_python_graph_skipped_without_python_changes(
 
     assert sent(route)["changed_files"] == ["README.md"]
     assert "affected_files" not in sent(route)
+
+
+# --- risk order -----------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("repo")
+@pytest.mark.parametrize(
+    ("args", "sent_order"),
+    [((), None), (("--order", "risk"), None), (("--order", "default"), "default")],
+)
+def test_order_is_sent_only_when_not_risk(
+    api: respx.MockRouter, args: tuple[str, ...], sent_order: str | None
+) -> None:
+    """risk is the server's default: leaving it out keeps the request valid for a server from
+    before risk ordering."""
+    route = api.post(SELECT_URL).respond(json=response())
+
+    assert run(*args).exit_code == 0
+    assert sent(route).get("order") == sent_order
+
+
+@pytest.mark.usefixtures("repo")
+@pytest.mark.parametrize("order", ["fastest", "risk-per-time", "risk-per-time-tiered"])
+def test_an_unknown_order_is_a_usage_error(api: respx.MockRouter, order: str) -> None:
+    """The risk-per-time orders are evaluated, not offered (docs/eval-results.md)."""
+    assert run("--order", order).exit_code == 2

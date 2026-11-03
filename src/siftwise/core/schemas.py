@@ -1,7 +1,7 @@
 """Pydantic request/response schemas."""
 
 from datetime import datetime
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -227,6 +227,11 @@ class SelectRequest(ChangeRequest):
         description="Directory for pytest JUnit reports: each pytest command gets "
         "--junitxml=<junit_dir>/siftwise-<n>.xml",
     )
+    order: Literal["risk", "default"] = Field(
+        default="risk",
+        description="'risk': the commands list the highest-risk tests, files and packages "
+        "first; 'default': by path, package and test ID. Never changes which tests run",
+    )
 
 
 class EstimatedMs(BaseModel):
@@ -240,6 +245,11 @@ class SelectedTestOut(BaseModel):
     reason: str = Field(description="All reasons, joined with '; '")
     runner: str | None
     file_path: str | None
+    score: float | None = Field(
+        default=None, description="Risk score (higher = more likely to fail; see ARCHITECTURE)"
+    )
+    rank: int | None = Field(default=None, description="Risk rank: 1 is the riskiest")
+    rank_reason: str = Field(default="", description="Why it ranks there, e.g. 'direct link'")
 
 
 class SelectResponse(BaseModel):
@@ -261,7 +271,10 @@ class SelectResponse(BaseModel):
     estimated_ms: EstimatedMs = Field(
         description="Estimated test time from history; full mode runs everything"
     )
-    tests: list[SelectedTestOut] = Field(description="Selected tests; empty in full mode")
+    tests: list[SelectedTestOut] = Field(
+        description="Selected tests, by test ID (each with its risk rank); empty in full mode"
+    )
+    order: str = Field(default="default", description="How the commands are ordered")
     shadow_stored: bool | None = Field(
         default=None,
         description="Shadow runs only: the selection was stored (false: this run won't be "

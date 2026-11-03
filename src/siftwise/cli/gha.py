@@ -64,6 +64,7 @@ import typer
 from siftwise.cli import reruns
 from siftwise.cli.repoconfig import RepoConfig, RepoConfigError
 from siftwise.core.junit import JUnitParseError, Status, parse_junit
+from siftwise.core.risk import OFFERED_ORDERS, Order
 
 app = typer.Typer(help="GitHub Actions steps (used by actions/select, record and rollup).")
 
@@ -229,6 +230,7 @@ def select_step(
     github_token: Annotated[str, typer.Option(envvar="SIFTWISE_GITHUB_TOKEN")] = "",
     shadow: Annotated[str, typer.Option(envvar="SIFTWISE_SHADOW")] = "off",
     variant: Annotated[str, typer.Option(envvar="SIFTWISE_VARIANT")] = "",
+    order: Annotated[str, typer.Option(envvar="SIFTWISE_ORDER")] = "risk",
 ) -> None:
     """Select tests for this run and set the step's outputs. In a shadow run the outputs say
     run the full suite, and the server stores the selection to measure recall."""
@@ -240,7 +242,8 @@ def select_step(
     if ctx.event_name == "pull_request_target":
         _annotate("warning", "siftwise doesn't support pull_request_target: full suite.")
     run_select(ctx, server=server, token=token, repo=repo, junit_dir=junit_dir,
-               comment=comment, scm_token=github_token, shadow=shadow, variant=variant)  # fmt: skip
+               comment=comment, scm_token=github_token, shadow=shadow, variant=variant,
+               order=order)  # fmt: skip
 
 
 def run_select(
@@ -254,8 +257,10 @@ def run_select(
     scm_token: str,
     shadow: str,
     variant: str,
+    order: str = "risk",
 ) -> None:
-    """The select step, for any CI provider (``scm_token``: the one that writes the comment)."""
+    """The select step, for any CI provider (``scm_token``: the one that writes the comment).
+    ``order``: 'risk' (likely failures first in the command) or 'default'."""
     from siftwise.cli import main as cli  # main registers this app: import it lazily
 
     env = os.environ
@@ -270,6 +275,14 @@ def run_select(
         _annotate("warning", f"siftwise: invalid shadow value {shadow!r} (use off, always or a "
                   "percentage such as 10%); shadow mode is off")  # fmt: skip
         rate = 0.0
+    try:
+        command_order = Order(order.strip().lower() or Order.RISK.value)
+        if command_order not in OFFERED_ORDERS:
+            raise ValueError(order)  # an eval-only order: the server would reject it
+    except ValueError:
+        _annotate("warning", f"siftwise: invalid order {order!r} (use risk or default); "
+                  "ordering by risk")  # fmt: skip
+        command_order = Order.RISK
     # A shadow run needs somewhere to store the selection: a token, a run ID and the commit.
     in_shadow = bool(token and ctx.run_id and ctx.head_sha) and sampled(repo, ctx.run_id, rate)
     if in_shadow:
@@ -282,7 +295,7 @@ def run_select(
     else:
         try:
             body = cli.selection_request(repo, ctx.base, ctx.head_sha or "HEAD",
-                                         junit_dir=junit_dir)  # fmt: skip
+                                         junit_dir=junit_dir, order=command_order)  # fmt: skip
             if in_shadow:
                 body["shadow"] = {
                     "ci_run_id": ctx.run_id,
@@ -618,7 +631,25 @@ def selection_markdown(
                      f"({100 * saved / total:.0f}% saved)"))  # fmt: skip
     if mode == "full":
         rows.append(("Why the full suite", _prose(result["reason"])))
+    riskiest = top_risk(result)
+    if riskiest:
+        first = "run first" if result.get("order", "risk") == "risk" else "default order"
+        rows.append((f"Highest risk ({first})", riskiest))
     return _selection_list(rows, head_sha)
+
+
+TOP_RISK = 3  # the riskiest selected tests the comment names
+
+
+def top_risk(result: dict[str, Any], limit: int = TOP_RISK) -> str:
+    """The highest-risk selected tests, as a nested list (empty if the server sent no ranks:
+    a server from before risk ordering). Test IDs and reasons are untrusted text."""
+    ranked = sorted((t for t in result.get("tests") or [] if t.get("rank")),
+                    key=lambda t: t["rank"])[:limit]  # fmt: skip
+    lines = [f"\n  {t['rank']}. {_code(t['test_id'])}"
+             + (f": {_text(t['rank_reason'])}" if t.get("rank_reason") else "")
+             for t in ranked]  # fmt: skip
+    return "".join(lines)
 
 
 def _shadow_selection_markdown(

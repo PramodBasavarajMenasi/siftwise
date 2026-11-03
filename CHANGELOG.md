@@ -6,6 +6,34 @@ All notable changes to siftwise. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Risk order ([#42](https://github.com/PramodBasavarajMenasi/siftwise/issues/42)): every
+  selected test gets a risk score, rank and short reason. By default, the commands run the
+  riskiest tests first, so likely failures show up early. The score is a fixed formula, with no
+  learning (ARCHITECTURE.md, "Risk order"):
+  - how directly the change reaches the test: direct, indirect or history only;
+  - how recently it failed (half-life 7 days) and its failure rate, with flaky failures
+    discounted;
+  - +2 for a new test.
+
+  Ties go to the shorter test, then the test ID. It never changes which tests are selected.
+  - pytest arguments, Go packages (one command each) and Jest files come in risk order. Jest
+    may still reorder files across workers.
+  - `/select` returns `score`, `rank` and `rank_reason` per test, and the request takes
+    `order` (`risk` or `default`). Older clients work unchanged.
+  - The PR comment and GitLab note name the three highest-risk tests, and MCP `select_tests`
+    lists tests riskiest first.
+  - To keep the old order: `siftwise select --order default`, the Action's `order: default`,
+    `SIFTWISE_ORDER: default` on GitLab, or the MCP `order` argument.
+- Eval: time to first failure, in the default and in risk order, for selective PR runs that
+  caught a failure (`scripts/eval/ordering.py`; results in docs/eval-results.md). A
+  cost-aware variant was also evaluated: risk per unit of estimated time, with or without
+  link tiers. It wasn't clearly better by time on both repos and was worse by test count, so
+  it isn't offered.
+- Dogfood: each failure's risk rank goes into the run's summary, and
+  `scripts/dogfood_report.py report` shows where failures ranked.
+
 ## [0.2.0] - 2026-10-27
 
 MCP for more coding agents, GitLab CI support, and `rerun-unknown` beyond pytest. `siftwise

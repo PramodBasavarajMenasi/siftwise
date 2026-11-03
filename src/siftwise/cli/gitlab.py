@@ -418,6 +418,7 @@ def select_job(
     comment: Annotated[bool, typer.Option(envvar="SIFTWISE_COMMENT")] = True,
     shadow: Annotated[str, typer.Option(envvar="SIFTWISE_SHADOW")] = "off",
     variant: Annotated[str, typer.Option(envvar="SIFTWISE_VARIANT")] = "",
+    order: Annotated[str, typer.Option(envvar="SIFTWISE_ORDER")] = "risk",
 ) -> None:
     """Select tests for this pipeline: ``SIFTWISE_MODE`` and ``SIFTWISE_COMMAND_FILE`` (and
     the rest) in .siftwise-ci/select.env for later jobs. Tokens: SIFTWISE_TOKEN (or
@@ -435,7 +436,7 @@ def select_job(
         token = _preflight(provider, ctx, server)
         gha.run_select(ctx, server=server, token=token, repo=repo, junit_dir=junit_dir,
                        comment=comment, scm_token=env.get(GITLAB_TOKEN_VAR, ""), shadow=shadow,
-                       variant=variant)  # fmt: skip
+                       variant=variant, order=order)  # fmt: skip
 
 
 @app.command("record")

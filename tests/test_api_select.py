@@ -72,11 +72,14 @@ def post_select(
 
 @pytest.mark.usefixtures("seeded")
 def test_selective_response(client: TestClient) -> None:
-    response = post_select(client, changed_files=["src/shop/cart.py", "cart/total.go"])
+    response = post_select(
+        client, changed_files=["src/shop/cart.py", "cart/total.go"], order="default"
+    )
 
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["repo"] == REPO
+    assert body["order"] == "default"
     assert body["mode"] == "selective"
     assert body["reason"] == "4 of 5 known tests selected"
     assert (body["selected_count"], body["total_known"]) == (4, 5)
@@ -98,6 +101,11 @@ def test_selective_response(client: TestClient) -> None:
         "reason": "tests/test_cart.py tests changed src/shop/cart.py",
         "runner": "pytest",
         "file_path": None,
+        # Added with risk ordering: old clients ignore them. Four direct, new tests tie at
+        # 8.0; equal durations, so by test ID ("g..." < "tests.test_cart.T..." < "...::").
+        "score": 8.0,
+        "rank": 4,
+        "rank_reason": "direct link; new: little history",
     }
     assert by_id[f"{GO_PKG}::TestAdd"]["runner"] == "go"
 
@@ -248,9 +256,47 @@ def test_select_is_post_only(client: TestClient) -> None:
 @pytest.mark.usefixtures("seeded")
 def test_estimated_time_and_junit_dir(client: TestClient) -> None:
     body = post_select(
-        client, changed_files=["src/shop/cart.py", "cart/total.go"], junit_dir="reports"
+        client,
+        changed_files=["src/shop/cart.py", "cart/total.go"],
+        junit_dir="reports",
+        order="default",
     ).json()
 
     # 1 ms each; the Go subtest's time is inside TestAdd's. test_db::test_query doesn't run.
     assert body["estimated_ms"] == {"total": 4.0, "would_run": 3.0}
     assert body["commands"][0].startswith("pytest --junitxml=reports/siftwise-1.xml ")
+
+
+# --- risk order -----------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("seeded")
+def test_risk_order_is_the_default_and_selects_the_same_tests(client: TestClient) -> None:
+    changed = ["src/shop/cart.py", "cart/total.go"]
+    risky = post_select(client, changed_files=changed).json()
+    default = post_select(client, changed_files=changed, order="default").json()
+
+    assert (risky["order"], default["order"]) == ("risk", "default")
+    assert risky["tests"] == default["tests"]  # same tests, scores and ranks
+    assert sorted(risky["commands"]) == sorted(default["commands"])
+    assert sorted(t["rank"] for t in risky["tests"]) == [1, 2, 3, 4]
+    # The Go test ranks first (same score, alphabetical tie-break), so its command leads.
+    assert risky["commands"][0] == f"go test {GO_PKG}"
+
+
+@pytest.mark.usefixtures("seeded")
+def test_an_old_client_still_works(client: TestClient) -> None:
+    """A body from before risk ordering (no order) is accepted; the new response fields are
+    additions: every field an old client reads is still there."""
+    body = post_select(client, changed_files=["src/shop/cart.py"]).json()
+    old_fields = {"repo", "mode", "reason", "selected_count", "total_known", "command",
+                  "commands", "go_packages_run_whole", "estimated_ms", "tests"}  # fmt: skip
+    assert old_fields <= set(body)
+    assert {"test_id", "reasons", "reason", "runner", "file_path"} <= set(body["tests"][0])
+
+
+@pytest.mark.usefixtures("seeded")
+def test_an_unknown_order_is_rejected(client: TestClient) -> None:
+    assert (
+        post_select(client, changed_files=["src/shop/cart.py"], order="fastest").status_code == 422
+    )

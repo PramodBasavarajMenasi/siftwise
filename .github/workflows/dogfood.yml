@@ -126,6 +126,20 @@ jobs:
           variant: ${{ env.VARIANT }}
           comment: false
 
+      # The would-be selection once more, now with each test's risk rank (a shadow select
+      # stores no ranks), before this run's results change the history: the summary records
+      # the rank of every failure, for the risk order's report.
+      - name: Risk ranks
+        id: ranks
+        continue-on-error: true
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/dogfood"
+          .venv/bin/siftwise select --repo "$GITHUB_REPOSITORY" --base "$BASE" \
+            --head "$HEAD_SHA" --json > "$RUNNER_TEMP/dogfood/selection.json"
+
       # A shadow run always runs everything. Test failures are CI's to report, not this job's.
       - name: Tests (full suite)
         id: tests
@@ -169,9 +183,11 @@ jobs:
           DOGFOOD_SHADOW_TOTAL: ${{ steps.select.outputs.shadow-total }}
           DOGFOOD_HISTORY_FROM: ${{ steps.cache.outputs.cache-matched-key }}
           DOGFOOD_TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          DOGFOOD_SELECTION: ${{ runner.temp }}/dogfood/selection.json
           DOGFOOD_STEPS: >-
             cache=${{ steps.cache.outcome }} history=${{ steps.history.outcome }}
             server=${{ steps.server.outcome }} select=${{ steps.select.outcome }}
+            ranks=${{ steps.ranks.outcome }}
             record=${{ steps.record.outcome }} rollup=${{ steps.rollup.outcome }}
         run: |
           uv run --no-sync python -m scripts.dogfood_report summary \

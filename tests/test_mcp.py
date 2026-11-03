@@ -838,3 +838,39 @@ def test_mcp_serves_over_stdio(tmp_path: Path) -> None:
 
     assert names == ["explain", "select_tests", "triage_failure"]
     assert out["mode"] == "full"  # not a git checkout, nothing listening: fails open
+
+
+# --- risk order -----------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("checkout")
+def test_select_lists_the_riskiest_tests_first(api: respx.MockRouter) -> None:
+    tests = [
+        {"test_id": f"tests.test_cart::test_{i}", "reasons": ["r"], "reason": "r",
+         "runner": "pytest", "file_path": None, "score": float(i), "rank": 4 - i,
+         "rank_reason": f"why {i}"}
+        for i in range(1, 4)
+    ]  # fmt: skip
+    route = api.post(f"{SERVER}/select").respond(json=selection(tests=tests))
+
+    out = call("select_tests", {})
+
+    assert "order" not in sent(route)  # risk: the server's default
+    assert [(t["test_id"][-1], t["rank"], t["why_ranked"]) for t in out["tests"]] == [
+        ("3", 1, "why 3"), ("2", 2, "why 2"), ("1", 3, "why 1")]  # fmt: skip
+    assert out["tests"][0]["risk"] == 3.0
+
+    call("select_tests", {"order": "default"})
+    assert sent(route)["order"] == "default"
+
+
+@pytest.mark.usefixtures("checkout")
+def test_select_from_an_older_server_lists_tests_without_ranks(api: respx.MockRouter) -> None:
+    api.post(f"{SERVER}/select").respond(json=selection())
+
+    out = call("select_tests", {"max_tests": 2})
+
+    assert out["tests"][0] == {
+        "test_id": "tests.test_cart::test_0",
+        "reason": "tests/test_cart.py tests changed src/cart.py",
+    }

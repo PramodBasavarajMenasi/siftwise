@@ -824,3 +824,13 @@ def test_the_examples_history_survives_a_dump_and_restore(
             for name in names:
                 conn.execute(text(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
         admin.dispose()
+
+
+def test_siftwise_order_keeps_the_old_order(repo: dict[str, str], api: respx.MockRouter) -> None:
+    select = api.post(f"{SERVER}/select").respond(json=selection())
+    notes(api)
+
+    assert run("select", mr_env(repo, SIFTWISE_ORDER="default")).exit_code == 0
+    assert json.loads(select.calls.last.request.content)["order"] == "default"
+    run("select", mr_env(repo))
+    assert "order" not in json.loads(select.calls.last.request.content)  # risk: the default

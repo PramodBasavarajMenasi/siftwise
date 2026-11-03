@@ -26,6 +26,7 @@ import argparse
 import io
 import json
 import os
+import statistics
 import sys
 import zipfile
 from collections import Counter
@@ -82,6 +83,8 @@ def build_summary(
         ),
         "shadow": None,
         "triage": None,
+        # Each failure's risk rank in the would-be selection (scripts: risk order's report).
+        "failure_ranks": None,
         "problems": [],
     }
     # A failed siftwise step is a problem (the run failed open), never a failed job.
@@ -108,7 +111,36 @@ def build_summary(
         }
     except SiftwiseError as exc:
         summary["problems"].append(f"triage: {exc}")
+    selection = _selection(env.get("DOGFOOD_SELECTION"))
+    if selection is not None and summary["triage"] is not None:
+        summary["failure_ranks"] = failure_ranks(selection, summary["triage"]["results"])
     return summary
+
+
+def _selection(path: str | None) -> Json | None:
+    """The would-be selection with its ranks (``siftwise select --json``), if the job saved
+    one."""
+    if not path:
+        return None
+    try:
+        loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def failure_ranks(selection: Json, results: list[Json]) -> Json:
+    """Where each failing test ranked in the selection's risk order: ``rank`` None when it
+    wasn't selected by name (full mode, or new and run as part of a whole file)."""
+    ranks = {t["test_id"]: t.get("rank") for t in selection.get("tests") or []}
+    seen: dict[str, Json] = {}
+    for result in results:
+        test_id = result["test_id"]
+        if test_id not in seen:
+            seen[test_id] = {"test_id": test_id, "verdict": result.get("verdict"),
+                             "rank": ranks.get(test_id)}  # fmt: skip
+    return {"mode": selection.get("mode"), "selected": selection.get("selected_count"),
+            "failures": list(seen.values())}  # fmt: skip
 
 
 def _int(value: str | None) -> int | None:
@@ -223,6 +255,7 @@ def aggregate(
         "malformed": 0,
         "verdicts": Counter(),
         "problems": Counter(),
+        "failure_ranks": [],  # (rank, selected) of each ranked failure in a selective run
     }
     for summary in deduplicate(summaries):
         try:
@@ -244,6 +277,11 @@ def aggregate(
             info["problems"][str(problem).split(":")[0]] += 1
         for verdict, n in ((summary.get("triage") or {}).get("counts") or {}).items():
             info["verdicts"][verdict] += n
+        ranked = summary.get("failure_ranks") or {}
+        if ranked.get("mode") == "selective" and isinstance(ranked.get("selected"), int):
+            for failure in ranked.get("failures") or []:
+                if isinstance(failure.get("rank"), int):
+                    info["failure_ranks"].append((failure["rank"], ranked["selected"]))
         targets = [result]
         if (period := periods.get(_week_start(at))) is not None:
             targets.append(period)
@@ -353,7 +391,21 @@ def report_lines(result: Json, *, by_week: bool) -> list[str]:
     if info["problems"]:
         problems = ", ".join(f"{n} {p}" for p, n in info["problems"].items())
         lines.append(f"Runs with problems (fail-open): {problems}")
+    lines += failure_rank_lines(info["failure_ranks"])
     return lines
+
+
+def failure_rank_lines(ranks: list[tuple[int, int]]) -> list[str]:
+    """Where failures ranked in risk order: how early the riskiest-first command reached
+    them (the share of the selection ranked above each failure)."""
+    if not ranks:
+        return []
+    shares = sorted((rank - 1) / selected for rank, selected in ranks if selected)
+    first = sum(1 for rank, _ in ranks if rank == 1)
+    top = sum(1 for share in shares if share < 0.1)
+    return [f"Failure ranks (risk order): {len(ranks)} failures in selective runs; median "
+            f"{statistics.median(shares):.0%} of the selection ranked above them; ranked "
+            f"first: {first}; in the top 10%: {top}"]  # fmt: skip
 
 
 # --- fetching -------------------------------------------------------------------------------

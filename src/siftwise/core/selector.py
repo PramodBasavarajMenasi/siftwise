@@ -45,6 +45,10 @@ Otherwise it selects the union of these signals, and every test carries its reas
 * **Always-run**: ``always_run`` globs (as in ``[[depends]]``), matched against test IDs and
   file paths.
 
+Every selected test also gets a risk score and rank (``core/risk.py``): with
+``order=Order.RISK`` the commands list the riskiest tests, files and packages first. The
+score never changes which tests are selected.
+
 Matching is deliberately loose (by file name or package suffix anywhere in the repo): extra
 tests are cheap, missed ones are not. Path mapping only sees direct naming relationships, not
 imports, so a change can still break a test in a dependent module or package. Co-change and
@@ -61,11 +65,13 @@ import re
 import shlex
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from siftwise.core.codes import FAILED_CODES_SQL
 from siftwise.core.junit import normalize_path
+from siftwise.core.risk import Link, Order, Ranked, RiskInputs, UnitKey, rank, unit_key
 
 if TYPE_CHECKING:
     # The light CLI (no server extra) imports this module: SQLAlchemy only where it's used.
@@ -254,9 +260,15 @@ def glob_match(path: str, pattern: str) -> bool:
 class KnownTest:
     test_id: str
     file_path: str | None = None
-    # Mean duration in history (test_stats.avg_duration_ms): only sizes the estimate of test
-    # time saved, never affects which tests are selected.
+    # Mean duration in history (test_stats.avg_duration_ms): sizes the estimate of test time
+    # saved and breaks risk-order ties; never affects which tests are selected.
     avg_duration_ms: float | None = None
+    # test_stats over the stats window, for the risk order only (core/risk.py): never affect
+    # which tests are selected. None: unknown (no stats).
+    runs: int | None = None
+    failures: int | None = None
+    last_failed_at: datetime | None = None
+    flaky_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -276,6 +288,8 @@ class RepoHistory:
     recent_main_failures: Mapping[str, tuple[int, str]] = field(default_factory=dict)
     # Recent runs (changed_files_known only) with at least one failure, newest first.
     failed_runs: Sequence[FailedRun] = ()
+    # The repo's newest run: the risk score's recency is measured back from it, not from now.
+    newest_run_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -284,6 +298,10 @@ class SelectedTest:
     reasons: tuple[str, ...]
     runner: Runner | None
     file_path: str | None
+    # Risk order (core/risk.py): rank 1 runs first. Selection never depends on them.
+    score: float | None = None
+    rank: int | None = None
+    rank_reason: str = ""
 
     @property
     def reason(self) -> str:
@@ -309,6 +327,8 @@ class Selection:
     # (see WouldRun). Go subtests are left out: their time is inside their parent's.
     estimated_ms_total: float = 0.0
     estimated_ms_would_run: float = 0.0
+    # How the commands list their tests (Order.RISK: highest risk first).
+    order: Order = Order.DEFAULT
 
     @property
     def command(self) -> str:
@@ -328,6 +348,7 @@ def select_tests(
     affected_files: Mapping[str, Sequence[str]] | None = None,
     deleted_files: Iterable[str] = (),
     junit_dir: str | None = None,
+    order: Order = Order.DEFAULT,
 ) -> Selection:
     """Select tests for a change.
 
@@ -338,12 +359,14 @@ def select_tests(
     ``deleted_files`` are changed files that no longer exist: no command names them.
     ``junit_dir``: each pytest command writes ``--junitxml=<junit_dir>/siftwise-<n>.xml``, so
     a line of several pytest commands doesn't overwrite one report with the next.
+    ``order``: ``Order.RISK`` lists the riskiest tests first in the commands (core/risk.py).
+    Every selected test gets its score and rank either way, and the same tests are selected.
     """
     # Every known test classified once, for the selection and its time estimate.
     tests = _index(history.tests.values() if history else ())
     selection = _select(
         history, changed_files, changed_files_known, config or SelectorConfig(),
-        affected_packages, affected_files, deleted_files, junit_dir, tests,
+        affected_packages, affected_files, deleted_files, junit_dir, tests, order,
     )  # fmt: skip
     return _with_estimate(selection, history, tests)
 
@@ -358,6 +381,7 @@ def _select(
     deleted_files: Iterable[str],
     junit_dir: str | None,
     tests: Mapping[str, _Test],
+    order: Order = Order.DEFAULT,
 ) -> Selection:
     affected_packages = affected_packages or {}
     affected_files = {
@@ -380,6 +404,7 @@ def _select(
                 for n, (r, cmd) in enumerate(FULL_SUITE_COMMANDS.items(), start=1)
                 if r in runners
             ),
+            order=order,
         )
 
     if not changed_files_known:
@@ -397,11 +422,13 @@ def _select(
         return full("no test history for this repo")
 
     selected: dict[str, list[str]] = {}
+    links: dict[str, Link] = {}  # each test's strongest link, for the risk score
 
-    def add(test_id: str, reason: str) -> None:
+    def add(test_id: str, reason: str, link: Link) -> None:
         reasons = selected.setdefault(test_id, [])
         if reason not in reasons:
             reasons.append(reason)
+        links[test_id] = max(links.get(test_id, Link.HISTORY), link)
 
     # Python test files, by path: the files pytest can be pointed at whole. (Doctests and
     # collection errors point at their module, which may be a source file.)
@@ -433,7 +460,7 @@ def _select(
         elif not hits:
             unmapped.append(path)
         for test_id, reason in hits.items():
-            add(test_id, reason)
+            add(test_id, reason, Link.DIRECT)
             if path.endswith(".go") and tests[test_id].runner is Runner.GO:
                 whole_packages.add(tests[test_id].classname)
 
@@ -457,7 +484,7 @@ def _select(
         first = sorted(modules)[0] if modules else "?"
         more = f" (+{len(modules) - 1} more)" if len(modules) > 1 else ""
         for test in known:
-            add(test.test_id, f"imports changed module {first}{more}")
+            add(test.test_id, f"imports changed module {first}{more}", Link.INDIRECT)
         py_whole_files.add(file)
         covered_by_imports.update(modules)
 
@@ -466,7 +493,8 @@ def _select(
     for path, directory in sorted(scoped_build.items()):
         for test in tests.values():
             if _test_under_dir(test, directory):
-                add(test.test_id, f"build file {path} changed (tests under {directory}/)")
+                reason = f"build file {path} changed (tests under {directory}/)"
+                add(test.test_id, reason, Link.INDIRECT)
                 if test.runner is Runner.GO:
                     whole_packages.add(test.classname)
 
@@ -477,7 +505,7 @@ def _select(
         if imported:
             first = sorted(imported)[0]
             more = f" (+{len(imported) - 1} more)" if len(imported) > 1 else ""
-            add(test.test_id, f"imports changed package {first}{more}")
+            add(test.test_id, f"imports changed package {first}{more}", Link.INDIRECT)
             whole_packages.add(test.classname)
             covered_by_dependents.update(imported)
 
@@ -492,7 +520,8 @@ def _select(
             continue
         covered_by_rules.update(triggers)
         for test in matched:
-            add(test.test_id, f"declared dependency: {rule.tests} on {_list(triggers, 1)}")
+            reason = f"declared dependency: {rule.tests} on {_list(triggers, 1)}"
+            add(test.test_id, reason, Link.INDIRECT)
             if test.runner is Runner.GO:
                 whole_packages.add(test.classname)
 
@@ -529,15 +558,16 @@ def _select(
                     test_id,
                     f"co-change: failed in run {run.run_id} ({run.commit_sha[:7]}), "
                     f"which also changed {_list(sorted(overlap))}",
+                    Link.HISTORY,
                 )
 
     # Recently failed or broken on main.
     for test_id, sha in sorted(history.broken_on_main.items()):
         if test_id in tests:
-            add(test_id, f"broken on main since {sha[:7]}")
+            add(test_id, f"broken on main since {sha[:7]}", Link.HISTORY)
     for test_id, (run_id, sha) in sorted(history.recent_main_failures.items()):
         if test_id in tests:
-            add(test_id, f"failed on main in run {run_id} ({sha[:7]})")
+            add(test_id, f"failed on main in run {run_id} ({sha[:7]})", Link.HISTORY)
 
     # Always-run patterns: the same globs as [[depends]] (`**` spans directories, `*` and `?`
     # stay within one), against the test ID and the test's file path.
@@ -546,7 +576,7 @@ def _select(
             if glob_match(test.test_id, pattern) or (
                 test.file_path and glob_match(test.file_path, pattern)
             ):
-                add(test.test_id, f"always-run pattern {pattern!r}")
+                add(test.test_id, f"always-run pattern {pattern!r}", Link.HISTORY)
 
     # Tests in a deleted Python file no longer exist (pytest errors on a missing path).
     chosen = [
@@ -575,21 +605,60 @@ def _select(
         summary = f"{len(py_module_files)} changed module(s) run with --doctest-modules"
     else:
         summary = NO_TESTS_AFFECTED
+    ranks = rank(
+        (_risk_inputs(history.tests[t.test_id], links[t.test_id]) for t in chosen),
+        history.newest_run_at,
+    )
     return Selection(
         mode=Mode.SELECTIVE,
         reason=summary,
         tests=tuple(
-            SelectedTest(t.test_id, tuple(selected[t.test_id]), t.runner, t.file_path)
+            SelectedTest(
+                t.test_id,
+                tuple(selected[t.test_id]),
+                t.runner,
+                t.file_path,
+                score=ranks[t.test_id][1].score,
+                rank=ranks[t.test_id][0],
+                rank_reason=ranks[t.test_id][1].why,
+            )
             for t in chosen
         ),
         selected_count=len(chosen),
         total_known=len(tests),
         commands=_build_commands(
-            chosen, config.go_module, whole_packages, py_whole_files, py_module_files, junit_dir
+            chosen,
+            config.go_module,
+            whole_packages,
+            py_whole_files,
+            py_module_files,
+            junit_dir,
+            None
+            if order is Order.DEFAULT
+            else unit_key(
+                order,
+                {
+                    t.test_id: Ranked(
+                        ranks[t.test_id][0],
+                        ranks[t.test_id][1].score,
+                        links[t.test_id],
+                        0.0
+                        if is_go_subtest(t.test_id)
+                        else history.tests[t.test_id].avg_duration_ms,
+                    )
+                    for t in chosen
+                },
+            ),
         ),
         go_packages_run_whole=tuple(sorted(whole_packages)),
         python_files_run_whole=tuple(sorted(files_run_whole)),
+        order=order,
     )
+
+
+def _risk_inputs(test: KnownTest, link: Link) -> RiskInputs:
+    return RiskInputs(test.test_id, link, test.runs, test.failures, test.last_failed_at,
+                      test.flaky_score, test.avg_duration_ms)  # fmt: skip
 
 
 @dataclass(frozen=True)
@@ -1121,8 +1190,9 @@ def _build_commands(
     py_whole_files: Collection[str] = (),
     py_module_files: Collection[str] = (),
     junit_dir: str | None = None,
+    key: UnitKey | None = None,
 ) -> tuple[str, ...]:
-    """One command per runner (per package for Go), in a stable order.
+    """One command per runner (per package for Go).
 
     Every argument is shell-quoted (``shlex.join``): test IDs come from uploaded JUnit, and the
     command is meant for ``eval``.
@@ -1131,23 +1201,47 @@ def _build_commands(
     know yet (added in this change) run too. Other Go packages only had tests pulled in by
     co-change, recently-failed or always-run, so they keep -run for just those tests.
     Python files in ``py_whole_files`` are likewise passed to pytest whole.
+
+    Order: without ``key``, by path, package and test ID (the order before risk ordering).
+    With ``key`` (``risk.unit_key``: from the selected tests a unit runs), every pytest
+    argument, Go package and Jest file comes in key order, and so do the commands.
     """
-    commands: list[str] = []
+
+    def best(test_ids: Iterable[str]) -> tuple[float, ...]:
+        return key(list(test_ids)) if key else ()
+
+    def ordered(items: Iterable[str], tests_of: Callable[[str], Iterable[str]]) -> list[str]:
+        if key is None:
+            return sorted(items)
+        return sorted(items, key=lambda item: (best(tests_of(item)), item))
+
+    commands: list[tuple[tuple[float, ...], str]] = []  # (key, command)
 
     nodes = {t.py_node for t in tests if t.runner is Runner.PYTEST and t.py_node and not t.doctest}
     nodes.update(py_whole_files)
     # A whole file (changed, imports a changed module, or a collection error) already runs
     # every test in it.
     whole_files = {node for node in nodes if "::" not in node}
-    pytest_ids = sorted(
-        node for node in nodes if "::" not in node or node.partition("::")[0] not in whole_files
+    by_node: dict[str, list[str]] = {}
+    for t in tests:
+        if t.runner is Runner.PYTEST and not t.doctest and t.py_node:
+            in_whole = t.py_path if t.py_path in whole_files else None
+            by_node.setdefault(in_whole or t.py_node, []).append(t.test_id)
+    pytest_ids = ordered(
+        (node for node in nodes if "::" not in node or node.partition("::")[0] not in whole_files),
+        lambda node: by_node.get(node, ()),
     )
     pytest_runs = 0
     if pytest_ids:
         pytest_runs += 1
-        commands.append(_with_junit(shlex.join(["pytest", *pytest_ids]), junit_dir, pytest_runs))
-    known_doctest_files = {t.py_node for t in tests if t.doctest and t.py_node}
-    doctest_files = sorted(known_doctest_files | set(py_module_files))
+        command = _with_junit(shlex.join(["pytest", *pytest_ids]), junit_dir, pytest_runs)
+        commands.append((best(i for n in pytest_ids for i in by_node.get(n, ())), command))
+    doctests = [t for t in tests if t.doctest and t.py_node]
+    known_doctest_files = {t.py_node for t in doctests if t.py_node}
+    doctest_files = ordered(
+        known_doctest_files | set(py_module_files),
+        lambda file: (t.test_id for t in doctests if t.py_node == file),
+    )
     if doctest_files:
         pytest_runs += 1
         command = _with_junit(
@@ -1157,25 +1251,35 @@ def _build_commands(
             # A module may have no doctests: pytest then exits 5 ("no tests collected"),
             # which isn't a failure. Import errors (exit 2) and doctest failures (1) still are.
             command = f"{{ {command} || test $? -eq 5; }}"
-        commands.append(command)
+        commands.append((best(t.test_id for t in doctests), command))
 
     # Go: -run matches top-level tests; subtests run as part of their parent.
     go_tests: dict[str, set[str]] = {}
+    go_ids: dict[str, list[str]] = {}
     for t in tests:
         if t.runner is Runner.GO:
             go_tests.setdefault(t.classname, set()).add(t.name.split("/", 1)[0])
-    for package in sorted(go_tests):
+            go_ids.setdefault(t.classname, []).append(t.test_id)
+    for package in ordered(go_tests, lambda package: go_ids[package]):
         target = _go_target(package, go_module)
         if package in go_whole_packages:
-            commands.append(shlex.join(["go", "test", target]))
+            command = shlex.join(["go", "test", target])
         else:
             pattern = "^(" + "|".join(sorted(go_tests[package])) + ")$"
-            commands.append(shlex.join(["go", "test", target, "-run", pattern]))
+            command = shlex.join(["go", "test", target, "-run", pattern])
+        commands.append((best(go_ids[package]), command))
 
-    jest_files = sorted({t.file_path for t in tests if t.runner is Runner.JEST and t.file_path})
+    jest_ids: dict[str, list[str]] = {}
+    for t in tests:
+        if t.runner is Runner.JEST and t.file_path:
+            jest_ids.setdefault(t.file_path, []).append(t.test_id)
+    jest_files = ordered(jest_ids, lambda file: jest_ids[file])
     if jest_files:
-        commands.append(shlex.join(["jest", *jest_files]))
-    return tuple(commands)
+        commands.append((best(i for ids in jest_ids.values() for i in ids),
+                         shlex.join(["jest", *jest_files])))  # fmt: skip
+    if key is not None:
+        commands.sort(key=lambda pair: pair[0])  # stable: same key keeps pytest, Go, Jest
+    return tuple(command for _, command in commands)
 
 
 def _with_junit(command: str, junit_dir: str | None, n: int) -> str:
@@ -1263,7 +1367,8 @@ def load_history(
         text(
             f"""
             WITH {_REPO_RUNS}, {recent_ci_runs_sql("repo_runs")}
-            SELECT ts.test_id, ts.file_path, ts.avg_duration_ms
+            SELECT ts.test_id, ts.file_path, ts.avg_duration_ms, ts.runs, ts.failures,
+                   ts.last_failed_at, ts.flaky_score
             FROM test_stats ts JOIN recent ON recent.id = ts.last_seen_run_id
             WHERE ts.repo_id = :repo_id
             """
@@ -1315,10 +1420,23 @@ def load_history(
         ).all():
             changed.setdefault(run_id, set()).add(path)
 
+    newest_run_at = session.execute(
+        text("SELECT max(COALESCE(started_at, created_at)) FROM runs WHERE repo_id = :repo_id"),
+        params,
+    ).scalar_one_or_none()
+
     return RepoHistory(
         tests={
-            test_id: KnownTest(test_id, file_path, duration)
-            for test_id, file_path, duration in known
+            row.test_id: KnownTest(
+                row.test_id,
+                row.file_path,
+                row.avg_duration_ms,
+                row.runs,
+                row.failures,
+                row.last_failed_at,
+                row.flaky_score,
+            )
+            for row in known
         },
         broken_on_main=dict(broken),
         recent_main_failures={test_id: (run_id, sha) for test_id, run_id, sha in recent_failures},
@@ -1326,6 +1444,7 @@ def load_history(
             FailedRun(run_id, sha, frozenset(changed.get(run_id, ())), frozenset(test_ids))
             for run_id, sha, test_ids in failed
         ),
+        newest_run_at=newest_run_at,
     )
 
 
