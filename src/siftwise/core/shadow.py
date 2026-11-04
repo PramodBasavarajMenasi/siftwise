@@ -10,6 +10,11 @@ otherwise it's missed if any non-flaky failing variant's selection wouldn't have
 
 Every miss gets a cause (``miss_cause``), from evidence the server has: triage's history and
 links for the test, and the run's recorded change. When the evidence doesn't say, ``unknown``.
+
+A budget-limited selection (a time budget left selected tests out) is stored as what would
+have run, plus the selection the budget cut (``shadow_selections.budget``): a miss that
+selection would have run is a ``budget`` miss, counted apart, so a budget never hides misses
+and never passes its own misses off as the selector's.
 """
 
 import logging
@@ -41,6 +46,7 @@ from siftwise.core.selector import (
     Selection,
     SelectionScope,
     WouldRun,
+    format_duration,
     is_generated,
     is_go_subtest,
     is_ignorable,
@@ -70,12 +76,13 @@ STORAGE_ERROR = "storage_error"  # the database failed (set by the /select route
 
 # Why a failure was missed (``shadow_failures.cause``), most specific first: a unit missed in
 # several variants takes the first of its variants' causes in this order.
+BUDGET = "budget"  # the selection had it, a time budget left it out
 NEW_TEST = "new_test"  # no result before the run
 FLAKY_HISTORY = "flaky_history"  # flaky before, but not called flaky now
 CONFIG_GAP = "config_gap"  # a non-code file in the test's own directory changed
 NO_LINK = "no_link"  # the change is known and nothing in it links to the test
 UNKNOWN_CAUSE = "unknown"
-CAUSES = (NEW_TEST, FLAKY_HISTORY, CONFIG_GAP, NO_LINK, UNKNOWN_CAUSE)
+CAUSES = (BUDGET, NEW_TEST, FLAKY_HISTORY, CONFIG_GAP, NO_LINK, UNKNOWN_CAUSE)
 UNCLASSIFIED = "unclassified"  # compared before causes existed (migration 0009): re-compare
 LINKED_NOT_SELECTED = (
     "linked to the change but not selected (selector didn't know the test at select time?)"
@@ -105,13 +112,32 @@ def store_selection(
     if repo_id is None:
         return UNKNOWN_REPO
     scope = SelectionScope.of(selection)
-    keys = _test_keys(session, repo_id, sorted(scope.test_ids))
+    budget = selection.budget if selection.budget and selection.budget.limited else None
+    before = budget.before if budget else None
+    named = scope.test_ids | (before.test_ids if before else frozenset())
+    keys = _test_keys(session, repo_id, sorted(named))
     # Selected tests come from history, so all have keys; a missing one can't be stored, and
     # the comparison would call it not selected: refuse rather than under-count.
-    if len(keys) < len(scope.test_ids):
+    if len(keys) < len(named):
         logger.warning("shadow selection not stored: %d selected tests unknown",
-                       len(scope.test_ids) - len(keys))  # fmt: skip
+                       len(named) - len(keys))  # fmt: skip
         return INCOMPLETE_SELECTION
+    stored_budget = None
+    if budget is not None and before is not None:
+        stored_budget = {
+            "seconds": budget.budget_ms / 1000,
+            "full_suite": budget.full_suite,
+            "left_out": budget.left_out,
+            "left_out_ms": budget.left_out_ms,
+            "left_out_risk_share": budget.left_out_risk_share,
+            "before": {
+                "full": before.full,
+                "keys": sorted(keys[test_id] for test_id in before.test_ids),
+                "go_keys": sorted(keys[test_id] for test_id in before.go_test_ids),
+                "go_packages": sorted(before.go_packages),
+                "python_files": sorted(before.python_files),
+            },
+        }
     inserted = session.execute(
         pg_insert(ShadowSelection)
         .values(
@@ -130,6 +156,7 @@ def store_selection(
             total_known=selection.total_known,
             estimated_ms_total=selection.estimated_ms_total,
             estimated_ms_would_run=selection.estimated_ms_would_run,
+            budget=stored_budget,
         )
         .on_conflict_do_nothing(
             # SHADOW_UNIQUE_INDEX: one selection per attempt and variant.
@@ -227,6 +254,7 @@ class Tally:
     """Counts over units: flaky ones are excluded from recall."""
 
     runs: int = 0
+    budget_runs: int = 0  # runs whose selection a time budget cut
     caught: int = 0
     missed: int = 0
     flaky_excluded: int = 0
@@ -241,6 +269,11 @@ class Tally:
     def recall(self) -> float | None:
         counted = self.caught + self.missed
         return self.caught / counted if counted else None
+
+    @property
+    def missed_by_budget(self) -> int:
+        """Misses a time budget left out (the selection had them)."""
+        return self.missed_by_cause[BUDGET]
 
     def add(self, unit: Unit) -> None:
         if unit.outcome == CAUGHT:
@@ -384,8 +417,18 @@ class AttemptComparison:
         return Mode.SELECTIVE.value if modes == {Mode.SELECTIVE.value} else Mode.FULL.value
 
     @property
+    def budget_limited(self) -> bool:
+        """A compared variant's selection was cut by a time budget."""
+        by_variant = {s.variant: s for s in self.selections}
+        return any(
+            (by_variant.get(v.variant) or by_variant[None]).budget is not None
+            for v in self.variants
+            if v.status == SHADOW_COMPARED
+        )
+
+    @property
     def tally(self) -> Tally:
-        tally = Tally(runs=int(self.counted))
+        tally = Tally(runs=int(self.counted), budget_runs=int(self.budget_limited))
         for unit in self.units:
             tally.add(unit)
         return tally
@@ -446,7 +489,7 @@ def _compare(
     selections: Sequence[ShadowSelection],
 ) -> AttemptComparison:
     by_variant = {s.variant: s for s in selections}
-    scopes = _scopes(session, selections)
+    scopes, befores = _scopes(session, selections)
     triaged = triage_ci_run(session, repo, ci_run_id, run_attempt, window_days) or []
     run_ids = [v.run_id for v in triaged]
     # A re-call replaces the earlier comparison (shadow_failures go with it).
@@ -476,6 +519,7 @@ def _compare(
             continue
         used[selection.id].append(SHADOW_COMPARED)
         would_run = WouldRun(scopes[selection.id])
+        before = befores.get(selection.id)
         selective = selection.mode == Mode.SELECTIVE.value
         results = v.report.results if v.report else []
         change = changes.get(v.run_id, RunChange())
@@ -485,7 +529,11 @@ def _compare(
         for r in results:
             runs_it = would_run(r.test_id)
             missed = not runs_it and r.verdict is not Verdict.FLAKY
-            cause = miss_cause(r, change, paths.get(r.test_id)) if missed else None
+            cause = None
+            if missed and before is not None and before(r.test_id):
+                cause = MissCause(BUDGET, _budget_detail(selection.budget or {}))
+            elif missed:
+                cause = miss_cause(r, change, paths.get(r.test_id))
             variant_rows.append(FailureRow(r.test_id, v.variant, runs_it, r.verdict.value,
                                            selective, cause))  # fmt: skip
         rows.extend(variant_rows)
@@ -544,15 +592,21 @@ def _compare(
     return AttemptComparison(True, tuple(selections), tuple(variants), tuple(units(rows)))
 
 
-def _scopes(session: Session, selections: Sequence[ShadowSelection]) -> dict[int, SelectionScope]:
+def _scopes(
+    session: Session, selections: Sequence[ShadowSelection]
+) -> tuple[dict[int, SelectionScope], dict[int, WouldRun]]:
+    """Each selection's scope, and for a budget-limited one, the selection the budget cut."""
     keys = {key for s in selections for key in s.selected_keys}
+    for s in selections:
+        before = (s.budget or {}).get("before") or {}
+        keys.update(before.get("keys") or ())
     names: dict[int, str] = {
         key: test_id
         for key, test_id in session.execute(
             text("SELECT id, test_id FROM tests WHERE id = ANY(:keys)"), {"keys": sorted(keys)}
         )
     }
-    return {
+    scopes = {
         s.id: SelectionScope(
             full=s.mode == Mode.FULL.value,
             test_ids=frozenset(names[key] for key in s.selected_keys),
@@ -562,6 +616,26 @@ def _scopes(session: Session, selections: Sequence[ShadowSelection]) -> dict[int
         )
         for s in selections
     }
+    befores = {}
+    for s in selections:
+        if not s.budget:
+            continue
+        before = s.budget.get("before") or {}
+        befores[s.id] = WouldRun(SelectionScope(
+            full=bool(before.get("full")),
+            test_ids=frozenset(names[key] for key in before.get("keys") or ()),
+            go_test_ids=frozenset(names[key] for key in before.get("go_keys") or ()),
+            go_packages=frozenset(before.get("go_packages") or ()),
+            python_files=frozenset(before.get("python_files") or ()),
+        ))  # fmt: skip
+    return scopes, befores
+
+
+def _budget_detail(budget: Mapping[str, Any]) -> str:
+    seconds = budget.get("seconds")
+    within = f"the {format_duration(seconds * 1000)} " if seconds else "the "
+    what = "full suite" if budget.get("full_suite") else "selection"
+    return f"left out by {within}budget target: the {what} without it would have run this test"
 
 
 def _durations(session: Session, run_ids: Sequence[int]) -> dict[int, list[tuple[str, int]]]:
@@ -728,9 +802,9 @@ def recall(
             report.not_counted[CANCELLED] += 1
 
     # Compared variants, by CI run attempt.
-    attempts: dict[tuple[str, int], list[tuple[str, float, float, datetime, str, datetime]]] = (
-        defaultdict(list)
-    )
+    attempts: dict[
+        tuple[str, int], list[tuple[str, float, float, datetime, str, datetime, bool]]
+    ] = defaultdict(list)
     for (
         ci_run_id,
         run_attempt,
@@ -740,11 +814,13 @@ def recall(
         at,
         commit,
         selected_at,
+        budget_limited,
     ) in session.execute(
         text(
             """
             SELECT s.ci_run_id, s.run_attempt, s.mode, sr.ms_total, sr.ms_would_run,
-                   COALESCE(r.started_at, r.created_at), r.commit_sha, s.created_at
+                   COALESCE(r.started_at, r.created_at), r.commit_sha, s.created_at,
+                   s.budget IS NOT NULL
             FROM shadow_selections s
             JOIN shadow_results sr ON sr.selection_id = s.id
             JOIN runs r ON r.id = sr.run_id
@@ -754,7 +830,7 @@ def recall(
         params,
     ):
         attempts[(ci_run_id, run_attempt)].append(
-            (mode, ms_total, ms_would_run, at, commit, selected_at)
+            (mode, ms_total, ms_would_run, at, commit, selected_at, budget_limited)
         )
     failures: dict[tuple[str, int], list[FailureRow]] = defaultdict(list)
     for (
@@ -798,6 +874,7 @@ def recall(
     suggestions: dict[str, Suggestion] = {}
     for attempt, variants in attempts.items():
         selective = all(mode == Mode.SELECTIVE.value for mode, *_ in variants)
+        budget_limited = any(row[6] for row in variants)
         at = max(row[3] for row in variants)
         commit = variants[0][4]
         targets: list[Recall | Period] = [report]
@@ -806,8 +883,10 @@ def recall(
             targets.append(period)
         for target in targets:
             target.all.runs += 1
+            target.all.budget_runs += budget_limited
             if selective:
                 target.selective.runs += 1
+                target.selective.budget_runs += budget_limited
             else:
                 target.full_runs += 1
             target.time.total_ms += sum(row[1] for row in variants)

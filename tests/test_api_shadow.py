@@ -137,8 +137,9 @@ def test_compare_and_recall(client: TestClient, db_session: Session) -> None:
     assert recall["all"] == recall["selective"] == {
         "runs": 1, "failures": 2, "flaky_excluded": 0, "caught": 1, "missed": 1, "recall": 0.5,
         "missed_by_verdict": {"new_regression": 0, "unknown": 1, "pre_existing": 0},
-        "missed_by_cause": {"new_test": 0, "flaky_history": 0, "config_gap": 0, "no_link": 1,
-                            "unknown": 0},
+        "missed_by_cause": {"budget": 0, "new_test": 0, "flaky_history": 0, "config_gap": 0,
+                            "no_link": 1, "unknown": 0},
+        "budget_limited_runs": 0, "missed_by_budget": 0,
     }  # fmt: skip
     [miss] = recall["misses"]
     assert (miss["test_id"], miss["ci_run_id"], miss["commit_sha"], miss["selection_mode"]) == (
@@ -175,3 +176,45 @@ def test_unknown_repo_invalid_days_and_auth(client: TestClient) -> None:
         assert response.status_code == 422
     assert client.get(f"/repos/{REPO}/recall").status_code == 401
     assert client.post(f"/repos/{REPO}/shadow", json={"ci_run_id": "1"}).status_code == 401
+
+
+@pytest.mark.usefixtures("seeded")
+def test_a_budget_limited_shadow_run_counts_budget_misses_apart(
+    client: TestClient, db_session: Session
+) -> None:
+    # The diff is unknown: siftwise would run the full suite; a 5 ms budget packs one of its
+    # two 5 ms tests (both new, so by test ID: test_cart).
+    selected = post_select(client, shadow=SHADOW_IN, changed_files_known=False,
+                           budget_seconds=0.005).json()  # fmt: skip
+    assert (selected["budget_limited"], selected["shadow_stored"]) == (True, True)
+    assert [t["test_id"] for t in selected["tests"]] == [TEST]
+    stored = db_session.scalars(select(ShadowSelection)).one()
+    assert stored.budget is not None
+    assert (stored.budget["full_suite"], stored.budget["left_out"]) == (True, 1)
+    assert stored.budget["before"]["full"] is True
+    shadow_run(db_session, {TEST: F, OTHER: F})
+
+    body = client.post(f"/repos/{REPO}/shadow", json={"ci_run_id": SHADOW}, headers=AUTH).json()
+    assert (body["caught"], body["missed"]) == (1, 1)
+    assert (body["budget_limited"], body["missed_by_budget"]) == (True, 1)
+    [selection] = body["selections"]
+    assert selection["budget_limited"] is True
+    [miss] = body["missed_tests"]
+    assert (miss["test_id"], miss["cause"]) == (OTHER, "budget")
+    assert miss["cause_detail"] == (
+        "left out by the 0s budget target: the full suite without it would have run this test"
+    )
+
+    recall = client.get(f"/repos/{REPO}/recall", params={"days": 7}, headers=AUTH).json()
+    every = recall["all"]
+    assert (every["missed"], every["budget_limited_runs"], every["missed_by_budget"]) == (1, 1, 1)
+    assert every["missed_by_cause"]["budget"] == 1
+    assert every["recall"] == 0.5  # a budget's misses are misses
+
+
+@pytest.mark.usefixtures("seeded")
+def test_a_budget_that_left_nothing_out_stores_no_budget(
+    client: TestClient, db_session: Session
+) -> None:
+    post_select(client, shadow=SHADOW_IN, budget_seconds=60)
+    assert db_session.scalars(select(ShadowSelection)).one().budget is None

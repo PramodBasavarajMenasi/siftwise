@@ -107,6 +107,46 @@ name the three highest-risk tests. To keep the old order (by path and test ID):
 `siftwise select --order default`, the Action's `order: default`, `SIFTWISE_ORDER: default`
 on GitLab, or the MCP argument `order: "default"`.
 
+### Time budget
+
+When there is only time for part of the selection, set a budget: siftwise runs the
+highest-risk tests whose estimated time fits and says plainly what it left out. Off by
+default. **A budget is an estimated target, not a hard cap**: the run can take longer.
+
+```sh
+siftwise select --repo acme/shop --base origin/main --budget 5m   # s, m or h: 90s, 5m, 1h30m
+```
+
+The Action takes `budget: 5m`, GitLab `SIFTWISE_BUDGET: 5m`, MCP `select_tests` a `budget`
+argument, and `/select` `budget_seconds`.
+
+- **What runs:** whole pytest arguments, Go packages and Jest files, taken in risk order when
+  their estimated time still fits (each test's mean duration from history; a test that only
+  ever skipped counts as 0, any other without a duration as the 90th percentile of the known
+  ones). One that doesn't fit is skipped and the next is tried. The riskiest one always runs,
+  even if it alone is over the budget.
+- **A target, not a cap:** the estimates are mean durations, so a run can take longer than the
+  budget. On the eval replays, substrate runs went over in up to 31 of 72 runs, by up to 1.4×
+  at 25% and 50% budgets, and by up to 3.9× (rdflib) at 10%, when the riskiest unit alone was
+  over the budget. Keep a real CI timeout if you need a hard limit.
+- **What you're told:** the estimated time against the target, how many selected tests were
+  left out, their estimated time, and their share of the selection's risk score. The PR
+  comment and GitLab note say **budget-limited (estimated 4m 50s of a 5m target): N tests left
+  out**, the CLI prints the same on stderr, and MCP returns it with `budget_limited`. A
+  budget-limited run is not a complete check of the change: run the full selection before
+  merging.
+- **Full-suite fallbacks:** when siftwise would run the full suite (unknown diff, build file
+  changed, ...), a budget packs the full suite's known tests by risk and labels the run a
+  *budget-limited full suite*. With no history to rank by, the budget isn't applied and the full
+  suite runs.
+- **Shadow mode:** misses the budget left out are counted, with the cause `budget`, and shown
+  apart in `siftwise report`.
+- **An older server** rejects the budget (its request schema doesn't know `budget_seconds`):
+  the Action, GitLab and MCP then run the full suite with a warning that the server doesn't
+  support budgets; `siftwise select` exits 1 with that error. Upgrade the server to use it.
+
+How much a budget catches, on real history: [eval results](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-results.md#time-budget-recall-within-a-budget).
+
 ## Quickstart
 
 From zero to a first selection in about 5 minutes, on a small example project. You need
@@ -568,6 +608,7 @@ Each miss gets a cause, from evidence the server already has:
 
 | Cause | Evidence |
 |---|---|
+| `budget` | a [time budget](#time-budget) left out a test the selection had (counted in recall, and shown apart) |
 | `new_test` | no result for the test before the run |
 | `flaky_history` | flaky before, but not called flaky this time |
 | `config_gap` | a non-code file (data, fixture, golden file) changed in the test's own directory, which no import graph follows; the report suggests a `[[depends]]` rule for you to review |
@@ -672,7 +713,7 @@ test:
 ```
 
 **Inputs** are the GitHub Action's, as variables: `SIFTWISE_REPO`, `SIFTWISE_BASE_REF`,
-`SIFTWISE_SHADOW`, `SIFTWISE_ORDER`, `SIFTWISE_COMMENT`, `SIFTWISE_VARIANT`, `SIFTWISE_JUNIT_GLOB`,
+`SIFTWISE_SHADOW`, `SIFTWISE_ORDER`, `SIFTWISE_BUDGET`, `SIFTWISE_COMMENT`, `SIFTWISE_VARIANT`, `SIFTWISE_JUNIT_GLOB`,
 `SIFTWISE_FAIL_ON`, `SIFTWISE_KNOWN_FLAKY_SOURCE`, the `SIFTWISE_RERUN_*` ones. The rollup's
 outputs are `SIFTWISE_VERDICTS_AVAILABLE`, `SIFTWISE_COUNT_<VERDICT>`, `SIFTWISE_REPORT` and
 the shadow ones.

@@ -75,7 +75,7 @@ if not __package__:  # run as a file path: make the repo root importable
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.eval import triage_labels as tl
-from scripts.eval.ordering import FirstFailure, RanTest, first_failure
+from scripts.eval.ordering import FirstFailure, RanTest, first_failure, run_time
 from siftwise.cli.gograph import GoGraph, build_graph, parse_go_list
 from siftwise.cli.pygraph import PyGraph, build_py_graph, module_of_test
 from siftwise.cli.repoconfig import load_repo_config, read_go_module
@@ -94,6 +94,7 @@ from siftwise.core.selector import (
     WouldRun,
     build_file_scope,
     is_build_file,
+    is_go_subtest,
     is_ignorable,
     select_tests,
 )
@@ -157,6 +158,27 @@ class Result:
     # Time to first failure in a selective run that caught one: the commands in the default
     # order (by path / package) and in risk order (scripts/eval/ordering.py).
     first_failure: dict[str, FirstFailure] | None = None
+    # Under a time budget of each BUDGET_SHARES of the run's full measured time (runs with
+    # failures and durations only).
+    budgets: list[BudgetRun] | None = None
+
+
+@dataclass(frozen=True)
+class BudgetRun:
+    """One run under a time budget: what it would have caught, and when."""
+
+    share: float  # of the run's full measured time
+    budget_ms: float
+    full_ms: float  # the run's full measured time (Go subtests left out)
+    mode: str
+    limited: bool  # the budget left tests out
+    full_suite: bool  # siftwise would have run the full suite: a packed full suite
+    failures: int
+    caught: int
+    caught_unbudgeted: int  # what the selection without a budget caught
+    measured_ms: float  # measured time of what the budgeted commands run
+    first_failure: FirstFailure | None  # None: caught nothing (or a full-suite command)
+    applied: bool = True  # False: the budget couldn't be applied (the selection ran as it is)
 
 
 # --- history as of a point in time --------------------------------------------------------
@@ -440,6 +462,47 @@ def changed_files_of(session: Session, run_ids: list[int]) -> dict[int, set[str]
     return changed
 
 
+# Budgets the eval tries, as shares of each run's full measured time.
+BUDGET_SHARES = (0.10, 0.25, 0.50)
+
+
+def budget_runs(
+    session: Session,
+    index: HistoryIndex,
+    run: TargetRun,
+    history: RepoHistory,
+    select: Callable[..., Selection],
+    failures: list[str],
+    caught: int,
+    go_module: str | None,
+) -> list[BudgetRun] | None:
+    """The run under each ``BUDGET_SHARES`` budget, in risk order, with durations estimated
+    as of the run (``with_durations``): None without failures or measured durations."""
+    if not failures:
+        return None
+    ran = ran_tests(session, list(run.run_ids or (run.run_id,)))
+    full_ms = sum(t.duration_ms for t in ran if not is_go_subtest(t.test_id))
+    if not full_ms:
+        return None
+    timed = with_durations(session, index, run, history, skipped_as_zero=True)
+    found = []
+    for share in BUDGET_SHARES:
+        budget_ms = share * full_ms
+        limited = select(timed, order=Order.RISK, budget_ms=budget_ms)
+        runs = WouldRun(limited)
+        budget = limited.budget
+        selective = limited.mode is Mode.SELECTIVE
+        found.append(BudgetRun(
+            share, budget_ms, full_ms, limited.mode.value, bool(budget and budget.limited),
+            bool(budget and budget.full_suite), len(failures),
+            sum(1 for f in failures if runs(f)), caught,
+            run_time(limited.commands, ran, go_module) if selective else full_ms,
+            first_failure(limited.commands, ran, go_module) if selective else None,
+            budget is None or budget.applied,
+        ))  # fmt: skip
+    return found
+
+
 # The orders time to first failure compares with the default one.
 EVAL_ORDERS = (Order.RISK, Order.RISK_PER_TIME, Order.RISK_PER_TIME_TIERED)
 # Durations as of a run: the mean over the latest this-many runs before it (uploads, so a few
@@ -448,27 +511,49 @@ DURATION_RUNS = 50
 
 
 def with_durations(
-    session: Session, index: HistoryIndex, run: TargetRun, history: RepoHistory
+    session: Session,
+    index: HistoryIndex,
+    run: TargetRun,
+    history: RepoHistory,
+    skipped_as_zero: bool = False,
 ) -> RepoHistory:
     """``history`` with each known test's mean duration (final attempts, not skipped) over the
-    latest ``DURATION_RUNS`` runs before ``run``: no peeking."""
+    latest ``DURATION_RUNS`` runs before ``run``: no peeking. ``skipped_as_zero``: a test
+    that only skipped in those runs gets 0, as the budget's estimate counts a test production
+    stats show with ``runs == 0`` (the eval's ``runs`` counts skipped runs too)."""
     prior = index.runs[: bisect.bisect_left(index._orders, (run.run_at, run.run_id))]
     run_ids = [r.id for r in prior[-DURATION_RUNS:]]
+    if skipped_as_zero:
+        # The budget's estimates: every variant of the latest DURATION_RUNS CI runs, the runs
+        # that make a test known, so (as with production's window stats) every known test has
+        # a duration or only skipped. 50 uploads are 2-3 CI runs of a 22-leg matrix.
+        ci_runs: dict[tuple[str, int], list[int]] = defaultdict(list)
+        for r in reversed(prior):
+            key = (r.ci_key, r.run_attempt)
+            if key in ci_runs or len(ci_runs) < DURATION_RUNS:
+                ci_runs[key].append(r.id)
+        run_ids = [i for ids in ci_runs.values() for i in ids]
     rows = session.execute(
         text(
             f"""
-            SELECT t.test_id, avg(final.duration_ms) FROM (
+            SELECT t.test_id,
+                   avg(final.duration_ms) FILTER (WHERE final.status <> {SKIPPED_CODE}),
+                   bool_and(final.status = {SKIPPED_CODE})
+            FROM (
                 SELECT DISTINCT ON (run_id, test_key) test_key, status, duration_ms
                 FROM test_results WHERE run_id = ANY(:run_ids)
                 ORDER BY run_id, test_key, attempt DESC
             ) final JOIN tests t ON t.id = final.test_key
-            WHERE final.status <> {SKIPPED_CODE} AND final.duration_ms IS NOT NULL
             GROUP BY t.test_id
             """
         ),
         {"run_ids": run_ids},
     ).all()
-    means = {test_id: float(ms) for test_id, ms in rows}
+    means = {
+        test_id: float(ms) if ms is not None else 0.0
+        for test_id, ms, skipped in rows
+        if ms is not None or (skipped and skipped_as_zero)
+    }
     tests = {
         test_id: dataclasses.replace(test, avg_duration_ms=means.get(test_id))
         for test_id, test in history.tests.items()
@@ -1228,9 +1313,16 @@ def evaluate(
             found[order.value] = first_failure(ordered.commands, ran, config.go_module)
         if all(found.values()):
             first = {name: ff for name, ff in found.items() if ff}
+
+    def select(timed: RepoHistory, **options: Any) -> Selection:
+        return select_tests(timed, changed, known, config, affected, affected_files, deleted,
+                            **options)  # fmt: skip
+
+    budgets = budget_runs(session, index, run, history, select, failures, len(caught),
+                          config.go_module)  # fmt: skip
     return Result(
         run, changed, selection, failures, caught, missed, graph_note,
-        tests_pct, time_pct, cf, dict(signals), first,
+        tests_pct, time_pct, cf, dict(signals), first, budgets,
     )  # fmt: skip
 
 
@@ -1282,6 +1374,7 @@ def result_json(r: Result) -> dict[str, Any]:
         "first_failure": None if r.first_failure is None else {
             order: dataclasses.asdict(ff) for order, ff in r.first_failure.items()
         },
+        "budgets": None if r.budgets is None else [dataclasses.asdict(b) for b in r.budgets],
     }  # fmt: skip
 
 
@@ -1620,6 +1713,13 @@ def print_result(r: Result, verbose: bool) -> None:
         total = r.first_failure["default"]
         typer.echo(f"  first failure, of {total.total} tests ({_secs(total.total_ms)}): "
                    f"{positions}")  # fmt: skip
+    for b in r.budgets or ():
+        first = f", first failure at {_secs(b.first_failure.ms)}" if b.first_failure else ""
+        kind = "packed full suite" if b.full_suite and b.limited else b.mode
+        kind += "" if b.applied else " (budget not applied)"
+        typer.echo(f"  budget {b.share:.0%} ({_secs(b.budget_ms)}): {kind}"
+                   f"{', limited' if b.limited else ''}, caught {b.caught}/{b.failures}, "
+                   f"measured {_secs(b.measured_ms)}{first}")  # fmt: skip
     for test_id in r.caught:
         typer.echo(f"    CAUGHT  {test_id}")
     for m in r.missed:
@@ -1694,6 +1794,8 @@ def print_summary(title: str, results: list[Result]) -> None:
             f"{only_fallback} more failures had nothing but a fallback"
         )
     print_first_failures([r.first_failure for r in results if r.first_failure])
+    for line in budget_lines([b for r in results for b in r.budgets or ()]):
+        typer.echo(f"  {line}")
     _print_miss_signals("missed", [m for r in results for m in r.missed])
     _print_miss_signals(
         "without fallbacks, would miss",
@@ -1754,6 +1856,48 @@ def first_failure_lines(pairs: list[dict[str, FirstFailure]]) -> list[str]:
                     part += f", vs risk {versus(order, 'risk', attribute)}"
             parts.append(part)
         lines.append(f"  {order}: " + "; ".join(parts))
+    return lines
+
+
+def budget_lines(runs: list[BudgetRun]) -> list[str]:
+    """Per budget share: recall within the budget (by failures, and by runs: did the run
+    still fail?), against the selection without a budget; time to first failure; and how the
+    measured time compared with the budget (estimates are means: a run can overrun)."""
+    if not runs:
+        return []
+    lines = ["time budgets (risk order; share of each run's full measured time):"]
+    for share in sorted({b.share for b in runs}):
+        group = [b for b in runs if b.share == share]
+        failures = sum(b.failures for b in group)
+        caught = sum(b.caught for b in group)
+        unbudgeted = sum(b.caught_unbudgeted for b in group)
+        red = sum(1 for b in group if b.caught)
+        red_unbudgeted = sum(1 for b in group if b.caught_unbudgeted)
+        limited = sum(1 for b in group if b.limited)
+        packed = sum(1 for b in group if b.full_suite and b.limited)
+        unapplied = sum(1 for b in group if not b.applied)
+        lines.append(
+            f"  {share:.0%}: {len(group)} runs ({limited} budget-limited, {packed} packed full "
+            f"suites, {unapplied} not applied); failures caught {recall(caught, failures)} "
+            f"(no budget: {recall(unbudgeted, failures)}); runs that still fail "
+            f"{red}/{len(group)} (no budget: {red_unbudgeted}/{len(group)})"
+        )
+        firsts = [b for b in group if b.first_failure]
+        if firsts:
+            secs = [b.first_failure.ms / 1000 for b in firsts if b.first_failure]
+            of_full = [b.first_failure.ms / b.full_ms for b in firsts if b.first_failure]
+            lines.append(
+                f"      first failure: median {statistics.median(secs):.1f} s, "
+                f"{statistics.median(of_full):.1%} of the full run (mean "
+                f"{statistics.mean(of_full):.1%}), {len(firsts)} runs"
+            )
+        ratio = [b.measured_ms / b.budget_ms for b in group if b.mode == Mode.SELECTIVE.value]
+        if ratio:
+            over = sum(1 for r in ratio if r > 1)
+            lines.append(
+                f"      measured / budget: median {statistics.median(ratio):.2f}, max "
+                f"{max(ratio):.2f}; over budget in {over} of {len(ratio)} runs"
+            )
     return lines
 
 

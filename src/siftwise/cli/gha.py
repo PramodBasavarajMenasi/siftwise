@@ -231,6 +231,7 @@ def select_step(
     shadow: Annotated[str, typer.Option(envvar="SIFTWISE_SHADOW")] = "off",
     variant: Annotated[str, typer.Option(envvar="SIFTWISE_VARIANT")] = "",
     order: Annotated[str, typer.Option(envvar="SIFTWISE_ORDER")] = "risk",
+    budget: Annotated[str, typer.Option(envvar="SIFTWISE_BUDGET")] = "",
 ) -> None:
     """Select tests for this run and set the step's outputs. In a shadow run the outputs say
     run the full suite, and the server stores the selection to measure recall."""
@@ -243,7 +244,7 @@ def select_step(
         _annotate("warning", "siftwise doesn't support pull_request_target: full suite.")
     run_select(ctx, server=server, token=token, repo=repo, junit_dir=junit_dir,
                comment=comment, scm_token=github_token, shadow=shadow, variant=variant,
-               order=order)  # fmt: skip
+               order=order, budget=budget)  # fmt: skip
 
 
 def run_select(
@@ -258,9 +259,11 @@ def run_select(
     shadow: str,
     variant: str,
     order: str = "risk",
+    budget: str = "",
 ) -> None:
     """The select step, for any CI provider (``scm_token``: the one that writes the comment).
-    ``order``: 'risk' (likely failures first in the command) or 'default'."""
+    ``order``: 'risk' (likely failures first in the command) or 'default'. ``budget``: a time
+    budget such as 5m (empty: none); the run is then budget-limited, and says so."""
     from siftwise.cli import main as cli  # main registers this app: import it lazily
 
     env = os.environ
@@ -283,6 +286,13 @@ def run_select(
         _annotate("warning", f"siftwise: invalid order {order!r} (use risk or default); "
                   "ordering by risk")  # fmt: skip
         command_order = Order.RISK
+    budget_seconds = None
+    if budget.strip():
+        try:
+            budget_seconds = cli.parse_budget(budget)
+        except ValueError as exc:
+            # No budget runs more tests, never fewer: the safe way to fail.
+            _annotate("warning", f"siftwise: {exc}; no time budget applied")
     # A shadow run needs somewhere to store the selection: a token, a run ID and the commit.
     in_shadow = bool(token and ctx.run_id and ctx.head_sha) and sampled(repo, ctx.run_id, rate)
     if in_shadow:
@@ -295,7 +305,8 @@ def run_select(
     else:
         try:
             body = cli.selection_request(repo, ctx.base, ctx.head_sha or "HEAD",
-                                         junit_dir=junit_dir, order=command_order)  # fmt: skip
+                                         junit_dir=junit_dir, order=command_order,
+                                         budget_seconds=budget_seconds)  # fmt: skip
             if in_shadow:
                 body["shadow"] = {
                     "ci_run_id": ctx.run_id,
@@ -310,7 +321,9 @@ def run_select(
                 # A repo siftwise has never seen: the normal first run, not an outage.
                 result = fail_open_result("")
                 result["reason"] = "no test history for this repo yet"
-            problem = str(exc)
+            # An older server rejects the budget: fail open (the full suite), and say why.
+            unsupported = budget_seconds is not None and cli.budget_rejected(exc)
+            problem = cli.BUDGET_UNSUPPORTED if unsupported else str(exc)
         except RepoConfigError as exc:
             problem = str(exc)
     if result is None:
@@ -344,6 +357,8 @@ def run_select(
         "shadow-mode": would_have["mode"] if would_have else "",
         "shadow-selected": str(would_have["selected_count"]) if would_have else "",
         "shadow-total": str(would_have["total_known"]) if would_have else "",
+        "budget-limited": "true" if result.get("budget_limited") else "false",
+        "budget-left-out": str((result.get("budget") or {}).get("left_out", 0)),
     })  # fmt: skip
     table = selection_markdown(result, ctx.head_sha, shadow=in_shadow, would_have=would_have,
                                not_counted=not_counted)  # fmt: skip
@@ -354,6 +369,9 @@ def run_select(
     _append_summary(env, "\n" + table + "".join(f"\n> {note}\n" for note in notes))
     ci.echo(f"siftwise: {result['mode']} ({result['selected_count']} of "
             f"{result['total_known']} known tests): {result['reason']}")  # fmt: skip
+    note = cli.budget_note(result)
+    if note:
+        ci.echo(f"siftwise: {note}")
     if would_have:
         ci.echo(f"siftwise: shadow run: would have run {would_have['selected_count']} of "
                 f"{would_have['total_known']} ({would_have['mode']})")  # fmt: skip
@@ -631,11 +649,39 @@ def selection_markdown(
                      f"({100 * saved / total:.0f}% saved)"))  # fmt: skip
     if mode == "full":
         rows.append(("Why the full suite", _prose(result["reason"])))
+    budget = result.get("budget")
+    if budget:
+        rows.append(("Time budget", budget_markdown(budget)))
+        if budget["limited"] and budget["full_suite"]:
+            rows.append(("Why budget-limited full suite", _prose(result["reason"])))
     riskiest = top_risk(result)
     if riskiest:
         first = "run first" if result.get("order", "risk") == "risk" else "default order"
         rows.append((f"Highest risk ({first})", riskiest))
     return _selection_list(rows, head_sha)
+
+
+def budget_markdown(budget: dict[str, Any]) -> str:
+    """What the time budget did: the estimated time against the target (a budget is never a
+    cap). A budget-limited run says so in bold and never reads as complete; the server's note
+    is untrusted text."""
+    from siftwise.cli import main as cli  # main registers this app: import it lazily
+
+    limit = _duration(budget["seconds"] * 1000)
+    estimated = _duration(budget["estimated_ms"])
+    if not budget["applied"]:
+        return f"{limit} target, not applied: {_text(budget['note'])}"
+    if not budget["limited"]:
+        return (f"{limit} target: everything fits (estimated {estimated}). "
+                f"{cli.BUDGET_IS_A_TARGET}")  # fmt: skip
+    what = "known tests of the full suite" if budget["full_suite"] else "selected tests"
+    return (
+        f"**budget-limited (estimated {estimated} of a {limit} target): "
+        f"{int(budget['left_out']):,} {what} left out** "
+        f"(~{_duration(budget['left_out_ms'])} estimated, "
+        f"{float(budget['left_out_risk_share']):.0%} of the risk score). "
+        f"{cli.BUDGET_IS_A_TARGET} This run is not a complete check of the change"
+    )
 
 
 TOP_RISK = 3  # the riskiest selected tests the comment names
@@ -679,6 +725,11 @@ def _would_have_run(selection: dict[str, Any]) -> str:
     total, would_run = estimated.get("total") or 0.0, estimated.get("would_run") or 0.0
     if total > 0:
         ran += f" (~{100 * (total - would_run) / total:.0f}% time saved, estimated)"
+    budget = selection.get("budget") or {}
+    if budget.get("limited"):
+        ran += (f"; **budget-limited (estimated {_duration(budget['estimated_ms'])} of a "
+                f"{_duration(budget['seconds'] * 1000)} target): {int(budget['left_out']):,} "
+                "tests left out**")  # fmt: skip
     return ran
 
 
@@ -1250,6 +1301,9 @@ def shadow_markdown(response: dict[str, Any], *, max_rows: int = COMMENT_ROWS) -
     flaky = response["flaky_excluded"]
     if flaky:
         outcome += f" ({flaky} flaky not counted)"
+    by_budget = response.get("missed_by_budget") or 0
+    if response.get("budget_limited"):
+        outcome += f"; budget-limited: {by_budget} of the misses left out by the time budget"
     lines = [f"**Shadow run:** would have run {ran} and {outcome}."]
     listed = response["missed_tests"][:max_rows]
     if listed:
@@ -1262,6 +1316,7 @@ def shadow_markdown(response: dict[str, Any], *, max_rows: int = COMMENT_ROWS) -
 
 # Why a shadow run's selection missed a test (core/shadow.py CAUSES).
 _CAUSE_LABELS = {
+    "budget": "left out by the time budget",
     "new_test": "new test",
     "flaky_history": "flaky history",
     "config_gap": "config gap",

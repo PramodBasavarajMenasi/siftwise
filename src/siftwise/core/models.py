@@ -263,7 +263,7 @@ SHADOW_STATUSES = (
 )
 SHADOW_UNIQUE_INDEX = "uq_shadow_selections_repo_ci_run_attempt_variant"
 # Why a failure was missed (core/shadow.py CAUSES, most specific first).
-MISS_CAUSES = ("new_test", "flaky_history", "config_gap", "no_link", "unknown")
+MISS_CAUSES = ("budget", "new_test", "flaky_history", "config_gap", "no_link", "unknown")
 
 
 class ShadowSelection(Base):
@@ -308,6 +308,9 @@ class ShadowSelection(Base):
     estimated_ms_would_run: Mapped[float] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(32), server_default=SHADOW_PENDING)
     compared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # A time budget that left selected tests out (NULL: none): the budget and the selection it
+    # cut, as core/shadow.py stores it, so the compare can tell budget misses apart.
+    budget: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
 
 
 class ShadowResult(Base):

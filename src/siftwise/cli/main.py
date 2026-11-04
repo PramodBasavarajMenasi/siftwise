@@ -27,6 +27,7 @@ from siftwise.cli.repoconfig import (
 )
 from siftwise.core.junit import JUnitParseError, Status, parse_junit
 from siftwise.core.risk import OfferedOrder, Order
+from siftwise.core.selector import format_duration
 
 app = typer.Typer(help="Siftwise: test impact analysis for CI.", no_args_is_help=True)
 app.add_typer(gha.app, name="gha")
@@ -117,6 +118,14 @@ def select_command(
         OfferedOrder,
         typer.Option(help="'risk': likely failures first; 'default': by path and test ID."),
     ] = OfferedOrder.RISK,
+    budget: Annotated[
+        str | None,
+        typer.Option(
+            help="Time budget, an estimated target (not a cap), e.g. 90s, 5m, 1h: run only the "
+            "highest-risk selected tests whose estimated time fits. The run may take longer, "
+            "and it is NOT a complete check (stderr says what was left out)."
+        ),
+    ] = None,
 ) -> None:
     """Print the test command for the changes in BASE...HEAD.
 
@@ -124,17 +133,28 @@ def select_command(
     to stderr. Needs SIFTWISE_API_TOKEN. Exit codes: 0 ok (stdout is empty if no tests are
     affected), 1 API error, 2 usage error, 3 full suite needed but no command is known.
     """
+    budget_seconds = None
+    if budget is not None:
+        try:
+            budget_seconds = parse_budget(budget)
+        except ValueError as exc:
+            _err(f"error: {exc}")
+            raise typer.Exit(EXIT_USAGE) from exc
     token = _token()
     try:
         body = selection_request(repo, base, head, go_list=go_list, py_imports=py_imports,
-                                 order=Order(order.value))  # fmt: skip
+                                 order=Order(order.value),
+                                 budget_seconds=budget_seconds)  # fmt: skip
     except RepoConfigError as exc:
         _err(f"error: {exc}")
         raise typer.Exit(EXIT_USAGE) from exc
     try:
         result = post_json(server, token, "/select", body)
     except SiftwiseError as exc:
-        _err(f"error: {exc}")
+        if budget_seconds is not None and budget_rejected(exc):
+            _err(f"error: {BUDGET_UNSUPPORTED} (--budget)")
+        else:
+            _err(f"error: {exc}")
         raise typer.Exit(EXIT_API_ERROR) from exc
 
     if json_output:
@@ -145,6 +165,9 @@ def select_command(
         f"siftwise: {result['mode']} ({result['selected_count']} of {result['total_known']} "
         f"known tests): {result['reason']}"
     )
+    note = budget_note(result)
+    if note:
+        _err(f"siftwise: {note}")
     if result["command"]:
         typer.echo(result["command"])
     elif result["mode"] == "full":
@@ -385,6 +408,11 @@ def recall_lines(result: dict[str, Any]) -> list[str]:
         lines.append(f"Warning: {_plural(linked, 'miss')} linked to the change but not "
                      "selected: the selector may not have known the test at select time. "
                      "This may be a selector bug.")  # fmt: skip
+    budget_runs = every.get("budget_limited_runs") or 0
+    if budget_runs:
+        left_out = every.get("missed_by_budget") or 0
+        lines.append(f"Budget-limited runs: {budget_runs}; misses a time budget left out: "
+                     f"{left_out} (counted in the recall above)")  # fmt: skip
     time = result["time"]
     if time["saved"] is not None:
         lines.append(f"Time saved (measured on the shadow runs): {time['saved']:.1%} of "
@@ -441,6 +469,7 @@ def weekly_lines(result: dict[str, Any]) -> list[str]:
 
 
 CAUSE_LABELS = {
+    "budget": "left out by a time budget",
     "new_test": "new test",
     "flaky_history": "flaky history",
     "config_gap": "config gap",
@@ -609,6 +638,63 @@ def known_flaky(
     return KnownFlaky(globs, sorted(set(head)) != sorted(set(globs)))
 
 
+# A budget: one or more <number><unit> parts, e.g. 90s, 5m, 1.5h, 1h30m.
+_BUDGET_PART = re.compile(r"(\d+(?:\.\d+)?)([smh])")
+_BUDGET_UNITS = {"s": 1, "m": 60, "h": 3600}
+MAX_BUDGET_SECONDS = 7 * 24 * 3600  # the API's limit
+
+
+def parse_budget(text: str) -> float:
+    """A time budget in seconds, from ``90s``, ``5m``, ``1.5h`` or ``1h30m``. Raises
+    ValueError for anything else (a bare number is ambiguous), zero, or more than a week."""
+    value = text.strip().lower().replace(" ", "")
+    parts = _BUDGET_PART.findall(value)
+    if not value or "".join(number + unit for number, unit in parts) != value:
+        raise ValueError(f"invalid budget {text!r}: use a duration such as 90s, 5m or 1h")
+    seconds = sum(float(number) * _BUDGET_UNITS[unit] for number, unit in parts)
+    if not 0 < seconds <= MAX_BUDGET_SECONDS:
+        raise ValueError(f"invalid budget {text!r}: it must be more than 0 and at most 7 days")
+    return seconds
+
+
+# A budget is an estimated target, never a cap: every surface says so.
+BUDGET_IS_A_TARGET = (
+    "The budget is a target, not a cap: estimates are mean durations, so the run may take longer."
+)
+# A server from before time budgets: its request schema forbids unknown fields.
+BUDGET_UNSUPPORTED = (
+    "the siftwise server doesn't support time budgets (it rejected budget_seconds: it's older "
+    "than this client); upgrade the server or run without a budget"
+)
+
+
+def budget_rejected(exc: SiftwiseError) -> bool:
+    """The server rejected ``budget_seconds`` as an unknown field (a 422 naming it)."""
+    return exc.status == httpx.codes.UNPROCESSABLE_ENTITY and "budget_seconds" in str(exc)
+
+
+def budget_note(result: dict[str, Any]) -> str:
+    """What a time budget did, in a line (empty without one). The estimated time against the
+    target, never a promise; never calls a budget-limited run complete."""
+    budget = result.get("budget")
+    if not budget:
+        return ""
+    limit = format_duration(budget["seconds"] * 1000)
+    estimated = format_duration(budget["estimated_ms"])
+    if not budget["applied"]:
+        return f"budget target {limit} not applied: {budget['note']}"
+    if not budget["limited"]:
+        return (f"budget target {limit}: everything fits (estimated {estimated}). "
+                f"{BUDGET_IS_A_TARGET}")  # fmt: skip
+    what = "known tests of the full suite" if budget["full_suite"] else "selected tests"
+    left_ms, share = format_duration(budget["left_out_ms"]), budget["left_out_risk_share"]
+    return (
+        f"budget-limited (estimated {estimated} of a {limit} target): {budget['left_out']:,} "
+        f"{what} left out (~{left_ms} estimated, {share:.0%} of the risk score). "
+        f"{BUDGET_IS_A_TARGET} This run is not a complete check of the change."
+    )
+
+
 def selection_request(
     repo: str,
     base: str | None,
@@ -618,11 +704,13 @@ def selection_request(
     py_imports: bool = True,
     junit_dir: str | None = None,
     order: Order = Order.RISK,
+    budget_seconds: float | None = None,
 ) -> dict[str, Any]:
     """The ``POST /select`` body for BASE...HEAD in the current checkout. ``base`` None (or a
     failing git diff) means the changed files are unknown, so the server picks the full suite.
     ``order`` is sent only when it isn't the server's default (risk), so a request still suits
-    a server from before risk ordering.
+    a server from before risk ordering. ``budget_seconds`` is sent only when set: an older
+    server rejects it (the request fails rather than silently ignoring the budget).
 
     Raises RepoConfigError for an invalid .siftwise.toml.
     """
@@ -636,6 +724,8 @@ def selection_request(
         body["junit_dir"] = junit_dir
     if order is not Order.RISK:
         body["order"] = order.value
+    if budget_seconds is not None:
+        body["budget_seconds"] = budget_seconds
     return body
 
 

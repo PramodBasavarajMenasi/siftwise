@@ -40,7 +40,13 @@ import httpx
 from scripts.eval._github import client, github_token, ts
 from siftwise.cli import gha
 from siftwise.cli.main import SiftwiseError, post_json, recall_lines, weekly_lines
-from siftwise.core.shadow import CAUSES, LINKED_NOT_SELECTED, UNCLASSIFIED, VERDICT_ORDER
+from siftwise.core.shadow import (
+    BUDGET,
+    CAUSES,
+    LINKED_NOT_SELECTED,
+    UNCLASSIFIED,
+    VERDICT_ORDER,
+)
 
 Json = dict[str, Any]
 SCHEMA = 1
@@ -189,6 +195,8 @@ def _tally() -> Json:
         "recall": None,
         "missed_by_verdict": {},
         "missed_by_cause": {},
+        "budget_limited_runs": 0,
+        "missed_by_budget": 0,
     }
 
 
@@ -325,6 +333,7 @@ def _add_run(summary: Json, at: datetime, targets: list[Json], result: Json) -> 
         target["time"]["would_run_ms"] += sum(v["ms_would_run"] for v in compared)
         for tally in (target["all"], target["selective"]) if selective else (target["all"],):
             tally["runs"] += 1
+            tally["budget_limited_runs"] += int(bool(shadow.get("budget_limited")))
             tally["caught"] += shadow["caught"]
             tally["missed"] += shadow["missed"]
             tally["flaky_excluded"] += shadow["flaky_excluded"]
@@ -364,6 +373,7 @@ def _finish(target: Json) -> None:
         tally["missed_by_cause"] = {c: causes.get(c, 0) for c in CAUSES}
         if causes.get(UNCLASSIFIED):
             tally["missed_by_cause"][UNCLASSIFIED] = causes[UNCLASSIFIED]
+        tally["missed_by_budget"] = tally["missed_by_cause"][BUDGET]
     time = target["time"]
     if time["total_ms"]:
         time["saved"] = 1 - time["would_run_ms"] / time["total_ms"]

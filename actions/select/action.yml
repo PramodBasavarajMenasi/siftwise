@@ -55,6 +55,19 @@ inputs:
       changes which tests run; an invalid value is a warning and means risk.
     required: false
     default: risk
+  budget:
+    description: >-
+      Time budget, e.g. '5m', '90s' or '1h' (empty, the default: none). An estimated target,
+      not a hard cap: estimates are each test's mean duration, so a run can take longer (on the
+      eval replays, up to 1.4x at 25-50% budgets, more when the riskiest unit alone is over).
+      Runs only the highest-risk selected tests (whole files, Go packages, Jest files) whose
+      estimated time fits; when siftwise would run the full suite, the full suite's known tests
+      are packed the same way. A budget-limited run is NOT a complete check: the comment shows
+      the estimated time against the target and how many tests were left out. An invalid value
+      is a warning and means no budget; a server too old for budgets means the full suite,
+      with a warning.
+    required: false
+    default: ""
   variant:
     description: >-
       Matrix leg, the same value as actions/record's variant. Only matters in shadow runs:
@@ -97,6 +110,12 @@ outputs:
   shadow-total:
     description: In a shadow run, the number of known tests.
     value: ${{ steps.select.outputs.shadow-total }}
+  budget-limited:
+    description: "'true' if the time budget left selected tests out: not a complete check."
+    value: ${{ steps.select.outputs.budget-limited }}
+  budget-left-out:
+    description: Selected tests the time budget left out (0 without a budget).
+    value: ${{ steps.select.outputs.budget-left-out }}
 runs:
   using: composite
   steps:
@@ -121,4 +140,5 @@ runs:
         SIFTWISE_SHADOW: ${{ inputs.shadow }}
         SIFTWISE_VARIANT: ${{ inputs.variant }}
         SIFTWISE_ORDER: ${{ inputs.order }}
+        SIFTWISE_BUDGET: ${{ inputs.budget }}
       run: '"$(uv tool dir --bin)/siftwise" gha select'

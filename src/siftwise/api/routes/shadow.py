@@ -77,6 +77,7 @@ def post_shadow_compare(
                     total=s.estimated_ms_total, would_run=s.estimated_ms_would_run
                 ),
                 status=s.status,
+                budget_limited=s.budget is not None,
             )
             for s in result.selections
         ],
@@ -86,6 +87,8 @@ def post_shadow_compare(
         missed=tally.missed,
         flaky_excluded=tally.flaky_excluded,
         missed_by_verdict=_by_verdict(tally),
+        budget_limited=result.budget_limited,
+        missed_by_budget=tally.missed_by_budget,
         missed_tests=[
             ShadowMissOut(
                 test_id=u.test_id,
@@ -182,6 +185,8 @@ def _stats(tally: Tally) -> RecallStatsOut:
         recall=tally.recall,
         missed_by_verdict=_by_verdict(tally),
         missed_by_cause=_by_cause(tally),
+        budget_limited_runs=tally.budget_runs,
+        missed_by_budget=tally.missed_by_budget,
     )
 
 

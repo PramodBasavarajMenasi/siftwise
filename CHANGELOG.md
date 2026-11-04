@@ -33,6 +33,30 @@ All notable changes to siftwise. The format follows
   it isn't offered.
 - Dogfood: each failure's risk rank goes into the run's summary, and
   `scripts/dogfood_report.py report` shows where failures ranked.
+- Time budget ([#43](https://github.com/PramodBasavarajMenasi/siftwise/issues/43)): run the
+  highest-risk selected tests whose estimated time fits a target. Off by default; without a budget
+  nothing changes. `siftwise select --budget 5m` (s, m or h), the Action's `budget` input
+  (outputs `budget-limited`, `budget-left-out`), `SIFTWISE_BUDGET` on GitLab, the MCP `budget`
+  argument, `budget_seconds` in `/select`.
+  - The budget is an estimated target, not a hard cap: every surface shows the estimated time
+    against the target, and runs can take longer (estimates are mean durations).
+  - Whole units (pytest arguments, Go packages, Jest files) are taken in risk order while
+    their estimate fits; one that doesn't is skipped. Estimates are each test's mean
+    duration, an unknown one counts as the 90th percentile of the known ones. The riskiest
+    unit always runs.
+  - The response says the run is budget-limited (`budget_limited`, `budget`): tests left out,
+    their estimated time, their share of the risk score. The PR comment and GitLab note show
+    **budget-limited (estimated 4m 50s of a 5m target): N tests left out**; the CLI prints it
+    on stderr.
+  - A full-suite fallback under a budget packs the full suite's known tests by risk, as a
+    "budget-limited full suite". Without history or durations the budget isn't applied.
+  - Shadow mode stores what the budget left out: such misses get the cause `budget`, and
+    `/recall` and `siftwise report` show budget-limited runs and their misses apart.
+  - Migration 0011: `shadow_selections.budget` (nullable) and the `budget` miss cause.
+  - A server older than this release rejects `budget_seconds` (422): the Action, GitLab and
+    MCP then run the full suite with a warning; `siftwise select --budget` exits 1.
+  - Eval: recall and time to first failure under budgets of 10%, 25% and 50% of each run's
+    measured time, on rdflib and substrate (docs/eval-results.md).
 
 ## [0.2.0] - 2026-10-27
 

@@ -8,7 +8,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from siftwise.core.risk import Order
-from siftwise.core.schemas import EstimatedMs, SelectedTestOut, SelectRequest, SelectResponse
+from siftwise.core.schemas import (
+    BudgetOut,
+    EstimatedMs,
+    SelectedTestOut,
+    SelectRequest,
+    SelectResponse,
+)
 from siftwise.core.selector import (
     DependsRule,
     Selection,
@@ -48,6 +54,7 @@ def post_select(
         deleted_files=body.deleted_files,
         junit_dir=body.junit_dir,
         order=Order(body.order),
+        budget_ms=None if body.budget_seconds is None else body.budget_seconds * 1000,
     )
     shadow_reason = _store_shadow(session, body, selection) if body.shadow else None
     return SelectResponse(
@@ -77,8 +84,28 @@ def post_select(
             for t in selection.tests
         ],
         order=selection.order.value,
+        budget_limited=bool(selection.budget and selection.budget.limited),
+        budget=_budget(selection),
         shadow_stored=None if body.shadow is None else shadow_reason is None,
         shadow_reason=shadow_reason,
+    )
+
+
+def _budget(selection: Selection) -> BudgetOut | None:
+    budget = selection.budget
+    if budget is None:
+        return None
+    return BudgetOut(
+        seconds=budget.budget_ms / 1000,
+        applied=budget.applied,
+        limited=budget.limited,
+        full_suite=budget.full_suite,
+        note=budget.note,
+        estimated_ms=budget.estimated_ms,
+        left_out=budget.left_out,
+        left_out_ms=budget.left_out_ms,
+        left_out_risk_share=budget.left_out_risk_share,
+        unknown_test_ms=budget.unknown_ms,
     )
 
 
