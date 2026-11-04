@@ -365,3 +365,29 @@ def test_an_unknown_field_is_a_422_naming_it(client: TestClient) -> None:
     assert response.status_code == 422
     [error] = response.json()["detail"]
     assert (error["type"], error["loc"]) == ("extra_forbidden", ["body", "budget_seconds_v9"])
+
+
+# --- JS/TS import graph -----------------------------------------------------------------------
+
+
+def test_js_graph_details_reach_the_reasons(client: TestClient, db_session: Session) -> None:
+    result = ParsedTestResult(test_id="src/sum.test.ts::adds", classname="src/sum.test.ts",
+                              name="adds", file_path="src/sum.test.ts", status=Status.PASSED,
+                              duration_ms=3, attempt=1)  # fmt: skip
+    create_run(db_session, RunMetadata(repo="acme/web", commit_sha="a" * 40, branch="main",
+                                       is_main=True), [result])  # fmt: skip
+    body = {"repo": "acme/web", "changed_files": ["src/money.ts"],
+            "affected_files": {"src/sum.test.ts": ["src/money.ts"]}}  # fmt: skip
+    old_client = client.post("/select", json=body, headers=AUTH).json()
+    assert old_client["mode"] == "selective"
+    assert old_client["tests"][0]["reasons"] == ["imports changed module src/money.ts"]
+    js_graph = {"nearest": {"src/sum.test.ts": {"module": "src/money.ts", "via": "src/sum.ts",
+                                                "depth": 2}},
+                "dynamic": {}, "notes": ["jest.config.ts can't be read without Node"]}  # fmt: skip
+    new = client.post("/select", json={**body, "js_graph": js_graph}, headers=AUTH).json()
+    assert new["tests"][0]["reasons"] == [
+        "imports changed module src/money.ts (via src/sum.ts); jest.config.ts can't be read "
+        "without Node"
+    ]
+    bad = {**js_graph, "nearest": {"src/sum.test.ts": {"module": "m", "depth": 0}}}
+    assert client.post("/select", json={**body, "js_graph": bad}, headers=AUTH).status_code == 422

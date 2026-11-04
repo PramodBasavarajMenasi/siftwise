@@ -2,6 +2,7 @@
 
 import json
 import os
+import posixpath
 import re
 import subprocess
 from collections.abc import Sequence
@@ -16,6 +17,7 @@ import typer
 from siftwise import __version__, extras
 from siftwise.cli import gha, gitlab, server
 from siftwise.cli.gograph import build_graph, run_go_list
+from siftwise.cli.jsgraph import Affected, build_js_graph
 from siftwise.cli.pygraph import build_py_graph
 from siftwise.cli.repoconfig import (
     FILE_NAME,
@@ -27,7 +29,7 @@ from siftwise.cli.repoconfig import (
 )
 from siftwise.core.junit import JUnitParseError, Status, parse_junit
 from siftwise.core.risk import OfferedOrder, Order
-from siftwise.core.selector import format_duration
+from siftwise.core.selector import JS_EXTENSIONS, format_duration, is_ignorable
 
 app = typer.Typer(help="Siftwise: test impact analysis for CI.", no_args_is_help=True)
 app.add_typer(gha.app, name="gha")
@@ -114,6 +116,13 @@ def select_command(
             "that import changed modules."
         ),
     ] = True,
+    js_imports: Annotated[
+        bool,
+        typer.Option(
+            help="When JS/TS (or files JS can import) changed, build a static import graph to "
+            "select Jest test files that import changed code."
+        ),
+    ] = True,
     order: Annotated[
         OfferedOrder,
         typer.Option(help="'risk': likely failures first; 'default': by path and test ID."),
@@ -143,13 +152,13 @@ def select_command(
     token = _token()
     try:
         body = selection_request(repo, base, head, go_list=go_list, py_imports=py_imports,
-                                 order=Order(order.value),
+                                 js_imports=js_imports, order=Order(order.value),
                                  budget_seconds=budget_seconds)  # fmt: skip
     except RepoConfigError as exc:
         _err(f"error: {exc}")
         raise typer.Exit(EXIT_USAGE) from exc
     try:
-        result = post_json(server, token, "/select", body)
+        result = post_select(server, token, body)
     except SiftwiseError as exc:
         if budget_seconds is not None and budget_rejected(exc):
             _err(f"error: {BUDGET_UNSUPPORTED} (--budget)")
@@ -534,6 +543,9 @@ class LocalChange:
     config: RepoConfig
     # Every import graph that applies was built: none failed or was turned off.
     graph_complete: bool
+    # /select's `js_graph` (the JS/TS graph's reasons and blind spots), or None. Only /select
+    # takes it: /triage and recorded runs need the edges alone (in affected_files).
+    js_graph: dict[str, Any] | None = None
 
     def graph(self) -> dict[str, Any] | None:
         """``runs.affected`` (schemas.ChangeGraph) to record, or None if the change's links are
@@ -557,6 +569,7 @@ def local_change(
     py_imports: bool = True,
     working_tree: bool = False,
     cwd: Path | None = None,
+    js_imports: bool = True,
 ) -> LocalChange:
     """The change BASE...HEAD with its import graphs and .siftwise.toml. ``base`` None (or a
     failing git diff) means the changed files are unknown. ``working_tree``: the change from
@@ -598,7 +611,48 @@ def local_change(
         complete = complete and files is not None
         if py_imports:
             fields["affected_files"] = files or {}
-    return LocalChange(fields, config, complete)
+    js_graph = None
+    if changed and wants_js_graph(root, changed, config.generated):
+        js = js_dependents(root, changed, diff[1] if diff else []) if js_imports else None
+        complete = complete and js is not None
+        if js is not None:
+            fields["affected_files"] = {**fields.get("affected_files", {}), **js.files}
+            if not any(_js_loadable(p, config.generated) for p in changed):
+                js = Affected(js.files, js.nearest, {}, js.notes)  # nothing dynamic to reach
+            js_graph = js.js_graph()
+    return LocalChange(fields, config, complete, js_graph)
+
+
+def _js_loadable(path: str, generated: Sequence[str]) -> bool:
+    """A changed file a JS import could load: anything but Python, Go and ignorable files."""
+    return not path.endswith((".py", ".go")) and not is_ignorable(path, generated)
+
+
+def wants_js_graph(root: Path, changed: Sequence[str], generated: Sequence[str] = ()) -> bool:
+    """Whether the change could reach JS imports: a JS/TS file changed, or a file JS might
+    import (JSON, styles, a package.json) in a repo with a JS/TS project at its root."""
+    if any(posixpath.splitext(p)[1] in JS_EXTENSIONS for p in changed):
+        return True
+    has_project = any((root / name).is_file() for name in JS_PROJECT_FILES)
+    return has_project and any(_js_loadable(p, generated) for p in changed)
+
+
+JS_PROJECT_FILES = ("package.json", "tsconfig.json", "jsconfig.json")
+
+
+def js_dependents(root: Path, changed: list[str], deleted: Sequence[str]) -> Affected | None:
+    """Jest test files that import a changed file; None (fallbacks apply) if the graph fails."""
+    try:
+        graph = build_js_graph(root, deleted)
+    except (OSError, ValueError, RecursionError) as exc:
+        _err(f"warning: could not build the JS/TS import graph ({exc}); not selecting importers")
+        return None
+    affected = graph.affected(changed)
+    if affected.files:
+        _err(f"siftwise: js imports: {len(affected.files)} test file(s) import changed files")
+    for note in affected.notes:
+        _err(f"siftwise: js imports: {note}")
+    return affected
 
 
 def local_config(root: Path | None = None) -> RepoConfig:
@@ -705,6 +759,7 @@ def selection_request(
     junit_dir: str | None = None,
     order: Order = Order.RISK,
     budget_seconds: float | None = None,
+    js_imports: bool = True,
 ) -> dict[str, Any]:
     """The ``POST /select`` body for BASE...HEAD in the current checkout. ``base`` None (or a
     failing git diff) means the changed files are unknown, so the server picks the full suite.
@@ -714,12 +769,15 @@ def selection_request(
 
     Raises RepoConfigError for an invalid .siftwise.toml.
     """
-    change = local_change(base, head, go_list=go_list, py_imports=py_imports)
+    change = local_change(base, head, go_list=go_list, py_imports=py_imports,
+                          js_imports=js_imports)  # fmt: skip
     body: dict[str, Any] = {
         "repo": repo,
         **change.fields,
         "always_run": list(change.config.always_run),
     }
+    if change.js_graph:
+        body["js_graph"] = change.js_graph
     if junit_dir:
         body["junit_dir"] = junit_dir
     if order is not Order.RISK:
@@ -770,6 +828,22 @@ def junit_failures(paths: Sequence[Path]) -> list[dict[str, Any]]:
         for r in final.values()
         if r.status in (Status.FAILED, Status.ERROR)
     ]
+
+
+def post_select(
+    server: str, token: str, body: dict[str, Any], timeout: float = 60
+) -> dict[str, Any]:
+    """``POST /select``. A server older than the JS/TS import graph rejects ``js_graph``:
+    then once more without it (its edges are in affected_files, which every server takes)."""
+    try:
+        return post_json(server, token, "/select", body, timeout=timeout)
+    except SiftwiseError as exc:
+        if not ("js_graph" in body and exc.status == 422 and "js_graph" in str(exc)):
+            raise
+    _err("siftwise: the server doesn't take js_graph (it's older than this client): selecting "
+         "without the JS import reasons")  # fmt: skip
+    rest = {key: value for key, value in body.items() if key != "js_graph"}
+    return post_json(server, token, "/select", rest, timeout=timeout)
 
 
 def post_json(

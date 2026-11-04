@@ -962,8 +962,21 @@ on = ["**/*.go", "!**/*_test.go"]         # ! excludes
 |---|---|---|
 | **Python** (pytest) | `foo.py` → `test_foo.py`; test files importing a changed module (static graph incl. parent packages, conftests, plugin strings); changed test files | `pytest` node IDs, whole test files, `pytest --doctest-modules` for doctests |
 | **Go** | changed package and every package whose tests import it (`go list -deps -test`) | `go test ./pkg` (whole) or `-run '^(TestA\|TestB)$'` |
-| **JS/TS** (Jest) | `foo.ts` → `foo.test.*`, `foo.spec.*`, `__tests__/foo.*` (needs file paths in the JUnit) | `jest <files>` |
+| **JS/TS** (Jest) | `foo.ts` → `foo.test.*`, `foo.spec.*`, `__tests__/foo.*`; test files importing a changed file (static graph, no Node needed: relative paths, tsconfig/jsconfig `paths`, workspace packages, a JSON Jest `moduleNameMapper`) (needs file paths in the JUnit: jest-junit's `addFileAttribute`) | `jest <files>` |
 | **Java** (Maven/Gradle) | recorded with full history; selection falls back to the full suite | — |
+
+The JS/TS graph is safe where it can't see: a test that reaches a `require()` or `import()`
+of a computed path runs for every JS change (but never counts as covering one), a changed
+file no static import reaches still falls back to the full suite, and tsconfig, jsconfig,
+Jest, Babel and SWC configs, root manifests and lockfiles force it as before. A
+`jest.config.js`/`.ts` can't be read without Node: the selection's reasons say so, and
+resolution uses tsconfig and relative paths. `--no-js-imports` turns the graph off.
+
+A Jest test file new in the change (`*.test.*`, `*.spec.*` or under `__tests__/`) runs first,
+by its path, once siftwise can tell the path Jest expects from a known Jest test in the same
+directory, a parent or a matching project-relative directory. Otherwise, and for a new file
+outside those patterns, the full suite runs as before. Shadow mode can't credit the tests in
+a new Jest file (it doesn't know their IDs yet): a failure there counts as a `new_test` miss.
 
 ## Results on real repos
 

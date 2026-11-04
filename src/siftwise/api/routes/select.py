@@ -17,6 +17,8 @@ from siftwise.core.schemas import (
 )
 from siftwise.core.selector import (
     DependsRule,
+    JsImport,
+    JsImports,
     Selection,
     SelectorConfig,
     load_history,
@@ -55,6 +57,16 @@ def post_select(
         junit_dir=body.junit_dir,
         order=Order(body.order),
         budget_ms=None if body.budget_seconds is None else body.budget_seconds * 1000,
+        js_imports=None
+        if body.js_graph is None
+        else JsImports(
+            nearest={
+                test: JsImport(n.module, n.via, n.depth)
+                for test, n in body.js_graph.nearest.items()
+            },
+            dynamic=dict(body.js_graph.dynamic),
+            notes=tuple(body.js_graph.notes),
+        ),
     )
     shadow_reason = _store_shadow(session, body, selection) if body.shadow else None
     return SelectResponse(

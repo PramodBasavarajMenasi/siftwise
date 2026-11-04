@@ -33,6 +33,27 @@ All notable changes to siftwise. The format follows
   it isn't offered.
 - Dogfood: each failure's risk rank goes into the run's summary, and
   `scripts/dogfood_report.py report` shows where failures ranked.
+- JS/TS import graph ([#44](https://github.com/PramodBasavarajMenasi/siftwise/issues/44)):
+  `siftwise select` (and the Action, GitLab and MCP, which use it) selects Jest test files
+  that import a changed file, at any depth, with no Node.js: a tokenizer that skips comments,
+  strings, templates, regexes and JSX; resolution through relative paths (extensions, index
+  files, TS ESM `.js` → `.ts`), tsconfig/jsconfig `paths` and `baseUrl` with `extends`,
+  npm/yarn/pnpm/lerna workspace packages, and a JSON Jest `moduleNameMapper`. Reasons name
+  the file the test imports on the way. A changed JSON or other asset a test imports selects
+  it too.
+  - Safe where it can't see: a test that reaches a `require()`/`import()` of a computed path
+    runs for every JS change but never covers one, a change no static import reaches still
+    falls back, and a `jest.config.js`/`.ts` (unreadable without Node) is named in the
+    reasons. `jsconfig*.json`, `.swcrc`, `swc.config.*`, `.babelrc.*`, `lerna.json` and
+    `.yarnrc.yml` now force the full suite like tsconfig and Babel configs.
+  - A Jest test file new in the change runs first, by its path, instead of forcing the full
+    suite, when the path Jest expects can be told from known Jest tests (the same, a parent
+    or a matching project-relative directory); else, and for a new file outside the Jest
+    test patterns, the full suite runs as before.
+  - `--no-js-imports` turns it off. `/select` takes an optional `js_graph`; a client gets
+    an older server's 422 on it and sends the request again without it.
+  - Measured on jestjs/jest (2,272 JS/TS files): 1.9 s to build, about 6 MB. No open-source
+    Jest repo with replayable JUnit was found (see docs/eval-results.md).
 - Time budget ([#43](https://github.com/PramodBasavarajMenasi/siftwise/issues/43)): run the
   highest-risk selected tests whose estimated time fits a target. Off by default; without a budget
   nothing changes. `siftwise select --budget 5m` (s, m or h), the Action's `budget` input
@@ -57,6 +78,11 @@ All notable changes to siftwise. The format follows
     MCP then run the full suite with a warning; `siftwise select --budget` exits 1.
   - Eval: recall and time to first failure under budgets of 10%, 25% and 50% of each run's
     measured time, on rdflib and substrate (docs/eval-results.md).
+
+### Fixed
+
+- A deleted Jest test file was still selected by path, so `jest <deleted file>` failed
+  with "No tests found". Its tests are dropped now, as deleted Python test files are.
 
 ## [0.2.0] - 2026-10-27
 

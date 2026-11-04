@@ -323,6 +323,8 @@ def _select(
     except RepoConfigError as exc:
         return _run_full(f"invalid .siftwise.toml ({exc})")
     body = {"repo": repo, **change.fields, "always_run": list(change.config.always_run)}
+    if change.js_graph:
+        body["js_graph"] = change.js_graph
     if order != "risk":
         body["order"] = order  # risk is the server's default: an older server accepts the body
     if budget_seconds is not None:
@@ -741,6 +743,8 @@ def _post(config: Config, path: str, body: dict[str, Any]) -> dict[str, Any]:
     if not config.token:
         raise Unavailable("SIFTWISE_API_TOKEN is not set")
     try:
+        if path == "/select":
+            return cli.post_select(config.server, config.token, body, timeout=TIMEOUT)
         return cli.post_json(config.server, config.token, path, body, timeout=TIMEOUT)
     except cli.SiftwiseError as exc:
         if exc.status == httpx.codes.NOT_FOUND:

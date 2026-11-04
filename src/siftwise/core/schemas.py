@@ -55,7 +55,8 @@ class ChangeGraph(BaseModel):
     affected_files: dict[str, list[str]] = Field(
         default_factory=dict,
         max_length=50_000,
-        description="Python test file -> changed modules it imports, from a static import graph",
+        description="Python test file, or Jest test file (repo-relative), -> the changed "
+        "modules it imports, from the CLI's static import graphs",
     )
     depends: list[DependsRuleIn] = Field(default_factory=list, max_length=100)
     go_module: NonEmpty255 | None = None
@@ -214,6 +215,33 @@ class ShadowIn(BaseModel):
     commit_sha: Sha40 = Field(description="The commit being tested (the run must match it)")
 
 
+class JsImportIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    module: Path4K = Field(description="The nearest changed file the test imports")
+    via: Path4K | None = Field(
+        default=None, description="The file the test imports on the way; null: directly"
+    )
+    depth: int = Field(ge=1, le=10_000, description="Import depth: 1 = a direct import")
+
+
+class JsGraphIn(BaseModel):
+    """What the CLI's JS/TS import graph adds to ``affected_files``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    nearest: dict[str, JsImportIn] = Field(default_factory=dict, max_length=50_000)
+    dynamic: dict[str, Path4K] = Field(
+        default_factory=dict,
+        max_length=50_000,
+        description="Jest test file -> a file it reaches whose require/import() of a "
+        "non-literal siftwise can't resolve: run for any JS change, never counted as covering",
+    )
+    notes: list[Annotated[str, StringConstraints(max_length=500)]] = Field(
+        default_factory=list, max_length=20, description="What the graph couldn't read"
+    )
+
+
 class SelectRequest(ChangeRequest):
     """Body of ``POST /select``."""
 
@@ -231,6 +259,11 @@ class SelectRequest(ChangeRequest):
         default="risk",
         description="'risk': the commands list the highest-risk tests, files and packages "
         "first; 'default': by path, package and test ID. Never changes which tests run",
+    )
+    js_graph: JsGraphIn | None = Field(
+        default=None,
+        description="Details of the JS/TS import graph (reasons, unresolvable dynamic imports); "
+        "its edges are in affected_files",
     )
     budget_seconds: float | None = Field(
         default=None,
