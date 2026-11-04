@@ -167,6 +167,56 @@ so every import is "indirect". Recency counts failures on any branch: the reques
 which branch it is on, and other PRs' failures count as well. Measured on rdflib and substrate
 PR runs in [eval results](docs/eval-results.md#risk-order-time-to-first-failure).
 
+## Time budget
+
+A time budget (`siftwise select --budget 5m`, the Action's `budget` input, `SIFTWISE_BUDGET` on
+GitLab, the MCP `budget` argument, `budget_seconds` in `/select`) runs only the highest-risk
+part of the selection that fits. It is off by default; without it nothing changes. It is the
+one thing that makes siftwise run *less* than its selection, so every result says so
+(`budget_limited`, `budget`). It is an estimated **target, not a cap**: estimates are mean
+durations, the first unit runs even when it alone is over, and every surface shows the
+estimated time against the target ("budget-limited (estimated 4m 50s of a 5m target): N tests
+left out").
+
+- **Packing.** The selection's runnable units (a pytest argument, a module under
+  `--doctest-modules`, a Go package, a Jest file) are walked in risk order (a unit by its best
+  rank; a changed file with no known test first). Each is kept if its estimate still fits in
+  what's left of the budget; one that doesn't is skipped and the walk goes on, so a single big
+  unit high in the order doesn't leave the rest of the budget unused (a smaller, lower-ranked
+  unit may then run while a bigger, higher-ranked one is left out). The first unit always
+  runs, even alone over the budget, so a budget never runs nothing when tests were selected.
+- **Estimates.** A unit costs the mean durations (`test_stats.avg_duration_ms`) of the known
+  tests it runs: a whole file or package counts every known test in it, Go subtests count
+  inside their parent. A test skipped in every run of the stats window counts as 0 (it will
+  most likely skip again). Any other test with no known duration counts as the 90th
+  percentile of the repo's known per-test means, a unit with no known test (a new test file)
+  as one such test. That errs towards running less than fits, not more. Without any durations the budget
+  isn't applied (`budget.applied: false`, with a note).
+- **Full-suite fallbacks.** When siftwise would run the full suite (an unknown diff, a build
+  file, an unmapped file), a budget packs the full suite's known tests the same way, every
+  test ranked as history-only, and the result is a *budget-limited full suite*: mode
+  `selective`, the full-suite reason kept in the reason. If the full suite fits, it runs as it
+  is (its own commands also run tests not known yet). Known tests no runner can name (e.g.
+  doctests siftwise can't map to a file) can't be packed: they're counted as left out. With no
+  history or no durations to rank and estimate by, the budget isn't applied and the full suite
+  runs.
+- **Honesty.** The response gives the tests left out, their estimated time and their share of
+  the selection's total risk score. The PR comment and GitLab note show a bold
+  "budget-limited (estimated X of a Y target): N tests left out" line, the CLI prints it on
+  stderr, and MCP returns it (`budget`) and adds it to the next step. A budget-limited run is never called a complete check.
+- **Shadow mode.** A budget-limited shadow selection is stored as what would have run, plus
+  the selection the budget cut (`shadow_selections.budget`). A miss that selection would have
+  run gets the cause `budget`, ahead of every other cause, and recall counts it like any miss.
+  `/recall` and `siftwise report` show the budget-limited runs and their misses separately.
+- **Older servers.** `/select` forbids unknown fields, so a server from before budgets
+  answers `budget_seconds` with a 422 naming it (`cli.budget_rejected`). The Action and GitLab
+  glue and MCP fail open: the full suite, with a warning that the server doesn't support
+  budgets. `siftwise select --budget` exits 1 with that error. Clients send the field only when
+  a budget is set.
+
+Measured on the rdflib and substrate replays (budgets of 10%, 25% and 50% of each run's
+measured time) in [eval results](docs/eval-results.md#time-budget-recall-within-a-budget).
+
 ## Triage verdicts
 
 The first rule that applies decides:
@@ -199,8 +249,9 @@ The first rule that applies decides:
   failing leg, and missed if any non-flaky failing leg's selection wouldn't have run it.
 - Whether a selection "would have run" a test is decided by the same code (`WouldRun`) that
   the evals use, from the stored selection, never by re-selecting.
-- Each miss gets a cause, the first that the evidence supports: `new_test`, `flaky_history`,
-  `unknown`, `config_gap`, `no_link`. Only `config_gap` gets a suggested `[[depends]]` rule,
+- Each miss gets a cause, the first that the evidence supports: `budget` (a time budget left
+  out a test the selection had), `new_test`, `flaky_history`, `unknown`, `config_gap`,
+  `no_link`. Only `config_gap` gets a suggested `[[depends]]` rule,
   shown and never applied.
 - A run counts as selective only if every compared leg's selection was; full-suite fallbacks
   catch everything, so the report always shows the selective-only recall next to the overall

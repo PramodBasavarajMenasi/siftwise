@@ -232,11 +232,42 @@ class SelectRequest(ChangeRequest):
         description="'risk': the commands list the highest-risk tests, files and packages "
         "first; 'default': by path, package and test ID. Never changes which tests run",
     )
+    budget_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        le=7 * 24 * 3600,
+        description="Time budget: run only the highest-risk selected tests (whole files, "
+        "packages) whose estimated time fits. The run is then budget-limited and NOT a "
+        "complete check; the response says what was left out. A full-suite fallback packs "
+        "the full suite's known tests the same way. Null: no budget",
+    )
 
 
 class EstimatedMs(BaseModel):
     total: float = Field(description="Average durations of all known tests (Go: top-level)")
     would_run: float = Field(description="Of those, the tests the commands would run")
+
+
+class BudgetOut(BaseModel):
+    seconds: float = Field(description="The budget asked for")
+    applied: bool = Field(
+        description="False: it couldn't be applied (see note) and the selection runs as it is"
+    )
+    limited: bool = Field(description="Selected tests were left out to fit the budget")
+    full_suite: bool = Field(
+        description="siftwise would have run the full suite; the run packs its known tests"
+    )
+    note: str = Field(description="Why the budget wasn't applied; empty when it was")
+    estimated_ms: float = Field(description="Estimated time of what runs")
+    left_out: int = Field(description="Selected tests left out (full suite: known tests)")
+    left_out_ms: float = Field(description="Their estimated time")
+    left_out_risk_share: float = Field(
+        description="Their share of the selection's total risk score (0-1)"
+    )
+    unknown_test_ms: float | None = Field(
+        description="What a test with no known duration counted as (the 90th percentile of "
+        "the known ones)"
+    )
 
 
 class SelectedTestOut(BaseModel):
@@ -275,6 +306,13 @@ class SelectResponse(BaseModel):
         description="Selected tests, by test ID (each with its risk rank); empty in full mode"
     )
     order: str = Field(default="default", description="How the commands are ordered")
+    budget_limited: bool = Field(
+        default=False,
+        description="A time budget left selected tests out: this run is not a complete check",
+    )
+    budget: BudgetOut | None = Field(
+        default=None, description="What the time budget did; null without budget_seconds"
+    )
     shadow_stored: bool | None = Field(
         default=None,
         description="Shadow runs only: the selection was stored (false: this run won't be "
@@ -633,6 +671,9 @@ class ShadowSelectionOut(BaseModel):
     status: str = Field(
         description="'compared', 'no_upload', 'commit_mismatch', 'compare_error' or 'pending'"
     )
+    budget_limited: bool = Field(
+        default=False, description="A time budget left selected tests out of this selection"
+    )
 
 
 class ShadowVariantOut(BaseModel):
@@ -661,8 +702,8 @@ class ShadowMissOut(BaseModel):
     variants: list[str | None] = Field(description="The variants whose selection missed it")
     cause: str | None = Field(
         default=None,
-        description="Why it was missed: 'new_test', 'flaky_history', 'config_gap', 'no_link' "
-        "or 'unknown'",
+        description="Why it was missed: 'budget' (a time budget left it out), 'new_test', "
+        "'flaky_history', 'config_gap', 'no_link' or 'unknown'",
     )
     cause_detail: str | None = Field(default=None, description="The evidence, in a line")
 
@@ -683,6 +724,12 @@ class ShadowCompareResponse(BaseModel):
     missed: int
     flaky_excluded: int
     missed_by_verdict: dict[str, int]
+    budget_limited: bool = Field(
+        default=False, description="A compared selection was cut by a time budget"
+    )
+    missed_by_budget: int = Field(
+        default=0, description="Of the misses, those the time budget left out (cause 'budget')"
+    )
     missed_tests: list[ShadowMissOut] = Field(description="At most 100")
     time: ShadowTimeOut
 
@@ -696,8 +743,15 @@ class RecallStatsOut(BaseModel):
     recall: float | None = Field(description="caught / (caught + missed); null with neither")
     missed_by_verdict: dict[str, int]
     missed_by_cause: dict[str, int] = Field(
-        description="new_test, flaky_history, config_gap, no_link, unknown; plus "
+        description="budget, new_test, flaky_history, config_gap, no_link, unknown; plus "
         "'unclassified' for misses compared before causes existed"
+    )
+    budget_limited_runs: int = Field(
+        default=0, description="Runs whose selection a time budget cut (counted in runs)"
+    )
+    missed_by_budget: int = Field(
+        default=0,
+        description="Misses a time budget left out (counted in missed: never hidden)",
     )
 
 

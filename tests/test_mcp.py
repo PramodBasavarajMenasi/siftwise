@@ -874,3 +874,51 @@ def test_select_from_an_older_server_lists_tests_without_ranks(api: respx.MockRo
         "test_id": "tests.test_cart::test_0",
         "reason": "tests/test_cart.py tests changed src/cart.py",
     }
+
+
+# --- time budget ----------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("checkout")
+def test_select_with_a_budget_says_it_is_not_a_complete_check(api: respx.MockRouter) -> None:
+    budget = {"seconds": 120.0, "applied": True, "limited": True, "full_suite": False,
+              "note": "", "estimated_ms": 110_000.0, "left_out": 7, "left_out_ms": 30_000.0,
+              "left_out_risk_share": 0.25, "unknown_test_ms": 500.0}  # fmt: skip
+    route = api.post(f"{SERVER}/select").respond(json=selection(budget_limited=True, budget=budget))
+
+    out = call("select_tests", {"budget": "2m"})
+
+    assert sent(route)["budget_seconds"] == 120.0
+    assert out["budget_limited"] is True
+    assert out["budget"].startswith(
+        "budget-limited (estimated 1m 50s of a 2m target): 7 selected tests left out"
+    )
+    assert "The budget is a target, not a cap" in out["budget"]
+    assert "7 tests were left out" in out["next_step"]
+
+    call("select_tests", {})
+    assert "budget_seconds" not in sent(route)
+
+
+@pytest.mark.usefixtures("checkout")
+def test_an_invalid_budget_runs_without_one(api: respx.MockRouter) -> None:
+    route = api.post(f"{SERVER}/select").respond(json=selection())
+
+    out = call("select_tests", {"budget": "soon"})
+
+    assert "budget_seconds" not in sent(route)
+    assert out["budget"] == ("invalid budget 'soon': use a duration such as 90s, 5m or 1h; no "
+                             "budget applied")  # fmt: skip
+
+
+@pytest.mark.usefixtures("checkout")
+def test_a_budget_against_an_older_server_says_run_the_full_suite(api: respx.MockRouter) -> None:
+    from tests.test_gha import OLD_SERVER_BUDGET_422
+
+    api.post(f"{SERVER}/select").respond(422, json=OLD_SERVER_BUDGET_422)
+
+    out = call("select_tests", {"budget": "5m"})
+
+    assert (out["mode"], out["command"]) == ("full", "")
+    assert out["reason"].startswith("the siftwise server doesn't support time budgets")
+    assert out["next_step"].endswith("run the full suite")

@@ -226,11 +226,21 @@ def build_server(env: Mapping[str, str] | None = None) -> MCPServer:
                 "likely to fail first; 'default': by path and test ID. Same tests either way."
             ),
         ] = "risk",
+        budget: Annotated[
+            str | None,
+            Field(
+                description="Time budget, an estimated target (not a cap), e.g. '5m', '90s' or "
+                "'1h' (default: none): run only the highest-risk tests whose estimated time "
+                "fits; the run may take longer. The result then says budget_limited and how "
+                "many tests were left out: not a complete check.",
+                json_schema_extra=STRING,
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         c = config()
         where = await _where(c, repo_path, ctx)
         return await _run(
-            c, lambda c: _select(c, where, base, include_uncommitted, max_tests, order)
+            c, lambda c: _select(c, where, base, include_uncommitted, max_tests, order, budget)
         )
 
     @server.tool(description=TRIAGE_DESCRIPTION)
@@ -294,7 +304,14 @@ def _select(
     uncommitted: bool,
     max_tests: int,
     order: str = "risk",
+    budget: str | None = None,
 ) -> dict[str, Any]:
+    budget_seconds, budget_problem = None, ""
+    if budget and budget.strip():
+        try:
+            budget_seconds = cli.parse_budget(budget)
+        except ValueError as exc:
+            budget_problem = f"{exc}; no budget applied"  # more tests, never fewer
     try:
         checkout = _checkout(config, where)
         root = checkout.root
@@ -308,6 +325,8 @@ def _select(
     body = {"repo": repo, **change.fields, "always_run": list(change.config.always_run)}
     if order != "risk":
         body["order"] = order  # risk is the server's default: an older server accepts the body
+    if budget_seconds is not None:
+        body["budget_seconds"] = budget_seconds
     try:
         result = _post(config, "/select", body)
     except Unavailable as exc:
@@ -329,6 +348,17 @@ def _select(
     }
     if total > 0:
         out["estimated_test_time_skipped"] = f"{100 * (total - would_run) / total:.0f}%"
+    if budget_problem:
+        out["budget"] = budget_problem
+    elif result.get("budget"):
+        out["budget_limited"] = bool(result.get("budget_limited"))
+        out["budget"] = cli.budget_note(result)
+        if out["budget_limited"]:
+            out["next_step"] += (
+                f" Budget-limited: {result['budget']['left_out']} tests were left out, so "
+                "passing tests don't show the change is safe; run the full selection before "
+                "you finish. The budget is an estimated target: the run may take longer."
+            )
     # Riskiest first (servers before risk ordering send no rank: by test ID, as before).
     tests = sorted(tests, key=lambda t: (t.get("rank") is None, t.get("rank") or 0))
     out["tests"] = [
@@ -715,6 +745,8 @@ def _post(config: Config, path: str, body: dict[str, Any]) -> dict[str, Any]:
     except cli.SiftwiseError as exc:
         if exc.status == httpx.codes.NOT_FOUND:
             raise Unavailable("no test history for this repo yet") from exc
+        if "budget_seconds" in body and cli.budget_rejected(exc):
+            raise Unavailable(cli.BUDGET_UNSUPPORTED) from exc
         raise Unavailable(str(exc)) from exc
 
 

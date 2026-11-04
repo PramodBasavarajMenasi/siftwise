@@ -300,3 +300,68 @@ def test_an_unknown_order_is_rejected(client: TestClient) -> None:
     assert (
         post_select(client, changed_files=["src/shop/cart.py"], order="fastest").status_code == 422
     )
+
+
+# --- time budget ----------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("seeded")
+def test_without_a_budget_the_response_says_none(client: TestClient) -> None:
+    body = post_select(client, changed_files=["src/shop/cart.py"]).json()
+    assert (body["budget_limited"], body["budget"]) == (False, None)
+
+
+@pytest.mark.usefixtures("seeded")
+def test_a_budget_limited_selection_says_what_it_left_out(client: TestClient) -> None:
+    changed = ["src/shop/cart.py", "cart/total.go"]
+    whole = post_select(client, changed_files=changed).json()
+    # Every test takes 1 ms: a 1 ms budget runs the riskiest unit only, the Go package (its
+    # test and subtest; the subtest's time is inside its parent's).
+    body = post_select(client, changed_files=changed, budget_seconds=0.001).json()
+    assert body["mode"] == "selective" and body["budget_limited"] is True
+    assert body["reason"].startswith(
+        "budget-limited (estimated 0s of a 0s target): 2 of 4 selected tests run; 2 left out"
+    )
+    assert body["commands"] == ["go test github.com/acme/shop/cart"]
+    assert body["selected_count"] == 2
+    budget = body["budget"]
+    assert {k: budget[k] for k in ("seconds", "applied", "limited", "full_suite", "note",
+                                   "estimated_ms", "left_out_ms", "unknown_test_ms")} == {
+        "seconds": 0.001, "applied": True, "limited": True, "full_suite": False, "note": "",
+        "estimated_ms": 1.0, "left_out_ms": 2.0, "unknown_test_ms": 1.0,
+    }  # fmt: skip
+    assert budget["left_out"] == 2
+    assert 0 < budget["left_out_risk_share"] < 1
+    kept = {t["test_id"] for t in body["tests"]}
+    assert kept < {t["test_id"] for t in whole["tests"]}
+
+
+@pytest.mark.usefixtures("seeded")
+def test_a_budget_on_a_full_suite_fallback_packs_the_full_suite(client: TestClient) -> None:
+    body = post_select(client, changed_files_known=False, budget_seconds=0.001).json()
+    assert body["mode"] == "selective" and body["budget_limited"] is True
+    assert body["budget"]["full_suite"] is True
+    assert body["reason"].startswith(
+        "budget-limited full suite (estimated 0s of a 0s target; siftwise would run the full "
+        "suite: changed files are unknown for this change)"
+    )
+    roomy = post_select(client, changed_files_known=False, budget_seconds=60).json()
+    assert roomy["mode"] == "full" and roomy["budget_limited"] is False
+    assert roomy["budget"]["full_suite"] is True and roomy["budget"]["limited"] is False
+
+
+@pytest.mark.usefixtures("seeded")
+@pytest.mark.parametrize("seconds", [0, -5, 8 * 24 * 3600, "5m"])
+def test_an_invalid_budget_is_rejected(client: TestClient, seconds: object) -> None:
+    response = post_select(client, changed_files=["src/shop/cart.py"], budget_seconds=seconds)
+    assert response.status_code == 422
+
+
+@pytest.mark.usefixtures("seeded")
+def test_an_unknown_field_is_a_422_naming_it(client: TestClient) -> None:
+    """What a server from before time budgets answers to budget_seconds: the clients recognise
+    this shape (tests.test_gha.OLD_SERVER_BUDGET_422) and fail open."""
+    response = post_select(client, changed_files=["src/shop/cart.py"], budget_seconds_v9=300)
+    assert response.status_code == 422
+    [error] = response.json()["detail"]
+    assert (error["type"], error["loc"]) == ("extra_forbidden", ["body", "budget_seconds_v9"])

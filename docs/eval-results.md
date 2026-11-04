@@ -852,22 +852,22 @@ against the order named.
 
 | | Order | By test count | By measured time | vs default (count; time) | vs risk (count; time) |
 |---|---|---|---|---|---|
-| RDFLib/rdflib, 17 runs | default | 8.7% (28.9%) | 41.3% (45.8%) | | |
-| | **risk** | **1.8%** (12.5%) | **1.6%** (11.1%) | 10/4/3; 11/3/3 | |
-| | risk-per-time | 4.5% (28.7%) | 0.3% (26.8%) | 8/6/3; 10/4/3 | 3/11/3; 3/11/3 |
-| | risk-per-time, tiered | 4.5% (28.8%) | 0.6% (27.0%) | 8/6/3; 10/4/3 | 3/11/3; 3/11/3 |
+| RDFLib/rdflib, 17 runs | default | 13.0% (26.0%) | 37.3% (42.5%) | | |
+| | **risk** | **1.2%** (12.8%) | **1.4%** (12.1%) | 10/4/3; 10/4/3 | |
+| | risk-per-time | 4.5% (28.3%) | 0.3% (27.2%) | 9/5/3; 10/4/3 | 3/11/3; 3/11/3 |
+| | risk-per-time, tiered | 4.5% (28.4%) | 0.5% (27.4%) | 9/5/3; 10/4/3 | 3/11/3; 3/11/3 |
 | agent-substrate/substrate, 19 runs | default | 74.8% (66.7%) | 42.0% (49.3%) | | |
 | | **risk** | **23.3%** (30.3%) | 25.6% (34.4%) | 16/2/1; 12/5/2 | |
 | | risk-per-time | 56.6% (52.2%) | 14.9% (27.4%) | 12/7/0; 12/7/0 | 5/13/1; 10/8/1 |
 | | risk-per-time, tiered | 50.1% (51.1%) | 33.5% (45.1%) | 14/4/1; 9/9/1 | 2/13/4; 7/8/4 |
 
 **Risk order** (the default):
-- **rdflib:** in 6 of the 14 timed runs, the first failure came after 230 to 340 s of a 340 to
-  500 s run in the default order, and within 21 s in risk order. In 7 of the 14 it came
+- **rdflib:** in 6 of the 14 timed runs, the first failure came after 238 to 359 s of a 388 to
+  550 s run in the default order, and within 25 s in risk order. In 7 of the 14 it came
   within the first 5 s of the risk-ordered run. Selective runs select about 93% of the suite,
   so the order matters most here.
 - **It's not always earlier.** In 4 rdflib runs risk order reached the failure later. In the
-  worst it moved from test 254 to test 2,458 (17 s to 47 s of 99 s). The likely reason is
+  worst it moved from test 775 to test 4,422 (22 s to 79 s of 136 s). The likely reason is
   that the failing test ranked below tests the change reaches more directly, but the eval
   doesn't record each failure's link to confirm it. Three runs selected 22 tests with no
   recorded durations: the same either way.
@@ -885,12 +885,12 @@ set before the runs and not tuned to them.
 - **It isn't clearly better by time on both repos.** On substrate, its median time is lower
   (14.9% vs 25.6%), but run for run it beats risk order in only 10 of 19 runs and loses 8. The
   swings are large both ways: one run went from 909 s to 4 s, another from 278 s to 1,239 s. On
-  rdflib it loses to risk order in 11 of 17 runs, and its mean doubles (26.8% vs 11.1%). In 3
-  runs the failing test went to the very end (test 7,120 of 7,131): a cheap, low-risk unit
-  outranks an expensive, high-risk one once the cost divides the score.
-- **It's clearly worse by count on both repos:** 4.5% vs 1.8% and 56.6% vs 23.3%.
+  rdflib it loses to risk order in 11 of 17 runs, and its mean more than doubles (27.2% vs
+  12.1%). In 3 runs the failing test went to the very end (test 10,761 of 10,772): a cheap,
+  low-risk unit outranks an expensive, high-risk one once the cost divides the score.
+- **It's clearly worse by count on both repos:** 4.5% vs 1.2% and 56.6% vs 23.3%.
 - **The tiered variant is worse than risk order on both repos.** On rdflib it differs from
-  the untiered one in a single run.
+  the untiered one in two runs.
 - **So the default stays `risk`, and risk-per-time isn't offered** as an option: nothing in
   these runs suggests when someone should pick it. Both variants stay in the eval
   (`risk.Order.RISK_PER_TIME*`, eval only; the API, CLI, Action, GitLab and MCP reject them),
@@ -901,14 +901,22 @@ set before the runs and not tuned to them.
 - **Execution model** (`scripts/eval/ordering.py`): commands run one after another. pytest
   arguments and Jest files run in the order given, one Go package per command. JUnit doesn't
   record a file's definition order, so tests within one argument or package are taken by test
-  ID, the same in every order. A Go subtest counts as its parent. Real Jest and pytest-xdist
+  ID, the same in every order. A Go subtest counts as its parent (only a Go subtest: see the
+  correction below). Real Jest and pytest-xdist
   runs parallelise and reorder, so these are upper bounds on the gain for them.
 - **Durations:** what each first failure costs is the evaluated run's own measured durations
   (mean over its variants), summed serially. Runs with no recorded durations are left out of
   the time figures. What the orders *estimate* (the tie-break, the risk-per-time cost) is each
   test's mean over the 50 runs (uploads) before the evaluated one; production uses
   `test_stats`' window mean. Using these estimates moved rdflib's risk order slightly from an
-  earlier run that broke ties by test ID only (by count 2.5% then, 1.8% now).
+  earlier run that broke ties by test ID only (by count 2.5% then, 1.8% after).
+- **Correction (with the time-budget work, 2026-11-04):** the execution model folded *any*
+  test with a `/` in its ID into a "parent", as it should only do for Go subtests. rdflib's W3C
+  suite tests are parametrized by URLs (`test_entry[http://...]`), so thousands of them lost
+  their time and their place in the count. Fixed, with a test; the rdflib rows above are
+  re-measured (risk by count 1.8% → 1.2%, by time 1.6% → 1.4%; default by count 8.7% →
+  13.0%, by time 41.3% → 37.3%). The conclusions are unchanged. substrate (Go) was not
+  affected.
 - **Score inputs as of each run** (`HistoryIndex._risk_stats`, no peeking): the failure rate,
   last failure and flaky share over the 90-day window before the run. A run counts when the
   test appears in it, and a failure is any failed attempt (production reads `test_stats`, which
@@ -929,6 +937,87 @@ uv run python -m scripts.eval.run_eval --repo agent-substrate/substrate --langua
     --go-module github.com/agent-substrate/substrate --source github --goos linux \
     --siftwise-toml scripts/eval/substrate.siftwise.toml --failing --resume substrate-risk.jsonl
 ```
+
+## Time budget: recall within a budget
+
+What does a time budget (`--budget`, [ARCHITECTURE](../ARCHITECTURE.md#time-budget)) still
+catch? Measured 2026-11-04 on the same PR replays (`--failing`): every run with failures and
+measured durations, under budgets of 10%, 25% and 50% of that run's own full measured time
+(every test it ran, Go subtests inside their parents). The budget packs the run's selection in
+risk order; when siftwise would have run the full suite (an unknown diff, a build file, ...),
+it packs the full suite's known tests (a "budget-limited full suite"). The estimates are each
+test's mean duration as of the run (no peeking); the recall and times are the run's own
+results.
+
+### Results
+
+"Runs that still fail" is the CI question: did the budget-limited run still go red? A run
+with several failures counts once. "Failures caught" counts every failing test, so a few runs
+with hundreds of failures dominate it; it's also shown without them. Time to first failure is
+over the runs whose budget caught one, as a share of the run's full time.
+
+| | Budget | Runs that still fail | Failures caught | Without the biggest runs | First failure (median) | Measured over budget |
+|---|---|---|---|---|---|---|
+| RDFLib/rdflib, 31 runs | none | 30 of 31 | 1,903 of 1,904 | | | |
+| | 10% | 22 of 31 | 1,240 (65.1%) | 127 of 246 (52%) | 5.0 s, 1.5% of the run | 1 run (at most 3.9×) |
+| | 25% | 24 of 31 | 1,620 (85.1%) | 144 of 246 (59%) | 9.4 s, 2.3% | 5 runs (at most 2.2×) |
+| | 50% | 28 of 31 | 1,825 (95.9%) | 176 of 246 (72%) | 11.6 s, 3.4% | 7 runs (at most 1.7×) |
+| agent-substrate/substrate, 72 runs | none | 71 of 72 | 2,043 of 2,044 | | | |
+| | 10% | 34 of 72 | 109 (5.3%) | 78 of 234 (33%) | 75 s, 4.6% | 31 runs (at most 3.2×) |
+| | 25% | 43 of 72 | 138 (6.8%) | 107 of 234 (46%) | 175 s, 15.1% | 27 runs (at most 1.3×) |
+| | 50% | 54 of 72 | 200 (9.8%) | 154 of 234 (66%) | 199 s, 17.5% | 25 runs (at most 1.4×) |
+
+"The biggest runs" are those with 100 or more failures: 5 rdflib runs (1,658 of its 1,904
+failures) and 3 substrate runs (1,810 of 2,044).
+
+- **Small budgets miss a lot.** At 10%, 9 of 31 rdflib runs and 38 of 72 substrate runs that
+  failed with the full selection would have passed. Even at 50%, 3 rdflib runs and 17
+  substrate runs would have passed. A budget-limited run is not a check of the change, and
+  siftwise says so on every surface; these numbers are why.
+- **rdflib does better.** When a budget catches a failure, it shows within seconds (median
+  5 to 12 s of a run of minutes). Its five biggest runs (311 to 343 failures each, all
+  full-suite fallbacks) are caught almost whole from 25% on; at 10% two of them lose most of
+  their failures (119 of 333, 68 of 311 caught).
+- **substrate does badly by failures.** Its three biggest runs (about 603 failures each) are
+  barely touched: the budget catches 31 of their 1,810 failures at 10% and 25%, 46 at 50%. By
+  runs it does better (about half of the runs still fail at 10%, three quarters at 50%), but
+  its first failures come late (median 75 to 199 s). Most of its failing runs (52 of 72) are
+  full-suite fallbacks, which a budget can only pack by history (every test ranked
+  history-only), and its three biggest runs are among them.
+- **The estimates are means, so a run can overrun.** rdflib's budget-limited runs measured a
+  median 0.75 to 0.79 of their budget: the estimates run high (in one run,
+  `test/test_sparql/test_service.py` was estimated at 56 s and measured 10 s). substrate's sit at 0.95 to 0.98 and overran in 25 to 31 of 72 runs, by
+  at most 1.4× at 25% and 50%. The big overruns at 10% (3.9× and 3.2×) are the "riskiest unit
+  always runs" rule: a single unit already over the budget.
+
+### Method and limits
+
+- **Targets:** the PR runs with failures from the replays above (39 rdflib, 72 substrate),
+  minus those without measured durations (8 rdflib runs). The budget is a
+  share of each run's own full measured time, so budgets differ per run.
+- **Estimates as of the run** (`run_eval.with_durations(skipped_as_zero=True)`): each known
+  test's mean over every variant of the latest 50 CI runs before the run (the runs that make a
+  test known), 0 for a test that only skipped there, as production counts a test whose
+  `test_stats.runs` is 0. Production's means come from `test_stats` over the 90-day window.
+- **Execution model:** as for time to first failure above (serial, `scripts/eval/ordering.py`).
+  "Measured" is the run's own durations of the tests the budget-limited commands run.
+- **What's caught** is what the budget-limited selection would run (`WouldRun`), any verdict;
+  flaky failures count as failures here, as in the rest of the selection eval.
+- **Not tuned:** the 90th percentile for unknown durations and the three budget shares were
+  set before the runs. Three problems found in the first runs were fixed, not tuned: packing
+  stopped at the first unit that didn't fit (one big rank-2 unit left a 50% budget running
+  about 1% of an rdflib run), so it now skips that unit and goes on; known tests without a
+  duration (about 6,100 on rdflib: tests that only skipped, or ran in none of the last 50
+  uploads, which are 2 or 3 rdflib CI runs) each counted at 30 ms, so a skipped-only test now
+  counts 0 and the eval estimates from the latest 50 CI runs; and the execution-model bug
+  above made measured times look several times below the estimates.
+- **Small samples:** 31 and 72 runs from two repos; substrate's figures by failures rest on
+  three runs.
+
+### Reproducing
+
+The PR-mode commands above: each run's line lists its budgets (`budget 10% (...): ...`), and
+the summary ends with `time budgets (...)`.
 
 ## Performance
 

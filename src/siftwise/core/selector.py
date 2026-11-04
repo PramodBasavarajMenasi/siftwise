@@ -49,6 +49,11 @@ Every selected test also gets a risk score and rank (``core/risk.py``): with
 ``order=Order.RISK`` the commands list the riskiest tests, files and packages first. The
 score never changes which tests are selected.
 
+A time budget (``budget_ms``) is the one exception, and it says so: the selection is cut to
+the highest-risk whole units (pytest arguments, Go packages, Jest files) whose estimated time
+fits, the result is marked budget-limited (``Budget``) with what was left out, and a full-suite
+fallback packs the full suite's known tests the same way ("budget-limited full suite").
+
 Matching is deliberately loose (by file name or package suffix anywhere in the repo): extra
 tests are cheap, missed ones are not. Path mapping only sees direct naming relationships, not
 imports, so a change can still break a test in a dependent module or package. Co-change and
@@ -63,6 +68,7 @@ import functools
 import posixpath
 import re
 import shlex
+from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -71,7 +77,7 @@ from typing import TYPE_CHECKING
 
 from siftwise.core.codes import FAILED_CODES_SQL
 from siftwise.core.junit import normalize_path
-from siftwise.core.risk import Link, Order, Ranked, RiskInputs, UnitKey, rank, unit_key
+from siftwise.core.risk import Link, Order, Ranked, Risk, RiskInputs, UnitKey, rank, unit_key
 
 if TYPE_CHECKING:
     # The light CLI (no server extra) imports this module: SQLAlchemy only where it's used.
@@ -329,11 +335,35 @@ class Selection:
     estimated_ms_would_run: float = 0.0
     # How the commands list their tests (Order.RISK: highest risk first).
     order: Order = Order.DEFAULT
+    # A time budget's effect; None when no budget was asked for.
+    budget: Budget | None = None
 
     @property
     def command(self) -> str:
         """All commands as one shell line (empty if nothing needs to run)."""
         return " && ".join(self.commands)
+
+
+@dataclass(frozen=True)
+class Budget:
+    """What a time budget did to a selection (``select_tests(budget_ms=...)``)."""
+
+    budget_ms: float
+    # False: it couldn't be applied (``note`` says why), and the selection runs as it is.
+    applied: bool = True
+    # Selected tests were left out to fit: the run is NOT a complete check of the change.
+    limited: bool = False
+    # siftwise would have run the full suite: the run packs the full suite's known tests.
+    full_suite: bool = False
+    note: str = ""
+    estimated_ms: float = 0.0  # what runs: its units' estimates
+    left_out: int = 0  # selected tests left out (in a full suite: known tests)
+    left_out_ms: float = 0.0  # their units' estimates
+    left_out_risk_share: float = 0.0  # their share of the selection's total risk score
+    unknown_ms: float | None = None  # what a test with no known duration counted as
+    # The selection without the budget, for shadow mode (limited runs only): a miss it would
+    # have run was left out by the budget.
+    before: SelectionScope | None = None
 
 
 # --- selection ----------------------------------------------------------------------------
@@ -349,6 +379,7 @@ def select_tests(
     deleted_files: Iterable[str] = (),
     junit_dir: str | None = None,
     order: Order = Order.DEFAULT,
+    budget_ms: float | None = None,
 ) -> Selection:
     """Select tests for a change.
 
@@ -361,12 +392,13 @@ def select_tests(
     a line of several pytest commands doesn't overwrite one report with the next.
     ``order``: ``Order.RISK`` lists the riskiest tests first in the commands (core/risk.py).
     Every selected test gets its score and rank either way, and the same tests are selected.
+    ``budget_ms``: run only the highest-risk units that fit (see ``Budget``); None = no budget.
     """
     # Every known test classified once, for the selection and its time estimate.
     tests = _index(history.tests.values() if history else ())
     selection = _select(
         history, changed_files, changed_files_known, config or SelectorConfig(),
-        affected_packages, affected_files, deleted_files, junit_dir, tests, order,
+        affected_packages, affected_files, deleted_files, junit_dir, tests, order, budget_ms,
     )  # fmt: skip
     return _with_estimate(selection, history, tests)
 
@@ -382,6 +414,7 @@ def _select(
     junit_dir: str | None,
     tests: Mapping[str, _Test],
     order: Order = Order.DEFAULT,
+    budget_ms: float | None = None,
 ) -> Selection:
     affected_packages = affected_packages or {}
     affected_files = {
@@ -393,7 +426,7 @@ def _select(
 
     def full(reason: str) -> Selection:
         runners = {t.runner for t in tests.values() if t.runner is not None}
-        return Selection(
+        selection = Selection(
             mode=Mode.FULL,
             reason=reason,
             tests=(),
@@ -406,6 +439,10 @@ def _select(
             ),
             order=order,
         )
+        if budget_ms is None:
+            return selection
+        return _full_within_budget(selection, history, tests, config.go_module, junit_dir,
+                                   order, budget_ms)  # fmt: skip
 
     if not changed_files_known:
         return full("changed files are unknown for this change")
@@ -609,7 +646,9 @@ def _select(
         (_risk_inputs(history.tests[t.test_id], links[t.test_id]) for t in chosen),
         history.newest_run_at,
     )
-    return Selection(
+    ranked = _ranked(chosen, ranks, links, history)
+    units = _units(chosen, whole_packages, py_whole_files, py_module_files)
+    selection = Selection(
         mode=Mode.SELECTIVE,
         reason=summary,
         tests=tuple(
@@ -626,34 +665,261 @@ def _select(
         ),
         selected_count=len(chosen),
         total_known=len(tests),
-        commands=_build_commands(
-            chosen,
-            config.go_module,
-            whole_packages,
-            py_whole_files,
-            py_module_files,
-            junit_dir,
-            None
-            if order is Order.DEFAULT
-            else unit_key(
-                order,
-                {
-                    t.test_id: Ranked(
-                        ranks[t.test_id][0],
-                        ranks[t.test_id][1].score,
-                        links[t.test_id],
-                        0.0
-                        if is_go_subtest(t.test_id)
-                        else history.tests[t.test_id].avg_duration_ms,
-                    )
-                    for t in chosen
-                },
-            ),
-        ),
+        commands=_commands(units, config.go_module, junit_dir, _key(order, ranked)),
         go_packages_run_whole=tuple(sorted(whole_packages)),
         python_files_run_whole=tuple(sorted(files_run_whole)),
         order=order,
     )
+    if budget_ms is None:
+        return selection
+    costs = _Costs(tests, history)
+    if costs.unknown_ms is None:
+        note = "no test durations in history to estimate with: no budget applied"
+        return dataclasses.replace(selection, budget=Budget(budget_ms, applied=False, note=note))
+    return _pack(selection, units, ranked, costs, budget_ms, config.go_module, junit_dir)
+
+
+def _ranked(
+    chosen: Iterable[_Test],
+    ranks: Mapping[str, tuple[int, Risk]],
+    links: Mapping[str, Link],
+    history: RepoHistory,
+) -> dict[str, Ranked]:
+    """The selected tests as the command order and the budget see them."""
+    return {
+        t.test_id: Ranked(
+            ranks[t.test_id][0],
+            ranks[t.test_id][1].score,
+            links[t.test_id],
+            0.0 if is_go_subtest(t.test_id) else history.tests[t.test_id].avg_duration_ms,
+        )
+        for t in chosen
+    }
+
+
+def _key(order: Order, ranked: Mapping[str, Ranked]) -> UnitKey | None:
+    return None if order is Order.DEFAULT else unit_key(order, ranked)
+
+
+# --- time budget ----------------------------------------------------------------------------
+
+# An unknown duration counts as this percentile of the known ones: most tests are faster, so a
+# budget errs towards running less than it could, not more than fits.
+UNKNOWN_DURATION_PERCENTILE = 0.9
+
+
+class _Costs:
+    """A unit's estimated time: the mean durations (``avg_duration_ms``) of the known tests it
+    runs, Go subtests left out (their time is inside their parent's). Whole files and whole
+    packages count every known test in them, not only the selected ones.
+
+    A known test that was skipped in every run of the window (``runs == 0``: no duration, by
+    definition) counts as 0: it will most likely be skipped again. Any other test with no known
+    duration counts as ``unknown_ms``, the ``UNKNOWN_DURATION_PERCENTILE`` of the known
+    (positive) durations; a unit with no known test (a new test file) counts as one such test.
+    """
+
+    def __init__(self, tests: Mapping[str, _Test], history: RepoHistory) -> None:
+        self.ms: dict[str, float | None] = {}
+        for test_id in tests:
+            stats = history.tests[test_id]
+            skipped_only = stats.avg_duration_ms is None and stats.runs == 0
+            self.ms[test_id] = 0.0 if skipped_only else stats.avg_duration_ms
+        timed = sorted(ms for test_id, ms in self.ms.items() if ms and not is_go_subtest(test_id))
+        self.unknown_ms: float | None = (
+            timed[min(len(timed) - 1, int(UNKNOWN_DURATION_PERCENTILE * len(timed)))]
+            if timed
+            else None
+        )
+        self.files: dict[str, list[str]] = defaultdict(list)
+        self.doctest_files: dict[str, list[str]] = defaultdict(list)
+        self.packages: dict[str, list[tuple[str, str]]] = defaultdict(list)  # (top-level, ID)
+        self.jest_files: dict[str, list[str]] = defaultdict(list)
+        for t in tests.values():
+            if is_go_subtest(t.test_id):
+                continue
+            if t.runner is Runner.PYTEST and t.py_path:
+                (self.doctest_files if t.doctest else self.files)[t.py_path].append(t.test_id)
+            elif t.runner is Runner.GO:
+                self.packages[t.classname].append((t.name.split("/", 1)[0], t.test_id))
+            elif t.runner is Runner.JEST and t.file_path:
+                self.jest_files[t.file_path].append(t.test_id)
+
+    def __call__(self, unit: _Unit) -> float:
+        assert self.unknown_ms is not None
+        if unit.doctest:
+            ids = self.doctest_files.get(unit.arg, [])
+        elif unit.runner is Runner.PYTEST:
+            ids = self.files.get(unit.arg, []) if "::" not in unit.arg else list(unit.test_ids)
+        elif unit.runner is Runner.GO:
+            names = unit.go_names
+            ids = [i for name, i in self.packages.get(unit.arg, []) if not names or name in names]
+        else:
+            ids = self.jest_files.get(unit.arg, [])
+        if not ids:
+            return self.unknown_ms
+        unknown = self.unknown_ms
+        return sum(
+            unknown if (ms := self.ms.get(i)) is None else ms for i in ids if not is_go_subtest(i)
+        )
+
+
+def _pack(
+    selection: Selection,
+    units: Sequence[_Unit],
+    ranked: Mapping[str, Ranked],
+    costs: _Costs,
+    budget_ms: float,
+    go_module: str | None,
+    junit_dir: str | None,
+    full_reason: str | None = None,
+) -> Selection:
+    """``selection`` cut to a time budget: walk its units in risk order and keep each one
+    whose estimate still fits in what's left (the first always: a budget never runs nothing
+    when tests were selected). A unit that doesn't fit is skipped, not the end of the walk:
+    one big unit high in the order would otherwise leave most of the budget unused.
+    ``full_reason``: siftwise would have run the full suite for this reason, and
+    ``selection`` holds the full suite's known tests."""
+    risk = unit_key(Order.RISK, ranked)
+    walk = sorted(range(len(units)), key=lambda n: (risk(units[n].test_ids), n))
+    kept: set[int] = set()
+    spent = 0.0
+    for n in walk:
+        cost = costs(units[n])
+        if kept and spent + cost > budget_ms:
+            continue
+        kept.add(n)
+        spent += cost
+    left = [units[n] for n in walk if n not in kept]
+    kept_units = [units[n] for n in sorted(kept)]  # by path within each kind, as built
+    kept_ids = {i for unit in kept_units for i in unit.test_ids}
+    left_ids = {i for unit in left for i in unit.test_ids} - kept_ids
+    if full_reason is not None and left:
+        # Tests no command can name (no known runner) don't run in a packed full suite either.
+        left_ids |= {t.test_id for t in selection.tests} - kept_ids
+    budget = Budget(budget_ms, full_suite=full_reason is not None, estimated_ms=spent,
+                    unknown_ms=costs.unknown_ms)  # fmt: skip
+    if not left_ids and not left:
+        return dataclasses.replace(selection, budget=budget)
+    total = sum(r.score for r in ranked.values())
+    share = (
+        sum(ranked[i].score for i in left_ids if i in ranked) / total
+        if total
+        else len(left_ids) / max(len(ranked), 1)  # every score 0: every test counts the same
+    )
+    left_ms = sum(costs(unit) for unit in left)
+    tests = tuple(t for t in selection.tests if t.test_id not in left_ids)
+    kept_args = {unit.arg for unit in kept_units if unit.runner is Runner.PYTEST}
+    budget = dataclasses.replace(
+        budget,
+        limited=True,
+        left_out=len(left_ids),
+        left_out_ms=left_ms,
+        left_out_risk_share=share,
+        before=SelectionScope(full=True) if full_reason else SelectionScope.of(selection),
+    )
+    # The budget is a target: the estimates are mean durations, and a run can take longer.
+    target = f"estimated {format_duration(spent)} of a {format_duration(budget_ms)} target"
+    fits = (
+        f"{len(tests):,} of {len(selection.tests):,} "
+        f"{'known' if full_reason else 'selected'} tests run; {len(left_ids):,} left out "
+        f"(~{format_duration(left_ms)} estimated, {share:.0%} of the "
+        f"{'suite' if full_reason else 'selection'}'s risk)"
+    )
+    reason = (
+        f"budget-limited full suite ({target}; siftwise would run the full suite: "
+        f"{full_reason}): {fits}"
+        if full_reason
+        else f"budget-limited ({target}): {fits}"
+    )
+    return dataclasses.replace(
+        selection,
+        mode=Mode.SELECTIVE,
+        reason=reason,
+        tests=tests,
+        selected_count=len(tests),
+        commands=_commands(kept_units, go_module, junit_dir, _key(selection.order, ranked)),
+        go_packages_run_whole=tuple(
+            u.arg for u in kept_units if u.runner is Runner.GO and u.go_names is None
+        ),
+        python_files_run_whole=tuple(f for f in selection.python_files_run_whole if f in kept_args),
+        budget=budget,
+    )
+
+
+def _full_within_budget(
+    selection: Selection,
+    history: RepoHistory | None,
+    tests: Mapping[str, _Test],
+    go_module: str | None,
+    junit_dir: str | None,
+    order: Order,
+    budget_ms: float,
+) -> Selection:
+    """A full-suite fallback under a budget: the full suite's known tests packed by risk (every
+    test history-only: the change can't be trusted to link them), flagged as a budget-limited
+    full suite. Tests no runner can name are left out of a pack (and counted). When the known
+    tests can't be ranked or estimated, the full suite runs as it is, and the budget says it
+    wasn't applied."""
+
+    def not_applied(note: str) -> Selection:
+        budget = Budget(budget_ms, applied=False, full_suite=True, note=note)
+        return dataclasses.replace(selection, budget=budget)
+
+    if history is None or not tests:
+        return not_applied("no test history to rank the full suite by: running all of it")
+    costs = _Costs(tests, history)
+    if costs.unknown_ms is None:
+        return not_applied("no test durations in history to estimate with: running the full "
+                           "suite")  # fmt: skip
+    chosen = [tests[test_id] for test_id in sorted(tests)]
+    links = dict.fromkeys(tests, Link.HISTORY)
+    ranks = rank(
+        (_risk_inputs(history.tests[t.test_id], Link.HISTORY) for t in chosen),
+        history.newest_run_at,
+    )
+    whole_packages = {t.classname for t in chosen if t.runner is Runner.GO}
+    whole_files = {
+        t.py_path for t in chosen if t.runner is Runner.PYTEST and t.py_path and not t.doctest
+    }
+    units = _units(chosen, whole_packages, whole_files)
+    reason = f"full suite: {selection.reason}"
+    candidate = dataclasses.replace(
+        selection,
+        tests=tuple(
+            SelectedTest(
+                t.test_id,
+                (reason,),
+                t.runner,
+                t.file_path,
+                score=ranks[t.test_id][1].score,
+                rank=ranks[t.test_id][0],
+                rank_reason=ranks[t.test_id][1].why,
+            )
+            for t in chosen
+        ),
+        python_files_run_whole=tuple(sorted(whole_files)),
+        order=order,
+    )
+    packed = _pack(candidate, units, _ranked(chosen, ranks, links, history), costs, budget_ms,
+                   go_module, junit_dir, full_reason=selection.reason)  # fmt: skip
+    assert packed.budget is not None
+    if not packed.budget.limited:
+        # Everything fits: the full suite as it is (its commands also run tests not known yet).
+        return dataclasses.replace(selection, budget=packed.budget)
+    return packed
+
+
+def format_duration(ms: float) -> str:
+    """``4m 50s``, ``38s``, ``1h 5m``: for budgets and estimates."""
+    seconds = round(ms / 1000)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s" if seconds else f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m" if minutes else f"{hours}h"
 
 
 def _risk_inputs(test: KnownTest, link: Link) -> RiskInputs:
@@ -1183,40 +1449,35 @@ def _js_test_matches(test_path: str, stem: str) -> bool:
 # --- commands -----------------------------------------------------------------------------
 
 
-def _build_commands(
+@dataclass(frozen=True)
+class _Unit:
+    """One runnable piece of a selection's commands: a pytest argument (a node or a whole file),
+    a module under ``--doctest-modules``, a Go package or a Jest file. A time budget keeps or
+    leaves out whole units."""
+
+    runner: Runner
+    arg: str  # the pytest node or file, the module, the Go package's import path, the Jest file
+    test_ids: tuple[str, ...]  # the selected tests it runs (none: a changed file run whole)
+    doctest: bool = False
+    # Go: the top-level tests for -run; None = the whole package.
+    go_names: tuple[str, ...] | None = None
+
+
+def _units(
     tests: Sequence[_Test],
-    go_module: str | None = None,
     go_whole_packages: Collection[str] = (),
     py_whole_files: Collection[str] = (),
     py_module_files: Collection[str] = (),
-    junit_dir: str | None = None,
-    key: UnitKey | None = None,
-) -> tuple[str, ...]:
-    """One command per runner (per package for Go).
-
-    Every argument is shell-quoted (``shlex.join``): test IDs come from uploaded JUnit, and the
-    command is meant for ``eval``.
+) -> list[_Unit]:
+    """The units that run ``tests``: pytest arguments, doctest modules, Go packages, Jest files,
+    each kind by path (the default order).
 
     Go packages in ``go_whole_packages`` run without -run, so tests that history doesn't
     know yet (added in this change) run too. Other Go packages only had tests pulled in by
     co-change, recently-failed or always-run, so they keep -run for just those tests.
     Python files in ``py_whole_files`` are likewise passed to pytest whole.
-
-    Order: without ``key``, by path, package and test ID (the order before risk ordering).
-    With ``key`` (``risk.unit_key``: from the selected tests a unit runs), every pytest
-    argument, Go package and Jest file comes in key order, and so do the commands.
     """
-
-    def best(test_ids: Iterable[str]) -> tuple[float, ...]:
-        return key(list(test_ids)) if key else ()
-
-    def ordered(items: Iterable[str], tests_of: Callable[[str], Iterable[str]]) -> list[str]:
-        if key is None:
-            return sorted(items)
-        return sorted(items, key=lambda item: (best(tests_of(item)), item))
-
-    commands: list[tuple[tuple[float, ...], str]] = []  # (key, command)
-
+    units: list[_Unit] = []
     nodes = {t.py_node for t in tests if t.runner is Runner.PYTEST and t.py_node and not t.doctest}
     nodes.update(py_whole_files)
     # A whole file (changed, imports a changed module, or a collection error) already runs
@@ -1227,31 +1488,14 @@ def _build_commands(
         if t.runner is Runner.PYTEST and not t.doctest and t.py_node:
             in_whole = t.py_path if t.py_path in whole_files else None
             by_node.setdefault(in_whole or t.py_node, []).append(t.test_id)
-    pytest_ids = ordered(
-        (node for node in nodes if "::" not in node or node.partition("::")[0] not in whole_files),
-        lambda node: by_node.get(node, ()),
-    )
-    pytest_runs = 0
-    if pytest_ids:
-        pytest_runs += 1
-        command = _with_junit(shlex.join(["pytest", *pytest_ids]), junit_dir, pytest_runs)
-        commands.append((best(i for n in pytest_ids for i in by_node.get(n, ())), command))
+    for node in sorted(
+        node for node in nodes if "::" not in node or node.partition("::")[0] not in whole_files
+    ):
+        units.append(_Unit(Runner.PYTEST, node, tuple(by_node.get(node, ()))))
     doctests = [t for t in tests if t.doctest and t.py_node]
-    known_doctest_files = {t.py_node for t in doctests if t.py_node}
-    doctest_files = ordered(
-        known_doctest_files | set(py_module_files),
-        lambda file: (t.test_id for t in doctests if t.py_node == file),
-    )
-    if doctest_files:
-        pytest_runs += 1
-        command = _with_junit(
-            shlex.join(["pytest", "--doctest-modules", *doctest_files]), junit_dir, pytest_runs
-        )
-        if set(doctest_files) - known_doctest_files:
-            # A module may have no doctests: pytest then exits 5 ("no tests collected"),
-            # which isn't a failure. Import errors (exit 2) and doctest failures (1) still are.
-            command = f"{{ {command} || test $? -eq 5; }}"
-        commands.append((best(t.test_id for t in doctests), command))
+    for file in sorted({t.py_node for t in doctests if t.py_node} | set(py_module_files)):
+        ids = tuple(t.test_id for t in doctests if t.py_node == file)
+        units.append(_Unit(Runner.PYTEST, file, ids, doctest=True))
 
     # Go: -run matches top-level tests; subtests run as part of their parent.
     go_tests: dict[str, set[str]] = {}
@@ -1260,23 +1504,90 @@ def _build_commands(
         if t.runner is Runner.GO:
             go_tests.setdefault(t.classname, set()).add(t.name.split("/", 1)[0])
             go_ids.setdefault(t.classname, []).append(t.test_id)
-    for package in ordered(go_tests, lambda package: go_ids[package]):
-        target = _go_target(package, go_module)
-        if package in go_whole_packages:
-            command = shlex.join(["go", "test", target])
-        else:
-            pattern = "^(" + "|".join(sorted(go_tests[package])) + ")$"
-            command = shlex.join(["go", "test", target, "-run", pattern])
-        commands.append((best(go_ids[package]), command))
+    for package in sorted(go_tests):
+        names = None if package in go_whole_packages else tuple(sorted(go_tests[package]))
+        units.append(_Unit(Runner.GO, package, tuple(go_ids[package]), go_names=names))
 
     jest_ids: dict[str, list[str]] = {}
     for t in tests:
         if t.runner is Runner.JEST and t.file_path:
             jest_ids.setdefault(t.file_path, []).append(t.test_id)
-    jest_files = ordered(jest_ids, lambda file: jest_ids[file])
-    if jest_files:
-        commands.append((best(i for ids in jest_ids.values() for i in ids),
-                         shlex.join(["jest", *jest_files])))  # fmt: skip
+    units.extend(_Unit(Runner.JEST, file, tuple(jest_ids[file])) for file in sorted(jest_ids))
+    return units
+
+
+def _build_commands(
+    tests: Sequence[_Test],
+    go_module: str | None = None,
+    go_whole_packages: Collection[str] = (),
+    py_whole_files: Collection[str] = (),
+    py_module_files: Collection[str] = (),
+    junit_dir: str | None = None,
+    key: UnitKey | None = None,
+) -> tuple[str, ...]:
+    """One command per runner (per package for Go), for ``tests`` (see ``_units``)."""
+    units = _units(tests, go_whole_packages, py_whole_files, py_module_files)
+    return _commands(units, go_module, junit_dir, key)
+
+
+def _commands(
+    units: Sequence[_Unit],
+    go_module: str | None = None,
+    junit_dir: str | None = None,
+    key: UnitKey | None = None,
+) -> tuple[str, ...]:
+    """The commands that run ``units``: one per runner (per package for Go).
+
+    Every argument is shell-quoted (``shlex.join``): test IDs come from uploaded JUnit, and the
+    command is meant for ``eval``.
+
+    Order: without ``key``, by path, package and test ID (the order before risk ordering).
+    With ``key`` (``risk.unit_key``: from the selected tests a unit runs), every pytest
+    argument, Go package and Jest file comes in key order, and so do the commands.
+    """
+
+    def best(group: Iterable[_Unit]) -> tuple[float, ...]:
+        return key([i for unit in group for i in unit.test_ids]) if key else ()
+
+    def ordered(group: Iterable[_Unit]) -> list[_Unit]:
+        if key is None:
+            return list(group)  # units come by path
+        return sorted(group, key=lambda unit: (key(unit.test_ids), unit.arg))
+
+    commands: list[tuple[tuple[float, ...], str]] = []  # (key, command)
+    pytest_units = [u for u in units if u.runner is Runner.PYTEST and not u.doctest]
+    pytest_runs = 0
+    if pytest_units:
+        pytest_runs += 1
+        args = [u.arg for u in ordered(pytest_units)]
+        command = _with_junit(shlex.join(["pytest", *args]), junit_dir, pytest_runs)
+        commands.append((best(pytest_units), command))
+    doctest_units = [u for u in units if u.doctest]
+    if doctest_units:
+        pytest_runs += 1
+        files = [u.arg for u in ordered(doctest_units)]
+        command = _with_junit(
+            shlex.join(["pytest", "--doctest-modules", *files]), junit_dir, pytest_runs
+        )
+        if any(not u.test_ids for u in doctest_units):
+            # A module may have no doctests: pytest then exits 5 ("no tests collected"),
+            # which isn't a failure. Import errors (exit 2) and doctest failures (1) still are.
+            command = f"{{ {command} || test $? -eq 5; }}"
+        commands.append((best(doctest_units), command))
+
+    for unit in ordered(u for u in units if u.runner is Runner.GO):
+        target = _go_target(unit.arg, go_module)
+        if unit.go_names is None:
+            command = shlex.join(["go", "test", target])
+        else:
+            pattern = "^(" + "|".join(unit.go_names) + ")$"
+            command = shlex.join(["go", "test", target, "-run", pattern])
+        commands.append((best([unit]), command))
+
+    jest_units = [u for u in units if u.runner is Runner.JEST]
+    if jest_units:
+        files = [u.arg for u in ordered(jest_units)]
+        commands.append((best(jest_units), shlex.join(["jest", *files])))
     if key is not None:
         commands.sort(key=lambda pair: pair[0])  # stable: same key keeps pytest, Go, Jest
     return tuple(command for _, command in commands)

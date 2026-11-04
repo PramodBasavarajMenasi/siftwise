@@ -1926,3 +1926,128 @@ def test_the_order_input(
     assert result.exit_code == 0, result.output
     assert json.loads(select.calls.last.request.content).get("order") == sent_order
     assert ("invalid order" in result.output) is warned
+
+
+# --- time budget ----------------------------------------------------------------------------
+
+BUDGET = {
+    "seconds": 300.0, "applied": True, "limited": True, "full_suite": False, "note": "",
+    "estimated_ms": 290_000.0, "left_out": 1234, "left_out_ms": 600_000.0,
+    "left_out_risk_share": 0.12, "unknown_test_ms": 800.0,
+}  # fmt: skip
+
+
+@pytest.mark.parametrize(("budget", "sent_seconds", "warned"), [
+    ("", None, False), ("5m", 300.0, False), ("90s", 90.0, False), ("five", None, True),
+    ("0s", None, True),
+])  # fmt: skip
+def test_the_budget_input(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, budget: str,
+    sent_seconds: float | None, warned: bool,
+) -> None:  # fmt: skip
+    select = api.post(f"{SERVER}/select").respond(json=selection())
+    no_comments(api)
+
+    result = gh.run("select", "pull_request", pr_event(repo), SIFTWISE_BUDGET=budget)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(select.calls.last.request.content).get("budget_seconds") == sent_seconds
+    # An invalid budget means none: more tests, never fewer.
+    assert ("no time budget applied" in result.output) is warned
+    assert gh.outputs()["budget-limited"] == "false"
+
+
+def test_a_budget_limited_run_says_so_in_the_comment_and_outputs(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    api.post(f"{SERVER}/select").respond(json=selection(budget_limited=True, budget=BUDGET))
+    created = no_comments(api)
+
+    assert gh.run("select", "pull_request", pr_event(repo), SIFTWISE_BUDGET="5m").exit_code == 0
+
+    comment = json.loads(created.calls.last.request.content)["body"]
+    assert ("- **Time budget:** **budget-limited (estimated 4m 50s of a 5m 00s target): 1,234 "
+            "selected tests left out** (~10m 00s estimated, 12% of the risk score). The budget "
+            "is a target, not a cap: estimates are mean durations, so the run may take longer. "
+            "This run is not a complete check of the change") in comment  # fmt: skip
+    assert (gh.outputs()["budget-limited"], gh.outputs()["budget-left-out"]) == ("true", "1234")
+
+
+def test_a_budget_limited_full_suite_gives_the_full_suite_reason_safely() -> None:
+    reason = (
+        "budget-limited full suite (siftwise would run the full suite: build/config file "
+        "changed: `x`<!-- y -->.github/workflows/ci.yml): 3 of 9 known tests fit in 5m"
+    )
+    text = gha.selection_markdown(
+        selection(reason=reason, budget_limited=True, budget={**BUDGET, "full_suite": True}),
+        "a" * 40,
+    )
+    assert ("**budget-limited (estimated 4m 50s of a 5m 00s target): 1,234 known tests of the "
+            "full suite left out**") in text  # fmt: skip
+    assert "- **Why budget-limited full suite:** " in text
+    assert "<!-- y" not in text
+
+
+def test_a_budget_that_was_not_applied_says_why_as_untrusted_text() -> None:
+    budget = {**BUDGET, "applied": False, "limited": False, "note": "no history <!-- x -->"}
+    text = gha.selection_markdown(selection(mode="full", budget=budget), "a" * 40)
+    assert "- **Time budget:** 5m 00s target, not applied: " in text
+    assert "<!-- x" not in text
+
+
+def test_a_shadow_run_counts_budget_misses_apart() -> None:
+    line = gha.shadow_markdown(compare_response(budget_limited=True, missed_by_budget=1,
+                                                missed_tests=[{"test_id": "t::a",
+                                                               "verdict": "unknown",
+                                                               "variants": [None],
+                                                               "cause": "budget"}]))  # fmt: skip
+    assert line.splitlines()[0].endswith(
+        "(1 flaky not counted); budget-limited: 1 of the misses left out by the time budget."
+    )
+    assert "- ` t::a `: left out by the time budget (verdict: unknown)" in line
+    would = gha.selection_markdown(
+        selection(),
+        "a" * 40,
+        shadow=True,
+        would_have=selection(budget_limited=True, budget=BUDGET),
+    )
+    assert ("; **budget-limited (estimated 4m 50s of a 5m 00s target): 1,234 tests left "
+            "out**") in would  # fmt: skip
+
+
+# What a server from before time budgets answers: its request schema forbids unknown fields.
+OLD_SERVER_BUDGET_422 = {
+    "detail": [{"type": "extra_forbidden", "loc": ["body", "budget_seconds"],
+                "msg": "Extra inputs are not permitted", "input": 300.0}]
+}  # fmt: skip
+
+
+def test_a_budget_against_an_older_server_fails_open_to_the_full_suite(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    api.post(f"{SERVER}/select").respond(422, json=OLD_SERVER_BUDGET_422)
+    created = no_comments(api)
+
+    result = gh.run("select", "pull_request", pr_event(repo), SIFTWISE_BUDGET="5m")
+
+    assert result.exit_code == 0, result.output
+    outputs = gh.outputs()
+    assert (outputs["mode"], outputs["command"], outputs["budget-limited"]) == ("full", "", "false")
+    assert ("::warning::siftwise: the siftwise server doesn't support time budgets (it rejected "
+            "budget_seconds: it's older than this client); upgrade the server or run without a "
+            "budget; running the full suite") in result.output  # fmt: skip
+    comment = json.loads(created.calls.last.request.content)["body"]
+    assert "- **Mode:** full" in comment and "doesn't support time budgets" in comment
+
+
+def test_an_older_servers_422_without_a_budget_is_reported_as_it_is(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    api.post(f"{SERVER}/select").respond(422, json={"detail": "something else"})
+    no_comments(api)
+
+    result = gh.run("select", "pull_request", pr_event(repo))
+
+    assert result.exit_code == 0 and gh.outputs()["mode"] == "full"
+    assert "siftwise returned 422: something else; running the full suite" in result.output
+    assert "time budgets" not in result.output

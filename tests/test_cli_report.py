@@ -259,3 +259,25 @@ def test_server_comes_from_siftwise_server(
     assert default.call_count == 1
     assert from_env.call_count == 1
     assert flag.call_count == 1  # the flag wins over SIFTWISE_SERVER
+
+
+def test_budget_misses_are_counted_apart_never_hidden() -> None:
+    every = {**stats(10, 8, 2, causes={"budget": 1, "no_link": 1}), "budget_limited_runs": 3,
+             "missed_by_budget": 1}  # fmt: skip
+    lines = recall_lines(
+        recall(
+            all=every,
+            misses=[
+                miss(cause="budget", cause_detail="left out by the 5m time budget", suggestion=None)
+            ],
+        )
+    )
+    assert lines[0].startswith("Recall 80.0% (8 of 10) over 10 shadow runs")
+    assert "Budget-limited runs: 3; misses a time budget left out: 1 (counted in the recall " \
+        "above)" in lines  # fmt: skip
+    assert any("1 left out by a time budget" in line for line in lines)
+    assert "      left out by a time budget: left out by the 5m time budget" in lines
+
+
+def test_no_budget_line_without_budget_runs() -> None:
+    assert not any(line.startswith("Budget-limited") for line in recall_lines(recall()))

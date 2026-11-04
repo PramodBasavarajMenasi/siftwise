@@ -1027,3 +1027,49 @@ def test_first_failure_lines_compare_the_orders() -> None:
         "  risk-per-time: by tests 40.0% (40.0%), vs default 1/2/0, vs risk 0/2/1; "
         "by time 40.0% (45.0%), vs default 1/2/0, vs risk 1/1/1"
     )
+
+
+def test_run_time_sums_what_the_commands_run() -> None:
+    ran = [
+        ordering.RanTest("tests.test_a::test_a", 100.0, False),
+        ordering.RanTest("tests.test_b::test_b", 300.0, True),
+        ordering.RanTest("tests.test_c::test_c", 900.0, False),
+    ]
+    assert ordering.run_time(["pytest tests/test_a.py tests/test_b.py"], ran) == 400.0
+    assert ordering.run_time([], ran) == 0.0
+
+
+def test_budget_lines_report_recall_by_failures_and_by_runs() -> None:
+    def run(share: float, caught: int, *, first_ms: float | None, measured: float,
+            unbudgeted: int = 4) -> ev.BudgetRun:  # fmt: skip
+        first = None if first_ms is None else ordering.FirstFailure(1, 10, first_ms, measured)
+        return ev.BudgetRun(share, share * 10_000, 10_000, "selective", True, False, 4, caught,
+                            unbudgeted, measured, first)  # fmt: skip
+
+    lines = ev.budget_lines([
+        run(0.1, 0, first_ms=None, measured=900),
+        run(0.1, 4, first_ms=200, measured=1200),
+        run(0.5, 4, first_ms=500, measured=4000),
+    ])  # fmt: skip
+    assert lines[0].startswith("time budgets")
+    assert lines[1] == (
+        "  10%: 2 runs (2 budget-limited, 0 packed full suites, 0 not applied); failures caught "
+        "4/8 (50.00%) "
+        "(no budget: 8/8 (100.00%)); runs that still fail 1/2 (no budget: 2/2)"
+    )
+    assert lines[2] == "      first failure: median 0.2 s, 2.0% of the full run (mean 2.0%), 1 runs"
+    assert lines[3] == "      measured / budget: median 1.05, max 1.20; over budget in 1 of 2 runs"
+    assert lines[4].startswith("  50%: 1 runs")
+    assert ev.budget_lines([]) == []
+
+
+def test_a_pytest_test_with_a_slash_in_its_id_is_not_a_go_subtest() -> None:
+    """Parametrized by a URL (rdflib's W3C suites): each one is its own test, with its own time.
+    Folding them into a "parent" undercounted rdflib runs' time and test positions."""
+    ran = [
+        ordering.RanTest("test.test_w3c::test_entry[http://x/a]", 100.0, False),
+        ordering.RanTest("test.test_w3c::test_entry[http://x/b]", 200.0, True),
+    ]
+    ff = ordering.first_failure(["pytest test/test_w3c.py"], ran)
+    assert ff == ordering.FirstFailure(2, 2, 300.0, 300.0)
+    assert ordering.run_time(["pytest test/test_w3c.py"], ran) == 300.0

@@ -516,3 +516,73 @@ def test_order_is_sent_only_when_not_risk(
 def test_an_unknown_order_is_a_usage_error(api: respx.MockRouter, order: str) -> None:
     """The risk-per-time orders are evaluated, not offered (docs/eval-results.md)."""
     assert run("--order", order).exit_code == 2
+
+
+# --- time budget ----------------------------------------------------------------------------
+
+LIMITED = {
+    "seconds": 300.0, "applied": True, "limited": True, "full_suite": False, "note": "",
+    "estimated_ms": 290_000.0, "left_out": 40, "left_out_ms": 600_000.0,
+    "left_out_risk_share": 0.12, "unknown_test_ms": 800.0,
+}  # fmt: skip
+
+
+@pytest.mark.usefixtures("repo")
+@pytest.mark.parametrize(("args", "seconds"), [((), None), (("--budget", "5m"), 300.0),
+                                               (("--budget", "1h30m"), 5400.0)])  # fmt: skip
+def test_the_budget_is_sent_in_seconds_only_when_given(
+    api: respx.MockRouter, args: tuple[str, ...], seconds: float | None
+) -> None:
+    route = api.post(SELECT_URL).respond(json=response())
+
+    assert run(*args).exit_code == 0
+    assert sent(route).get("budget_seconds") == seconds
+    assert ("budget_seconds" in sent(route)) is (seconds is not None)
+
+
+@pytest.mark.usefixtures("repo")
+@pytest.mark.parametrize("budget", ["5", "0s", "5 minutes", "9d"])
+def test_an_invalid_budget_is_a_usage_error(api: respx.MockRouter, budget: str) -> None:
+    route = api.post(SELECT_URL).respond(json=response())
+    result = run("--budget", budget)
+    assert result.exit_code == 2
+    assert "invalid budget" in result.output
+    assert not route.called
+
+
+@pytest.mark.usefixtures("repo")
+def test_a_budget_limited_run_says_so_on_stderr(api: respx.MockRouter) -> None:
+    api.post(SELECT_URL).respond(json=response(budget_limited=True, budget=LIMITED))
+    result = run("--budget", "5m")
+    assert result.exit_code == 0
+    assert result.stdout == "pytest tests/test_cart.py::test_total\n"
+    assert (
+        "siftwise: budget-limited (estimated 4m 50s of a 5m target): 40 selected tests left out "
+        "(~10m estimated, 12% of the risk score). The budget is a target, not a cap: estimates "
+        "are mean durations, so the run may take longer. This run is not a complete check of "
+        "the change."
+    ) in result.stderr
+
+
+@pytest.mark.usefixtures("repo")
+def test_a_budget_that_could_not_be_applied_says_why(api: respx.MockRouter) -> None:
+    budget = {**LIMITED, "applied": False, "limited": False, "full_suite": True,
+              "note": "no test history to rank the full suite by: running all of it"}  # fmt: skip
+    api.post(SELECT_URL).respond(json=response(mode="full", budget=budget))
+    result = run("--budget", "5m")
+    assert ("siftwise: budget target 5m not applied: no test history to rank the full suite by: "
+            "running all of it") in result.stderr  # fmt: skip
+
+
+@pytest.mark.usefixtures("repo")
+def test_a_budget_against_an_older_server_is_a_clear_error(api: respx.MockRouter) -> None:
+    """The CLI exits 1 (the Action and GitLab glue fail open to the full suite instead)."""
+    from tests.test_gha import OLD_SERVER_BUDGET_422
+
+    api.post(SELECT_URL).respond(422, json=OLD_SERVER_BUDGET_422)
+    result = run("--budget", "5m")
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert ("error: the siftwise server doesn't support time budgets (it rejected "
+            "budget_seconds: it's older than this client); upgrade the server or run without a "
+            "budget (--budget)") in result.stderr  # fmt: skip

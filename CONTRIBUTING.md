@@ -146,6 +146,8 @@ uv run alembic revision --rev-id 0011 -m "what it changes"
   `test_results` meanwhile).
 - **0008 and 0009** only add the shadow-mode tables and columns.
 - **0010** adds `runs.known_flaky` and `runs.rerun` and rebuilds the small `runs` unique index.
+- **0011** adds the nullable `shadow_selections.budget` and lets `shadow_failures.cause` be
+  `budget` (no rewrite).
 
 ## Evals
 

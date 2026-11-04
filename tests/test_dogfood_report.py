@@ -162,6 +162,7 @@ def test_recall_time_saved_and_misses_add_up_like_the_servers_recall() -> None:
     )
     assert every["recall"] == 0.75 and selective["recall"] == pytest.approx(2 / 3)
     assert every["missed_by_cause"] == {
+        "budget": 0,
         "new_test": 1,
         "flaky_history": 0,
         "config_gap": 0,

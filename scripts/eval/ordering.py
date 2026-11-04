@@ -21,7 +21,7 @@ import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from siftwise.core.selector import pytest_file, pytest_node
+from siftwise.core.selector import is_go_subtest, pytest_file, pytest_node
 
 _DOCTEST_SUFFIX = " || test $? -eq 5; }"
 
@@ -74,11 +74,37 @@ def first_failure(
     commands: Sequence[str], tests: Sequence[RanTest], go_module: str | None = None
 ) -> FirstFailure | None:
     """None when none of the tests the commands run failed."""
+    ran = _ran(commands, tests, go_module)
+    elapsed = 0.0
+    first: tuple[int, float] | None = None
+    for position, (ms, failed) in enumerate(ran, start=1):
+        elapsed += ms
+        if failed and first is None:
+            first = (position, elapsed)
+    if first is None:
+        return None
+    return FirstFailure(first[0], len(ran), first[1], elapsed)
+
+
+def run_time(
+    commands: Sequence[str], tests: Sequence[RanTest], go_module: str | None = None
+) -> float:
+    """The measured time of the tests the commands run."""
+    return sum(ms for ms, _ in _ran(commands, tests, go_module))
+
+
+def _ran(
+    commands: Sequence[str], tests: Sequence[RanTest], go_module: str | None
+) -> list[tuple[float, bool]]:
+    """The top-level tests the commands run, in run order: (measured ms, failed)."""
     order = {unit: n for n, unit in reversed(list(enumerate(units(commands, go_module))))}
     runs: dict[str, tuple[int, float, bool]] = {}  # top-level test -> (unit, ms, failed)
     for test in tests:
         classname, _, name = test.test_id.partition("::")
-        top = f"{classname}::{name.split('/', 1)[0]}"
+        # Only a Go subtest folds into its parent: a pytest ID may hold a "/" (a URL param).
+        top = (
+            f"{classname}::{name.split('/', 1)[0]}" if is_go_subtest(test.test_id) else test.test_id
+        )
         keys = [("go", classname), ("js", test.file_path or ""),
                 ("py", pytest_node(test.test_id, test.file_path) or ""),
                 ("py", pytest_file(test.test_id, test.file_path) or "")]  # fmt: skip
@@ -90,12 +116,4 @@ def first_failure(
         # A subtest's time is inside its parent's; its failure is its parent's.
         runs[top] = (unit, ms if is_sub else test.duration_ms, failed or test.failed)
     ran = sorted(runs.items(), key=lambda item: (item[1][0], item[0]))
-    elapsed = 0.0
-    first: tuple[int, float] | None = None
-    for position, (_, (_, ms, failed)) in enumerate(ran, start=1):
-        elapsed += ms
-        if failed and first is None:
-            first = (position, elapsed)
-    if first is None:
-        return None
-    return FirstFailure(first[0], len(ran), first[1], elapsed)
+    return [(ms, failed) for _, (_, ms, failed) in ran]

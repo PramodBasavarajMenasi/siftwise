@@ -15,9 +15,11 @@ import httpx
 import pytest
 import respx
 import yaml  # type: ignore[import-untyped]  # PyYAML, through uvicorn[standard]
+from alembic.script import ScriptDirectory
 from typer.testing import CliRunner, Result
 
 import siftwise
+from siftwise import migrate
 from siftwise.cli import gha, gitlab
 from siftwise.cli.main import app
 from tests.test_gha import failure, git, recorded_runs, selection, triage_response
@@ -804,8 +806,8 @@ def test_the_examples_history_survives_a_dump_and_restore(
         target = create_engine(urls[1])
         with target.begin() as conn:
             assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == (
-                "0010"
-            )  # then migrated on
+                ScriptDirectory.from_config(migrate.alembic_config()).get_current_head()
+            )  # then migrated on to head
             assert conn.execute(text("SELECT rerun FROM runs")).scalars().all() == [0]
             conn.execute(text("INSERT INTO repos (name) VALUES ('acme/other')"))  # a new ID
             assert conn.execute(text("SELECT count(*) FROM repos")).scalar() == 2
@@ -834,3 +836,44 @@ def test_siftwise_order_keeps_the_old_order(repo: dict[str, str], api: respx.Moc
     assert json.loads(select.calls.last.request.content)["order"] == "default"
     run("select", mr_env(repo))
     assert "order" not in json.loads(select.calls.last.request.content)  # risk: the default
+
+
+def test_siftwise_budget_limits_the_run_and_the_note_says_so(
+    repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    budget = {"seconds": 300.0, "applied": True, "limited": True, "full_suite": False,
+              "note": "", "estimated_ms": 290_000.0, "left_out": 12, "left_out_ms": 60_000.0,
+              "left_out_risk_share": 0.2, "unknown_test_ms": 500.0}  # fmt: skip
+    select = api.post(f"{SERVER}/select").respond(
+        json=selection(budget_limited=True, budget=budget)
+    )
+    routes = notes(api)
+
+    assert run("select", mr_env(repo, SIFTWISE_BUDGET="5m")).exit_code == 0
+    assert json.loads(select.calls.last.request.content)["budget_seconds"] == 300.0
+    note = json.loads(routes["create"].calls.last.request.content)["body"]
+    assert (
+        "**budget-limited (estimated 4m 50s of a 5m 00s target): 12 selected tests left out**"
+        in note
+    )
+    env = dotenv("select")
+    assert (env["SIFTWISE_BUDGET_LIMITED"], env["SIFTWISE_BUDGET_LEFT_OUT"]) == ("true", "12")
+    run("select", mr_env(repo))
+    assert "budget_seconds" not in json.loads(select.calls.last.request.content)
+
+
+def test_a_budget_against_an_older_server_fails_open_on_gitlab(
+    repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    from tests.test_gha import OLD_SERVER_BUDGET_422
+
+    api.post(f"{SERVER}/select").respond(422, json=OLD_SERVER_BUDGET_422)
+    notes(api)
+
+    result = run("select", mr_env(repo, SIFTWISE_BUDGET="5m"))
+
+    assert result.exit_code == 0, result.output
+    env = dotenv("select")
+    assert (env["SIFTWISE_MODE"], env["SIFTWISE_BUDGET_LIMITED"]) == ("full", "false")
+    assert (gitlab.OUT_DIR / "command.sh").read_text(encoding="utf-8").strip() == ""
+    assert "doesn't support time budgets" in result.output
