@@ -118,6 +118,7 @@ _BUILD_BASENAMES = frozenset(
         # JS/TS
         "package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
         "pnpm-lock.yaml", "pnpm-workspace.yaml", "bun.lockb", "bun.lock", ".babelrc", ".nvmrc",
+        ".swcrc", "lerna.json", ".yarnrc.yml",
         # Go
         "go.mod", "go.sum", "go.work", "go.work.sum",
         # Build / CI
@@ -126,8 +127,8 @@ _BUILD_BASENAMES = frozenset(
 )  # fmt: skip
 _BUILD_GLOBS = (
     "requirements*.txt", "Dockerfile.*", "*.Dockerfile", "docker-compose*.yml",
-    "docker-compose*.yaml", "tsconfig*.json", "jest.config.*", "babel.config.*",
-    "vitest.config.*",
+    "docker-compose*.yaml", "tsconfig*.json", "jsconfig*.json", "jest.config.*", "babel.config.*",
+    ".babelrc.*", "swc.config.*", "vitest.config.*",
 )  # fmt: skip
 _BUILD_DIRS = (".github/workflows/", ".github/actions/")
 
@@ -366,6 +367,27 @@ class Budget:
     before: SelectionScope | None = None
 
 
+@dataclass(frozen=True)
+class JsImport:
+    """A Jest test file's nearest changed file in the CLI's JS/TS import graph."""
+
+    module: str
+    via: str | None  # the file the test imports on the way; None: it imports it directly
+    depth: int  # 1 = a direct import (the risk order counts every import as indirect for now)
+
+
+@dataclass(frozen=True)
+class JsImports:
+    """What the CLI's JS/TS import graph adds to ``affected_files`` (``/select``'s
+    ``js_graph``): reasons and the files it can't see through."""
+
+    nearest: Mapping[str, JsImport] = field(default_factory=dict)
+    # Test file -> a file it reaches whose require/import() of a non-literal may load
+    # anything: such tests run for any JS change, but never count as covering it.
+    dynamic: Mapping[str, str] = field(default_factory=dict)
+    notes: tuple[str, ...] = ()  # what the graph couldn't read (a jest.config.ts)
+
+
 # --- selection ----------------------------------------------------------------------------
 
 
@@ -380,13 +402,16 @@ def select_tests(
     junit_dir: str | None = None,
     order: Order = Order.DEFAULT,
     budget_ms: float | None = None,
+    js_imports: JsImports | None = None,
 ) -> Selection:
     """Select tests for a change.
 
     ``affected_packages`` maps a Go package import path to the changed packages it imports
     (directly or transitively), as computed by the CLI from ``go list -deps -test``.
     ``affected_files`` maps a Python test file to the changed modules it imports (directly,
-    transitively, via parent packages or conftest.py), from the CLI's static import graph.
+    transitively, via parent packages or conftest.py), from the CLI's static import graph, and
+    a Jest test file (repo-relative) to the changed files it imports, from the JS/TS graph;
+    ``js_imports`` adds that graph's details (``JsImports``).
     ``deleted_files`` are changed files that no longer exist: no command names them.
     ``junit_dir``: each pytest command writes ``--junitxml=<junit_dir>/siftwise-<n>.xml``, so
     a line of several pytest commands doesn't overwrite one report with the next.
@@ -399,6 +424,7 @@ def select_tests(
     selection = _select(
         history, changed_files, changed_files_known, config or SelectorConfig(),
         affected_packages, affected_files, deleted_files, junit_dir, tests, order, budget_ms,
+        js_imports or JsImports(),
     )  # fmt: skip
     return _with_estimate(selection, history, tests)
 
@@ -415,7 +441,9 @@ def _select(
     tests: Mapping[str, _Test],
     order: Order = Order.DEFAULT,
     budget_ms: float | None = None,
+    js_imports: JsImports | None = None,
 ) -> Selection:
+    js_imports = js_imports or JsImports()
     affected_packages = affected_packages or {}
     affected_files = {
         path: modules
@@ -484,6 +512,8 @@ def _select(
     unmapped = []
     whole_packages: set[str] = set()
     py_whole_files: set[str] = set()
+    jest_files = _JestFiles(tests.values())
+    js_new_files: dict[str, str] = {}  # a new Jest test file's path as Jest runs it -> repo path
     for path in relevant:
         is_py_test_file = path.endswith(".py") and (
             is_python_test_file(path) or path in py_test_files
@@ -491,6 +521,15 @@ def _select(
         if is_py_test_file and path in deleted:
             continue  # a deleted test file: its tests are gone, there's nothing to run
         hits = _map_path(path, tests, config)
+        if not hits and is_jest_test_file(path) and path not in deleted:
+            # A changed Jest test file reported from its project's root (a suffix of the repo
+            # path), or a new one: Jest runs files whole, so tests new in it run too.
+            for test in jest_files.tests_for(path):
+                hits[test.test_id] = f"test file changed: {path}"
+            runnable = None if hits else jest_files.runnable(path)
+            if runnable is not None:
+                js_new_files[runnable] = path
+                continue
         if is_py_test_file:
             # Changed or added test file: run it whole, so tests new in it run too.
             py_whole_files.add(path)
@@ -524,6 +563,24 @@ def _select(
             add(test.test_id, f"imports changed module {first}{more}", Link.INDIRECT)
         py_whole_files.add(file)
         covered_by_imports.update(modules)
+
+    # JS/TS dependents: Jest test files that import a changed file (Jest runs files whole).
+    for file, modules in sorted(affected_files.items()):
+        if file in deleted or posixpath.splitext(file)[1] not in JS_EXTENSIONS or not modules:
+            continue
+        known_js = jest_files.tests_for(file)
+        if not known_js:
+            continue
+        reason = js_import_reason(modules, js_imports.nearest.get(file), js_imports.notes)
+        for test in known_js:
+            add(test.test_id, reason, Link.INDIRECT)
+        covered_by_imports.update(modules)
+    # Tests that reach an import the graph can't resolve may load any changed file: they run,
+    # but cover nothing (a change no static import reaches still falls back as before).
+    for file, source in sorted(js_imports.dynamic.items()):
+        for test in jest_files.tests_for(file):
+            add(test.test_id, f"reaches {source}, whose dynamic import siftwise can't resolve: "
+                "it may load changed code", Link.INDIRECT)  # fmt: skip
 
     # Nested manifests/lockfiles: every known test under their directory runs (Go packages
     # whole). They never force the full suite, even when no known tests live there.
@@ -615,11 +672,14 @@ def _select(
             ):
                 add(test.test_id, f"always-run pattern {pattern!r}", Link.HISTORY)
 
-    # Tests in a deleted Python file no longer exist (pytest errors on a missing path).
+    # Tests in a deleted Python or Jest file no longer exist (pytest errors on a missing path,
+    # and so does Jest: "No tests found").
+    gone = {t.test_id for path in deleted for t in jest_files.tests_for(path)}
     chosen = [
         tests[test_id]
         for test_id in sorted(selected)
         if not (tests[test_id].runner is Runner.PYTEST and tests[test_id].py_path in deleted)
+        and test_id not in gone
     ]
     unrunnable = [t.test_id for t in chosen if t.runner is None]
     if unrunnable:
@@ -636,18 +696,21 @@ def _select(
     )
     if chosen:
         summary = f"{len(chosen)} of {len(tests)} known tests selected"
-    elif py_whole_files:
-        summary = f"{len(py_whole_files)} changed test file(s) run whole, no known tests"
+    elif py_whole_files or js_new_files:
+        summary = (f"{len(py_whole_files) + len(js_new_files)} changed test file(s) run whole, "
+                   "no known tests")  # fmt: skip
     elif py_module_files:
         summary = f"{len(py_module_files)} changed module(s) run with --doctest-modules"
     else:
         summary = NO_TESTS_AFFECTED
+    if js_new_files:
+        summary += f"; new test file: {_list(sorted(js_new_files.values()))}"
     ranks = rank(
         (_risk_inputs(history.tests[t.test_id], links[t.test_id]) for t in chosen),
         history.newest_run_at,
     )
     ranked = _ranked(chosen, ranks, links, history)
-    units = _units(chosen, whole_packages, py_whole_files, py_module_files)
+    units = _units(chosen, whole_packages, py_whole_files, py_module_files, js_new_files)
     selection = Selection(
         mode=Mode.SELECTIVE,
         reason=summary,
@@ -1037,6 +1100,7 @@ LINK_TEST_FILE = "test file changed"
 LINK_PATH = "path mapping"
 LINK_PY_IMPORT = "imports changed module"
 LINK_GO_IMPORT = "imports changed package"
+LINK_JS_IMPORT = "imports changed module"
 LINK_DECLARED = "declared dependency"
 LINK_NESTED_BUILD = "nested build file"
 LINK_ROOT_BUILD = "root build/config file"
@@ -1076,6 +1140,12 @@ def change_links(
         if (path := normalize_path(file))
     }
     packages = affected_packages or {}
+    js_by_test: dict[str, set[str]] = defaultdict(set)  # test_id -> changed files (JS imports)
+    jest_files = _JestFiles(tests_by_id.values())
+    for file, modules in by_file.items():
+        if file not in deleted and posixpath.splitext(file)[1] in JS_EXTENSIONS:
+            for test in jest_files.tests_for(file):
+                js_by_test[test.test_id].update(modules)
     paths = sorted({p for p in (normalize_path(f) for f in changed_files) if p})
     scoped_build = {p: d for p in paths if (d := build_file_scope(p)) is not None}
     build = [p for p in paths if is_build_file(p) and p not in scoped_build]
@@ -1095,7 +1165,14 @@ def change_links(
             and (is_python_test_file(path) or path in py_test_files)
         ):
             continue  # a deleted test file: its tests are gone (as in select_tests)
-        for test_id, reason in _map_path(path, tests_by_id, config).items():
+        hits = _map_path(path, tests_by_id, config)
+        if not hits and is_jest_test_file(path) and path not in deleted:
+            # A changed Jest test file reported from its project's root (as select_tests).
+            for test in jest_files.tests_for(path):
+                found[test.test_id].append(ChangeLink(LINK_TEST_FILE, path,
+                                                      f"test file changed: {path}",
+                                                      Strength.HIGH))  # fmt: skip
+        for test_id, reason in hits.items():
             test = tests_by_id[test_id]
             signal = LINK_TEST_FILE if path in (test.file_path, test.py_path) else LINK_PATH
             found[test_id].append(ChangeLink(signal, path, reason, Strength.HIGH))
@@ -1114,6 +1191,8 @@ def change_links(
             imported, signal = by_file.get(test.py_path), LINK_PY_IMPORT
         elif test.runner is Runner.GO:
             imported, signal = packages.get(test.classname), LINK_GO_IMPORT
+        elif test.runner is Runner.JEST and test.test_id in js_by_test:
+            imported, signal = sorted(js_by_test[test.test_id]), LINK_JS_IMPORT
         if imported:
             first = sorted(imported)[0]
             more = f" (+{len(imported) - 1} more)" if len(imported) > 1 else ""
@@ -1131,6 +1210,74 @@ def change_links(
             reason = f"build/config file changed: {_list(build)}; every test depends on it"
             links.append(ChangeLink(LINK_ROOT_BUILD, build[0], reason, Strength.LOW))
     return {test_id: tuple(links) for test_id, links in found.items()}
+
+
+def is_jest_test_file(path: str) -> bool:
+    """Jest's default ``testMatch``: ``**/__tests__/**`` or ``*.test.*`` / ``*.spec.*``."""
+    stem, ext = posixpath.splitext(posixpath.basename(path))
+    if ext not in JS_EXTENSIONS:
+        return False
+    return stem.endswith((".test", ".spec")) or "__tests__" in path.split("/")[:-1]
+
+
+def js_import_reason(
+    modules: Sequence[str], nearest: JsImport | None = None, notes: Sequence[str] = ()
+) -> str:
+    """``imports changed module src/price.ts (via src/cart.ts) (+1 more)``, plus what the
+    graph couldn't read."""
+    first = nearest.module if nearest and nearest.module in modules else sorted(modules)[0]
+    via = f" (via {nearest.via})" if nearest and nearest.via and nearest.module == first else ""
+    more = f" (+{len(modules) - 1} more)" if len(modules) > 1 else ""
+    return f"{LINK_JS_IMPORT} {first}{via}{more}" + "".join(f"; {note}" for note in notes)
+
+
+class _JestFiles:
+    """Known Jest tests by file. The CLI's graph names files from the repo root, but
+    jest-junit reports them from the Jest project's root (``src/a.test.ts`` for
+    ``packages/web/src/a.test.ts``): a known path that the repo path ends with matches too."""
+
+    def __init__(self, tests: Iterable[_Test]) -> None:
+        self.by_path: dict[str, list[_Test]] = defaultdict(list)
+        for test in tests:
+            if test.runner is Runner.JEST and test.file_path:
+                self.by_path[test.file_path].append(test)
+        self.by_name: dict[str, list[str]] = defaultdict(list)
+        for path in self.by_path:
+            self.by_name[posixpath.basename(path)].append(path)
+
+    def runnable(self, repo_path: str) -> str | None:
+        """A new Jest test file's path as the known tests name theirs (repo-relative, or from
+        the Jest project's root), or None if that can't be told: no known Jest test's
+        directory ends its directory (the deepest such match gives the project's root) or is
+        an ancestor of it (paths are then repo-relative). Then the full suite runs, as before."""
+        directory = posixpath.dirname(repo_path)
+        prefixes: dict[int, str] = {}  # matched directory depth -> the project root before it
+        ancestor = False
+        for known in self.by_path:
+            known_dir = posixpath.dirname(known)
+            if not known_dir:
+                continue
+            if directory == known_dir:
+                prefixes[known_dir.count("/") + 1] = ""
+            elif directory.endswith("/" + known_dir):
+                prefixes[known_dir.count("/") + 1] = directory[: -len(known_dir) - 1]
+            elif directory.startswith(known_dir + "/"):
+                ancestor = True
+        if prefixes:
+            prefix = prefixes[max(prefixes)]  # one string per depth: the suffix decides it
+            return repo_path[len(prefix) + 1 :] if prefix else repo_path
+        return repo_path if ancestor else None
+
+    def tests_for(self, repo_path: str) -> list[_Test]:
+        exact = self.by_path.get(repo_path)
+        if exact:
+            return exact
+        return [
+            test
+            for known in self.by_name.get(posixpath.basename(repo_path), ())
+            if repo_path.endswith("/" + known)
+            for test in self.by_path[known]
+        ]
 
 
 def is_go_subtest(test_id: str) -> bool:
@@ -1468,6 +1615,7 @@ def _units(
     go_whole_packages: Collection[str] = (),
     py_whole_files: Collection[str] = (),
     py_module_files: Collection[str] = (),
+    js_new_files: Collection[str] = (),
 ) -> list[_Unit]:
     """The units that run ``tests``: pytest arguments, doctest modules, Go packages, Jest files,
     each kind by path (the default order).
@@ -1508,7 +1656,7 @@ def _units(
         names = None if package in go_whole_packages else tuple(sorted(go_tests[package]))
         units.append(_Unit(Runner.GO, package, tuple(go_ids[package]), go_names=names))
 
-    jest_ids: dict[str, list[str]] = {}
+    jest_ids: dict[str, list[str]] = {file: [] for file in js_new_files}  # new: no known test
     for t in tests:
         if t.runner is Runner.JEST and t.file_path:
             jest_ids.setdefault(t.file_path, []).append(t.test_id)

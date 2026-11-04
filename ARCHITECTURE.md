@@ -96,7 +96,7 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
 ## Selection
 
 - **Signals:** path mapping (`foo.py` → `test_foo.py`, Go package directories, JS/TS test
-  files), Go and Python import graphs, `[[depends]]` rules, nested build files (scoped to their
+  files), Go, Python and JS/TS import graphs, `[[depends]]` rules, nested build files (scoped to their
   directory), co-change from past failing runs, tests that failed recently on main, and
   `always_run`.
 - **Whole files and packages:** a changed or imported test file runs whole, and a changed Go
@@ -104,6 +104,50 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
 - **Full-suite fallbacks**, when anything is uncertain: an unknown or empty diff, no history,
   a root build or CI file changed, a changed source file no signal covers, or a selected test
   with no known runner. Docs, lint-only configs and generated files never force it.
+
+### The JS/TS import graph
+
+`cli/jsgraph.py`, built by the CLI in the checkout like the Python graph, with no Node.js.
+
+- **Parser:** a small tokenizer that skips comments, strings, template literals (their
+  `${...}` is code), regular expressions (a `/` where an operand is expected) and JSX text (a
+  `<` in an expression position in .js/.jsx/.tsx; never in .ts, where it is a type
+  assertion). It finds `import ... from`, `import '...'`, `import type`, `export ... from`,
+  `require('...')`, `require.resolve`, `import('...')` and `jest.mock`/`requireActual`/...
+  with a literal. A `require` or `import()` of anything else makes the file *dynamic*.
+- **Resolution**, first that applies: a JSON Jest `moduleNameMapper` (`jest.config.json` or
+  package.json `jest`; a match that maps outside the checkout, like a CSS stub, is no edge);
+  relative paths (exact, TS ESM's `.js` → `.ts`, `.ts .tsx .js .jsx .mts .cts .mjs .cjs
+  .json`, then `index.*`); the nearest tsconfig.json/jsconfig.json's `paths` and `baseUrl`
+  (JSONC, `extends` within the repo; a child's `paths` replace its parent's, as in
+  TypeScript); workspace packages (package.json `workspaces`, pnpm-workspace.yaml,
+  lerna.json, `!` exclusions) by `exports`/`source`/`module`/`main`, a built entry
+  (`dist/`, `lib/`, `build/`) mapped back to `src/`, else `src/index.*`, `index.*`, and the
+  package's package.json as an edge. Anything else is external or not in the checkout: no
+  edge, never an error. node_modules is never read. A deleted file counts as existing, so its
+  importers are selected.
+- **What is sent:** `affected_files` gets Jest test file → changed files it imports, at any
+  depth (every server takes it; one from before the JS graph ignores JS keys). `/select`
+  alone also gets `js_graph`: each test's nearest changed file, the file it imports on the
+  way and the depth (for reasons like "imports changed module src/price.ts (via
+  src/cart.ts)"), the tests that reach a dynamic file, and notes (a `jest.config.ts` it
+  couldn't read). An older server's 422 on `js_graph` gets the request again without it.
+- **On the server:** a key matches a known Jest test by its repo path, or by the project-
+  relative path jest-junit reports (`packages/web/src/a.test.ts` ends with `src/a.test.ts`).
+  Imports cover the changed file (no fallback) and link it for triage (medium), like
+  Python's. Tests that reach a dynamic file are selected for any JS change but cover
+  nothing, so a change only a dynamic import might reach still falls back.
+- **New test files:** a changed file matching Jest's default patterns with no known test in
+  it runs whole and first (a unit with no ranked test), under the path the known tests use:
+  repo-relative when a known test lives in its directory or above it, else project-relative
+  when a known test directory ends its directory (the deepest such match gives the project
+  root). With none (or no known Jest tests at all) the path can't be trusted: the full suite.
+  A changed known test file that jest-junit reports from its project's root matches its tests
+  the same way (and triage links it). `WouldRun` can't credit a new file's tests in shadow
+  mode: no test IDs yet.
+- **Depth:** recorded, not used by the risk order: like Python and Go imports, every JS
+  import is an indirect link. Using depth 1 as direct is the import-depth issue's to decide
+  for all three graphs.
 
 ## Risk order
 

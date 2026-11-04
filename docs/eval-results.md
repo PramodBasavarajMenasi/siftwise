@@ -1019,6 +1019,56 @@ failures) and 3 substrate runs (1,810 of 2,044).
 The PR-mode commands above: each run's line lists its budgets (`budget 10% (...): ...`), and
 the summary ends with `time budgets (...)`.
 
+## JS/TS import graph: performance and validation
+
+Measured 2026-11-05 for the JS/TS import graph (`cli/jsgraph.py`,
+[ARCHITECTURE](../ARCHITECTURE.md#the-jsts-import-graph)).
+
+**No replay.** A replay needs an open-source Jest repo whose GitHub Actions upload JUnit with
+each test's file (jest-junit's `addFileAttribute`): without file paths siftwise has no runner
+for Jest tests and always runs the full suite, so there's nothing to measure. A code search
+for workflows using jest-junit (`scripts.eval.find_candidates`, TypeScript and JavaScript)
+found 8 repos with live JUnit artifacts and enough PRs and tests; the 5 checked
+(starwards/starwards, tomquist/hm2mqtt, dorny/test-reporter, ejjays/phantom, druxt/druxt.js)
+report no `file` attribute, and most had no failing runs to measure recall on. So there are
+no recall or savings numbers for JS/TS.
+
+**Performance** on jestjs/jest's main branch (downloaded as a zipball, 2026-11-05): 3,497
+files, 2,272 JS/TS (5.7 MB), 1,362 Jest test files. Building the graph took 1.9 s (Windows
+laptop; the tokenizer itself 1.3 s), 0.6 s again in the same process (the content-hash
+cache), and about 6 MB of memory; finding the tests one changed file affects took 5 ms. Of
+4,441 import specifiers, 1,927 resolved as relative paths, 915 through workspace packages
+and aliases, 1,561 were external packages and 38 relative ones aren't in the checkout (test
+fixtures that import missing files on purpose). 40 files are dynamic, and the graph noted 5
+`jest.config.js`/`.ts` files it can't read.
+
+**Validation by hand** on the same checkout, for 8 recent jestjs/jest commits (their changed
+files from the GitHub API, the graph as of the snapshot, not of each commit):
+
+| Commit | Changed (source) | Test files selected by import | More, reaching a dynamic import | Fallback |
+|---|---|---|---|---|
+| 4685157 | jest-mock/src/index.ts | 388 | 82 | no |
+| 0dbdc23 | jest-source-map/src/SourceMapCache.ts | 43 | 430 | no |
+| 121c2ae | an e2e fixture, e2e/runJest.ts, eslint.config.mjs, ... | 370 | 100 | yes: the e2e fixture and the ESLint config no import reaches |
+| 981920c | scripts/buildUtils.mjs | 0 | 470 | yes: build tooling no test imports |
+| 74bd550 | jest-each/src/table/interpolation.ts | 46 | 424 | no |
+| c94f28d | jest-resolve/src/resolver.ts | 321 | 149 | no |
+| cda97a3 | jest-runtime/src/internals/EsmLoader.ts | 32 | 438 | no |
+| ea7258e | jest-config (3 files), jest-types/src/Config.ts | 468 | 12 | no |
+
+- **Chains checked by hand**, file by file, for 5 sampled tests (e.g. a jest-circus test ->
+  jest-circus/src/index.ts -> jest-each's index -> bind.ts -> table/array.ts ->
+  table/interpolation.ts): every link is a real import, including `@jest/source-map`, which
+  resolves through the package's `exports` (`./build/index.js`) back to `src/index.ts`.
+- **Possible misses:** the test files that mention a changed file's name without being
+  selected were, read by hand, about other files of the same name. The e2e fixture in
+  121c2ae is run by `e2e/__tests__/nativeTypescriptStrip.test.ts` spawning Jest on its
+  directory: no import reaches it, so the selector keeps its full-suite fallback.
+- **The cost of the dynamic rule:** Jest's own runtime and config loading `require()` paths
+  it computes, and most of its tests reach that code, so 12 to 470 test files run on top of
+  the import graph's for every change. That's the safe answer for a test runner's own
+  source; most application repos have far fewer dynamic imports, but that isn't measured.
+
 ## Performance
 
 Measured on 2026-10-19 on a Windows laptop, Postgres 16 in Docker, on the rdflib and substrate

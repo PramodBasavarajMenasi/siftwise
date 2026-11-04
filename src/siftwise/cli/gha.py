@@ -314,7 +314,7 @@ def run_select(
                     "variant": variant or None,
                     "commit_sha": ctx.head_sha,
                 }
-            result = cli.post_json(server, token, "/select", body, timeout=SELECT_TIMEOUT)
+            result = cli.post_select(server, token, body, timeout=SELECT_TIMEOUT)
             problem = ""
         except cli.SiftwiseError as exc:
             if exc.status == httpx.codes.NOT_FOUND:

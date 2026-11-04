@@ -1,0 +1,14 @@
+{
+  "name": "shop-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "!packages/legacy"
+  ],
+  "jest": {
+    "moduleNameMapper": {
+      "^@web/(.*)$": "<rootDir>/packages/web/src/$1",
+      "\\.(css|svg)$": "identity-obj-proxy"
+    }
+  }
+}

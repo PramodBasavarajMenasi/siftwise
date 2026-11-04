@@ -1,0 +1,10 @@
+{
+  // shared options
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@shared/*": ["packages/core/src/shared/*"],
+      "~/*": ["packages/web/src/*"], // the web app's own alias
+    },
+  },
+}
