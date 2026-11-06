@@ -391,3 +391,38 @@ def test_js_graph_details_reach_the_reasons(client: TestClient, db_session: Sess
     ]
     bad = {**js_graph, "nearest": {"src/sum.test.ts": {"module": "m", "depth": 0}}}
     assert client.post("/select", json={**body, "js_graph": bad}, headers=AUTH).status_code == 422
+
+
+# --- import depths (#48) ----------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("seeded")
+def test_import_depths_reorder_without_changing_the_selection(client: TestClient) -> None:
+    body: dict[str, Any] = {"changed_files": ["src/shop/money.py"],
+            "affected_files": {"tests/test_cart.py": ["src/shop/money.py"],
+                               "tests/test_db.py": ["src/shop/money.py"]}}  # fmt: skip
+    old = post_select(client, **body).json()
+    new = post_select(client, **body, import_depths={"tests/test_db.py": 1,
+                                                     "tests/test_cart.py": 3}).json()  # fmt: skip
+
+    rank = {t["test_id"]: (t["rank"], t["score"], t["rank_reason"]) for t in new["tests"]}
+    # Every test is new (2 runs): +2. test_db imports money.py itself: direct, 6 + 2.
+    assert rank["tests.test_db::test_query"] == (1, 8.0, "direct link; new: little history")
+    assert all(score == 5.0 for test_id, (_, score, _) in rank.items()
+               if test_id != "tests.test_db::test_query")  # fmt: skip
+    assert new["commands"] == ["pytest tests/test_db.py tests/test_cart.py"]
+    # Without depths every import is indirect: a tie, by test ID.
+    assert {t["score"] for t in old["tests"]} == {5.0}
+    assert old["commands"] == ["pytest tests/test_cart.py tests/test_db.py"]
+    # Order only: the same tests, counts and scope.
+    for key in ("mode", "selected_count", "python_files_run_whole", "go_packages_run_whole"):
+        assert new[key] == old[key]
+    assert sorted(t["test_id"] for t in new["tests"]) == sorted(t["test_id"] for t in old["tests"])
+
+
+@pytest.mark.usefixtures("seeded")
+@pytest.mark.parametrize("depths", [{"tests/test_db.py": 0}, {"tests/test_db.py": "near"},
+                                    {"tests/test_db.py": 1.5}, []])  # fmt: skip
+def test_invalid_import_depths_are_rejected(client: TestClient, depths: object) -> None:
+    response = post_select(client, changed_files=["src/shop/money.py"], import_depths=depths)
+    assert response.status_code == 422

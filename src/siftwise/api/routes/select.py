@@ -70,6 +70,7 @@ def post_select(
             notes=tuple(body.js_graph.notes),
         ),
         java=_java(body),
+        import_depths=body.import_depths,
     )
     shadow_reason = _store_shadow(session, body, selection) if body.shadow else None
     return SelectResponse(

@@ -95,6 +95,39 @@ class PyGraph:
                 affected[file] = sorted(modules)
         return affected
 
+    def depths(self, changed_files: Iterable[str]) -> dict[str, int]:
+        """Test file -> the shortest import depth from it to a changed module other than
+        itself (1 = it imports one: by name, or as a parent package's ``__init__.py``), for
+        the test files ``affected`` returns. A ``conftest.py`` pytest loads for the test is one
+        hop: a changed conftest is depth 1, a module it imports depth 2."""
+        importers: dict[str, set[str]] = defaultdict(set)
+        for file, imports in self.edges.items():
+            for imported in imports:
+                importers[imported].add(file)
+        # file -> [(distance, changed module)], over every changed module (reverse BFS each)
+        reach: dict[str, list[tuple[int, str]]] = defaultdict(list)
+        for changed in sorted({p for p in changed_files if p in self.edges}):
+            distance = {changed: 0}
+            queue = deque([changed])
+            while queue:
+                current = queue.popleft()
+                for importer in importers.get(current, ()):
+                    if importer not in distance:
+                        distance[importer] = distance[current] + 1
+                        queue.append(importer)
+            for file, d in distance.items():
+                reach[file].append((d, changed))
+        depths: dict[str, int] = {}
+        for file in sorted(self.edges):
+            if not is_python_test_file(file):
+                continue
+            found = [d for d, changed in reach.get(file, ()) if changed != file]
+            for conftest in conftests_for(file, self.edges):
+                found += [d + 1 for d, changed in reach.get(conftest, ()) if changed != file]
+            if found:
+                depths[file] = min(found)
+        return depths
+
     def to_json(self) -> dict[str, Any]:
         return {"edges": {f: sorted(e) for f, e in self.edges.items()}}
 

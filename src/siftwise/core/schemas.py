@@ -316,6 +316,13 @@ class SelectRequest(ChangeRequest):
             "commands then run in the package's module (`go test -C <dir>`)",
         )
     )
+    import_depths: dict[Path4K, Annotated[int, Field(ge=1, le=10_000)]] | None = Field(
+        default=None,
+        max_length=100_000,
+        description="Test file (Python, Jest, Java) or Go package -> the shortest import depth "
+        "from it to a changed file, 1 = it imports changed code itself. Order only: depth 1 "
+        "ranks as a direct link, deeper as indirect; missing = indirect",
+    )
     budget_seconds: float | None = Field(
         default=None,
         gt=0,

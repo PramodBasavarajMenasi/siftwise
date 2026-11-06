@@ -207,3 +207,23 @@ def test_directories_pytest_never_collects_are_not_walked(tmp_path: Path) -> Non
 
     assert sorted(graph.edges) == ["pkg/__init__.py", "tests/test_a.py"]
     assert graph.affected(["pkg/__init__.py"]) == {"tests/test_a.py": ["pkg/__init__.py"]}
+
+
+def test_import_depths_are_the_shortest_chain_with_a_conftest_as_one_hop(graph: PyGraph) -> None:
+    # pkg/util.py: test_core -> pkg/core.py -> util (2); every test under tests/ also loads
+    # tests/conftest.py (1 hop) -> pkg/sub/mod.py -> util (1 + 2 = 3).
+    assert graph.depths(["pkg/util.py"]) == {
+        "tests/test_core.py": 2,
+        "tests/test_lib2.py": 3,
+        "tests/test_plain.py": 3,
+        "tests/unit/test_deep.py": 3,
+    }
+    # `from pkg import core` runs pkg/__init__.py: a direct import.
+    assert graph.depths(["pkg/__init__.py"])["tests/test_core.py"] == 1
+    assert graph.depths(["src/lib2/a.py"]) == {"tests/test_lib2.py": 1}
+    # The shortest over every changed module; a changed conftest is one hop.
+    assert graph.depths(["src/lib2/a.py", "pkg/util.py"])["tests/test_lib2.py"] == 1
+    assert set(graph.depths(["tests/conftest.py"]).values()) == {1}
+    # Exactly the files `affected` returns, and a changed test file doesn't count itself.
+    for changed in (["pkg/util.py"], ["pkg/sub/sibling.py"], ["tests/test_core.py"]):
+        assert set(graph.depths(changed)) == set(graph.affected(changed))

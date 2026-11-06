@@ -482,6 +482,7 @@ def select_tests(
     budget_ms: float | None = None,
     js_imports: JsImports | None = None,
     java: JavaBuildInfo | None = None,
+    import_depths: Mapping[str, int] | None = None,
 ) -> Selection:
     """Select tests for a change.
 
@@ -498,6 +499,9 @@ def select_tests(
     Every selected test gets its score and rank either way, and the same tests are selected.
     ``budget_ms``: run only the highest-risk units that fit (see ``Budget``); None = no budget.
     ``java``: the checkout's Java build; without it Java tests have no runner (full suite).
+    ``import_depths``: test file (Python, Jest, Java) or Go package -> the shortest import
+    depth from it to a changed file (1 = it imports changed code itself). Order only: a test
+    selected by an import at depth 1 ranks as a direct link, deeper (or unknown) as indirect.
     """
     # Every known test classified once, for the selection and its time estimate.
     tests = _index(history.tests.values() if history else ())
@@ -506,7 +510,7 @@ def select_tests(
     selection = _select(
         history, changed_files, changed_files_known, config or SelectorConfig(),
         affected_packages, affected_files, deleted_files, junit_dir, tests, order, budget_ms,
-        js_imports or JsImports(), java,
+        js_imports or JsImports(), java, import_depths,
     )  # fmt: skip
     return _with_estimate(selection, history, tests)
 
@@ -525,8 +529,17 @@ def _select(
     budget_ms: float | None = None,
     js_imports: JsImports | None = None,
     java: JavaBuildInfo | None = None,
+    import_depths: Mapping[str, int] | None = None,
 ) -> Selection:
     js_imports = js_imports or JsImports()
+    depths = {path: depth for key, depth in (import_depths or {}).items()
+              if (path := normalize_path(key))}  # fmt: skip
+
+    def import_link(key: str) -> Link:
+        """An import of changed code: direct when the test (file or Go package) imports it
+        itself, else (deeper, or no depth sent) indirect. Only the risk order reads it."""
+        return Link.DIRECT if depths.get(key) == 1 else Link.INDIRECT
+
     affected_packages = affected_packages or {}
     affected_files = {
         path: modules
@@ -674,7 +687,7 @@ def _select(
         first = sorted(modules)[0] if modules else "?"
         more = f" (+{len(modules) - 1} more)" if len(modules) > 1 else ""
         for test in known:
-            add(test.test_id, f"imports changed module {first}{more}", Link.INDIRECT)
+            add(test.test_id, f"imports changed module {first}{more}", import_link(file))
         py_whole_files.add(file)
         covered_by_imports.update(modules)
 
@@ -687,7 +700,7 @@ def _select(
             continue
         reason = js_import_reason(modules, js_imports.nearest.get(file), js_imports.notes)
         for test in known_js:
-            add(test.test_id, reason, Link.INDIRECT)
+            add(test.test_id, reason, import_link(file))
         covered_by_imports.update(modules)
     # Java dependents: test classes that use a changed class (run whole, per module).
     if java is not None:
@@ -698,7 +711,7 @@ def _select(
             known_java = java_classes.get(located[1], [])
             reason = java_use_reason(modules, java.nearest.get(file), java.notes)
             for test in known_java:
-                add(test.test_id, reason, Link.INDIRECT)
+                add(test.test_id, reason, import_link(file))
             if not known_java and located[1] in java.test_classes and _is_test_class(located[1]):
                 java_new.add((java.test_classes[located[1]], located[1]))
             covered_by_imports.update(modules)
@@ -731,7 +744,7 @@ def _select(
         if imported:
             first = sorted(imported)[0]
             more = f" (+{len(imported) - 1} more)" if len(imported) > 1 else ""
-            add(test.test_id, f"imports changed package {first}{more}", Link.INDIRECT)
+            add(test.test_id, f"imports changed package {first}{more}", import_link(test.classname))
             whole_packages.add(test.classname)
             covered_by_dependents.update(imported)
 

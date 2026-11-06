@@ -93,7 +93,11 @@ The selected tests come riskiest first, so a likely failure shows up early. Each
 from how directly the change reaches it, how recently and how often it failed (flaky failures
 discounted), and whether it's new: a fixed, documented formula, no learning
 ([details and an example](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/ARCHITECTURE.md#risk-order)).
-The order never changes which tests run.
+A test whose own file imports changed code (a Python, Jest or Java test file, or a Go
+package or its tests) counts as directly reached, like a test named after the changed file;
+one that reaches it only through other files or packages counts as indirect. The CLI sends
+each import's depth (`import_depths`); with an older CLI or server, every import counts as
+indirect. The order never changes which tests run.
 
 | Runner | What the order guarantees |
 |---|---|

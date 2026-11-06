@@ -7,6 +7,10 @@
     example.com/m/d        imports nothing
     example.com/m/notests  imports a (has no tests of its own)
 
+Each package lists its direct imports as go list does: ``Imports`` (non-test files),
+``TestImports`` (in-package _test.go files) and ``XTestImports`` (the _test package, which
+imports the package itself).
+
 Plus what go list really emits alongside: test variants ("p [p.test]"), generated test
 mains ("p.test"), a standard-library package and a third-party module package.
 """
@@ -48,13 +52,19 @@ def go_list_packages(root: Path) -> list[dict[str, Any]]:
             "Dir": "/gomod/github.com/x/y",
             "Module": {"Path": "github.com/x/y"},
         },
-        pkg("", ["fmt"]),
-        pkg("a", ["fmt"]),
+        pkg("", ["fmt"], Imports=["fmt"]),
+        pkg("a", ["fmt"], Imports=["fmt"], TestImports=["testing"]),
         test_variant("a", ["fmt", "testing"]),
         test_main("a", [f"{a} [{a}.test]", "testing"]),
-        pkg("b", [a, "fmt"]),
+        pkg("b", [a, "fmt"], Imports=[a, "fmt"], TestImports=["testing"]),
         test_variant("b", [a, "fmt", "testing"]),
-        pkg("c", [a, b]),
+        pkg(
+            "c",
+            [a, b],
+            Imports=[b],
+            TestImports=["testing"],
+            XTestImports=[c, d, "github.com/x/y", "testing"],
+        ),
         test_variant("c", [a, b, "testing"]),
         {  # external test package c_test, importing d only in tests
             **pkg("c", [a, b, f"{c} [{c}.test]", d, "github.com/x/y"]),
@@ -64,7 +74,7 @@ def go_list_packages(root: Path) -> list[dict[str, Any]]:
         },
         test_main("c", [f"{c} [{c}.test]", f"{c}_test [{c}.test]"]),
         pkg("d", []),
-        pkg("notests", [a]),
+        pkg("notests", [a], Imports=[a]),
     ]
 
 
