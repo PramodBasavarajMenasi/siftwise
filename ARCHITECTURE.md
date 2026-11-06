@@ -96,7 +96,8 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
 ## Selection
 
 - **Signals:** path mapping (`foo.py` → `test_foo.py`, Go package directories, JS/TS test
-  files), Go, Python and JS/TS import graphs, `[[depends]]` rules, nested build files (scoped to their
+  files, Java test classes by name), Go, Python and JS/TS import graphs and the Java
+  dependency graph, `[[depends]]` rules, nested build files (scoped to their
   directory), co-change from past failing runs, tests that failed recently on main, and
   `always_run`.
 - **Whole files and packages:** a changed or imported test file runs whole, and a changed Go
@@ -148,6 +149,61 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
 - **Depth:** recorded, not used by the risk order: like Python and Go imports, every JS
   import is an indirect link. Using depth 1 as direct is the import-depth issue's to decide
   for all three graphs.
+
+### Java (Maven and Gradle)
+
+`cli/javagraph.py`, built by the CLI in the checkout, with no JVM, Maven or Gradle.
+
+- **Build model** (`detect_build`): Maven's `pom.xml` and its `<modules>` (profiles' too),
+  recursively; Gradle's `settings.gradle[.kts]` `include` of string literals (a single project
+  without one). Each module's sources are `src/main/java` and `src/test/java`. Settings are
+  inherited along `<parent>` (relativePath) for Maven, from the root build file and buildSrc
+  for Gradle. A module is *not analysed* (a change to its Java sources runs the full suite)
+  with custom source directories (`<sourceDirectory>`, `sourceSets ... srcDir`), annotation
+  processors that may generate code (anything but Lombok and checkers: ErrorProne, NullAway,
+  the Checker Framework), or Kotlin, Groovy or Scala sources. A build it can't read (an
+  `include` of anything but literals, `includeBuild`, `projectDir`, Android, Maven and Gradle
+  side by side with no wrapper to decide) is *unsupported*: every Java change runs the full
+  suite.
+- **Graph:** a tokenizer skips comments, strings, text blocks and char literals; each file's
+  `package`, imports (single-type, static, on demand), top-level types, identifiers, dotted
+  names and string literals are resolved to the repo's classes: imports (a nested class's
+  file, a static import's class), on-demand imports by the simple names used, same-package
+  names, fully-qualified names in code, and strings that name a class (`Class.forName`).
+  Edges are reversed from the changed files to the test classes, across modules, with the
+  nearest change, the file on the way and the depth. An import of a class no source declares
+  in one of the repo's packages (generated code) makes the file *dynamic*: tests that reach it
+  run for any Java change but never count as covering it.
+- **What is sent:** `affected_files` gets test file → changed files (every server takes it;
+  one from before Java support ignores them), and `/select` alone gets `java`: the tool,
+  wrapper, modules (with why one isn't analysed), every module's test classes (from file
+  names, so even history-selected tests get a runner), and the graph's details. An older
+  server's 422 on `java` gets the request again without it (Java tests then run in full).
+- **On the server:** a known test whose outer class (before `$`) is a test class of the
+  checkout gets the build's runner and its module. A changed main class selects its tests by
+  name (`FooTest`, `FooTests`, `TestFoo`, `FooTestCase`, `FooIT`, `FooITCase`) in its module,
+  else in any module (direct links); a changed or new test class runs itself; the graph's
+  users are indirect links, like imports. `src/test/resources` selects the module's test
+  classes. Main resources, other JVM languages, unanalysed modules and an unsupported build
+  run the full suite; so does a changed class nothing reaches.
+- **Commands**, one per module, classes and modules in risk order, packed by the budget like
+  any unit: Maven `./mvnw -B -pl <module> -am test -Dtest=A,B
+  -Dsurefire.failIfNoSpecifiedTests=false` (`-am` builds the modules it depends on, their
+  tests filtered out by the same `-Dtest`, so no installed snapshot is needed; `verify` with
+  `-Dit.test=... -Dit.failIfNoSpecifiedTests=false` when Failsafe's `*IT` classes are in it);
+  Gradle `./gradlew :<module>:test --tests A --tests B` (`:test` for the root project). Both
+  shapes were run for real on multi-module fixtures with Maven 3.9.9 and Gradle 8.10.2. The
+  full suite is `mvn -B verify` (with integration tests in history; else `test`) or
+  `gradle test`.
+- **Triage** links Java tests without the build model (recorded runs keep only the edges): a
+  changed test class (high), name mapping (high), a graph user (medium).
+- **Limits:** reflection by computed name (Spring component scanning, `ServiceLoader`),
+  resources loaded by name, and code generated outside annotation processors are invisible:
+  declare them with `[[depends]]` rules. A module per command means Maven builds shared
+  upstream modules once per module that needs them. A known test reported under a class no
+  test file is named after (a second top-level class in a file) has no runner: selecting it
+  falls back to the full suite. Shadow mode credits every test of a class it runs
+  (`java_classes`, migration 0012), new ones too.
 
 ## Risk order
 

@@ -10,6 +10,9 @@ in the order given. The model is the eval's, not a promise of every runner:
 * Go: one command per package, so packages run one after another; within a package, tests
   are taken by test ID. A subtest runs inside its parent: it counts as its parent.
 * Jest: files in the order given (Jest itself may reorder them across workers).
+* Java: one command per module; within it, the classes in the order given (Surefire's, then
+  Failsafe's integration tests), a class's tests by test ID. A ``$Nested`` class counts as
+  its outer class.
 
 A test the commands don't run (not selected) is left out. The position counts the tests run
 up to and including the first failing one; the time sums their measured durations.
@@ -17,11 +20,12 @@ up to and including the first failing one; the time sums their measured duration
 
 from __future__ import annotations
 
+import itertools
 import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from siftwise.core.selector import is_go_subtest, pytest_file, pytest_node
+from siftwise.core.selector import NO_UNIT_TESTS, is_go_subtest, pytest_file, pytest_node
 
 _DOCTEST_SUFFIX = " || test $? -eq 5; }"
 
@@ -58,6 +62,15 @@ def units(commands: Sequence[str], go_module: str | None = None) -> list[tuple[s
             found.append(("go", _package(args[2], go_module)))
         elif args[:1] == ["jest"]:
             found += [("js", a) for a in args[1:] if not a.startswith("-")]
+        elif args[:1] and args[0].endswith(("mvn", "mvnw")):
+            # Surefire's classes, then (in verify) Failsafe's.
+            for flag in ("-Dtest=", "-Dit.test="):
+                for a in args:
+                    if a.startswith(flag):
+                        found += [("java", c) for c in a[len(flag) :].split(",")
+                                  if c and c != NO_UNIT_TESTS]  # fmt: skip
+        elif args[:1] and args[0].endswith(("gradle", "gradlew")):
+            found += [("java", b) for a, b in itertools.pairwise(args) if a == "--tests"]
     return found
 
 
@@ -106,6 +119,7 @@ def _ran(
             f"{classname}::{name.split('/', 1)[0]}" if is_go_subtest(test.test_id) else test.test_id
         )
         keys = [("go", classname), ("js", test.file_path or ""),
+                ("java", classname.split("$", 1)[0]),
                 ("py", pytest_node(test.test_id, test.file_path) or ""),
                 ("py", pytest_file(test.test_id, test.file_path) or "")]  # fmt: skip
         unit = min((order[k] for k in keys if k in order), default=None)

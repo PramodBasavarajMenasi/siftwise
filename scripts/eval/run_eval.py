@@ -77,6 +77,15 @@ if not __package__:  # run as a file path: make the repo root importable
 from scripts.eval import triage_labels as tl
 from scripts.eval.ordering import FirstFailure, RanTest, first_failure, run_time
 from siftwise.cli.gograph import GoGraph, build_graph, parse_go_list
+from siftwise.cli.javagraph import (
+    JavaChange,
+    build_java_graph,
+    change_from,
+    detect_build,
+    snapshot_from_json,
+    snapshot_json,
+    test_classes_of,
+)
 from siftwise.cli.pygraph import PyGraph, build_py_graph, module_of_test
 from siftwise.cli.repoconfig import load_repo_config, read_go_module
 from siftwise.config import get_settings
@@ -85,6 +94,7 @@ from siftwise.core.models import FAILED_CODES_SQL, PASSED_CODE, SKIPPED_CODE, ST
 from siftwise.core.risk import Order
 from siftwise.core.selector import (
     FailedRun,
+    JavaBuildInfo,
     KnownTest,
     Mode,
     RepoHistory,
@@ -959,6 +969,31 @@ class GraphProvider:
             shutil.rmtree(_long_path(self._src), ignore_errors=True)
             self._src = None
 
+    def java_at(
+        self, sha: str, changed: Sequence[str], deleted: Sequence[str]
+    ) -> tuple[JavaChange | None, str]:
+        """The Java build, test classes and graph at ``sha`` (cached per commit), and what
+        ``changed`` does to the test classes."""
+        cache = self.cache_dir / f"javagraph-{sha}.json"
+        if cache.exists() and not deleted:
+            build, classes, graph = snapshot_from_json(json.loads(cache.read_text()))
+        else:
+            root = self._root_at(sha)
+            if root is None:
+                return None, f"java: no source for {sha[:7]}"
+            detected = detect_build(root)
+            if detected is None:
+                return None, f"java: no Maven or Gradle build at {sha[:7]}"
+            build = detected
+            classes = test_classes_of(root, build)
+            java_deleted = [p for p in deleted if p.endswith(".java")]
+            graph = None if build.unsupported else build_java_graph(root, build, java_deleted)
+            if not deleted:
+                _write_atomic(cache, json.dumps(snapshot_json(build, classes, graph)))
+        note = f"java at {sha[:7]}" + (f" (unsupported: {build.unsupported})"
+                                       if build.unsupported else "")  # fmt: skip
+        return change_from(build, classes, graph, changed), note
+
     def has_py_graph(self, sha: str) -> bool:
         return (self.cache_dir / f"pygraph-{sha}.json").exists()
 
@@ -1208,11 +1243,13 @@ def counterfactual(
     affected_files: dict[str, list[str]],
     deleted: tuple[str, ...],
     explain: Explainer,
+    java: JavaBuildInfo | None = None,
 ) -> Counterfactual:
     """Select from only the changed files that are covered by a signal on their own."""
 
     def select(files: list[str]) -> Selection:
-        return select_tests(history, files, True, config, affected, affected_files, deleted)
+        return select_tests(history, files, True, config, affected, affected_files, deleted,
+                            java=java)  # fmt: skip
 
     mapped = [
         p
@@ -1253,6 +1290,7 @@ def evaluate(
     graphs: GraphProvider,
     durations: dict[str, float],
     go: bool,
+    java_mode: bool = False,
 ) -> Result:
     history = index.history_before(run, config)
     known = run.changed_files is not None
@@ -1263,6 +1301,8 @@ def evaluate(
         graph_note = "diff unknown"
     elif go:
         graph, graph_note = graphs.go_graph_at(run.commit_sha)
+    elif java_mode:
+        graph_note = "java: build read at each commit"
     elif not graphs.has_source and not graphs.has_py_graph(run.commit_sha):
         graph_note = "python: no --checkout, no import graph"
     elif not any(p.endswith(".py") for p in changed):
@@ -1281,15 +1321,24 @@ def evaluate(
     if deleted is None:
         deleted = ()
         graph_note += "; deleted files unknown (no file list)"
+    java: JavaBuildInfo | None = None
+    if java_mode:
+        # As `siftwise select` does: the build, its test classes and (when Java changed) the
+        # graph at the target's commit; the build even for an unknown diff (full suite).
+        change, graph_note = graphs.java_at(run.commit_sha, changed, deleted)
+        if change is not None:
+            java = JavaBuildInfo.from_json(change.payload())
+            affected_files = change.files
     explain = Explainer(history, changed, config.go_module, go, graph, graphs, run.commit_sha)
-    selection = select_tests(history, changed, known, config, affected, affected_files, deleted)
+    selection = select_tests(history, changed, known, config, affected, affected_files, deleted,
+                             java=java)  # fmt: skip
     failures = actual_failures(session, list(run.run_ids or (run.run_id,)))
     runs = WouldRun(selection)
     caught = [f for f in failures if runs(f)]
     missed = [explain(f) for f in failures if f not in caught]
     cf = (
         counterfactual(
-            history, changed, failures, config, affected, affected_files, deleted, explain
+            history, changed, failures, config, affected, affected_files, deleted, explain, java
         )
         if failures and selection.mode is Mode.FULL and known
         else None
@@ -1307,7 +1356,7 @@ def evaluate(
         found = {Order.DEFAULT.value: first_failure(selection.commands, ran, config.go_module)}
         for order in EVAL_ORDERS:
             ordered = select_tests(timed, changed, known, config, affected, affected_files,
-                                   deleted, order=order)  # fmt: skip
+                                   deleted, order=order, java=java)  # fmt: skip
             # An order never changes what's selected: only the commands' order.
             assert ordered.commands and SelectionScope.of(ordered) == SelectionScope.of(selection)
             found[order.value] = first_failure(ordered.commands, ran, config.go_module)
@@ -1316,7 +1365,7 @@ def evaluate(
 
     def select(timed: RepoHistory, **options: Any) -> Selection:
         return select_tests(timed, changed, known, config, affected, affected_files, deleted,
-                            **options)  # fmt: skip
+                            java=java, **options)  # fmt: skip
 
     budgets = budget_runs(session, index, run, history, select, failures, len(caught),
                           config.go_module)  # fmt: skip
@@ -1382,6 +1431,8 @@ def _signal(reason: str) -> str:
     for prefix, name in (
         ("imports changed package", "go imports"),
         ("imports changed module", "python imports"),
+        ("uses changed class", "java graph"),
+        ("test resources changed", "test resources"),
         ("declared dependency", "declared"),
         ("co-change", "co-change"),
         ("failed on main", "recently failed"),
@@ -1994,7 +2045,8 @@ def main(
         ),
     ] = None,
     language: Annotated[
-        str, typer.Option(help="auto, go or python (auto: go if the checkout has go.mod).")
+        str,
+        typer.Option(help="auto, go, python or java (auto: go if the checkout has go.mod)."),
     ] = "auto",
     go_module: Annotated[
         str | None, typer.Option(help="Go module path (default: from the checkout's go.mod).")
@@ -2038,6 +2090,7 @@ def main(
     if checkout and not go_module:
         go_module = read_go_module(checkout)
     is_go = language == "go" or (language == "auto" and go_module is not None)
+    is_java = language == "java"
     repo_config = load_repo_config(siftwise_toml) if siftwise_toml else None
     config = SelectorConfig(
         go_module=go_module,
@@ -2114,7 +2167,8 @@ def main(
                 prefetch_go_graphs(shas, jobs, cache_dir, go, source_token, repo, goos)
             results = []
             for target in todo:
-                result = evaluate(session, index, target, config, graphs, durations, is_go)
+                result = evaluate(session, index, target, config, graphs, durations, is_go,
+                                  is_java)  # fmt: skip
                 print_result(result, verbose)
                 results.append(result)
                 if resume:  # one line per target as soon as it's done: a crash loses nothing

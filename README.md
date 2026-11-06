@@ -963,7 +963,7 @@ on = ["**/*.go", "!**/*_test.go"]         # ! excludes
 | **Python** (pytest) | `foo.py` → `test_foo.py`; test files importing a changed module (static graph incl. parent packages, conftests, plugin strings); changed test files | `pytest` node IDs, whole test files, `pytest --doctest-modules` for doctests |
 | **Go** | changed package and every package whose tests import it (`go list -deps -test`) | `go test ./pkg` (whole) or `-run '^(TestA\|TestB)$'` |
 | **JS/TS** (Jest) | `foo.ts` → `foo.test.*`, `foo.spec.*`, `__tests__/foo.*`; test files importing a changed file (static graph, no Node needed: relative paths, tsconfig/jsconfig `paths`, workspace packages, a JSON Jest `moduleNameMapper`) (needs file paths in the JUnit: jest-junit's `addFileAttribute`) | `jest <files>` |
-| **Java** (Maven/Gradle) | recorded with full history; selection falls back to the full suite | — |
+| **Java** (Maven/Gradle) | `a/b/Foo.java` → `FooTest`, `FooTests`, `TestFoo`, `FooIT` in its module (else any module); test classes that use a changed class (static graph, no JVM: imports, static and on-demand imports, same-package names, fully-qualified names), across modules; a module's tests for its `src/test/resources` | per module: `./mvnw -B -pl <module> -am test -Dtest=A,B` (`verify -Dit.test=...` for `*IT`), `./gradlew :<module>:test --tests A` |
 
 The JS/TS graph is safe where it can't see: a test that reaches a `require()` or `import()`
 of a computed path runs for every JS change (but never counts as covering one), a changed
@@ -971,6 +971,21 @@ file no static import reaches still falls back to the full suite, and tsconfig, 
 Jest, Babel and SWC configs, root manifests and lockfiles force it as before. A
 `jest.config.js`/`.ts` can't be read without Node: the selection's reasons say so, and
 resolution uses tsconfig and relative paths. `--no-js-imports` turns the graph off.
+
+For Java, siftwise reads `pom.xml` modules or `settings.gradle[.kts]` includes (no Maven,
+Gradle or JVM runs) and each module's `src/main/java` and `src/test/java`. It runs the full
+suite instead when a build file changes (`pom.xml`, `build.gradle*`, `settings.gradle*`,
+`gradle.properties`, `gradle/`, wrappers, `.mvn/`, `lombok.config`), when main resources
+change (any code may load them at runtime), when Kotlin, Groovy or Scala sources change, when
+a changed Java file is in a module it doesn't analyse (custom source directories, annotation
+processors that generate code; Lombok and checkers like ErrorProne don't count), or when it
+can't read the build (`include` of non-literals, `includeBuild`, Android). Reflection can't
+be seen statically (Spring component scanning, `ServiceLoader`, `Class.forName` of a computed
+name): declare those dependencies with `[[depends]]` rules. `--no-java-graph` turns the graph
+off.
+On dropwizard's history (42 Maven modules) it caught 74 of 74 failures, and its selective
+runs skipped a median 91% of test time, but most of its PRs change a `pom.xml` and run
+everything ([eval results](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-results.md#java-dropwizarddropwizard-maven)).
 
 A Jest test file new in the change (`*.test.*`, `*.spec.*` or under `__tests__/`) runs first,
 by its path, once siftwise can tell the path Jest expects from a known Jest test in the same

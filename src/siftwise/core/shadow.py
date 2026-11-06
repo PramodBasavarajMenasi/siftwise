@@ -136,6 +136,7 @@ def store_selection(
                 "go_keys": sorted(keys[test_id] for test_id in before.go_test_ids),
                 "go_packages": sorted(before.go_packages),
                 "python_files": sorted(before.python_files),
+                "java_classes": sorted(before.java_classes),
             },
         }
     inserted = session.execute(
@@ -152,6 +153,7 @@ def store_selection(
             go_selected_keys=sorted(keys[test_id] for test_id in scope.go_test_ids),
             go_packages=sorted(scope.go_packages),
             python_files=sorted(scope.python_files),
+            java_classes=sorted(scope.java_classes),
             selected_count=selection.selected_count,
             total_known=selection.total_known,
             estimated_ms_total=selection.estimated_ms_total,
@@ -613,6 +615,7 @@ def _scopes(
             go_test_ids=frozenset(names[key] for key in s.go_selected_keys),
             go_packages=frozenset(s.go_packages),
             python_files=frozenset(s.python_files),
+            java_classes=frozenset(s.java_classes),
         )
         for s in selections
     }
@@ -627,6 +630,7 @@ def _scopes(
             go_test_ids=frozenset(names[key] for key in before.get("go_keys") or ()),
             go_packages=frozenset(before.get("go_packages") or ()),
             python_files=frozenset(before.get("python_files") or ()),
+            java_classes=frozenset(before.get("java_classes") or ()),
         ))  # fmt: skip
     return scopes, befores
 

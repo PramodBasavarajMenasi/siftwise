@@ -99,26 +99,30 @@ jobs:
           echo "SIFTWISE_TEST_JEST_HOME=$RUNNER_TEMP/jest" >> "$GITHUB_ENV"
 
       # setup-java caches one build tool per call. The test projects (POM, build.gradle) are
-      # in tests/test_reruns.py, so it keys both caches.
+      # in tests/test_reruns.py and the Java selection fixtures, so they key both caches.
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
           cache: maven
-          cache-dependency-path: tests/test_reruns.py
+          cache-dependency-path: |
+            tests/test_reruns.py
+            tests/fixtures/java_maven/**/pom.xml
 
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
           cache: gradle
-          cache-dependency-path: tests/test_reruns.py
+          cache-dependency-path: |
+            tests/test_reruns.py
+            tests/fixtures/java_gradle/**/*.gradle.kts
 
       - name: Install dependencies
         run: uv sync --locked
 
       - name: Real-tool tests
-        run: uv run pytest tests/test_reruns.py -k for_real --durations=0
+        run: uv run pytest tests/test_reruns.py tests/test_javagraph.py -k for_real --durations=0
 
   package:
     name: package (build, twine check, light/server/mcp installs)

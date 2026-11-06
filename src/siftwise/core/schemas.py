@@ -242,6 +242,43 @@ class JsGraphIn(BaseModel):
     )
 
 
+class JavaModuleIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: Path4K = Field(description="Repo-relative directory; empty for the root project")
+    name: Annotated[str, StringConstraints(max_length=1024)] = Field(
+        description="Maven: the -pl argument; Gradle: the project path (:a:b), empty for the root"
+    )
+    unanalysed: list[Annotated[str, StringConstraints(max_length=500)]] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Why its Java sources aren't analysed (a change to them runs everything)",
+    )
+
+
+class JavaIn(BaseModel):
+    """The checkout's Java build as the CLI read it, and its dependency graph's details."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool: Literal["maven", "gradle"]
+    wrapper: bool = Field(default=False, description="./mvnw or ./gradlew is at the root")
+    unsupported: Annotated[str, StringConstraints(max_length=500)] = Field(
+        default="", description="Why the build couldn't be read: every Java change runs everything"
+    )
+    modules: list[JavaModuleIn] = Field(default_factory=list, max_length=5_000)
+    test_classes: dict[Path4K, list[Annotated[str, StringConstraints(max_length=1024)]]] = Field(
+        default_factory=dict,
+        max_length=5_000,
+        description="Module path -> the test classes under its src/test/java",
+    )
+    nearest: dict[str, JsImportIn] = Field(default_factory=dict, max_length=100_000)
+    dynamic: dict[str, Path4K] = Field(default_factory=dict, max_length=100_000)
+    notes: list[Annotated[str, StringConstraints(max_length=500)]] = Field(
+        default_factory=list, max_length=20
+    )
+
+
 class SelectRequest(ChangeRequest):
     """Body of ``POST /select``."""
 
@@ -259,6 +296,11 @@ class SelectRequest(ChangeRequest):
         default="risk",
         description="'risk': the commands list the highest-risk tests, files and packages "
         "first; 'default': by path, package and test ID. Never changes which tests run",
+    )
+    java: JavaIn | None = Field(
+        default=None,
+        description="The Java build (Maven or Gradle modules, test classes) so Java test classes "
+        "can run per module; the dependency graph's edges are in affected_files",
     )
     js_graph: JsGraphIn | None = Field(
         default=None,

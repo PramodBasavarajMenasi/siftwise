@@ -73,7 +73,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from siftwise.core.codes import FAILED_CODES_SQL
 from siftwise.core.junit import normalize_path
@@ -93,6 +93,11 @@ class Runner(StrEnum):
     PYTEST = "pytest"
     GO = "go"
     JEST = "jest"
+    MAVEN = "maven"  # Java test classes, run per module (JavaBuildInfo)
+    GRADLE = "gradle"
+
+
+JAVA_RUNNERS = frozenset({Runner.MAVEN, Runner.GRADLE})
 
 
 # Full-suite commands, in the order commands are emitted.
@@ -121,6 +126,9 @@ _BUILD_BASENAMES = frozenset(
         ".swcrc", "lerna.json", ".yarnrc.yml",
         # Go
         "go.mod", "go.sum", "go.work", "go.work.sum",
+        # Java: Maven and Gradle builds, wrappers, Lombok's generation settings
+        "pom.xml", "gradle.properties", "mvnw", "mvnw.cmd", "gradlew", "gradlew.bat",
+        "lombok.config",
         # Build / CI
         "Dockerfile", "Makefile", ".gitlab-ci.yml",
     }
@@ -128,9 +136,11 @@ _BUILD_BASENAMES = frozenset(
 _BUILD_GLOBS = (
     "requirements*.txt", "Dockerfile.*", "*.Dockerfile", "docker-compose*.yml",
     "docker-compose*.yaml", "tsconfig*.json", "jsconfig*.json", "jest.config.*", "babel.config.*",
-    ".babelrc.*", "swc.config.*", "vitest.config.*",
+    ".babelrc.*", "swc.config.*", "vitest.config.*", "build.gradle*", "settings.gradle*",
 )  # fmt: skip
-_BUILD_DIRS = (".github/workflows/", ".github/actions/")
+# gradle/: the wrapper and version catalogs (libs.versions.toml); .mvn/: Maven's wrapper,
+# extensions and maven.config.
+_BUILD_DIRS = (".github/workflows/", ".github/actions/", "gradle/", ".mvn/")
 
 # Project manifests and their lockfiles. At the repo root they force the full suite; in a
 # subdirectory they belong to a nested project (an example module, a sub-package) and only
@@ -330,6 +340,9 @@ class Selection:
     # Python files passed to pytest as a whole file: changed/added test files, test files that
     # import a changed module, collection errors and doctest modules. New tests in them run too.
     python_files_run_whole: tuple[str, ...] = ()
+    # Java test classes the commands run whole (outer class names): every test in them runs,
+    # new ones too (a test class with no history among them).
+    java_classes_run: tuple[str, ...] = ()
     # Estimated test time from history: all known tests, and the ones the commands would run
     # (see WouldRun). Go subtests are left out: their time is inside their parent's.
     estimated_ms_total: float = 0.0
@@ -388,6 +401,67 @@ class JsImports:
     notes: tuple[str, ...] = ()  # what the graph couldn't read (a jest.config.ts)
 
 
+@dataclass(frozen=True)
+class JavaModuleInfo:
+    path: str  # repo-relative directory; "" = the root project
+    name: str  # Maven: the -pl argument; Gradle: the project path (":a:b"; "" for the root)
+    unanalysed: tuple[str, ...] = ()  # why its Java sources aren't analysed: full suite
+
+    def prefix(self, root: str) -> str:
+        return f"{self.path}/{root}/" if self.path else f"{root}/"
+
+
+@dataclass(frozen=True)
+class JavaBuildInfo:
+    """The checkout's Java build as the CLI read it (``/select``'s ``java``), so Java test
+    classes can run per module."""
+
+    tool: str  # "maven" or "gradle"
+    wrapper: bool = False
+    modules: tuple[JavaModuleInfo, ...] = ()
+    test_classes: Mapping[str, str] = field(default_factory=dict)  # test class -> module path
+    nearest: Mapping[str, JsImport] = field(default_factory=dict)  # test file -> nearest change
+    dynamic: Mapping[str, str] = field(default_factory=dict)  # test file -> file it reaches
+    notes: tuple[str, ...] = ()
+    unsupported: str = ""  # the build couldn't be read: every Java change runs everything
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> JavaBuildInfo:
+        """From ``/select``'s ``java`` (``javagraph.JavaChange.payload``)."""
+        return cls(
+            tool=data["tool"],
+            wrapper=bool(data.get("wrapper")),
+            modules=tuple(
+                JavaModuleInfo(m["path"], m["name"], tuple(m.get("unanalysed") or ()))
+                for m in data.get("modules") or ()
+            ),
+            test_classes={
+                c: module
+                for module, classes in (data.get("test_classes") or {}).items()
+                for c in classes
+            },
+            nearest={
+                test: JsImport(n["module"], n.get("via"), n["depth"])
+                for test, n in (data.get("nearest") or {}).items()
+            },
+            dynamic=dict(data.get("dynamic") or {}),
+            notes=tuple(data.get("notes") or ()),
+            unsupported=data.get("unsupported") or "",
+        )
+
+    @property
+    def runner(self) -> Runner:
+        return Runner.MAVEN if self.tool == "maven" else Runner.GRADLE
+
+    def module(self, path: str) -> JavaModuleInfo | None:
+        return next((m for m in self.modules if m.path == path), None)
+
+    def module_of(self, file: str) -> JavaModuleInfo | None:
+        """The deepest module whose directory holds ``file``."""
+        found = [m for m in self.modules if not m.path or file.startswith(m.path + "/")]
+        return max(found, key=lambda m: len(m.path), default=None)
+
+
 # --- selection ----------------------------------------------------------------------------
 
 
@@ -403,6 +477,7 @@ def select_tests(
     order: Order = Order.DEFAULT,
     budget_ms: float | None = None,
     js_imports: JsImports | None = None,
+    java: JavaBuildInfo | None = None,
 ) -> Selection:
     """Select tests for a change.
 
@@ -418,13 +493,16 @@ def select_tests(
     ``order``: ``Order.RISK`` lists the riskiest tests first in the commands (core/risk.py).
     Every selected test gets its score and rank either way, and the same tests are selected.
     ``budget_ms``: run only the highest-risk units that fit (see ``Budget``); None = no budget.
+    ``java``: the checkout's Java build; without it Java tests have no runner (full suite).
     """
     # Every known test classified once, for the selection and its time estimate.
     tests = _index(history.tests.values() if history else ())
+    if java is not None:
+        tests = _with_java(tests, java)
     selection = _select(
         history, changed_files, changed_files_known, config or SelectorConfig(),
         affected_packages, affected_files, deleted_files, junit_dir, tests, order, budget_ms,
-        js_imports or JsImports(),
+        js_imports or JsImports(), java,
     )  # fmt: skip
     return _with_estimate(selection, history, tests)
 
@@ -442,6 +520,7 @@ def _select(
     order: Order = Order.DEFAULT,
     budget_ms: float | None = None,
     js_imports: JsImports | None = None,
+    java: JavaBuildInfo | None = None,
 ) -> Selection:
     js_imports = js_imports or JsImports()
     affected_packages = affected_packages or {}
@@ -464,13 +543,14 @@ def _select(
                 _with_junit(cmd, junit_dir, n) if r is Runner.PYTEST else cmd
                 for n, (r, cmd) in enumerate(FULL_SUITE_COMMANDS.items(), start=1)
                 if r in runners
-            ),
+            )
+            + (_java_full_command(java, tests) if java and runners & JAVA_RUNNERS else ()),
             order=order,
         )
         if budget_ms is None:
             return selection
         return _full_within_budget(selection, history, tests, config.go_module, junit_dir,
-                                   order, budget_ms)  # fmt: skip
+                                   order, budget_ms, java)  # fmt: skip
 
     if not changed_files_known:
         return full("changed files are unknown for this change")
@@ -514,7 +594,37 @@ def _select(
     py_whole_files: set[str] = set()
     jest_files = _JestFiles(tests.values())
     js_new_files: dict[str, str] = {}  # a new Jest test file's path as Jest runs it -> repo path
+    java_classes: dict[str, list[_Test]] = defaultdict(list)  # test class -> its known tests
+    for test in tests.values():
+        if test.java_class:
+            java_classes[test.java_class].append(test)
+    java_new: set[tuple[str, str]] = set()  # (module, class) with no known test: run it
+    if java is not None:
+        problem = _java_problem(relevant, java)
+        if problem:
+            return full(problem)
     for path in relevant:
+        if java is not None and (module := java.module_of(path)) is not None:
+            if path.startswith(module.prefix("src/test/resources")):
+                # Test resources: every test class of the module may read them.
+                for cls, owner in sorted(java.test_classes.items()):
+                    if owner != module.path:
+                        continue
+                    for test in java_classes.get(cls, ()):
+                        add(test.test_id, f"test resources changed in {module.name or '.'}: "
+                            f"{path}", Link.INDIRECT)  # fmt: skip
+                    if not java_classes.get(cls):
+                        java_new.add((owner, cls))
+                continue
+            located = java_class_of(path)
+            if located is not None:
+                hits, new = _java_path_hits(path, located, java, java_classes, path in deleted)
+                java_new.update(new)
+                if not hits and not new and not (located[2] and path in deleted):
+                    unmapped.append(path)
+                for test_id, reason in hits.items():
+                    add(test_id, reason, Link.DIRECT)
+                continue
         is_py_test_file = path.endswith(".py") and (
             is_python_test_file(path) or path in py_test_files
         )
@@ -575,6 +685,24 @@ def _select(
         for test in known_js:
             add(test.test_id, reason, Link.INDIRECT)
         covered_by_imports.update(modules)
+    # Java dependents: test classes that use a changed class (run whole, per module).
+    if java is not None:
+        for file, modules in sorted(affected_files.items()):
+            located = java_class_of(file)
+            if file in deleted or located is None or not located[2] or not modules:
+                continue
+            known_java = java_classes.get(located[1], [])
+            reason = java_use_reason(modules, java.nearest.get(file), java.notes)
+            for test in known_java:
+                add(test.test_id, reason, Link.INDIRECT)
+            if not known_java and located[1] in java.test_classes and _is_test_class(located[1]):
+                java_new.add((java.test_classes[located[1]], located[1]))
+            covered_by_imports.update(modules)
+        for file, source in sorted(java.dynamic.items()):
+            located = java_class_of(file)
+            for test in java_classes.get(located[1], []) if located else []:
+                add(test.test_id, f"uses {source}, which imports a class the sources don't "
+                    "declare (generated?): it may use changed code", Link.INDIRECT)  # fmt: skip
     # Tests that reach an import the graph can't resolve may load any changed file: they run,
     # but cover nothing (a change no static import reaches still falls back as before).
     for file, source in sorted(js_imports.dynamic.items()):
@@ -675,6 +803,12 @@ def _select(
     # Tests in a deleted Python or Jest file no longer exist (pytest errors on a missing path,
     # and so does Jest: "No tests found").
     gone = {t.test_id for path in deleted for t in jest_files.tests_for(path)}
+    gone |= {
+        t.test_id
+        for path in deleted
+        if (located := java_class_of(path)) is not None and located[2]
+        for t in java_classes.get(located[1], ())
+    }
     chosen = [
         tests[test_id]
         for test_id in sorted(selected)
@@ -696,21 +830,24 @@ def _select(
     )
     if chosen:
         summary = f"{len(chosen)} of {len(tests)} known tests selected"
-    elif py_whole_files or js_new_files:
-        summary = (f"{len(py_whole_files) + len(js_new_files)} changed test file(s) run whole, "
-                   "no known tests")  # fmt: skip
+    elif py_whole_files or js_new_files or java_new:
+        new_files = len(py_whole_files) + len(js_new_files) + len(java_new)
+        summary = f"{new_files} changed test file(s) run whole, no known tests"
     elif py_module_files:
         summary = f"{len(py_module_files)} changed module(s) run with --doctest-modules"
     else:
         summary = NO_TESTS_AFFECTED
     if js_new_files:
         summary += f"; new test file: {_list(sorted(js_new_files.values()))}"
+    if java_new:
+        summary += f"; test class with no history: {_list(sorted(c for _, c in java_new))}"
     ranks = rank(
         (_risk_inputs(history.tests[t.test_id], links[t.test_id]) for t in chosen),
         history.newest_run_at,
     )
     ranked = _ranked(chosen, ranks, links, history)
-    units = _units(chosen, whole_packages, py_whole_files, py_module_files, js_new_files)
+    units = _units(chosen, whole_packages, py_whole_files, py_module_files, js_new_files,
+                   java_new)  # fmt: skip
     selection = Selection(
         mode=Mode.SELECTIVE,
         reason=summary,
@@ -728,9 +865,10 @@ def _select(
         ),
         selected_count=len(chosen),
         total_known=len(tests),
-        commands=_commands(units, config.go_module, junit_dir, _key(order, ranked)),
+        commands=_commands(units, config.go_module, junit_dir, _key(order, ranked), java),
         go_packages_run_whole=tuple(sorted(whole_packages)),
         python_files_run_whole=tuple(sorted(files_run_whole)),
+        java_classes_run=_java_classes_run(units),
         order=order,
     )
     if budget_ms is None:
@@ -739,7 +877,8 @@ def _select(
     if costs.unknown_ms is None:
         note = "no test durations in history to estimate with: no budget applied"
         return dataclasses.replace(selection, budget=Budget(budget_ms, applied=False, note=note))
-    return _pack(selection, units, ranked, costs, budget_ms, config.go_module, junit_dir)
+    return _pack(selection, units, ranked, costs, budget_ms, config.go_module, junit_dir,
+                 java=java)  # fmt: skip
 
 
 def _ranked(
@@ -758,6 +897,10 @@ def _ranked(
         )
         for t in chosen
     }
+
+
+def _java_classes_run(units: Iterable[_Unit]) -> tuple[str, ...]:
+    return tuple(sorted({u.java_class for u in units if u.java_class}))
 
 
 def _key(order: Order, ranked: Mapping[str, Ranked]) -> UnitKey | None:
@@ -798,8 +941,12 @@ class _Costs:
         self.doctest_files: dict[str, list[str]] = defaultdict(list)
         self.packages: dict[str, list[tuple[str, str]]] = defaultdict(list)  # (top-level, ID)
         self.jest_files: dict[str, list[str]] = defaultdict(list)
+        self.java_classes: dict[tuple[str, str], list[str]] = defaultdict(list)
         for t in tests.values():
             if is_go_subtest(t.test_id):
+                continue
+            if t.java_class and t.java_module is not None:
+                self.java_classes[(t.java_module, t.java_class)].append(t.test_id)
                 continue
             if t.runner is Runner.PYTEST and t.py_path:
                 (self.doctest_files if t.doctest else self.files)[t.py_path].append(t.test_id)
@@ -817,6 +964,8 @@ class _Costs:
         elif unit.runner is Runner.GO:
             names = unit.go_names
             ids = [i for name, i in self.packages.get(unit.arg, []) if not names or name in names]
+        elif unit.runner in JAVA_RUNNERS:
+            ids = self.java_classes.get((unit.java_module or "", unit.java_class or ""), [])
         else:
             ids = self.jest_files.get(unit.arg, [])
         if not ids:
@@ -836,6 +985,7 @@ def _pack(
     go_module: str | None,
     junit_dir: str | None,
     full_reason: str | None = None,
+    java: JavaBuildInfo | None = None,
 ) -> Selection:
     """``selection`` cut to a time budget: walk its units in risk order and keep each one
     whose estimate still fits in what's left (the first always: a budget never runs nothing
@@ -901,11 +1051,12 @@ def _pack(
         reason=reason,
         tests=tests,
         selected_count=len(tests),
-        commands=_commands(kept_units, go_module, junit_dir, _key(selection.order, ranked)),
+        commands=_commands(kept_units, go_module, junit_dir, _key(selection.order, ranked), java),
         go_packages_run_whole=tuple(
             u.arg for u in kept_units if u.runner is Runner.GO and u.go_names is None
         ),
         python_files_run_whole=tuple(f for f in selection.python_files_run_whole if f in kept_args),
+        java_classes_run=_java_classes_run(kept_units),
         budget=budget,
     )
 
@@ -918,6 +1069,7 @@ def _full_within_budget(
     junit_dir: str | None,
     order: Order,
     budget_ms: float,
+    java: JavaBuildInfo | None = None,
 ) -> Selection:
     """A full-suite fallback under a budget: the full suite's known tests packed by risk (every
     test history-only: the change can't be trusted to link them), flagged as a budget-limited
@@ -965,7 +1117,7 @@ def _full_within_budget(
         order=order,
     )
     packed = _pack(candidate, units, _ranked(chosen, ranks, links, history), costs, budget_ms,
-                   go_module, junit_dir, full_reason=selection.reason)  # fmt: skip
+                   go_module, junit_dir, full_reason=selection.reason, java=java)  # fmt: skip
     assert packed.budget is not None
     if not packed.budget.limited:
         # Everything fits: the full suite as it is (its commands also run tests not known yet).
@@ -1001,6 +1153,7 @@ class SelectionScope:
     go_test_ids: frozenset[str] = frozenset()
     go_packages: frozenset[str] = frozenset()
     python_files: frozenset[str] = frozenset()
+    java_classes: frozenset[str] = frozenset()
 
     @classmethod
     def of(cls, selection: Selection) -> SelectionScope:
@@ -1010,13 +1163,14 @@ class SelectionScope:
             go_test_ids=frozenset(t.test_id for t in selection.tests if t.runner is Runner.GO),
             go_packages=frozenset(selection.go_packages_run_whole),
             python_files=frozenset(selection.python_files_run_whole),
+            java_classes=frozenset(selection.java_classes_run),
         )
 
 
 class WouldRun:
     """Whether a selection's commands would execute a test, including tests that history
-    doesn't name: everything in a Python file or Go package run whole, and the subtests of a
-    Go test selected with ``-run``. Precomputed, for many lookups."""
+    doesn't name: everything in a Python file, Go package or Java test class run whole, and
+    the subtests of a Go test selected with ``-run``. Precomputed, for many lookups."""
 
     def __init__(
         self,
@@ -1031,6 +1185,7 @@ class WouldRun:
         self.selected = scope.test_ids
         self.go_packages = scope.go_packages
         self.py_files = scope.python_files
+        self.java_classes = scope.java_classes
         # go test -run '^(TestX)$' runs TestX with all of its subtests.
         self.go_top_level = {
             (package, name.split("/", 1)[0])
@@ -1045,6 +1200,8 @@ class WouldRun:
             return True  # `go test ./pkg` with no -run: every test in the package, new ones too
         if (package, name.split("/", 1)[0]) in self.go_top_level:
             return True
+        if self.java_classes and package.split("$", 1)[0] in self.java_classes:
+            return True  # -Dtest=a.FooTest / --tests a.FooTest: the whole class, nested too
         # `pytest path/test_x.py`: every test in the file, new ones too.
         return bool(self.py_files) and self.py_file(test_id) in self.py_files
 
@@ -1101,6 +1258,7 @@ LINK_PATH = "path mapping"
 LINK_PY_IMPORT = "imports changed module"
 LINK_GO_IMPORT = "imports changed package"
 LINK_JS_IMPORT = "imports changed module"
+LINK_JAVA_USE = "uses changed class"
 LINK_DECLARED = "declared dependency"
 LINK_NESTED_BUILD = "nested build file"
 LINK_ROOT_BUILD = "root build/config file"
@@ -1146,10 +1304,38 @@ def change_links(
         if file not in deleted and posixpath.splitext(file)[1] in JS_EXTENSIONS:
             for test in jest_files.tests_for(file):
                 js_by_test[test.test_id].update(modules)
+    # Java, by class name (triage has no build model: recorded runs keep only the edges).
+    java_tests: dict[str, list[str]] = defaultdict(list)  # outer class -> test IDs
+    for test in tests_by_id.values():
+        if test.runner is None and "." in test.classname:
+            java_tests[test.classname.split("$", 1)[0]].append(test.test_id)
+    java_by_test: dict[str, set[str]] = defaultdict(set)  # test_id -> changed files it uses
+    for file, modules in by_file.items():
+        located = java_class_of(file)
+        if file not in deleted and located is not None and located[2]:
+            for test_id in java_tests.get(located[1], ()):
+                java_by_test[test_id].update(modules)
     paths = sorted({p for p in (normalize_path(f) for f in changed_files) if p})
     scoped_build = {p: d for p in paths if (d := build_file_scope(p)) is not None}
     build = [p for p in paths if is_build_file(p) and p not in scoped_build]
     relevant = [p for p in paths if not is_ignorable(p, config.generated) and p not in scoped_build]
+    for path in relevant:
+        located = java_class_of(path)
+        if located is None or (located[2] and path in deleted):
+            continue
+        _, cls, is_test = located
+        if is_test:
+            reason = f"test file changed: {path}"
+            for test_id in java_tests.get(cls, ()):
+                found[test_id].append(ChangeLink(LINK_TEST_FILE, path, reason, Strength.HIGH))
+            continue
+        package, _, simple = cls.rpartition(".")
+        for name in JAVA_TEST_NAMES:
+            candidate = f"{package}.{name.format(simple)}" if package else name.format(simple)
+            for test_id in java_tests.get(candidate, ()):
+                found[test_id].append(ChangeLink(LINK_PATH, path,
+                                                 f"{candidate} tests changed {path}",
+                                                 Strength.HIGH))  # fmt: skip
     py_test_files = {
         t.py_path
         for t in tests_by_id.values()
@@ -1193,6 +1379,8 @@ def change_links(
             imported, signal = packages.get(test.classname), LINK_GO_IMPORT
         elif test.runner is Runner.JEST and test.test_id in js_by_test:
             imported, signal = sorted(js_by_test[test.test_id]), LINK_JS_IMPORT
+        elif test.test_id in java_by_test:
+            imported, signal = sorted(java_by_test[test.test_id]), LINK_JAVA_USE
         if imported:
             first = sorted(imported)[0]
             more = f" (+{len(imported) - 1} more)" if len(imported) > 1 else ""
@@ -1352,6 +1540,9 @@ class _Test:
     py_node: str | None = None
     # A doctest (run with ``pytest --doctest-modules <file>``).
     doctest: bool = False
+    # Java: the test class (outer, without $Nested) and its module, from JavaBuildInfo.
+    java_class: str | None = None
+    java_module: str | None = None
 
     @property
     def collects_source_module(self) -> bool:
@@ -1608,6 +1799,9 @@ class _Unit:
     doctest: bool = False
     # Go: the top-level tests for -run; None = the whole package.
     go_names: tuple[str, ...] | None = None
+    # Java: the module and test class it runs.
+    java_module: str | None = None
+    java_class: str | None = None
 
 
 def _units(
@@ -1616,6 +1810,7 @@ def _units(
     py_whole_files: Collection[str] = (),
     py_module_files: Collection[str] = (),
     js_new_files: Collection[str] = (),
+    java_new: Collection[tuple[str, str]] = (),
 ) -> list[_Unit]:
     """The units that run ``tests``: pytest arguments, doctest modules, Go packages, Jest files,
     each kind by path (the default order).
@@ -1661,6 +1856,21 @@ def _units(
         if t.runner is Runner.JEST and t.file_path:
             jest_ids.setdefault(t.file_path, []).append(t.test_id)
     units.extend(_Unit(Runner.JEST, file, tuple(jest_ids[file])) for file in sorted(jest_ids))
+
+    # Java: one unit per test class and module; a class with no known test (new) too.
+    java_ids: dict[tuple[str, str], list[str]] = {key: [] for key in java_new}
+    java_runner: dict[tuple[str, str], Runner] = {}
+    for t in tests:
+        if t.runner in JAVA_RUNNERS and t.java_class and t.java_module is not None:
+            key = (t.java_module, t.java_class)
+            java_ids.setdefault(key, []).append(t.test_id)
+            java_runner[key] = t.runner
+    for (module, cls), class_ids in sorted(java_ids.items()):
+        # A new class has no known test to take the runner from; commands come from the
+        # build's tool either way.
+        runner = java_runner.get((module, cls), Runner.MAVEN)
+        units.append(_Unit(runner, f"{module}::{cls}", tuple(class_ids), java_module=module,
+                           java_class=cls))  # fmt: skip
     return units
 
 
@@ -1683,8 +1893,10 @@ def _commands(
     go_module: str | None = None,
     junit_dir: str | None = None,
     key: UnitKey | None = None,
+    java: JavaBuildInfo | None = None,
 ) -> tuple[str, ...]:
-    """The commands that run ``units``: one per runner (per package for Go).
+    """The commands that run ``units``: one per runner (per package for Go, per module for
+    Java).
 
     Every argument is shell-quoted (``shlex.join``): test IDs come from uploaded JUnit, and the
     command is meant for ``eval``.
@@ -1736,9 +1948,189 @@ def _commands(
     if jest_units:
         files = [u.arg for u in ordered(jest_units)]
         commands.append((best(jest_units), shlex.join(["jest", *files])))
+
+    by_module: dict[str, list[_Unit]] = defaultdict(list)
+    for unit in units:
+        if unit.runner in JAVA_RUNNERS and unit.java_module is not None:
+            by_module[unit.java_module].append(unit)
+    for module, group in sorted(by_module.items()):
+        if java is None:
+            continue  # no build to run them with (a selection never gets here: no runner)
+        classes = [u.java_class for u in ordered(group) if u.java_class]
+        commands.append((best(group), java_command(java, module, classes)))
     if key is not None:
         commands.sort(key=lambda pair: pair[0])  # stable: same key keeps pytest, Go, Jest
     return tuple(command for _, command in commands)
+
+
+# Surefire runs no unit test when -Dtest names no class: for a run of integration tests only.
+NO_UNIT_TESTS = "siftwise.NoUnitTests"
+
+
+def is_integration_test(cls: str) -> bool:
+    """Failsafe's default includes: ``IT*``, ``*IT``, ``*ITCase``."""
+    simple = cls.rsplit(".", 1)[-1]
+    return simple.endswith(("IT", "ITCase")) or (simple.startswith("IT") and simple[2:3].isupper())
+
+
+def _is_test_class(cls: str) -> bool:
+    """Surefire's and Failsafe's default includes: ``Test*``, ``*Test``, ``*Tests``,
+    ``*TestCase``, and the integration tests."""
+    simple = cls.rsplit(".", 1)[-1]
+    return (
+        simple.startswith("Test")
+        or simple.endswith(("Test", "Tests", "TestCase"))
+        or is_integration_test(cls)
+    )
+
+
+def java_command(java: JavaBuildInfo, module: str, classes: Sequence[str]) -> str:
+    """One module's test classes: ``./mvnw -B -pl <module> -am test -Dtest=A,B ...`` (with
+    Failsafe's ``verify -Dit.test=`` for integration tests), ``./gradlew :<module>:test
+    --tests A --tests B``. Maven's ``-am`` builds the modules it depends on (their tests
+    filtered out by the same ``-Dtest``), so it works without an installed snapshot."""
+    info = java.module(module) or JavaModuleInfo(module, module)
+    if java.tool == "maven":
+        argv = ["./mvnw" if java.wrapper else "mvn", "-B"]
+        if module:
+            argv += ["-pl", info.name, "-am"]
+        units = [c for c in classes if not is_integration_test(c)]
+        its = [c for c in classes if is_integration_test(c)]
+        argv += ["verify" if its else "test", f"-Dtest={','.join(units) or NO_UNIT_TESTS}",
+                 "-Dsurefire.failIfNoSpecifiedTests=false"]  # fmt: skip
+        if its:
+            argv += [f"-Dit.test={','.join(its)}", "-Dit.failIfNoSpecifiedTests=false"]
+        return shlex.join(argv)
+    task = f"{info.name}:test" if info.name else ":test"
+    tests = [a for c in classes for a in ("--tests", c)]
+    return shlex.join(["./gradlew" if java.wrapper else "gradle", task, *tests])
+
+
+def _java_full_command(java: JavaBuildInfo, tests: Mapping[str, _Test]) -> tuple[str, ...]:
+    """The whole Java suite: ``mvn -B test`` (``verify`` if history has integration tests,
+    so Failsafe runs), ``gradle test``."""
+    if java.tool == "maven":
+        its = any(t.java_class and is_integration_test(t.java_class) for t in tests.values())
+        return (
+            shlex.join(["./mvnw" if java.wrapper else "mvn", "-B", "verify" if its else "test"]),
+        )
+    return (shlex.join(["./gradlew" if java.wrapper else "gradle", "test"]),)
+
+
+def java_class_of(path: str) -> tuple[str, str, bool] | None:
+    """``(module directory, class, is a test)`` of a Java file under a conventional source
+    root: ``core/src/test/java/a/b/FooTest.java`` -> ``("core", "a.b.FooTest", True)``."""
+    if not path.endswith(".java"):
+        return None
+    for root, test in (("src/test/java", True), ("src/main/java", False)):
+        if path.startswith(root + "/"):
+            module, rest = "", path[len(root) + 1 :]
+        elif f"/{root}/" in path:
+            module, _, rest = path.partition(f"/{root}/")
+        else:
+            continue
+        return module, rest[: -len(".java")].replace("/", "."), test
+    return None
+
+
+_OTHER_JVM_SOURCES = (".kt", ".groovy", ".scala")
+# Names a main class's tests go by, after Surefire's and Failsafe's default includes.
+JAVA_TEST_NAMES = ("{}Test", "{}Tests", "Test{}", "{}TestCase", "{}IT", "{}ITCase")
+
+
+def _java_problem(paths: Iterable[str], java: JavaBuildInfo) -> str | None:
+    """Why a change needs the full suite as far as Java goes, or None."""
+    for path in paths:
+        ext = posixpath.splitext(path)[1]
+        if ext in _OTHER_JVM_SOURCES:
+            return f"Kotlin, Groovy or Scala source changed (not analysed): {path}"
+        module = java.module_of(path)
+        if module is not None and path.startswith(module.prefix("src/main/resources")):
+            return (f"main resources changed: {path} (code anywhere may load them at runtime, "
+                    "which no graph sees)")  # fmt: skip
+        if ext != ".java":
+            continue
+        if java.unsupported:
+            return f"the Java build couldn't be read ({java.unsupported}): {path}"
+        located = java_class_of(path)
+        if module is None or located is None or located[0] != module.path:
+            return (
+                f"Java file outside the build's source roots (src/main/java, src/test/java): {path}"
+            )
+        if module.unanalysed:
+            where = module.name if module.path else "the root project"
+            return f"{where} isn't analysed ({module.unanalysed[0]}): {path}"
+    return None
+
+
+def _java_path_hits(
+    path: str,
+    located: tuple[str, str, bool],
+    java: JavaBuildInfo,
+    java_classes: Mapping[str, Sequence[_Test]],
+    deleted: bool,
+) -> tuple[dict[str, str], set[tuple[str, str]]]:
+    """A changed Java file's tests by name: (test_id -> reason, new classes to run). A test
+    class: its own tests (or, new, itself). A main class ``a.b.Foo``: ``a.b.FooTest``,
+    ``FooTests``, ``TestFoo``, ``FooIT``... in its module's tests, else in any module's."""
+    module, cls, is_test = located
+    hits: dict[str, str] = {}
+    new: set[tuple[str, str]] = set()
+    if is_test:
+        if deleted:
+            return hits, new
+        for test in java_classes.get(cls, ()):
+            hits[test.test_id] = f"test file changed: {path}"
+        if not hits and _is_test_class(cls) and java.test_classes.get(cls) == module:
+            new.add((module, cls))
+        return hits, new
+    package, _, simple = cls.rpartition(".")
+    names = [f"{package}.{n.format(simple)}" if package else n.format(simple)
+             for n in JAVA_TEST_NAMES]  # fmt: skip
+    candidates = [c for c in names if java.test_classes.get(c) == module] or [
+        c for c in names if c in java.test_classes
+    ]
+    for candidate in candidates:
+        known = java_classes.get(candidate, ())
+        for test in known:
+            hits[test.test_id] = f"{candidate} tests changed {path}"
+        if not known:
+            new.add((java.test_classes[candidate], candidate))
+    return hits, new
+
+
+def java_use_reason(
+    modules: Sequence[str], nearest: JsImport | None = None, notes: Sequence[str] = ()
+) -> str:
+    """``uses changed class a.b.Price (via a.b.Cart) (+1 more)``, plus what the graph
+    couldn't read."""
+
+    def name(file: str) -> str:
+        located = java_class_of(file)
+        return located[1] if located else file
+
+    first = nearest.module if nearest and nearest.module in modules else sorted(modules)[0]
+    via = (
+        f" (via {name(nearest.via)})" if nearest and nearest.via and nearest.module == first else ""
+    )
+    more = f" (+{len(modules) - 1} more)" if len(modules) > 1 else ""
+    return f"{LINK_JAVA_USE} {name(first)}{via}{more}" + "".join(f"; {n}" for n in notes)
+
+
+def _with_java(tests: Mapping[str, _Test], java: JavaBuildInfo) -> dict[str, _Test]:
+    """Java tests get the build's runner and their module: a known test whose class (the
+    outer one, for a ``$Nested`` class) is one of the checkout's test classes."""
+    found = {}
+    for test_id, test in tests.items():
+        if test.runner is None:
+            cls = test.classname.split("$", 1)[0]
+            module = java.test_classes.get(cls)
+            if module is not None:
+                test = dataclasses.replace(
+                    test, runner=java.runner, java_class=cls, java_module=module
+                )
+        found[test_id] = test
+    return found
 
 
 def _with_junit(command: str, junit_dir: str | None, n: int) -> str:

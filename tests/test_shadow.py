@@ -68,6 +68,7 @@ def selection(
     mode: Mode = Mode.SELECTIVE,
     go_packages: Sequence[str] = (),
     python_files: Sequence[str] = (),
+    java_classes: Sequence[str] = (),
 ) -> Selection:
     """Selected tests as test IDs (pytest) or (test ID, runner)."""
     selected = tuple(
@@ -85,6 +86,7 @@ def selection(
         commands=(),
         go_packages_run_whole=tuple(go_packages),
         python_files_run_whole=tuple(python_files),
+        java_classes_run=tuple(java_classes),
         estimated_ms_total=100.0,
         estimated_ms_would_run=10.0,
     )
@@ -231,6 +233,18 @@ def test_tests_a_stored_selection_runs_but_does_not_name(db_session: Session) ->
     outcomes = {u.test_id: u.outcome for u in compare(db_session).units}
 
     assert outcomes == {f"{GO}::TestA/new_sub": CAUGHT, f"{GO}::TestC": MISSED, NEW: CAUGHT}
+
+
+@pytest.mark.usefixtures("seeded")
+def test_a_java_class_run_whole_runs_its_tests_history_doesnt_know(db_session: Session) -> None:
+    """A test class with no history, run by -Dtest (dropwizard: counted as a miss before)."""
+    assert store(db_session, selection(java_classes=["a.NewTest"]))
+    shadow_run(db_session, {"a.NewTest::first": F, "a.NewTest$Inner::second": F, "a.Other::x": F})
+
+    outcomes = {u.test_id: u.outcome for u in compare(db_session).units}
+
+    assert outcomes == {"a.NewTest::first": CAUGHT, "a.NewTest$Inner::second": CAUGHT,
+                        "a.Other::x": MISSED}  # fmt: skip
 
 
 @pytest.mark.usefixtures("seeded")

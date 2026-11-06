@@ -17,6 +17,7 @@ import typer
 from siftwise import __version__, extras
 from siftwise.cli import gha, gitlab, server
 from siftwise.cli.gograph import build_graph, run_go_list
+from siftwise.cli.javagraph import java_change
 from siftwise.cli.jsgraph import Affected, build_js_graph
 from siftwise.cli.pygraph import build_py_graph
 from siftwise.cli.repoconfig import (
@@ -123,6 +124,13 @@ def select_command(
             "select Jest test files that import changed code."
         ),
     ] = True,
+    java_graph: Annotated[
+        bool,
+        typer.Option(
+            help="For Maven/Gradle builds, read the modules and, when Java changed, build a "
+            "static dependency graph to select test classes that use changed classes."
+        ),
+    ] = True,
     order: Annotated[
         OfferedOrder,
         typer.Option(help="'risk': likely failures first; 'default': by path and test ID."),
@@ -152,7 +160,8 @@ def select_command(
     token = _token()
     try:
         body = selection_request(repo, base, head, go_list=go_list, py_imports=py_imports,
-                                 js_imports=js_imports, order=Order(order.value),
+                                 js_imports=js_imports, java_graph=java_graph,
+                                 order=Order(order.value),
                                  budget_seconds=budget_seconds)  # fmt: skip
     except RepoConfigError as exc:
         _err(f"error: {exc}")
@@ -546,6 +555,8 @@ class LocalChange:
     # /select's `js_graph` (the JS/TS graph's reasons and blind spots), or None. Only /select
     # takes it: /triage and recorded runs need the edges alone (in affected_files).
     js_graph: dict[str, Any] | None = None
+    # /select's `java`: the Maven/Gradle build (modules, test classes) and the graph's details.
+    java: dict[str, Any] | None = None
 
     def graph(self) -> dict[str, Any] | None:
         """``runs.affected`` (schemas.ChangeGraph) to record, or None if the change's links are
@@ -570,6 +581,7 @@ def local_change(
     working_tree: bool = False,
     cwd: Path | None = None,
     js_imports: bool = True,
+    java_graph: bool = True,
 ) -> LocalChange:
     """The change BASE...HEAD with its import graphs and .siftwise.toml. ``base`` None (or a
     failing git diff) means the changed files are unknown. ``working_tree``: the change from
@@ -620,7 +632,39 @@ def local_change(
             if not any(_js_loadable(p, config.generated) for p in changed):
                 js = Affected(js.files, js.nearest, {}, js.notes)  # nothing dynamic to reach
             js_graph = js.js_graph()
-    return LocalChange(fields, config, complete, js_graph)
+    java = None
+    if changed is not None and java_graph:
+        found = java_dependents(root, changed, diff[1] if diff else [])
+        if found is False:
+            complete = False
+        elif found is not None:
+            if found.files:
+                fields["affected_files"] = {**fields.get("affected_files", {}), **found.files}
+            java = found.payload()
+    elif changed and any(p.endswith(".java") for p in changed):
+        complete = False  # --no-java-graph: the Java links are unknown
+    return LocalChange(fields, config, complete, js_graph, java)
+
+
+def java_dependents(root: Path, changed: list[str], deleted: Sequence[str]) -> Any:
+    """The checkout's Java build and the test classes that use changed classes: a
+    ``javagraph.JavaChange``, None without a Java build, or False if reading it failed (then
+    Java tests can't run selectively: the server falls back)."""
+    try:
+        found = java_change(root, changed, deleted)
+    except (OSError, ValueError, RecursionError) as exc:
+        _err(f"warning: could not read the Java build or build its graph ({exc}); Java tests "
+             "will run in full")  # fmt: skip
+        return False
+    if found is None:
+        return None
+    if found.build.unsupported:
+        _err(f"siftwise: java: {found.build.unsupported}; Java changes run the full suite")
+    if found.files:
+        _err(f"siftwise: java: {len(found.files)} test class(es) use changed classes")
+    for note in found.notes:
+        _err(f"siftwise: java: {note}")
+    return found
 
 
 def _js_loadable(path: str, generated: Sequence[str]) -> bool:
@@ -760,6 +804,7 @@ def selection_request(
     order: Order = Order.RISK,
     budget_seconds: float | None = None,
     js_imports: bool = True,
+    java_graph: bool = True,
 ) -> dict[str, Any]:
     """The ``POST /select`` body for BASE...HEAD in the current checkout. ``base`` None (or a
     failing git diff) means the changed files are unknown, so the server picks the full suite.
@@ -770,7 +815,7 @@ def selection_request(
     Raises RepoConfigError for an invalid .siftwise.toml.
     """
     change = local_change(base, head, go_list=go_list, py_imports=py_imports,
-                          js_imports=js_imports)  # fmt: skip
+                          js_imports=js_imports, java_graph=java_graph)  # fmt: skip
     body: dict[str, Any] = {
         "repo": repo,
         **change.fields,
@@ -778,6 +823,8 @@ def selection_request(
     }
     if change.js_graph:
         body["js_graph"] = change.js_graph
+    if change.java:
+        body["java"] = change.java
     if junit_dir:
         body["junit_dir"] = junit_dir
     if order is not Order.RISK:
@@ -833,17 +880,23 @@ def junit_failures(paths: Sequence[Path]) -> list[dict[str, Any]]:
 def post_select(
     server: str, token: str, body: dict[str, Any], timeout: float = 60
 ) -> dict[str, Any]:
-    """``POST /select``. A server older than the JS/TS import graph rejects ``js_graph``:
-    then once more without it (its edges are in affected_files, which every server takes)."""
+    """``POST /select``. A server older than the JS/TS graph or the Java build rejects
+    ``js_graph`` or ``java``: then once more without them (the graphs' edges are in
+    affected_files, which every server takes; Java tests then run in full, as before)."""
     try:
         return post_json(server, token, "/select", body, timeout=timeout)
     except SiftwiseError as exc:
-        if not ("js_graph" in body and exc.status == 422 and "js_graph" in str(exc)):
+        rejected = [k for k in OPTIONAL_SELECT_FIELDS if k in body and k in str(exc)]
+        if exc.status != 422 or not rejected:
             raise
-    _err("siftwise: the server doesn't take js_graph (it's older than this client): selecting "
-         "without the JS import reasons")  # fmt: skip
-    rest = {key: value for key, value in body.items() if key != "js_graph"}
+    _err(f"siftwise: the server doesn't take {', '.join(rejected)} (it's older than this "
+         "client): selecting without them")  # fmt: skip
+    rest = {key: value for key, value in body.items() if key not in rejected}
     return post_json(server, token, "/select", rest, timeout=timeout)
+
+
+# /select fields a server older than this client may not know; dropped on its 422.
+OPTIONAL_SELECT_FIELDS = ("js_graph", "java")
 
 
 def post_json(

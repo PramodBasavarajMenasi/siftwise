@@ -325,6 +325,8 @@ def _select(
     body = {"repo": repo, **change.fields, "always_run": list(change.config.always_run)}
     if change.js_graph:
         body["js_graph"] = change.js_graph
+    if change.java:
+        body["java"] = change.java
     if order != "risk":
         body["order"] = order  # risk is the server's default: an older server accepts the body
     if budget_seconds is not None:
