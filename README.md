@@ -525,10 +525,18 @@ Two ways to keep known flakes from reading as regressions, both in `record`:
   | Runner | When | Re-run command | Report |
   |---|---|---|---|
   | pytest | a test ID that maps to a file in the checkout | `[prefix] pytest -p no:cacheprovider <node IDs>` | `--junitxml` in the runner's temp dir |
-  | Go | an import path in the root `go.mod`'s module | per package: `gotestsum ... -- -count=1 -run '^(TestA\|TestB)$' <package>`, or `go test -json` with the same flags when gotestsum isn't on PATH | gotestsum's JUnit, or `go test -json` converted by siftwise |
-  | Jest | a JS/TS test file (the JUnit must name it: jest-junit's `addFileAttribute`) under a `package.json` or `jest.config.*` with Jest | per file, from that package: `[prefix] jest --ci --runTestsByPath <file> -t '^(<full name>\|...)$'` | jest-junit (it must be installed, as for the CI run) |
+  | Go | an import path in one of the checkout's modules (the root's `go.mod`, a `go.mod` below it, `go.work`'s) | per package, in its module's directory: `gotestsum ... -- -count=1 -run '^(TestA\|TestB)$' <package>`, or `go test -json` with the same flags when gotestsum isn't on PATH | gotestsum's JUnit, or `go test -json` converted by siftwise |
+  | Jest | a JS/TS test file under a `package.json` or `jest.config.*` with Jest: the one the JUnit names (jest-junit's `addFileAttribute` or `usePathForSuiteName`), else the one test file in the checkout whose string literals make up every test name of the report's suite | per file, from that package: `[prefix] jest --ci --runTestsByPath <file> -t '^(<full name>\|...)$'` | jest-junit (it must be installed, as for the CI run) |
   | Maven | a Java class and method, `pom.xml` at the root | `mvn -B -Dtest=Class#m1+m2,Other#m3 test` (`./mvnw` when present) | the `target/surefire-reports` files the re-run wrote, copied out (then put back as they were) |
   | Gradle | a Java class and method, `build.gradle[.kts]` or `settings.gradle[.kts]` at the root | `gradle test --continue --tests Class.method ...` (`./gradlew` when present) | the `build/test-results` files the re-run wrote, copied out (then put back as they were) |
+
+  JUnit 5 display names (Gradle's reports name tests by them; so does Surefire's phrased
+  reporter, for classes too) re-run by the method that carries them, read from the class's
+  source: a method's `@DisplayName`, or a `@ParameterizedTest` / `@RepeatedTest` invocation
+  that its name template (or JUnit's default) produces, which re-runs every case of the
+  method. A name more than one method may carry (two equal display names, a display name
+  that isn't a string literal, a `@DisplayNameGeneration`, a `@TestFactory`) isn't re-run,
+  with the reason, and keeps its verdict.
 
   Go subtests re-run through their top-level test; Java parameter lists and `[n]` indexes are
   dropped (all of a method's cases run). Names that reach a regex are escaped; Java class and
@@ -543,7 +551,9 @@ Two ways to keep known flakes from reading as regressions, both in `record`:
   rounds and runners. Tests whose file isn't in the checkout aren't re-run. Every command runs
   without a shell. A re-run's report must name the test as the CI run did: with custom
   jest-junit name templates (or settings only the test step had), the re-run may not match,
-  and the test keeps its verdict.
+  and the test keeps its verdict. Without jest-junit's `addFileAttribute`, a Jest suite whose
+  test names two test files could both make (or none) isn't re-run, with a warning: never a
+  guess.
 - **Maven and Gradle reports:** both write a re-run's reports where the CI run's are (Surefire
   can't be pointed elsewhere from the command line, and Gradle empties its results directory,
   leaving only the re-run classes'). So `record` backs up every `TEST-*.xml` under
@@ -690,6 +700,17 @@ siftwise-rollup:
   variables:
     SIFTWISE_FAIL_ON: new_regression,unknown   # optional: see fail-on
 ```
+
+**The Tests tab:** GitLab's pipeline Tests tab and the merge request's test summary show only
+the reports a job declares under `artifacts:reports:junit` ([unit test
+reports](https://docs.gitlab.com/ci/testing/unit_test_reports/)), never what siftwise
+uploads to its own server. `.siftwise-record` declares `.siftwise-ci/junit/*.xml`: siftwise's
+pytest commands write their reports there, so write your full suite's report there too (as
+above). Go, Jest, Maven and Gradle commands don't take a report path from siftwise: point
+their JUnit output at `.siftwise-ci/junit/` (gotestsum `--junitfile`, jest-junit's
+`JEST_JUNIT_OUTPUT_DIR`), or declare their own report paths in your job (a job's
+`artifacts:reports:junit` replaces the template's). Reports written in `after_script` are
+uploaded too: it runs before the artifact upload.
 
 If `siftwise-select` failed or didn't run, `SIFTWISE_MODE` is empty and the test job runs the
 full suite. Test jobs that use `needs:` must list `siftwise-select` to get its variables. If
@@ -961,8 +982,8 @@ on = ["**/*.go", "!**/*_test.go"]         # ! excludes
 | Language | Selection | Commands |
 |---|---|---|
 | **Python** (pytest) | `foo.py` → `test_foo.py`; test files importing a changed module (static graph incl. parent packages, conftests, plugin strings); changed test files | `pytest` node IDs, whole test files, `pytest --doctest-modules` for doctests |
-| **Go** | changed package and every package whose tests import it (`go list -deps -test`) | `go test ./pkg` (whole) or `-run '^(TestA\|TestB)$'` |
-| **JS/TS** (Jest) | `foo.ts` → `foo.test.*`, `foo.spec.*`, `__tests__/foo.*`; test files importing a changed file (static graph, no Node needed: relative paths, tsconfig/jsconfig `paths`, workspace packages, a JSON Jest `moduleNameMapper`) (needs file paths in the JUnit: jest-junit's `addFileAttribute`) | `jest <files>` |
+| **Go** | changed package and every package whose tests import it (`go list -deps -test`, in every module of the checkout: `go.work`, nested `go.mod`) | `go test ./pkg` (whole) or `-run '^(TestA\|TestB)$'`; `go test -C <module> ./pkg` for a module below the root |
+| **JS/TS** (Jest) | `foo.ts` → `foo.test.*`, `foo.spec.*`, `__tests__/foo.*`; test files importing a changed file (static graph, no Node needed: relative paths, tsconfig/jsconfig `paths`, workspace packages, a JSON Jest `moduleNameMapper`) (needs each test's file: jest-junit's `addFileAttribute` or `usePathForSuiteName`, or `record` finds it, see below) | `jest <files>` |
 | **Java** (Maven/Gradle) | `a/b/Foo.java` → `FooTest`, `FooTests`, `TestFoo`, `FooIT` in its module (else any module); test classes that use a changed class (static graph, no JVM: imports, static and on-demand imports, same-package names, fully-qualified names), across modules; a module's tests for its `src/test/resources` | per module: `./mvnw -B -pl <module> -am test -Dtest=A,B` (`verify -Dit.test=...` for `*IT`), `./gradlew :<module>:test --tests A` |
 
 The JS/TS graph is safe where it can't see: a test that reaches a `require()` or `import()`
@@ -986,6 +1007,30 @@ off.
 On dropwizard's history (42 Maven modules) it caught 74 of 74 failures, and its selective
 runs skipped a median 91% of test time, but most of its PRs change a `pom.xml` and run
 everything ([eval results](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-results.md#java-dropwizarddropwizard-maven)).
+
+Jest selection needs each test's file. jest-junit writes it only with `addFileAttribute:
+"true"` (or `usePathForSuiteName`), so without it `record` finds it in
+the checkout: jest-junit writes one `<testsuite>` per test file, and the one Jest test file
+(under a package.json with Jest or a `jest.config.*`) whose string literals make up all of the suite's test names (titles joined by spaces,
+`test.each` placeholders included) is the file, which `record` adds to the report it
+uploads. Two files that could both be it, or none (titles built from variables or template
+literals), leave the suite without a file, with a warning: its tests run with the full
+suite, as before. A title made only of placeholders (`test.each(...)('%s')`) matches no name,
+so such tests aren't found either. The search reads only files matching Jest's default
+`testMatch` (a custom `testMatch`/`testRegex` isn't read) in a Jest project, skips
+`node_modules` and build folders, reads them once per command, and stops after 20 seconds:
+the suites not found by then get no file, with one warning. jestjs/jest (1,362 test files)
+took about 3 s with a cold cache on Linux and 45 s on a cold Windows checkout. Setting
+`addFileAttribute: "true"` avoids the search.
+
+For Go, siftwise finds every module of the checkout: the root's `go.mod`, `go.mod` files
+below it (not in `vendor/`, `testdata/` or directories starting with `.` or `_`) and
+`go.work`'s `use` directories. `go list` runs in each (it never crosses into a nested module,
+not even in a workspace), and the graphs are merged: a package of one module that another
+imports through a local `replace` or the workspace links their tests. A package of a module
+below the root runs as `go test -C <module dir> ./pkg` (from the root, Go can't build it).
+`go list` runs with `-mod=mod` turned into `-mod=readonly`, so selecting tests never edits
+`go.mod` or `go.sum`; `-mod=vendor` is kept.
 
 A Jest test file new in the change (`*.test.*`, `*.spec.*` or under `__tests__/`) runs first,
 by its path, once siftwise can tell the path Jest expects from a known Jest test in the same

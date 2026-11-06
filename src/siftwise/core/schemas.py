@@ -307,6 +307,15 @@ class SelectRequest(ChangeRequest):
         description="Details of the JS/TS import graph (reasons, unresolvable dynamic imports); "
         "its edges are in affected_files",
     )
+    go_modules: dict[Annotated[str, StringConstraints(max_length=1024)], NonEmpty255] | None = (
+        Field(
+            default=None,
+            max_length=1000,
+            description="Every Go module of the checkout when there are several (go.work, "
+            "nested go.mod): repo-relative directory ('' = the root) -> module path. Go "
+            "commands then run in the package's module (`go test -C <dir>`)",
+        )
+    )
     budget_seconds: float | None = Field(
         default=None,
         gt=0,

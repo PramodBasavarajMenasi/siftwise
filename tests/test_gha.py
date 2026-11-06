@@ -1253,7 +1253,7 @@ def test_a_matrix_leg_re_runs_its_unknown_failures(
     assert upload.calls.last.request.url.params["defer_rollup"] == "true"
     assert gh.outputs()["rerun-tests"] == "1" and gh.outputs()["rerun-passed"] == "1"
     line = ("siftwise: re-ran 1 failure (unknown) in 1 round: 1 passed on a re-run (now flaky); "
-            "2 not re-run (a Go test, but there's no go.mod at the checkout's root; its file "
+            "2 not re-run (a Go test, but the checkout has no Go module (go.mod); its file "
             "isn't in the checkout)")  # fmt: skip
     assert line in result.output and line in gh.summary.read_text()
 

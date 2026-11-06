@@ -586,3 +586,63 @@ def test_a_budget_against_an_older_server_is_a_clear_error(api: respx.MockRouter
     assert ("error: the siftwise server doesn't support time budgets (it rejected "
             "budget_seconds: it's older than this client); upgrade the server or run without a "
             "budget (--budget)") in result.stderr  # fmt: skip
+
+
+def test_every_go_module_gets_its_go_list_and_the_server_its_modules(
+    go_repo: Path, api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A nested module: go list runs in each module's directory, the graphs merge, and
+    /select gets the modules so its commands run in the right one."""
+    (go_repo / "tools").mkdir()
+    (go_repo / "tools" / "go.mod").write_text("module example.com/tools\n\ngo 1.24\n")
+    git(go_repo, "add", "-A")
+    git(go_repo, "commit", "-q", "-m", "tools")
+    roots: list[Path] = []
+
+    def fake_go_list(root: Path) -> list[dict[str, Any]]:
+        roots.append(root.resolve())
+        if root.name != "tools":
+            return go_list_packages(go_repo)
+        x = {
+            "ImportPath": "example.com/tools/x",
+            "Dir": str(go_repo / "tools" / "x"),
+            "Module": {"Path": "example.com/tools", "Main": True},
+            "Deps": [f"{M}/a"],
+        }
+        a = {
+            "ImportPath": f"{M}/a",
+            "Dir": str(go_repo / "a"),
+            "Module": {"Path": M, "Replace": {"Path": "../", "Dir": str(go_repo)}},
+        }
+        return [a, x]
+
+    monkeypatch.setattr("siftwise.cli.main.run_go_list", fake_go_list)
+    route = api.post(SELECT_URL).respond(json=response())
+
+    result = run()
+
+    assert result.exit_code == 0, result.output
+    assert roots == [go_repo.resolve(), (go_repo / "tools").resolve()]
+    body = sent(route)
+    assert body["go_module"] == M
+    assert body["go_modules"] == {"": M, "tools": "example.com/tools"}
+    assert body["affected_packages"]["example.com/tools/x"] == [f"{M}/a"]
+
+
+def test_an_older_server_gets_the_request_without_go_modules(
+    go_repo: Path, api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (go_repo / "tools").mkdir()
+    (go_repo / "tools" / "go.mod").write_text("module example.com/tools\n")
+    monkeypatch.setattr("siftwise.cli.main.run_go_list", lambda root: go_list_packages(go_repo))
+    old = {"detail": [{"type": "extra_forbidden", "loc": ["body", "go_modules"],
+                       "msg": "Extra inputs are not permitted"}]}  # fmt: skip
+    route = api.post(SELECT_URL).mock(side_effect=[
+        httpx.Response(422, json=old), httpx.Response(200, json=response())])  # fmt: skip
+
+    result = run()
+
+    assert result.exit_code == 0, result.output
+    assert "go_modules" in json.loads(route.calls[0].request.content)
+    assert "go_modules" not in sent(route)
+    assert "doesn't take go_modules" in result.stderr

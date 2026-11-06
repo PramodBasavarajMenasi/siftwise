@@ -42,6 +42,7 @@ def post_select(
         always_run=tuple(body.always_run),
         depends=tuple(DependsRule(rule.tests, tuple(rule.on)) for rule in body.depends),
         go_module=body.go_module,
+        go_modules=tuple(sorted((body.go_modules or {}).items())),
         generated=tuple(body.generated),
     )
     history = load_history(session, body.repo, config)

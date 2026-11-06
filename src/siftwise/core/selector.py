@@ -218,6 +218,10 @@ class SelectorConfig:
     # Go module path (e.g. "github.com/ipfs/kubo"). When set, Go commands use ./relative
     # package dirs and root-package changes can be mapped; otherwise import paths are used.
     go_module: str | None = None
+    # Every Go module of the checkout when there are several (go.work, nested go.mod):
+    # (repo-relative directory, module path). Go commands then run in the package's module
+    # (`go test -C <dir> ./pkg`) and packages map to directories through their module.
+    go_modules: tuple[tuple[str, str], ...] = ()
     # Declared dependencies from the repo's .siftwise.toml.
     depends: tuple[DependsRule, ...] = ()
     # Generated-file globs from .siftwise.toml, on top of GENERATED_GLOBS.
@@ -549,7 +553,7 @@ def _select(
         )
         if budget_ms is None:
             return selection
-        return _full_within_budget(selection, history, tests, config.go_module, junit_dir,
+        return _full_within_budget(selection, history, tests, _GoLayout.of(config), junit_dir,
                                    order, budget_ms, java)  # fmt: skip
 
     if not changed_files_known:
@@ -757,7 +761,7 @@ def _select(
         and not (
             p.endswith(".go")
             and any(
-                _go_package_matches(pkg, posixpath.dirname(p), config.go_module)
+                _go_package_matches(pkg, posixpath.dirname(p), config.go_module, config.go_modules)
                 for pkg in covered_by_dependents
             )
         )
@@ -865,7 +869,7 @@ def _select(
         ),
         selected_count=len(chosen),
         total_known=len(tests),
-        commands=_commands(units, config.go_module, junit_dir, _key(order, ranked), java),
+        commands=_commands(units, _GoLayout.of(config), junit_dir, _key(order, ranked), java),
         go_packages_run_whole=tuple(sorted(whole_packages)),
         python_files_run_whole=tuple(sorted(files_run_whole)),
         java_classes_run=_java_classes_run(units),
@@ -877,7 +881,7 @@ def _select(
     if costs.unknown_ms is None:
         note = "no test durations in history to estimate with: no budget applied"
         return dataclasses.replace(selection, budget=Budget(budget_ms, applied=False, note=note))
-    return _pack(selection, units, ranked, costs, budget_ms, config.go_module, junit_dir,
+    return _pack(selection, units, ranked, costs, budget_ms, _GoLayout.of(config), junit_dir,
                  java=java)  # fmt: skip
 
 
@@ -982,7 +986,7 @@ def _pack(
     ranked: Mapping[str, Ranked],
     costs: _Costs,
     budget_ms: float,
-    go_module: str | None,
+    go_module: str | _GoLayout | None,
     junit_dir: str | None,
     full_reason: str | None = None,
     java: JavaBuildInfo | None = None,
@@ -1065,7 +1069,7 @@ def _full_within_budget(
     selection: Selection,
     history: RepoHistory | None,
     tests: Mapping[str, _Test],
-    go_module: str | None,
+    go_module: str | _GoLayout | None,
     junit_dir: str | None,
     order: Order,
     budget_ms: float,
@@ -1731,7 +1735,7 @@ def _map_path(path: str, tests: Mapping[str, _Test], config: SelectorConfig) -> 
         directory = posixpath.dirname(path)
         for t in tests.values():
             if t.runner is Runner.GO and _go_package_matches(
-                t.classname, directory, config.go_module
+                t.classname, directory, config.go_module, config.go_modules
             ):
                 hits.setdefault(t.test_id, f"in Go package {t.classname}, which has changed {path}")
     elif ext in JS_EXTENSIONS and not _is_js_test_file(path):
@@ -1762,7 +1766,12 @@ def _test_matches_glob(test: _Test, pattern: str, config: SelectorConfig) -> boo
     return False
 
 
-def _go_package_matches(package: str, directory: str, module: str | None) -> bool:
+def _go_package_matches(
+    package: str, directory: str, module: str | None, modules: Sequence[tuple[str, str]] = ()
+) -> bool:
+    located = go_package_dir(package, modules)
+    if located is not None:
+        return located == directory
     if module and (package == module or package.startswith(module + "/")):
         return package[len(module) :].lstrip("/") == directory
     # No module path: match the directory as an import-path suffix. May over-select a
@@ -1890,7 +1899,7 @@ def _build_commands(
 
 def _commands(
     units: Sequence[_Unit],
-    go_module: str | None = None,
+    go_module: str | _GoLayout | None = None,
     junit_dir: str | None = None,
     key: UnitKey | None = None,
     java: JavaBuildInfo | None = None,
@@ -1938,10 +1947,10 @@ def _commands(
     for unit in ordered(u for u in units if u.runner is Runner.GO):
         target = _go_target(unit.arg, go_module)
         if unit.go_names is None:
-            command = shlex.join(["go", "test", target])
+            command = shlex.join(["go", "test", *target])
         else:
             pattern = "^(" + "|".join(unit.go_names) + ")$"
-            command = shlex.join(["go", "test", target, "-run", pattern])
+            command = shlex.join(["go", "test", *target, "-run", pattern])
         commands.append((best([unit]), command))
 
     jest_units = [u for u in units if u.runner is Runner.JEST]
@@ -2141,12 +2150,51 @@ def _with_junit(command: str, junit_dir: str | None, n: int) -> str:
     return command.replace("pytest", shlex.join(["pytest", f"--junitxml={report}"]), 1)
 
 
-def _go_target(package: str, module: str | None) -> str:
+@dataclass(frozen=True)
+class _GoLayout:
+    """The root's module path and every module of the checkout (directory, module path)."""
+
+    module: str | None
+    modules: tuple[tuple[str, str], ...] = ()
+
+    @classmethod
+    def of(cls, config: SelectorConfig) -> _GoLayout:
+        return cls(config.go_module, config.go_modules)
+
+
+def go_module_of(package: str, modules: Sequence[tuple[str, str]]) -> tuple[str, str] | None:
+    """(directory, module path) of the module a Go package belongs to: the longest module path
+    it is, or starts with plus "/". None if no module of the checkout has it."""
+    found = [(d, m) for d, m in modules if package == m or package.startswith(m + "/")]
+    return max(found, key=lambda dm: len(dm[1])) if found else None
+
+
+def go_package_dir(package: str, modules: Sequence[tuple[str, str]]) -> str | None:
+    """A Go package's repo-relative directory, through its module; None if unknown."""
+    found = go_module_of(package, modules)
+    if found is None:
+        return None
+    directory, module = found
+    return posixpath.join(directory, package[len(module) :].lstrip("/")).strip("/")
+
+
+def _go_target(package: str, layout: str | _GoLayout | None) -> list[str]:
+    """``go test``'s arguments for a package: ``./dir`` from the root's module, ``-C <module
+    dir> ./dir`` for another module of the checkout, else the import path."""
+    module = layout.module if isinstance(layout, _GoLayout) else layout
+    modules = layout.modules if isinstance(layout, _GoLayout) else ()
+    found = go_module_of(package, modules)
+    if found is not None and found[0]:
+        directory, path = found
+        rest = package[len(path) :].lstrip("/")
+        return ["-C", directory, f"./{rest}" if rest else "."]
+    if found is not None:
+        module = found[1]
     if module and package == module:
-        return "."
+        return ["."]
     if module and package.startswith(module + "/"):
-        return "./" + package[len(module) + 1 :]
-    return package  # import paths work with `go test` from inside the module
+        return ["./" + package[len(module) + 1 :]]
+    return [package]  # import paths work with `go test` from inside the module
 
 
 # --- history from the database ------------------------------------------------------------
