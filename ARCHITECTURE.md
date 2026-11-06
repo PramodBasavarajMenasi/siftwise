@@ -168,9 +168,9 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   `TIME_LIMIT_S` (20 s, walk included); past it the search stops for good and no later suite
   gets a file (a partial read could leave one wrong file as the only match), with one
   warning per command.
-- **Depth:** recorded, not used by the risk order: like Python and Go imports, every JS
-  import is an indirect link. Using depth 1 as direct is the import-depth issue's to decide
-  for all three graphs.
+- **Depth:** the nearest change's depth goes to `/select` twice: in `js_graph` (the
+  reason's "via") and in `import_depths`, which the risk order reads (depth 1 = a direct
+  link), as for the other graphs.
 
 ### Java (Maven and Gradle)
 
@@ -205,7 +205,8 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   checkout gets the build's runner and its module. A changed main class selects its tests by
   name (`FooTest`, `FooTests`, `TestFoo`, `FooTestCase`, `FooIT`, `FooITCase`) in its module,
   else in any module (direct links); a changed or new test class runs itself; the graph's
-  users are indirect links, like imports. `src/test/resources` selects the module's test
+  users are import links, like imports (direct when the test class uses the changed class
+  itself, else indirect: see "Import depth"). `src/test/resources` selects the module's test
   classes. Main resources, other JVM languages, unanalysed modules and an unsupported build
   run the full suite; so does a changed class nothing reaches.
 - **Commands**, one per module, classes and modules in risk order, packed by the budget like
@@ -241,7 +242,7 @@ score = link + 3 × recency × (1 − flaky) + 2 × failure_rate × (1 − flaky
 
 | Term | Value |
 |---|---|
-| `link` | the test's strongest reason: **6** direct (its own file changed, or path mapping: `test_x.py` for `x.py`, the changed file's Go package, a JS test named after it); **3** indirect (an import of changed code at any depth, a `[[depends]]` rule, a nested build file); **0** history only (co-change, recently failed or broken on main, `always_run`) |
+| `link` | the test's strongest reason: **6** direct (its own file changed; path mapping: `test_x.py` for `x.py`, the changed file's Go package, a JS test named after it; or its test file or Go package imports changed code itself, import depth 1); **3** indirect (an import of changed code through other files or packages, or of unknown depth; a `[[depends]]` rule; a nested build file); **0** history only (co-change, recently failed or broken on main, `always_run`) |
 | `recency` | `0.5 ^ (days / 7)`: days from the test's last failure to the repo's newest run (not to now, so the answer doesn't drift with the clock); 0 if it hasn't failed in the window |
 | `failure_rate` | failures ÷ runs in the window |
 | `flaky` | `test_stats.flaky_score`: recency and rate count only failure evidence that isn't flakiness |
@@ -252,7 +253,8 @@ Ties go to the shorter average duration (unknown last), then the test ID. Scores
 
 **Example.** A change to `src/shop/cart.py` selects three tests. `tests/test_cart.py::test_total`
 maps to it by path, has 50 runs and no failures: 6. `tests/test_zip.py::test_zip` imports
-`shop.cart` through another module: 3. `tests/test_tax.py::test_rate` only failed alongside
+`shop.cart` through another module: 3 (had it imported `shop.cart` itself, import depth 1:
+6). `tests/test_tax.py::test_rate` only failed alongside
 `cart.py` before (co-change), most recently 10 days before the newest run, in 10 of its 50
 runs: 0 + 3 × 0.5^(10/7) + 2 × 0.2 = 1.51. So the command is
 `pytest tests/test_cart.py::test_total tests/test_zip.py tests/test_tax.py::test_rate`. Had
@@ -284,8 +286,30 @@ wasn't clearly faster by time and was slower by test count
 ([eval results](docs/eval-results.md#risk-order-time-to-first-failure)). It stays in the
 eval only.
 
-**Limits:** the import graphs say which changed modules a test file imports, not how directly,
-so every import is "indirect". Recency counts failures on any branch: the request doesn't say
+**Import depth.** `/select` takes an optional `import_depths`: test file (Python, Jest, Java)
+or Go package -> the shortest import depth from it to a changed file, 1 = it imports changed
+code itself. The CLI computes it with the graphs it already builds:
+- **Python** (`PyGraph.depths`): the shortest chain over the import edges (a parent package's
+  `__init__.py` is an edge, so `from pkg import core` imports `pkg/__init__.py` directly); a
+  `conftest.py` pytest loads for the test is one hop.
+- **Go** (`GoGraph.depths`): direct edges from `go list`'s `Imports` (non-test files) and the
+  tested package's `TestImports` and `XTestImports`; depth 1 = the package changed, or it or
+  its tests import a changed package. `Deps` (transitive) still decides what is affected.
+- **Jest, Java:** the graphs' `nearest.depth`.
+
+Depth 1 makes an import a direct link; deeper, or a test with no depth sent, stays indirect.
+Only the four import signals read it: path mapping stays direct and `[[depends]]`, nested
+build files and dynamic imports stay indirect whatever the depth. It is order only, so
+`order: default` and the selected tests are the same with or without it (a time budget does
+pack in risk order, so it can keep other tests). An older server rejects the field; the
+clients send the request again without it (`OPTIONAL_SELECT_FIELDS`), and every import is
+indirect, as before. It isn't stored (`runs.affected`, shadow selections) and triage doesn't
+read it.
+
+**Limits:** depth counts import hops, not how much of the changed code a test exercises: a
+test that imports a large module for one constant is as "direct" as one testing it. The eval
+doesn't send depths, so the replays' risk-order figures are without them. Recency counts
+failures on any branch: the request doesn't say
 which branch it is on, and other PRs' failures count as well. Measured on rdflib and substrate
 PR runs in [eval results](docs/eval-results.md#risk-order-time-to-first-failure).
 

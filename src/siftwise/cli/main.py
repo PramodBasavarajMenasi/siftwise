@@ -561,6 +561,9 @@ class LocalChange:
     # /select's `go_modules`: directory -> module path, when the checkout has Go modules other
     # than the root's (go.work, nested go.mod): Go commands run in the package's module.
     go_modules: dict[str, str] | None = None
+    # /select's `import_depths`: test file (Python, Jest, Java) or Go package -> the shortest
+    # import depth to a changed file (1 = it imports changed code itself), for the risk order.
+    import_depths: dict[str, int] | None = None
 
     def select_only(self) -> dict[str, Any]:
         """The fields only /select takes (an older server rejects them with a 422 naming
@@ -572,6 +575,8 @@ class LocalChange:
             extra["java"] = self.java
         if self.go_modules:
             extra["go_modules"] = self.go_modules
+        if self.import_depths:
+            extra["import_depths"] = self.import_depths
         return extra
 
     def graph(self) -> dict[str, Any] | None:
@@ -624,6 +629,7 @@ def local_change(
         "generated": list(config.generated),
     }
     complete = True
+    depths: dict[str, int] = {}
     if diff and diff[1]:
         fields["deleted_files"] = diff[1]
     modules = go_modules_of(root, changed)
@@ -634,19 +640,24 @@ def local_change(
         packages = go_dependents(root, changed, modules) if go_list else None
         complete = packages is not None
         if go_list:
-            fields["affected_packages"] = packages or {}
+            fields["affected_packages"] = packages[0] if packages else {}
+        if packages:
+            depths.update(packages[1])
     go_modules = modules if set(modules) - {""} else None
     if changed and any(p.endswith(".py") for p in changed):
         files = python_dependents(root, changed) if py_imports else None
         complete = complete and files is not None
         if py_imports:
-            fields["affected_files"] = files or {}
+            fields["affected_files"] = files[0] if files else {}
+        if files:
+            depths.update(files[1])
     js_graph = None
     if changed and wants_js_graph(root, changed, config.generated):
         js = js_dependents(root, changed, diff[1] if diff else []) if js_imports else None
         complete = complete and js is not None
         if js is not None:
             fields["affected_files"] = {**fields.get("affected_files", {}), **js.files}
+            depths.update((test, n.depth) for test, n in js.nearest.items())
             if not any(_js_loadable(p, config.generated) for p in changed):
                 js = Affected(js.files, js.nearest, {}, js.notes)  # nothing dynamic to reach
             js_graph = js.js_graph()
@@ -658,10 +669,11 @@ def local_change(
         elif found is not None:
             if found.files:
                 fields["affected_files"] = {**fields.get("affected_files", {}), **found.files}
+                depths.update((test, n.depth) for test, n in found.nearest.items())
             java = found.payload()
     elif changed and any(p.endswith(".java") for p in changed):
         complete = False  # --no-java-graph: the Java links are unknown
-    return LocalChange(fields, config, complete, js_graph, java, go_modules)
+    return LocalChange(fields, config, complete, js_graph, java, go_modules, depths or None)
 
 
 def go_modules_of(root: Path, changed: Sequence[str] | None) -> dict[str, str]:
@@ -909,10 +921,11 @@ def junit_failures(paths: Sequence[Path]) -> list[dict[str, Any]]:
 def post_select(
     server: str, token: str, body: dict[str, Any], timeout: float = 60
 ) -> dict[str, Any]:
-    """``POST /select``. A server older than the JS/TS graph, the Java build or Go
-    workspaces rejects ``js_graph``, ``java`` or ``go_modules``: then once more without them
-    (the graphs' edges are in affected_files/affected_packages, which every server takes; Java
-    tests then run in full and Go commands name packages as before)."""
+    """``POST /select``. A server older than the JS/TS graph, the Java build, Go workspaces
+    or import depths rejects ``js_graph``, ``java``, ``go_modules`` or ``import_depths``: then
+    once more without them (the graphs' edges are in affected_files/affected_packages, which
+    every server takes; Java tests then run in full, Go commands name packages as before, and
+    every import ranks as an indirect link)."""
     try:
         return post_json(server, token, "/select", body, timeout=timeout)
     except SiftwiseError as exc:
@@ -926,7 +939,7 @@ def post_select(
 
 
 # /select fields a server older than this client may not know; dropped on its 422.
-OPTIONAL_SELECT_FIELDS = ("js_graph", "java", "go_modules")
+OPTIONAL_SELECT_FIELDS = ("js_graph", "java", "go_modules", "import_depths")
 
 
 def post_json(
@@ -1059,9 +1072,10 @@ def git_toplevel(cwd: Path | None = None) -> Path | None:
 
 def go_dependents(
     root: Path, changed: list[str], modules: Mapping[str, str] | None = None
-) -> dict[str, list[str]] | None:
-    """Packages whose tests import a changed package, over every module of the checkout
-    (``go list`` in each module's directory); None (fallbacks apply) if any go list fails."""
+) -> tuple[dict[str, list[str]], dict[str, int]] | None:
+    """Packages whose tests import a changed package, and each one's import depth
+    (``GoGraph.depths``), over every module of the checkout (``go list`` in each module's
+    directory); None (fallbacks apply) if any go list fails."""
     graphs = []
     for directory in sorted(modules or {"": ""}):
         packages = run_go_list(root / directory if directory else root)
@@ -1071,14 +1085,18 @@ def go_dependents(
                  "dependents")  # fmt: skip
             return None
         graphs.append(build_graph(packages, root))
-    affected = merge_graphs(graphs, (modules or {}).get("")).affected(changed)
+    graph = merge_graphs(graphs, (modules or {}).get(""))
+    affected = graph.affected(changed)
     if affected:
         _err(f"siftwise: go list: {len(affected)} package(s) depend on changed Go code")
-    return affected
+    return affected, graph.depths(changed)
 
 
-def python_dependents(root: Path, changed: list[str]) -> dict[str, list[str]] | None:
-    """Test files that import a changed module; None (fallbacks apply) if the graph fails."""
+def python_dependents(
+    root: Path, changed: list[str]
+) -> tuple[dict[str, list[str]], dict[str, int]] | None:
+    """Test files that import a changed module, and each one's import depth
+    (``PyGraph.depths``); None (fallbacks apply) if the graph fails."""
     try:
         graph = build_py_graph(root)
     except (OSError, ValueError, RecursionError) as exc:
@@ -1087,7 +1105,7 @@ def python_dependents(root: Path, changed: list[str]) -> dict[str, list[str]] | 
     affected = graph.affected(changed)
     if affected:
         _err(f"siftwise: python imports: {len(affected)} test file(s) import changed modules")
-    return affected
+    return affected, graph.depths(changed)
 
 
 def git_output(*args: str, cwd: Path | None = None, timeout: float = 30) -> bytes | None:

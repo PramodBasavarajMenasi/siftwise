@@ -70,8 +70,37 @@ def test_affected_packages(
     assert graph.affected(changed) == expected
 
 
+@pytest.mark.parametrize(
+    ("changed", "expected"),
+    [
+        # b imports a; c only through b (c -> b -> a); notests imports a.
+        (["a/a.go"], {A: 1, B: 1, C: 2, f"{M}/notests": 1}),
+        (["d/d.go"], {C: 1, D: 1}),  # c's _test package imports d itself
+        (["b/b.go", "d/d.go"], {B: 1, C: 1, D: 1}),
+        (["version.go"], {M: 1}),
+        (["a/a_test.go"], {}),
+    ],
+    ids=["a", "test-only-import", "two-packages", "root", "test-file"],
+)
+def test_import_depths(graph: GoGraph, changed: list[str], expected: dict[str, int]) -> None:
+    assert graph.depths(changed) == expected
+    assert set(graph.depths(changed)) == set(graph.affected(changed))
+
+
+def test_direct_edges_leave_out_tests_variants_and_other_modules(graph: GoGraph) -> None:
+    assert graph.imports[C] == {B}  # not fmt
+    assert graph.test_imports[C] == {D}  # XTestImports without c itself or github.com/x/y
+    assert graph.test_imports[A] == frozenset()
+    assert set(graph.imports) == set(graph.dirs.values())
+
+
 def test_json_round_trip(graph: GoGraph) -> None:
     assert GoGraph.from_json(graph.to_json()) == graph
+    # A graph cached before the direct edges were kept: no depths, the rest as before.
+    old = {key: value for key, value in graph.to_json().items()
+           if key not in ("imports", "test_imports")}  # fmt: skip
+    assert GoGraph.from_json(old).affected(["a/a.go"]) == graph.affected(["a/a.go"])
+    assert GoGraph.from_json(old).depths(["a/a.go"]) == {}
 
 
 def test_run_go_list_returns_none_on_failure(
@@ -235,8 +264,95 @@ def test_nested_modules_and_workspaces_for_real(
             "example.com/root/a": ["example.com/root/a"],
             "example.com/tools/x": ["example.com/root/a"],
         }, work
+        # x imports a (in the other module) itself; a is the changed package.
+        assert graph.depths(["a/a.go"]) == {"example.com/root/a": 1, "example.com/tools/x": 1}
         assert (tmp_path / "tools" / "go.mod").read_text() == tools_mod
     monkeypatch.setenv("GOFLAGS", "")
     proc = subprocess.run([GO, "test", "-C", "tools", "./x"], cwd=tmp_path,
                           capture_output=True, text=True, check=False)  # fmt: skip
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.skipif(os.environ.get("SIFTWISE_REAL_TOOL_TESTS") != "1", reason="real Go")
+def test_import_depths_for_real(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Depths from real go list output: b imports a, c imports b, d's in-package test imports
+    a, e's _test package imports a, f's _test package imports c."""
+    if GO is None:
+        pytest.fail("SIFTWISE_REAL_TOOL_TESTS=1, but go isn't on PATH")
+    for name, value in {"GOFLAGS": "", "GOPROXY": "off", "GOTOOLCHAIN": "local"}.items():
+        monkeypatch.setenv(name, value)
+    m = "example.com/depth"
+    files = {
+        "go.mod": f"""module {m}
+
+go 1.21
+""",
+        "a/a.go": """package a
+
+func A() int { return 1 }
+""",
+        "b/b.go": f"""package b
+
+import "{m}/a"
+
+func B() int {{ return a.A() }}
+""",
+        "b/b_test.go": """package b
+
+import "testing"
+
+func TestB(t *testing.T) {}
+""",
+        "c/c.go": f"""package c
+
+import "{m}/b"
+
+func C() int {{ return b.B() }}
+""",
+        "c/c_test.go": """package c
+
+import "testing"
+
+func TestC(t *testing.T) {}
+""",
+        "d/d.go": "package d",
+        "d/d_test.go": f"""package d
+
+import (
+    "testing"
+    "{m}/a"
+)
+
+func TestD(t *testing.T) {{ _ = a.A() }}
+""",
+        "e/e.go": "package e",
+        "e/e_test.go": f"""package e_test
+
+import (
+    "testing"
+    "{m}/a"
+)
+
+func TestE(t *testing.T) {{ _ = a.A() }}
+""",
+        "f/f.go": "package f",
+        "f/f_test.go": f"""package f_test
+
+import (
+    "testing"
+    "{m}/c"
+)
+
+func TestF(t *testing.T) {{ _ = c.C() }}
+""",
+    }
+    for name, text in files.items():
+        write(tmp_path / name, text)
+
+    packages = run_go_list(tmp_path)
+    assert packages is not None
+    graph = build_graph(packages, tmp_path)
+
+    assert graph.affected(["a/a.go"]).keys() == {f"{m}/{p}" for p in "abcdef"}
+    assert graph.depths(["a/a.go"]) == {
+        f"{m}/a": 1, f"{m}/b": 1, f"{m}/c": 2, f"{m}/d": 1, f"{m}/e": 1, f"{m}/f": 3}  # fmt: skip

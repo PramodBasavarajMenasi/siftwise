@@ -96,6 +96,15 @@ All notable changes to siftwise. The format follows
   - Eval: recall and time to first failure under budgets of 10%, 25% and 50% of each run's
     measured time, on rdflib and substrate (docs/eval-results.md).
 
+- Import depth in the risk order ([#48](https://github.com/PramodBasavarajMenasi/siftwise/issues/48)):
+  a test whose own file imports changed code now ranks as a direct link (6), above tests that
+  reach it only through other files (3). The CLI sends an optional `import_depths` in
+  `/select`: the shortest depth per Python, Jest and Java test file and per Go package
+  (Python counts a `conftest.py` as one hop; Go uses `go list`'s `Imports`, `TestImports` and
+  `XTestImports`). Order only: the selected tests and `--order default` don't change. An
+  older server gets the request again without it, and an older client's imports stay
+  indirect.
+
 - v0.2 follow-ups ([#46](https://github.com/PramodBasavarajMenasi/siftwise/issues/46)):
   - **Jest without `addFileAttribute`:** jest-junit's default report names no test file, so
     Jest tests couldn't be selected by file or re-run. A suite named by its test file's path

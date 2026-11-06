@@ -319,6 +319,8 @@ def test_go_dependents_and_repo_config_are_sent(
     assert body["depends"] == [{"tests": "e2e/**", "on": ["**/*.go", "!**/*_test.go"]}]
     assert body["always_run"] == ["smoke/**"]
     assert body["generated"] == ["build/reports/**"]  # the server ignores these files too
+    # b and notests import a; c only through b (gofixture's Imports).
+    assert body["import_depths"] == {f"{M}/a": 1, f"{M}/b": 1, f"{M}/c": 2, f"{M}/notests": 1}
     assert "4 package(s) depend on changed Go code" in result.stderr
 
 
@@ -446,6 +448,8 @@ def test_python_importers_are_sent(api: respx.MockRouter) -> None:
 
     assert result.exit_code == 0, result.output
     assert sent(route)["affected_files"] == {"tests/test_cart.py": ["shop/money.py"]}
+    # test_cart -> shop/cart.py -> shop/money.py: indirect; test_tax imports nothing changed.
+    assert sent(route)["import_depths"] == {"tests/test_cart.py": 2}
     assert "deleted_files" not in sent(route)
     assert "python imports: 1 test file(s) import changed modules" in result.stderr
 
@@ -627,6 +631,23 @@ def test_every_go_module_gets_its_go_list_and_the_server_its_modules(
     assert body["go_module"] == M
     assert body["go_modules"] == {"": M, "tools": "example.com/tools"}
     assert body["affected_packages"]["example.com/tools/x"] == [f"{M}/a"]
+
+
+@pytest.mark.usefixtures("py_repo")
+def test_an_older_server_gets_the_request_without_import_depths(api: respx.MockRouter) -> None:
+    old = {"detail": [{"type": "extra_forbidden", "loc": ["body", "import_depths"],
+                       "msg": "Extra inputs are not permitted"}]}  # fmt: skip
+    route = api.post(SELECT_URL).mock(side_effect=[
+        httpx.Response(422, json=old), httpx.Response(200, json=response())])  # fmt: skip
+
+    result = run()
+
+    assert result.exit_code == 0, result.output
+    first = json.loads(route.calls[0].request.content)
+    assert first["import_depths"] == {"tests/test_cart.py": 2}
+    assert "import_depths" not in sent(route)
+    assert sent(route)["affected_files"] == first["affected_files"]  # the edges still go
+    assert "doesn't take import_depths" in result.stderr
 
 
 def test_an_older_server_gets_the_request_without_go_modules(

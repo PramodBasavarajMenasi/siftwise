@@ -9,6 +9,7 @@ import pytest
 
 from siftwise.core.risk import Link, Order, Ranked, RiskInputs, rank, score, unit_key
 from siftwise.core.selector import (
+    DependsRule,
     FailedRun,
     KnownTest,
     Mode,
@@ -289,3 +290,74 @@ def test_no_order_changes_what_is_selected(order: Order) -> None:
     # The same commands and arguments, only in another order.
     words = [sorted(shlex.split(c)) for c in other.commands]
     assert sorted(words) == sorted(sorted(shlex.split(c)) for c in default.commands)
+
+
+# --- import depth (#48) -----------------------------------------------------------------------
+
+
+def test_a_test_that_imports_changed_code_itself_ranks_as_a_direct_link() -> None:
+    """Both test files import engine.py (no path mapping): without depths both are indirect
+    and test_far's failure a week ago puts it first; at depth 1, test_near is a direct link
+    and goes first. Depth 2+ stays indirect. The selection and the default order never move."""
+    hist = history(
+        KnownTest("tests.test_near::test_n", **ESTABLISHED),  # type: ignore[arg-type]
+        KnownTest(
+            "tests.test_far::test_f", runs=50, failures=10, last_failed_at=NOW - timedelta(days=7)
+        ),
+    )
+    changed = ["src/shop/engine.py"]
+    affected = {"tests/test_near.py": changed, "tests/test_far.py": changed}
+    depths = {"tests/test_near.py": 1, "tests/test_far.py": 2}
+
+    def pick(order: Order, import_depths: dict[str, int] | None) -> Selection:
+        return select_tests(hist, changed, True, affected_files=affected, order=order,
+                            import_depths=import_depths)  # fmt: skip
+
+    before, after = pick(Order.RISK, None), pick(Order.RISK, depths)
+    scores = {t.test_id: (t.score, t.rank) for t in after.tests}
+    far = round(3 + 3 * 0.5 + 2 * 0.2, 3)  # indirect + failed 7 days ago + 20% failure rate
+    assert {t.test_id: (t.score, t.rank) for t in before.tests} == {
+        "tests.test_far::test_f": (far, 1), "tests.test_near::test_n": (3.0, 2)}  # fmt: skip
+    assert scores == {"tests.test_near::test_n": (6.0, 1), "tests.test_far::test_f": (far, 2)}
+    assert before.commands == ("pytest tests/test_far.py tests/test_near.py",)
+    assert after.commands == ("pytest tests/test_near.py tests/test_far.py",)
+    assert next(t for t in after.tests if t.rank == 1).rank_reason == "direct link"
+    # Order only: the same tests and scope, and the default order is byte for byte the same.
+    assert SelectionScope.of(after) == SelectionScope.of(before)
+    assert [t.test_id for t in after.tests] == [t.test_id for t in before.tests]
+    assert pick(Order.DEFAULT, depths).commands == pick(Order.DEFAULT, None).commands
+    # Depth 2 or unknown: indirect, as before.
+    assert pick(Order.RISK, {"tests/test_near.py": 2}).tests == before.tests
+
+
+def test_go_packages_rank_by_their_import_depth() -> None:
+    hist = history(
+        KnownTest("example.com/m/b::TestB", **ESTABLISHED),  # type: ignore[arg-type]
+        KnownTest("example.com/m/c::TestC", **ESTABLISHED),  # type: ignore[arg-type]
+    )
+    config = SelectorConfig(go_module="example.com/m")
+    affected = {"example.com/m/b": ["example.com/m/a"], "example.com/m/c": ["example.com/m/a"]}
+
+    def pick(order: Order, depths: dict[str, int] | None) -> Selection:
+        return select_tests(hist, ["a/a.go"], True, config, affected_packages=affected,
+                            order=order, import_depths=depths)  # fmt: skip
+
+    depths = {"example.com/m/b": 2, "example.com/m/c": 1}
+    assert pick(Order.RISK, None).commands == ("go test ./b", "go test ./c")  # a tie: by ID
+    assert pick(Order.RISK, depths).commands == ("go test ./c", "go test ./b")
+    assert pick(Order.DEFAULT, depths).commands == pick(Order.DEFAULT, None).commands
+    assert SelectionScope.of(pick(Order.RISK, depths)) == SelectionScope.of(pick(Order.RISK, None))
+
+
+def test_depth_never_touches_links_that_are_not_imports() -> None:
+    """Path mapping stays direct, a [[depends]] rule stays indirect, whatever depth says."""
+    hist = history(
+        KnownTest("tests.test_cart::test_total", **ESTABLISHED),  # type: ignore[arg-type]
+        KnownTest("e2e.test_flow::test_flow", **ESTABLISHED),  # type: ignore[arg-type]
+    )
+    config = SelectorConfig(depends=(DependsRule("e2e/**", ("src/**",)),))
+    selection = select_tests(hist, ["src/cart.py"], True, config, order=Order.RISK,
+                             import_depths={"tests/test_cart.py": 5,
+                                            "e2e/test_flow.py": 1})  # fmt: skip
+    assert {t.test_id: t.score for t in selection.tests} == {
+        "tests.test_cart::test_total": 6.0, "e2e.test_flow::test_flow": 3.0}  # fmt: skip
