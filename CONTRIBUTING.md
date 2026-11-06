@@ -148,6 +148,8 @@ uv run alembic revision --rev-id 0011 -m "what it changes"
 - **0010** adds `runs.known_flaky` and `runs.rerun` and rebuilds the small `runs` unique index.
 - **0011** adds the nullable `shadow_selections.budget` and lets `shadow_failures.cause` be
   `budget` (no rewrite).
+- **0012** adds `shadow_selections.java_classes` (the Java test classes a selection runs
+  whole), with a default (no rewrite).
 
 ## Evals
 

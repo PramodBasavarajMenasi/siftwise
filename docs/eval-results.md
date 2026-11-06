@@ -1019,6 +1019,68 @@ failures) and 3 substrate runs (1,810 of 2,044).
 The PR-mode commands above: each run's line lists its budgets (`budget 10% (...): ...`), and
 the summary ends with `time budgets (...)`.
 
+## Java: dropwizard/dropwizard (Maven)
+
+Measured 2026-11-06 for Java selection ([ARCHITECTURE](../ARCHITECTURE.md#java-maven-and-gradle)):
+the first replay of Java history. dropwizard is a Maven build of 42 modules with a wrapper;
+its CI (`maven.yml`) runs Ubuntu and Windows legs on three JDKs and uploads Surefire reports.
+
+**Finding a repo.** A code search for workflows uploading Surefire or Gradle reports
+(`scripts.eval.find_candidates`, Java and Kotlin) found 15 repos with live artifacts and
+enough PRs and tests; dropwizard has the most failing runs among the Maven ones (Gradle:
+naver/fixture-monkey and apple/servicetalk are left for later).
+
+**Data.** 2,144 uploads (each CI run's six legs) from the last 400 `maven.yml` runs, backfilled
+with `scripts/backfill.py`. The first pass lost all 781 Windows uploads: Surefire writes a
+`<testcase name="">` for a JUnit 5 `@Nested` class skipped as a whole (Docker tests on
+Windows), and the parser rejected the whole file. Fixed (recorded as the class's `(class)`
+result) and re-backfilled; 0 errors.
+
+**Replay** (`run_eval --language java --source github --failing`): every PR run with
+failures plus the 10 newest, each with the build, test classes and graph read at its commit
+(no peeking).
+
+| | |
+|---|---|
+| Targets | 148 PR runs on 58 branches; 114 are Renovate dependency bumps |
+| Full suite | 131: 129 for a changed build file (every bump, plus module `pom.xml` edits), 1 for a changed file no test reaches, 1 for a selected test with no runner (a class no test file is named after) |
+| Selective | 17 runs from 7 branches; median 91% of the estimated test time skipped (26% to 93%) |
+| Failures caught | 74 of 74 (34 runs with failures); in selective runs 7 of 7 |
+| Without fallbacks | the full-suite runs whose change some signal reaches would have caught 21 of 21; 46 more failures had only a fallback |
+| Time skipped over all runs | 10.6% (full runs count as 0%) |
+
+- **Recall in selective runs rests on one PR**: the 7 failures are 10 runs of
+  `limit-json-logged-exceptions`. It's a real check (a failing test in a class with no
+  history, run because it's new, and failures reached through the graph), not a broad one.
+- **The savings are capped by the fallbacks.** Most dropwizard PRs are dependency bumps that
+  change a `pom.xml`, and a `pom.xml` at any depth runs the full suite. Scoping a module's
+  POM change to that module and its dependents would help here; it isn't built.
+- **Time to first failure** (7 selective runs that caught one, all from that PR): risk order
+  reached it after a median 9.7% of the tests and 1.3% of the time, against 100% for the
+  default order (the failing class sorts last by path there).
+- **Under a time budget** (34 runs with failures; 27 are packed full suites): runs that still
+  fail 21, 23 and 27 of 34 at 10%, 25% and 50% (34 without a budget); failures caught 73%,
+  76% and 88%.
+- **Graph checked by hand** for a change to `EventJsonLayout.java` (that PR): the three test
+  classes it selects all use it, directly or through `EventJsonLayoutBaseFactory` (an import,
+  and a same-package reference with no import); a text search finds no other test naming it.
+  Layouts discovered through `ServiceLoader` (`META-INF/services`) are what the graph can't
+  see: no failure in this history came from that.
+- **Performance** on the snapshot (927 Java files, 438 test files): reading the build 0.8 s,
+  the graph about 2 s warm (19 s the first time after unpacking, from the cold file cache).
+
+**An eval bug the replay found:** a test class with no history that the selection runs (by
+`-Dtest`) was scored as a miss, because `WouldRun` only credited tests by ID. It now credits
+every test of a class run whole, in the eval and in shadow mode (`java_classes`, migration
+0012); the first replay's one "miss" was that.
+
+### Reproducing
+
+```sh
+uv run python scripts/backfill.py --repo dropwizard/dropwizard --workflow maven.yml     --artifact-pattern "test-reports-*" --max-runs 400 --batch --workers 6
+uv run python -m scripts.eval.run_eval --repo dropwizard/dropwizard --language java     --source github --failing --resume dropwizard-java.jsonl
+```
+
 ## JS/TS import graph: performance and validation
 
 Measured 2026-11-05 for the JS/TS import graph (`cli/jsgraph.py`,

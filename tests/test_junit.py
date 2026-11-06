@@ -345,12 +345,26 @@ def test_make_test_id_collapses_whitespace() -> None:
     [
         ("<testsuite><testcase", "invalid JUnit XML"),
         ("<html><body/></html>", "unexpected root element <html>"),
-        ('<testsuite><testcase classname="c"/></testsuite>', "without a name"),
+        ('<testsuite><testcase classname=""/></testsuite>', "without a name"),
+        ("<testsuite><testcase/></testsuite>", "without a name"),
     ],
 )
 def test_invalid_input_raises(xml: str, match: str) -> None:
     with pytest.raises(JUnitParseError, match=match):
         parse_junit(xml)
+
+
+def test_a_class_level_result_with_no_test_name_is_the_class() -> None:
+    """Surefire's report of a @Nested class skipped as a whole (dropwizard, Windows without
+    Docker): it used to reject the whole upload."""
+    xml = """<testsuite name="a.ITest">
+      <testcase name="t" classname="a.ITest"><skipped/></testcase>
+      <testcase name="" classname="a.ITest$Nested"><skipped message="no Docker"/></testcase>
+      <testcase classname="a.Broken"><error message="@BeforeAll threw"/></testcase>
+    </testsuite>"""
+    results = {r.test_id: r.status for r in parse_junit(xml)}
+    assert results == {"a.ITest::t": Status.SKIPPED, "a.ITest$Nested::(class)": Status.SKIPPED,
+                       "a.Broken::(class)": Status.ERROR}  # fmt: skip
 
 
 def test_entity_expansion_is_rejected() -> None:

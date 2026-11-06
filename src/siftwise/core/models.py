@@ -302,6 +302,10 @@ class ShadowSelection(Base):
     go_selected_keys: Mapped[list[int]] = mapped_column(ARRAY(Integer))
     go_packages: Mapped[list[str]] = mapped_column(ARRAY(Text))
     python_files: Mapped[list[str]] = mapped_column(ARRAY(Text))
+    # Java test classes run whole (their every test runs, new ones too).
+    java_classes: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), server_default=text("'{}'::text[]"), default=list
+    )
     selected_count: Mapped[int] = mapped_column(Integer)
     total_known: Mapped[int] = mapped_column(Integer)
     estimated_ms_total: Mapped[float] = mapped_column(Float)

@@ -33,6 +33,23 @@ All notable changes to siftwise. The format follows
   it isn't offered.
 - Dogfood: each failure's risk rank goes into the run's summary, and
   `scripts/dogfood_report.py report` shows where failures ranked.
+- Java selection for Maven and Gradle ([#45](https://github.com/PramodBasavarajMenasi/siftwise/issues/45)):
+  Java tests used to always run the full suite. `siftwise select` (and the Action, GitLab
+  and MCP) now reads the build (Maven modules, Gradle includes; no JVM runs) and runs test
+  classes per module: `./mvnw -B -pl <module> -am test -Dtest=...` (`verify -Dit.test=...` for
+  integration tests), `./gradlew :<module>:test --tests ...`, in risk order and within a
+  budget.
+  - A changed class selects its tests by name (`FooTest`, `FooTests`, `TestFoo`, `FooIT`...)
+    and every test class that uses it, through a static dependency graph (imports, static and
+    on-demand imports, same-package names, fully-qualified names, `Class.forName` literals)
+    across modules, with "uses changed class X (via Y)" reasons.
+  - Safe where it can't see: build files, wrappers, `gradle/`, `.mvn/` and `lombok.config`,
+    main resources, Kotlin/Groovy/Scala sources, modules with custom source directories or
+    code-generating annotation processors, and builds it can't read run the full suite. Test
+    resources run their module's tests. Tests that use a generated class run for any Java
+    change. Reflection (Spring scanning, `ServiceLoader`) needs `[[depends]]` rules.
+  - `/select` takes an optional `java`; a client resends without it on an older server's
+    422. `--no-java-graph` turns the graph off. Triage links Java tests too.
 - JS/TS import graph ([#44](https://github.com/PramodBasavarajMenasi/siftwise/issues/44)):
   `siftwise select` (and the Action, GitLab and MCP, which use it) selects Jest test files
   that import a changed file, at any depth, with no Node.js: a tokenizer that skips comments,
@@ -81,6 +98,10 @@ All notable changes to siftwise. The format follows
 
 ### Fixed
 
+- A Surefire report with a class-level result (`<testcase name="" classname="...">`, written
+  for a JUnit 5 `@Nested` class skipped or failing as a whole) made `POST /runs` reject the
+  whole upload (400). It's recorded as the class's `(class)` result now: every Windows leg of
+  dropwizard's CI (781 uploads) was rejected for it.
 - A deleted Jest test file was still selected by path, so `jest <deleted file>` failed
   with "No tests found". Its tests are dropped now, as deleted Python test files are.
 

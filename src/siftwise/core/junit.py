@@ -117,6 +117,10 @@ def _walk(
             _parse_testcase(child, suite, results, attempts)
 
 
+# The name of a class-level result: a <testcase> naming its class but no test.
+CLASS_LEVEL = "(class)"
+
+
 def _parse_testcase(
     case: Element,
     suite: _Suite,
@@ -124,6 +128,10 @@ def _parse_testcase(
     attempts: Counter[str],
 ) -> None:
     name = _normalize(case.get("name") or "")
+    if not name and _normalize(case.get("classname") or ""):
+        # Surefire writes name="" for a class skipped or failing as a whole (a JUnit 5
+        # @Nested class with no Docker, an @BeforeAll that throws): the class itself.
+        name = CLASS_LEVEL
     if not name:
         raise JUnitParseError("<testcase> without a name attribute")
     # Without a classname, prefer the suite's package over its name: some Go reporters name

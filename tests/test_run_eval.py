@@ -1073,3 +1073,24 @@ def test_a_pytest_test_with_a_slash_in_its_id_is_not_a_go_subtest() -> None:
     ff = ordering.first_failure(["pytest test/test_w3c.py"], ran)
     assert ff == ordering.FirstFailure(2, 2, 300.0, 300.0)
     assert ordering.run_time(["pytest test/test_w3c.py"], ran) == 300.0
+
+
+def test_java_commands_run_their_classes_in_order() -> None:
+    """Surefire's classes, then Failsafe's; Gradle's --tests; a $Nested class is its outer."""
+    commands = [
+        "mvn -B -pl app -am verify -Dtest=a.BTest,a.ATest -Dsurefire.failIfNoSpecifiedTests=false "
+        "-Dit.test=a.CIT -Dit.failIfNoSpecifiedTests=false",
+        "./gradlew :core:test --tests b.DTest",
+    ]
+    assert ordering.units(commands) == [("java", "a.BTest"), ("java", "a.ATest"),
+                                        ("java", "a.CIT"), ("java", "b.DTest")]  # fmt: skip
+    ran = [
+        ordering.RanTest("a.ATest::one", 100.0, True),
+        ordering.RanTest("a.BTest$Inner::two", 50.0, False),
+        ordering.RanTest("b.DTest::three()", 10.0, False),
+        ordering.RanTest("z.Unselected::x", 999.0, True),
+    ]
+    assert ordering.first_failure(commands, ran) == ordering.FirstFailure(2, 3, 150.0, 160.0)
+    assert ordering.units(["mvn -B verify -Dtest=siftwise.NoUnitTests -Dit.test=a.XIT"]) == [
+        ("java", "a.XIT")
+    ]

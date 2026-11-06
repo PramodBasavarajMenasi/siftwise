@@ -17,6 +17,7 @@ from siftwise.core.schemas import (
 )
 from siftwise.core.selector import (
     DependsRule,
+    JavaBuildInfo,
     JsImport,
     JsImports,
     Selection,
@@ -67,6 +68,7 @@ def post_select(
             dynamic=dict(body.js_graph.dynamic),
             notes=tuple(body.js_graph.notes),
         ),
+        java=_java(body),
     )
     shadow_reason = _store_shadow(session, body, selection) if body.shadow else None
     return SelectResponse(
@@ -101,6 +103,10 @@ def post_select(
         shadow_stored=None if body.shadow is None else shadow_reason is None,
         shadow_reason=shadow_reason,
     )
+
+
+def _java(body: SelectRequest) -> JavaBuildInfo | None:
+    return None if body.java is None else JavaBuildInfo.from_json(body.java.model_dump())
 
 
 def _budget(selection: Selection) -> BudgetOut | None:
