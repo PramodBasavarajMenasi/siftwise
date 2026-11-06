@@ -168,9 +168,8 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   `TIME_LIMIT_S` (20 s, walk included); past it the search stops for good and no later suite
   gets a file (a partial read could leave one wrong file as the only match), with one
   warning per command.
-- **Depth:** recorded, not used by the risk order: like Python and Go imports, every JS
-  import is an indirect link. Using depth 1 as direct is the import-depth issue's to decide
-  for all three graphs.
+- **Depth:** recorded as the shortest path to a changed file. In risk order, depth 1 counts as
+  a direct link and depth 2+ as indirect. Selection itself is unchanged.
 
 ### Java (Maven and Gradle)
 
@@ -241,7 +240,7 @@ score = link + 3 × recency × (1 − flaky) + 2 × failure_rate × (1 − flaky
 
 | Term | Value |
 |---|---|
-| `link` | the test's strongest reason: **6** direct (its own file changed, or path mapping: `test_x.py` for `x.py`, the changed file's Go package, a JS test named after it); **3** indirect (an import of changed code at any depth, a `[[depends]]` rule, a nested build file); **0** history only (co-change, recently failed or broken on main, `always_run`) |
+| `link` | the test's strongest reason: **6** direct (its own file changed, or path mapping: `test_x.py` for `x.py`, the changed file's Go package, a JS test named after it, or an import depth of 1); **3** indirect (an import depth of 2+, a `[[depends]]` rule, a nested build file); **0** history only (co-change, recently failed or broken on main, `always_run`) |
 | `recency` | `0.5 ^ (days / 7)`: days from the test's last failure to the repo's newest run (not to now, so the answer doesn't drift with the clock); 0 if it hasn't failed in the window |
 | `failure_rate` | failures ÷ runs in the window |
 | `flaky` | `test_stats.flaky_score`: recency and rate count only failure evidence that isn't flakiness |
@@ -284,10 +283,11 @@ wasn't clearly faster by time and was slower by test count
 ([eval results](docs/eval-results.md#risk-order-time-to-first-failure)). It stays in the
 eval only.
 
-**Limits:** the import graphs say which changed modules a test file imports, not how directly,
-so every import is "indirect". Recency counts failures on any branch: the request doesn't say
-which branch it is on, and other PRs' failures count as well. Measured on rdflib and substrate
-PR runs in [eval results](docs/eval-results.md#risk-order-time-to-first-failure).
+**Limits:** import depth only affects ordering (`order: risk`), never which tests are selected.
+Older clients that don't send depth keep the old behavior (every import is "indirect"). Recency
+counts failures on any branch: the request doesn't say which branch it is on, and other PRs'
+failures count as well. Measured on rdflib and substrate PR runs in
+[eval results](docs/eval-results.md#risk-order-time-to-first-failure).
 
 ## Time budget
 

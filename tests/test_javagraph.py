@@ -698,6 +698,11 @@ def test_the_cli_sends_the_build_and_the_edges() -> None:
     assert body["java"]["tool"] == "maven"
     assert body["java"]["test_classes"]["core"] == ["acme.core.MoneyTest"]
     assert body["affected_files"]["app/src/test/java/acme/app/CartTest.java"] == [MONEY]
+    assert body["import_depths"]["affected_files"] == {
+        "app/src/test/java/acme/app/CartTest.java": 2,
+        "app/src/test/java/acme/app/ReceiptTest.java": 2,
+        "app/src/test/java/acme/app/deep/DeepTest.java": 3,
+    }
     change = cli.local_change("HEAD~1", "HEAD")
     assert change.graph_complete and "java" not in change.fields  # /select only
     assert not cli.local_change("HEAD~1", "HEAD", java_graph=False).graph_complete

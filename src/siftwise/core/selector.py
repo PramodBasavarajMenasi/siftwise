@@ -390,7 +390,7 @@ class JsImport:
 
     module: str
     via: str | None  # the file the test imports on the way; None: it imports it directly
-    depth: int  # 1 = a direct import (the risk order counts every import as indirect for now)
+    depth: int  # 1 = a direct import
 
 
 @dataclass(frozen=True)
@@ -403,6 +403,14 @@ class JsImports:
     # anything: such tests run for any JS change, but never count as covering it.
     dynamic: Mapping[str, str] = field(default_factory=dict)
     notes: tuple[str, ...] = ()  # what the graph couldn't read (a jest.config.ts)
+
+
+@dataclass(frozen=True)
+class ImportDepths:
+    """Import depth per test file/package from the CLI's graphs (1 direct, 2+ transitive)."""
+
+    files: Mapping[str, int] = field(default_factory=dict)
+    packages: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -482,6 +490,7 @@ def select_tests(
     budget_ms: float | None = None,
     js_imports: JsImports | None = None,
     java: JavaBuildInfo | None = None,
+    import_depths: ImportDepths | None = None,
 ) -> Selection:
     """Select tests for a change.
 
@@ -491,6 +500,8 @@ def select_tests(
     transitively, via parent packages or conftest.py), from the CLI's static import graph, and
     a Jest test file (repo-relative) to the changed files it imports, from the JS/TS graph;
     ``js_imports`` adds that graph's details (``JsImports``).
+    ``import_depths`` optionally says whether each import link is direct (depth 1) or
+    transitive (2+), per test file/package. Without it, imports stay indirect as before.
     ``deleted_files`` are changed files that no longer exist: no command names them.
     ``junit_dir``: each pytest command writes ``--junitxml=<junit_dir>/siftwise-<n>.xml``, so
     a line of several pytest commands doesn't overwrite one report with the next.
@@ -506,7 +517,7 @@ def select_tests(
     selection = _select(
         history, changed_files, changed_files_known, config or SelectorConfig(),
         affected_packages, affected_files, deleted_files, junit_dir, tests, order, budget_ms,
-        js_imports or JsImports(), java,
+        js_imports or JsImports(), java, import_depths or ImportDepths(),
     )  # fmt: skip
     return _with_estimate(selection, history, tests)
 
@@ -525,15 +536,26 @@ def _select(
     budget_ms: float | None = None,
     js_imports: JsImports | None = None,
     java: JavaBuildInfo | None = None,
+    import_depths: ImportDepths | None = None,
 ) -> Selection:
     js_imports = js_imports or JsImports()
+    import_depths = import_depths or ImportDepths()
     affected_packages = affected_packages or {}
     affected_files = {
         path: modules
         for file, modules in (affected_files or {}).items()
         if (path := normalize_path(file))
     }
+    import_file_depth = {
+        path: depth
+        for file, depth in import_depths.files.items()
+        if depth >= 1 and (path := normalize_path(file))
+    }
+    import_package_depth = {pkg: depth for pkg, depth in import_depths.packages.items() if depth >= 1}
     deleted = frozenset(p for p in (normalize_path(f) for f in deleted_files) if p)
+
+    def import_link(depth: int | None) -> Link:
+        return Link.DIRECT if depth == 1 else Link.INDIRECT
 
     def full(reason: str) -> Selection:
         runners = {t.runner for t in tests.values() if t.runner is not None}
@@ -674,7 +696,11 @@ def _select(
         first = sorted(modules)[0] if modules else "?"
         more = f" (+{len(modules) - 1} more)" if len(modules) > 1 else ""
         for test in known:
-            add(test.test_id, f"imports changed module {first}{more}", Link.INDIRECT)
+            add(
+                test.test_id,
+                f"imports changed module {first}{more}",
+                import_link(import_file_depth.get(file)),
+            )
         py_whole_files.add(file)
         covered_by_imports.update(modules)
 
@@ -687,7 +713,7 @@ def _select(
             continue
         reason = js_import_reason(modules, js_imports.nearest.get(file), js_imports.notes)
         for test in known_js:
-            add(test.test_id, reason, Link.INDIRECT)
+            add(test.test_id, reason, import_link(import_file_depth.get(file)))
         covered_by_imports.update(modules)
     # Java dependents: test classes that use a changed class (run whole, per module).
     if java is not None:
@@ -698,7 +724,7 @@ def _select(
             known_java = java_classes.get(located[1], [])
             reason = java_use_reason(modules, java.nearest.get(file), java.notes)
             for test in known_java:
-                add(test.test_id, reason, Link.INDIRECT)
+                add(test.test_id, reason, import_link(import_file_depth.get(file)))
             if not known_java and located[1] in java.test_classes and _is_test_class(located[1]):
                 java_new.add((java.test_classes[located[1]], located[1]))
             covered_by_imports.update(modules)
@@ -731,7 +757,11 @@ def _select(
         if imported:
             first = sorted(imported)[0]
             more = f" (+{len(imported) - 1} more)" if len(imported) > 1 else ""
-            add(test.test_id, f"imports changed package {first}{more}", Link.INDIRECT)
+            add(
+                test.test_id,
+                f"imports changed package {first}{more}",
+                import_link(import_package_depth.get(test.classname)),
+            )
             whole_packages.add(test.classname)
             covered_by_dependents.update(imported)
 

@@ -86,6 +86,9 @@ def test_affected_test_files_import_a_changed_module(graph: PyGraph) -> None:
         "tests/test_plain.py": ["pkg/util.py"],
         "tests/unit/test_deep.py": ["pkg/util.py"],
     }
+    _, depth = graph.affected_with_depth(["pkg/util.py"])
+    assert depth["tests/test_core.py"] == 2  # test_core -> pkg/__init__.py -> pkg/util.py
+    assert depth["tests/test_plain.py"] == 3  # test_plain -> conftest -> mod -> util
 
 
 def test_affected_through_a_parent_package(graph: PyGraph) -> None:

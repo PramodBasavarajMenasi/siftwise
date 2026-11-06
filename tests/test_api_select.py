@@ -285,6 +285,39 @@ def test_risk_order_is_the_default_and_selects_the_same_tests(client: TestClient
 
 
 @pytest.mark.usefixtures("seeded")
+def test_import_depth_changes_risk_order_only(client: TestClient) -> None:
+    body = {
+        "changed_files": ["src/shop/money.py"],
+        "affected_files": {
+            "tests/test_cart.py": ["src/shop/money.py"],
+            "tests/test_db.py": ["src/shop/money.py"],
+        },
+    }
+    old = post_select(client, **body).json()
+    new = post_select(
+        client,
+        **body,
+        import_depths={"affected_files": {"tests/test_cart.py": 2, "tests/test_db.py": 1}},
+    ).json()
+
+    assert {t["test_id"] for t in old["tests"]} == {t["test_id"] for t in new["tests"]}
+    old_by_id = {t["test_id"]: t for t in old["tests"]}
+    new_by_id = {t["test_id"]: t for t in new["tests"]}
+    assert old_by_id["tests.test_cart::test_total"]["rank_reason"].startswith("indirect link")
+    assert old_by_id["tests.test_db::test_query"]["rank_reason"].startswith("indirect link")
+    assert new_by_id["tests.test_cart::test_total"]["rank_reason"].startswith("indirect link")
+    assert new_by_id["tests.test_db::test_query"]["rank_reason"].startswith("direct link")
+    assert old["commands"] == [
+        "pytest tests/test_cart.py::TestDiscount::test_applies tests/test_cart.py::test_total "
+        "tests/test_db.py::test_query"
+    ]
+    assert new["commands"] == [
+        "pytest tests/test_db.py::test_query tests/test_cart.py::TestDiscount::test_applies "
+        "tests/test_cart.py::test_total"
+    ]
+
+
+@pytest.mark.usefixtures("seeded")
 def test_an_old_client_still_works(client: TestClient) -> None:
     """A body from before risk ordering (no order) is accepted; the new response fields are
     additions: every field an old client reads is still there."""
@@ -391,3 +424,8 @@ def test_js_graph_details_reach_the_reasons(client: TestClient, db_session: Sess
     ]
     bad = {**js_graph, "nearest": {"src/sum.test.ts": {"module": "m", "depth": 0}}}
     assert client.post("/select", json={**body, "js_graph": bad}, headers=AUTH).status_code == 422
+    bad_depth = {
+        **body,
+        "import_depths": {"affected_files": {"src/sum.test.ts": 0}},
+    }
+    assert client.post("/select", json=bad_depth, headers=AUTH).status_code == 422

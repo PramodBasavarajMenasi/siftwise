@@ -28,6 +28,9 @@ def go_list_packages(root: Path) -> list[dict[str, Any]]:
             "Dir": str(root / rel) if rel else str(root),
             "Module": MAIN,
             "Deps": deps,
+            "Imports": [],
+            "TestImports": [],
+            "XTestImports": [],
             **extra,
         }
 
@@ -48,23 +51,23 @@ def go_list_packages(root: Path) -> list[dict[str, Any]]:
             "Dir": "/gomod/github.com/x/y",
             "Module": {"Path": "github.com/x/y"},
         },
-        pkg("", ["fmt"]),
-        pkg("a", ["fmt"]),
-        test_variant("a", ["fmt", "testing"]),
+        pkg("", ["fmt"], Imports=["fmt"]),
+        pkg("a", ["fmt"], Imports=["fmt"]),
+        test_variant("a", ["fmt", "testing"], Imports=["fmt"], TestImports=["testing"]),
         test_main("a", [f"{a} [{a}.test]", "testing"]),
-        pkg("b", [a, "fmt"]),
-        test_variant("b", [a, "fmt", "testing"]),
-        pkg("c", [a, b]),
-        test_variant("c", [a, b, "testing"]),
+        pkg("b", [a, "fmt"], Imports=[a, "fmt"]),
+        test_variant("b", [a, "fmt", "testing"], Imports=[a, "fmt"], TestImports=["testing"]),
+        pkg("c", [a, b], Imports=[a, b]),
+        test_variant("c", [a, b, "testing"], Imports=[a, b], TestImports=["testing"]),
         {  # external test package c_test, importing d only in tests
-            **pkg("c", [a, b, f"{c} [{c}.test]", d, "github.com/x/y"]),
+            **pkg("c", [a, b, f"{c} [{c}.test]", d, "github.com/x/y"], Imports=[a, b, d]),
             "ImportPath": f"{c}_test [{c}.test]",
             "Name": "c_test",
             "ForTest": c,
         },
         test_main("c", [f"{c} [{c}.test]", f"{c}_test [{c}.test]"]),
-        pkg("d", []),
-        pkg("notests", [a]),
+        pkg("d", [], Imports=[]),
+        pkg("notests", [a], Imports=[a]),
     ]
 
 

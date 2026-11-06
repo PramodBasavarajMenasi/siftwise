@@ -22,8 +22,9 @@ import json
 import os
 import posixpath
 import subprocess
+from collections import deque
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,8 @@ class GoGraph:
     dirs: Mapping[str, str]
     # testable import path -> main-module import paths its test build depends on
     deps: Mapping[str, frozenset[str]]
+    # testable import path -> checkout packages directly imported by that package's tests
+    imports: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
     def changed_packages(self, changed_files: Iterable[str]) -> set[str]:
         """Packages with changed non-test ``.go`` files (test files can't be imported)."""
@@ -53,21 +56,44 @@ class GoGraph:
         }
 
     def affected(self, changed_files: Iterable[str]) -> dict[str, list[str]]:
+        return self.affected_with_depth(changed_files)[0]
+
+    def affected_with_depth(self, changed_files: Iterable[str]) -> tuple[
+        dict[str, list[str]], dict[str, int]
+    ]:
         """Package -> the changed packages its tests depend on, for every affected package."""
         changed = self.changed_packages(changed_files)
         if not changed:
-            return {}
-        return {
+            return {}, {}
+        affected = {
             package: sorted(deps & changed)
             for package, deps in sorted(self.deps.items())
             if deps & changed
         }
+        depth: dict[str, int] = {}
+        if self.imports:
+            for package in affected:
+                queue = deque([(package, 0)])
+                seen = {package}
+                while queue:
+                    current, d = queue.popleft()
+                    if d > 0 and current in changed:
+                        old = depth.get(package)
+                        if old is None or d < old:
+                            depth[package] = d
+                        break
+                    for imported in sorted(self.imports.get(current, ())):
+                        if imported not in seen:
+                            seen.add(imported)
+                            queue.append((imported, d + 1))
+        return affected, depth
 
     def to_json(self) -> dict[str, Any]:
         return {
             "module": self.module,
             "dirs": dict(self.dirs),
             "deps": {pkg: sorted(deps) for pkg, deps in self.deps.items()},
+            "imports": {pkg: sorted(deps) for pkg, deps in (self.imports or {}).items()},
         }
 
     @classmethod
@@ -76,6 +102,7 @@ class GoGraph:
             module=data["module"],
             dirs=dict(data["dirs"]),
             deps={pkg: frozenset(deps) for pkg, deps in data["deps"].items()},
+            imports={pkg: frozenset(deps) for pkg, deps in (data.get("imports") or {}).items()},
         )
 
 
@@ -209,6 +236,7 @@ def build_graph(packages: Iterable[Package], root: Path) -> GoGraph:
     in_module = set(dirs.values())
 
     deps: dict[str, set[str]] = {}
+    imports: dict[str, set[str]] = {}
     for p in main:
         if _is_test_main(p):
             continue
@@ -217,18 +245,37 @@ def build_graph(packages: Iterable[Package], root: Path) -> GoGraph:
             continue
         found = {d.split(" ", 1)[0] for d in p.get("Deps") or ()} | {base}
         deps.setdefault(base, set()).update(found & in_module)
-    return GoGraph(module, dirs, {pkg: frozenset(d) for pkg, d in deps.items()})
+        direct = {
+            d.split(" ", 1)[0]
+            for key in ("Imports", "TestImports", "XTestImports")
+            for d in p.get(key) or ()
+        }
+        imports.setdefault(base, set()).update(direct & in_module)
+    return GoGraph(
+        module,
+        dirs,
+        {pkg: frozenset(d) for pkg, d in deps.items()},
+        {pkg: frozenset(d) for pkg, d in imports.items()},
+    )
 
 
 def merge_graphs(graphs: Iterable[GoGraph], module: str | None) -> GoGraph:
     """One graph from per-module ones (``module``: the root's module path, if any)."""
     dirs: dict[str, str] = {}
     deps: dict[str, set[str]] = {}
+    imports: dict[str, set[str]] = {}
     for graph in graphs:
         dirs.update(graph.dirs)
         for package, found in graph.deps.items():
             deps.setdefault(package, set()).update(found)
-    return GoGraph(module, dirs, {pkg: frozenset(d) for pkg, d in sorted(deps.items())})
+        for package, found in (graph.imports or {}).items():
+            imports.setdefault(package, set()).update(found)
+    return GoGraph(
+        module,
+        dirs,
+        {pkg: frozenset(d) for pkg, d in sorted(deps.items())},
+        {pkg: frozenset(d) for pkg, d in sorted(imports.items())},
+    )
 
 
 def _local(p: Package) -> bool:

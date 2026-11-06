@@ -279,6 +279,26 @@ class JavaIn(BaseModel):
     )
 
 
+class ImportDepthsIn(BaseModel):
+    """Per test file/package import depth from the CLI's import graphs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    affected_files: dict[Path4K, Annotated[int, Field(ge=1, le=10_000)]] = Field(
+        default_factory=dict,
+        max_length=50_000,
+        description="Python/Jest/Java test file -> import depth to changed code (1 direct)",
+    )
+    affected_packages: dict[
+        Annotated[str, StringConstraints(max_length=1024)],
+        Annotated[int, Field(ge=1, le=10_000)],
+    ] = Field(
+        default_factory=dict,
+        max_length=20_000,
+        description="Go package -> import depth to changed package (1 direct)",
+    )
+
+
 class SelectRequest(ChangeRequest):
     """Body of ``POST /select``."""
 
@@ -315,6 +335,11 @@ class SelectRequest(ChangeRequest):
             "nested go.mod): repo-relative directory ('' = the root) -> module path. Go "
             "commands then run in the package's module (`go test -C <dir>`)",
         )
+    )
+    import_depths: ImportDepthsIn | None = Field(
+        default=None,
+        description="Per test file/package import depth from the CLI's import graphs; absent "
+        "means every import stays indirect as before",
     )
     budget_seconds: float | None = Field(
         default=None,

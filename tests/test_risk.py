@@ -10,6 +10,7 @@ import pytest
 from siftwise.core.risk import Link, Order, Ranked, RiskInputs, rank, score, unit_key
 from siftwise.core.selector import (
     FailedRun,
+    ImportDepths,
     KnownTest,
     Mode,
     RepoHistory,
@@ -202,6 +203,33 @@ def test_go_packages_and_jest_files_come_riskiest_first() -> None:
     default, risky = both(js_hist, "src/cart.ts", "src/tax.ts")
     assert default.commands == ("jest src/cart.test.ts src/tax.test.ts",)
     assert risky.commands == ("jest src/tax.test.ts src/cart.test.ts",)
+
+
+def test_import_depth_1_beats_transitive_when_provided() -> None:
+    hist = history(
+        KnownTest("tests.test_a::test_a", **ESTABLISHED),  # type: ignore[arg-type]
+        KnownTest("tests.test_b::test_b", **ESTABLISHED),  # type: ignore[arg-type]
+    )
+    affected = {
+        "tests/test_a.py": ["src/lib.py"],
+        "tests/test_b.py": ["src/lib.py"],
+    }
+    without = select_tests(hist, ["src/lib.py"], True, affected_files=affected, order=Order.RISK)
+    with_depth = select_tests(
+        hist,
+        ["src/lib.py"],
+        True,
+        affected_files=affected,
+        import_depths=ImportDepths(files={"tests/test_a.py": 2, "tests/test_b.py": 1}),
+        order=Order.RISK,
+    )
+
+    assert {t.test_id for t in without.tests} == {t.test_id for t in with_depth.tests}
+    assert [t.test_id for t in without.tests] == ["tests.test_a::test_a", "tests.test_b::test_b"]
+    assert [t.test_id for t in with_depth.tests] == ["tests.test_b::test_b", "tests.test_a::test_a"]
+    by_id = {t.test_id: t for t in with_depth.tests}
+    assert by_id["tests.test_b::test_b"].rank_reason.startswith("direct link")
+    assert by_id["tests.test_a::test_a"].rank_reason.startswith("indirect link")
 
 
 def test_commands_of_several_runners_come_by_their_best_rank() -> None:

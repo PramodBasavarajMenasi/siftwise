@@ -17,6 +17,7 @@ from siftwise.core.schemas import (
 )
 from siftwise.core.selector import (
     DependsRule,
+    ImportDepths,
     JavaBuildInfo,
     JsImport,
     JsImports,
@@ -70,6 +71,12 @@ def post_select(
             notes=tuple(body.js_graph.notes),
         ),
         java=_java(body),
+        import_depths=None
+        if body.import_depths is None
+        else ImportDepths(
+            files=dict(body.import_depths.affected_files),
+            packages=dict(body.import_depths.affected_packages),
+        ),
     )
     shadow_reason = _store_shadow(session, body, selection) if body.shadow else None
     return SelectResponse(

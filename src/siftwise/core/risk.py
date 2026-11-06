@@ -7,10 +7,10 @@ fixed, documented sum (no learning), from what the selection and ``test_stats`` 
 
 * ``link``: how the change reaches the test, its strongest reason: 6 direct (the test's own
   file changed, or path mapping: ``test_x.py`` for ``x.py``, the changed file's Go package, a
-  JS test named after it), 3 indirect (imports a changed module or package at any depth, a
-  declared ``[[depends]]`` rule, a nested build file), 0 history only (co-change, recently
-  failed or broken on main, always-run). The CLI's import graphs don't say how deep an import
-  is, so every import is "indirect".
+  JS test named after it, or an import depth of 1), 3 indirect (a transitive import depth 2+,
+  a declared ``[[depends]]`` rule, a nested build file), 0 history only (co-change, recently
+  failed or broken on main, always-run). Without import depth (older clients), imports stay
+  "indirect".
 * ``recency``: ``0.5 ** (days / 7)``, ``days`` = from the test's last failure to the repo's
   newest run (not to now: a backfilled or quiet repo scores the same whenever it's asked); 0 if
   it never failed in the stats window.
@@ -61,7 +61,7 @@ class Link(IntEnum):
     """The strongest way a change reaches a selected test."""
 
     HISTORY = 0  # co-change, recently failed, broken on main, always-run
-    INDIRECT = 1  # an import (any depth), a declared rule, a nested build file
+    INDIRECT = 1  # a transitive import, a declared rule, a nested build file
     DIRECT = 2  # its own file changed, or path mapping
 
 

@@ -464,6 +464,11 @@ def test_the_cli_sends_js_edges_and_details() -> None:
     }
     js_graph = body["js_graph"]
     assert js_graph["nearest"]["packages/web/src/__tests__/cart.test.ts"]["depth"] == 3
+    assert body["import_depths"]["affected_files"] == {
+        "packages/core/src/sum.spec.ts": 1,
+        "packages/web/src/__tests__/Price.test.tsx": 3,
+        "packages/web/src/__tests__/cart.test.ts": 3,
+    }
     assert js_graph["dynamic"] == {
         "packages/web/src/plugins.test.ts": "packages/web/src/plugins.ts"
     }

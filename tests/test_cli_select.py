@@ -316,6 +316,11 @@ def test_go_dependents_and_repo_config_are_sent(
         f"{M}/c": [f"{M}/a"],
         f"{M}/notests": [f"{M}/a"],
     }
+    assert body["import_depths"]["affected_packages"] == {
+        f"{M}/b": 1,
+        f"{M}/c": 1,
+        f"{M}/notests": 1,
+    }
     assert body["depends"] == [{"tests": "e2e/**", "on": ["**/*.go", "!**/*_test.go"]}]
     assert body["always_run"] == ["smoke/**"]
     assert body["generated"] == ["build/reports/**"]  # the server ignores these files too
@@ -446,6 +451,7 @@ def test_python_importers_are_sent(api: respx.MockRouter) -> None:
 
     assert result.exit_code == 0, result.output
     assert sent(route)["affected_files"] == {"tests/test_cart.py": ["shop/money.py"]}
+    assert sent(route)["import_depths"]["affected_files"] == {"tests/test_cart.py": 2}
     assert "deleted_files" not in sent(route)
     assert "python imports: 1 test file(s) import changed modules" in result.stderr
 
@@ -627,6 +633,7 @@ def test_every_go_module_gets_its_go_list_and_the_server_its_modules(
     assert body["go_module"] == M
     assert body["go_modules"] == {"": M, "tools": "example.com/tools"}
     assert body["affected_packages"]["example.com/tools/x"] == [f"{M}/a"]
+    assert body["import_depths"]["affected_packages"]["example.com/tools/x"] == 1
 
 
 def test_an_older_server_gets_the_request_without_go_modules(
@@ -646,3 +653,18 @@ def test_an_older_server_gets_the_request_without_go_modules(
     assert "go_modules" in json.loads(route.calls[0].request.content)
     assert "go_modules" not in sent(route)
     assert "doesn't take go_modules" in result.stderr
+
+
+@pytest.mark.usefixtures("py_repo")
+def test_an_older_server_gets_the_request_without_import_depths(api: respx.MockRouter) -> None:
+    old = {"detail": [{"type": "extra_forbidden", "loc": ["body", "import_depths"],
+                       "msg": "Extra inputs are not permitted"}]}  # fmt: skip
+    route = api.post(SELECT_URL).mock(side_effect=[
+        httpx.Response(422, json=old), httpx.Response(200, json=response())])  # fmt: skip
+
+    result = run()
+
+    assert result.exit_code == 0, result.output
+    assert "import_depths" in json.loads(route.calls[0].request.content)
+    assert "import_depths" not in sent(route)
+    assert "doesn't take import_depths" in result.stderr

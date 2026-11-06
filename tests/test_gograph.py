@@ -50,6 +50,8 @@ def test_graph_deps_include_test_imports(graph: GoGraph) -> None:
     assert graph.deps[A] == {A}
     assert graph.deps[B] == {A, B}
     assert graph.deps[C] == {A, B, C, D}  # d comes from the external c_test package
+    assert graph.imports[B] == {A}
+    assert graph.imports[C] == {A, B, D}
 
 
 @pytest.mark.parametrize(
@@ -68,6 +70,14 @@ def test_affected_packages(
     graph: GoGraph, changed: list[str], expected: dict[str, list[str]]
 ) -> None:
     assert graph.affected(changed) == expected
+
+
+def test_affected_packages_depth(graph: GoGraph) -> None:
+    affected, depth = graph.affected_with_depth(["a/a.go"])
+    assert affected[B] == [A]
+    assert depth[B] == 1  # b imports a directly
+    assert depth[C] == 1  # c imports a directly too
+    assert depth[f"{M}/notests"] == 1
 
 
 def test_json_round_trip(graph: GoGraph) -> None:

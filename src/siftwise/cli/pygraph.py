@@ -65,6 +65,11 @@ class PyGraph:
         return None
 
     def affected(self, changed_files: Iterable[str]) -> dict[str, list[str]]:
+        return self.affected_with_depth(changed_files)[0]
+
+    def affected_with_depth(self, changed_files: Iterable[str]) -> tuple[
+        dict[str, list[str]], dict[str, int]
+    ]:
         """Test file -> the changed modules it imports (itself excluded), for every test file
         that imports one: directly, transitively, through a parent package's ``__init__.py``
         or through a ``conftest.py`` pytest loads for it."""
@@ -73,27 +78,42 @@ class PyGraph:
             for imported in imports:
                 importers[imported].add(file)
         reached_by: dict[str, set[str]] = defaultdict(set)  # file -> changed modules it reaches
+        min_depth: dict[str, int] = {}  # file -> shortest import depth to any changed module
         for changed in sorted({p for p in changed_files if p in self.edges}):
             seen = {changed}
+            depth = {changed: 0}
             queue = deque(seen)
             while queue:
-                for importer in importers.get(queue.popleft(), ()):
+                current = queue.popleft()
+                for importer in importers.get(current, ()):
                     if importer not in seen:
                         seen.add(importer)
+                        depth[importer] = depth[current] + 1
                         queue.append(importer)
             for file in seen:
                 reached_by[file].add(changed)
+                if d := depth.get(file):
+                    old = min_depth.get(file)
+                    if old is None or d < old:
+                        min_depth[file] = d
         affected = {}
+        affected_depth: dict[str, int] = {}
         for file in sorted(self.edges):
             if not is_python_test_file(file):
                 continue
             modules = set(reached_by.get(file, ()))
+            depths = [min_depth[file]] if file in min_depth else []
             for conftest in conftests_for(file, self.edges):
                 modules |= reached_by.get(conftest, set())
+                if conftest in min_depth:
+                    # A test loads its conftest.py: one step before what that conftest imports.
+                    depths.append(min_depth[conftest] + 1)
             modules.discard(file)
             if modules:
                 affected[file] = sorted(modules)
-        return affected
+                if depths:
+                    affected_depth[file] = min(depths)
+        return affected, affected_depth
 
     def to_json(self) -> dict[str, Any]:
         return {"edges": {f: sorted(e) for f, e in self.edges.items()}}

@@ -90,8 +90,9 @@ Full details: [ARCHITECTURE.md](https://github.com/PramodBasavarajMenasi/siftwis
 ### Risk order
 
 The selected tests come riskiest first, so a likely failure shows up early. Each gets a score
-from how directly the change reaches it, how recently and how often it failed (flaky failures
-discounted), and whether it's new: a fixed, documented formula, no learning
+from how directly the change reaches it (including import depth: depth 1 = direct, 2+ =
+transitive), how recently and how often it failed (flaky failures discounted), and whether
+it's new: a fixed, documented formula, no learning
 ([details and an example](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/ARCHITECTURE.md#risk-order)).
 The order never changes which tests run.
 

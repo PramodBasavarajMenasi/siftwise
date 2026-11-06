@@ -26,6 +26,11 @@ All notable changes to siftwise. The format follows
     lists tests riskiest first.
   - To keep the old order: `siftwise select --order default`, the Action's `order: default`,
     `SIFTWISE_ORDER: default` on GitLab, or the MCP `order` argument.
+- Risk order import depth ([#48](https://github.com/PramodBasavarajMenasi/siftwise/issues/48)):
+  the CLI now sends import depth per test/package (Python, Go, JS/TS, Java) in `/select`.
+  In risk order, import depth 1 now scores as a direct link while depth 2+ stays indirect.
+  Selection recall is unchanged: depth affects order only. Older clients still work (imports
+  stay indirect), and a newer CLI retries without the new field against an older server.
 - Eval: time to first failure, in the default and in risk order, for selective PR runs that
   caught a failure (`scripts/eval/ordering.py`; results in docs/eval-results.md). A
   cost-aware variant was also evaluated: risk per unit of estimated time, with or without
