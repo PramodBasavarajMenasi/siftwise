@@ -135,3 +135,57 @@ def test_rollup(checkout: str, api: respx.MockRouter) -> None:
 
     assert result.exit_code == 0, result.output
     assert "3 tests updated" in result.output
+
+
+def test_record_adds_jest_files_the_report_left_out(checkout: str, api: respx.MockRouter) -> None:
+    """jest-junit without addFileAttribute: the upload names each suite's file from the
+    checkout, so the server can select Jest tests by file; an ambiguous suite is a warning."""
+    upload = api.post(f"{SERVER}/runs").respond(
+        201, json={"run_id": 4, "created": True, "counts": {"total": 2}})  # fmt: skip
+    Path("package.json").write_text('{"devDependencies": {"jest": "29.7.0"}}')
+    Path("src").mkdir()
+    Path("src/cart.test.js").write_text("describe('Cart', () => { test('adds', () => {}); });")
+    Path("a.test.js").write_text("test('same', () => {});")
+    Path("b.test.js").write_text("test('same', () => {});")
+    Path("jest.xml").write_text(
+        '<testsuites name="jest tests">'
+        '<testsuite name="Cart"><testcase classname="Cart adds" name="Cart adds"/></testsuite>'
+        '<testsuite name="undefined"><testcase classname="same" name="same"/></testsuite>'
+        "</testsuites>")  # fmt: skip
+
+    result = CliRunner().invoke(app, ["record", "jest.xml", "--repo", "acme/shop",
+                                      "--branch", "main", "--server", SERVER])  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    body = upload.calls.last.request.content
+    assert b'classname="Cart adds" name="Cart adds" file="src/cart.test.js"' in body
+    assert b'classname="same" name="same" />' in body or b'name="same"/>' in body
+    assert "no test file for 1 Jest suite(s)" in result.output
+    assert "more than one test file may be it (a.test.js, b.test.js)" in result.output
+
+
+def test_uploads_share_one_jest_search_and_one_time_limit_warning(
+    tmp_path: Path, api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every upload of one command (record, each re-run round) uses the same index; past the
+    time limit, the suites get no file and the command warns once."""
+    from siftwise.cli import jestfiles
+    from siftwise.cli import main as cli
+
+    api.post(f"{SERVER}/runs").respond(201, json={"run_id": 4, "created": True})
+    monkeypatch.setattr(jestfiles, "TIME_LIMIT_S", 0.0)
+    (tmp_path / "package.json").write_text('{"devDependencies": {"jest": "29.7.0"}}')
+    (tmp_path / "cart.test.js").write_text("test('adds', () => {});")
+    report = tmp_path / "jest.xml"
+    report.write_text(
+        '<testsuites><testsuite name="undefined">'
+        '<testcase classname="adds" name="adds"/></testsuite></testsuites>'
+    )
+    warnings: list[str] = []
+
+    for _ in range(3):
+        cli.upload_run(SERVER, "t", [report], {}, jest_root=tmp_path, warn=warnings.append)
+
+    assert len(warnings) == 1
+    assert "1 not searched (the search stopped at its 0 s limit)" in warnings[0]
+    assert jestfiles.finder(tmp_path).stopped

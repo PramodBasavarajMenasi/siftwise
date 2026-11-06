@@ -1595,3 +1595,48 @@ def test_select_tests_output_is_unchanged_by_the_speed_ups(
     old = select_tests(hist, changed, True, config)
 
     assert new == old
+
+
+# --- several Go modules (go.work, nested go.mod) -------------------------------------------
+
+TOOLS = "example.com/kubo-tools"  # a nested module whose path isn't under the root's
+TOOLS_X = f"{TOOLS}/x"
+EXT = f"{KUBO}/plugins/ext"  # a nested module under the root's path
+GO_MODULES = (("", KUBO), ("plugins/ext", EXT), ("tools", TOOLS))
+
+
+def test_go_commands_run_in_the_packages_module() -> None:
+    """A package of a nested module can't be tested from the root (`setup failed`, checked
+    with Go 1.27): its command runs in the module's directory."""
+    hist = history(*GO.tests.values(), f"{EXT}::TestExt", f"{TOOLS_X}::TestX")
+    selection = select(hist, "plugins/ext/ext.go", "tools/x/x.go", "test/cli/add.go",
+                       go_module=KUBO, go_modules=GO_MODULES)  # fmt: skip
+
+    assert selection.mode is Mode.SELECTIVE
+    assert set(selection.commands) == {
+        "go test -C plugins/ext .",
+        "go test -C tools ./x",
+        "go test ./test/cli",
+    }
+    # Without the modules (an older client), the nested module's path isn't under the root's:
+    # its file maps to nothing and the full suite runs, as before.
+    assert select(hist, "tools/x/x.go", go_module=KUBO).mode is Mode.FULL
+
+
+def test_go_packages_map_to_directories_through_their_module() -> None:
+    hist = history(f"{TOOLS_X}::TestX", f"{KUBO}/x::TestRootX")
+
+    selection = select(hist, "tools/x/x.go", go_module=KUBO, go_modules=GO_MODULES)
+
+    assert ids(selection) == [f"{TOOLS_X}::TestX"]  # not the root module's x
+    assert selection.commands == ("go test -C tools ./x",)
+
+
+def test_go_workspace_without_a_root_module() -> None:
+    hist = history(f"{TOOLS_X}::TestX", "example.com/app/y::TestY")
+    modules = (("app", "example.com/app"), ("tools", TOOLS))
+
+    selection = select(hist, "app/y/y.go", go_modules=modules)
+
+    assert ids(selection) == ["example.com/app/y::TestY"]
+    assert selection.commands == ("go test -C app ./y",)

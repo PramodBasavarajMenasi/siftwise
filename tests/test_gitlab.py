@@ -728,6 +728,8 @@ def test_the_template_jobs() -> None:
     assert rollup["dependencies"] == []
     assert record["variables"]["SIFTWISE_TRIAGE"] == "false"
     assert record["after_script"][-1].endswith("siftwise gitlab record")
+    # GitLab's Tests tab shows only declared reports: the directory siftwise writes to.
+    assert record["artifacts"]["reports"]["junit"] == f"{gitlab.JUNIT_DIR}/*.xml"
     for job in (select, rollup):
         assert job["script"][0] == ["!reference", [".siftwise-install", "script"]]
 
@@ -749,6 +751,11 @@ def test_the_example_carries_the_template_unchanged() -> None:
     assert pipeline["include"] == [{"local": "siftwise.gitlab-ci.yml"}]
     assert pipeline["siftwise-select"]["extends"] == [".siftwise-select", ".example-server"]
     assert pipeline["siftwise-rollup"]["variables"]["SIFTWISE_FAIL_ON"] == "new_regression,unknown"
+    # Its test job writes every report (selective and full) where it declares them.
+    test = pipeline["test"]
+    assert test["artifacts"]["reports"]["junit"] == f"{gitlab.JUNIT_DIR}/*.xml"
+    assert test["artifacts"]["when"] == "always"
+    assert f"--junitxml={gitlab.JUNIT_DIR}/full.xml" in "\n".join(test["script"])
     # The only secret it needs is the note's; the siftwise token is made in each job.
     server = pipeline[".example-server"]
     assert "SIFTWISE_TOKEN" not in server["variables"]

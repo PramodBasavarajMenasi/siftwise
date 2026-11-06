@@ -51,7 +51,7 @@ def test_go_tests_need_the_module(root: Path) -> None:
     pkg = "github.com/acme/shop/cart"
 
     assert classify(f"{pkg}::TestTotal", None, Checkout(root)) == (
-        "a Go test, but there's no go.mod at the checkout's root"
+        "a Go test, but the checkout has no Go module (go.mod)"
     )
     write(root / "go.mod", ROOT_GO_MOD)
     checkout = Checkout(root)
@@ -60,7 +60,7 @@ def test_go_tests_need_the_module(root: Path) -> None:
         f"{pkg}::TestTotal/with_discount", "go", "TestTotal", (pkg,)
     )
     assert classify("github.com/other/lib::TestX", None, checkout) == (
-        "its Go package isn't in this module (github.com/acme/shop)"
+        "its Go package isn't in a module of the checkout (github.com/acme/shop)"
     )
 
 
@@ -139,9 +139,12 @@ def test_java_method_names_lose_parameters_and_indexes(root: Path, name: str) ->
     ],
 )
 def test_names_that_arent_java_identifiers_are_not_re_run(root: Path, test_id: str) -> None:
-    write(root / "pom.xml")
+    write(root / "pom.xml")  # and no source to map a display name with
 
-    assert classify(test_id, None, Checkout(root)) == NO_RUNNER
+    reason = classify(test_id, None, Checkout(root))
+
+    assert isinstance(reason, str)
+    assert reason == NO_RUNNER or "isn't a method name (a JUnit 5 display name?)" in reason
 
 
 def test_both_build_tools_need_a_wrapper_to_choose(root: Path) -> None:
@@ -527,6 +530,52 @@ def test_jest_for_real(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         shutil.rmtree(project, ignore_errors=True)
 
 
+@real_tools
+def test_jest_without_add_file_attribute_for_real(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """jest-junit's defaults (no file attribute): the file comes from the checkout."""
+    require("node")
+    if not JEST_HOME:
+        pytest.fail("set SIFTWISE_TEST_JEST_HOME to a folder whose node_modules has jest and "
+                    "jest-junit")  # fmt: skip
+    project = Path(JEST_HOME) / f"project-nofile-{tmp_path.name}"
+    try:
+        write(project / "package.json", json.dumps({"devDependencies": {"jest": "*"}}))
+        write(project / "src" / "__tests__" / "cart.test.js",
+              "const fs = require('fs');\n"
+              "describe('cart', () => {\n"
+              "  test('passes the second time', () => {\n"
+              "    const first = !fs.existsSync('ran-once'); fs.writeFileSync('ran-once', '');\n"
+              "    expect(first).toBe(false);\n"
+              "  });\n"
+              "  test.each([1, 2])('is one: %i', (n) => { expect(n).toBe(1); });\n"
+              "});\n")  # fmt: skip
+        write(project / "src" / "__tests__" / "other.test.js",
+              "test('passes the second time', () => {});\n")  # fmt: skip
+        monkeypatch.chdir(project)
+        jest = Path(JEST_HOME) / "node_modules" / "jest" / "bin" / "jest.js"
+        # The CI run: every test, the report as jest-junit writes it by default.
+        subprocess.run(["node", str(jest), "--ci", "--reporters=jest-junit"], cwd=project,
+                       env={**os.environ, "JEST_JUNIT_OUTPUT_DIR": str(tmp_path)},
+                       check=False, capture_output=True)  # fmt: skip
+        report = tmp_path / "junit.xml"
+        assert b"file=" not in report.read_bytes()
+        ids = ("cart passes the second time::cart passes the second time",
+               "cart is one: 2::cart is one: 2")  # fmt: skip
+        paths = gha._reported_paths([report], project)()
+        assert paths[ids[0]] == paths[ids[1]] == "src/__tests__/cart.test.js"
+        checkout = Checkout(project)
+
+        statuses = run_for_real([classify(t, paths[t], checkout) for t in ids],
+                                project, ("node", str(jest)))  # fmt: skip
+
+        assert statuses[ids[0]] is Status.PASSED
+        assert statuses[ids[1]] is Status.FAILED
+    finally:
+        shutil.rmtree(project, ignore_errors=True)
+
+
 CART_TEST = """package acme;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -616,3 +665,110 @@ def test_gradle_for_real(root: Path) -> None:
     assert statuses[ids[1]] is Status.FAILED
     assert "acme.CartTest::notReRun()" not in statuses
     assert reports_in(root / "build" / "test-results" / "test") == before
+
+
+DISPLAY_TEST = """package acme;
+
+import static org.junit.jupiter.api.Assertions.*;
+import java.nio.file.*;
+import org.junit.jupiter.api.*;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+@DisplayName("A cart")
+class CartTest {
+    @Test @DisplayName("passes the second time") void once() throws Exception {
+        boolean first = !Files.exists(Path.of("ran-once"));
+        Files.writeString(Path.of("ran-once"), "");
+        assertFalse(first);
+    }
+    @ParameterizedTest(name = "{0} is one") @ValueSource(ints = {1, 2})
+    @DisplayName("ones") void one(int n) { assertEquals(1, n); }
+    @Test @DisplayName("not re-run") void notReRun() { fail("must be filtered out"); }
+}
+"""
+
+PHRASED_REPORTER = """<artifactId>maven-surefire-plugin</artifactId><version>3.5.2</version>
+    <configuration><statelessTestsetReporter
+      implementation="org.apache.maven.plugin.surefire.extensions.junit5.JUnit5Xml30StatelessReporter">
+      <usePhrasedTestCaseClassName>true</usePhrasedTestCaseClassName>
+      <usePhrasedTestCaseMethodName>true</usePhrasedTestCaseMethodName>
+    </statelessTestsetReporter></configuration>"""
+
+
+@real_tools
+def test_gradle_display_names_for_real(root: Path) -> None:
+    """Gradle names JUnit 5 tests by display name: re-run by the method that carries it."""
+    require("gradle")
+    write(root / "settings.gradle", "rootProject.name = 'cart'\n")
+    write(root / "build.gradle", BUILD_GRADLE + "dependencies { testImplementation "
+          "'org.junit.jupiter:junit-jupiter-params' }\n")  # fmt: skip
+    write(root / "src" / "test" / "java" / "acme" / "CartTest.java", DISPLAY_TEST)
+    (root / "ran-once").touch()
+    ids = ("acme.CartTest::passes the second time", "acme.CartTest::2 is one")
+
+    statuses = run_for_real([classify(t, None, Checkout(root)) for t in ids], root)
+
+    assert statuses[ids[0]] is Status.PASSED
+    assert statuses[ids[1]] is Status.FAILED
+    assert statuses["acme.CartTest::1 is one"] is Status.PASSED  # the whole method re-ran
+    assert "acme.CartTest::not re-run" not in statuses
+
+
+@real_tools
+def test_maven_phrased_names_for_real(root: Path) -> None:
+    """Surefire's phrased reporter names the class and the test by their display names."""
+    require("mvn")
+    write(root / "pom.xml", POM.replace(
+        "<artifactId>maven-surefire-plugin</artifactId><version>3.5.2</version>",
+        PHRASED_REPORTER))  # fmt: skip
+    write(root / "src" / "test" / "java" / "acme" / "CartTest.java", DISPLAY_TEST)
+    (root / "ran-once").touch()
+    ids = ("A cart::passes the second time", "A cart::ones 2 is one")
+
+    statuses = run_for_real([classify(t, None, Checkout(root)) for t in ids], root)
+
+    assert statuses[ids[0]] is Status.PASSED
+    assert statuses[ids[1]] is Status.FAILED
+    assert "A cart::not re-run" not in statuses
+
+
+def test_go_tests_of_a_nested_module_re_run_in_its_directory(root: Path) -> None:
+    write(root / "go.mod", ROOT_GO_MOD)
+    write(root / "tools" / "go.mod", "module example.com/tools\n")
+    write(root / "vendor" / "v" / "go.mod", "module example.com/vendored\n")  # Go ignores it
+    checkout = Checkout(root)
+
+    nested = classify("example.com/tools/x::TestX/sub", None, checkout)
+    at_root = classify("github.com/acme/shop/cart::TestTotal", None, checkout)
+
+    assert nested == Target("example.com/tools/x::TestX/sub", "go", "TestX",
+                            ("example.com/tools/x", "tools"))  # fmt: skip
+    assert at_root == Target("github.com/acme/shop/cart::TestTotal", "go", "TestTotal",
+                             ("github.com/acme/shop/cart",))  # fmt: skip
+    assert classify("example.com/vendored::TestV", None, checkout) == (
+        "its Go package isn't in a module of the checkout (example.com/tools, github.com/acme/shop)"
+    )
+    assert isinstance(nested, Target) and isinstance(at_root, Target)
+    first, second = invocations([nested, at_root], root / "out", 1, (), root)
+    assert (first.cwd, first.argv[-1]) == (root / "tools", "example.com/tools/x")
+    assert second.cwd is None  # the root's module: as before
+
+
+@real_tools
+def test_go_nested_module_for_real(root: Path) -> None:
+    """A test of a module below the root re-runs from the module's directory (from the root,
+    Go can't build it: `setup failed`)."""
+    require("go")
+    write(root / "go.mod", "module example.com/root\n\ngo 1.21\n")
+    write(root / "tools" / "go.mod", "module example.com/flaky\n\ngo 1.21\n")
+    write(root / "tools" / "flaky_test.go", FLAKY_GO)
+    (root / "tools" / "ran-once").touch()  # tests run in their package's directory
+    checkout = Checkout(root)
+    ids = ("example.com/flaky::TestOnce", "example.com/flaky::TestAlways/sub_case")
+
+    statuses = run_for_real([classify(t, None, checkout) for t in ids], root)
+
+    assert statuses[ids[0]] is Status.PASSED
+    assert statuses[ids[1]] is Status.FAILED
+    assert "example.com/flaky::TestNotReRun" not in statuses

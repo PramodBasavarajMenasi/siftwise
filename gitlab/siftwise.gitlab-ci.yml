@@ -68,6 +68,12 @@
     expire_in: 1 week
     paths:
       - .siftwise-ci/
+    reports:
+      # The pipeline's Tests tab and the merge request's test summary read only the files a
+      # job declares here (siftwise's own upload doesn't count). siftwise's pytest commands
+      # write to .siftwise-ci/junit; write your full suite's and other runners' reports
+      # there too, or declare their paths in your job (it replaces this one).
+      junit: .siftwise-ci/junit/*.xml
 
 .siftwise-rollup:
   extends: .siftwise-base

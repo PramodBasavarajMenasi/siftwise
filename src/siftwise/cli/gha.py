@@ -509,7 +509,8 @@ def _record(
     }
     try:
         result = cli.upload_run(server, token, files, metadata, defer_rollup=defer,
-                                timeout=RECORD_TIMEOUT)  # fmt: skip
+                                timeout=RECORD_TIMEOUT, jest_root=Path.cwd(),
+                                warn=lambda m: _annotate("warning", m))  # fmt: skip
     except cli.SiftwiseError as exc:
         _annotate("warning", f"siftwise: results not recorded: {exc}")
         return f"{NOTHING_RECORDED} ({exc})", None
@@ -1082,7 +1083,7 @@ def rerun_failures(
         _annotate("warning", f"siftwise: re-runs skipped: {report.problem}")
         return report
     checkout = reruns.Checkout(Path.cwd())
-    paths = _reported_paths(reported)
+    paths = _reported_paths(reported, checkout.root)
     targets: dict[str, reruns.Target] = {}
     no_runner: list[str] = []
     for result in response["results"]:
@@ -1132,7 +1133,8 @@ def rerun_failures(
             break
         try:
             cli.upload_run(server, token, files, {**metadata, "rerun": n, "started_at": _now()},
-                           defer_rollup=defer, timeout=RECORD_TIMEOUT)  # fmt: skip
+                           defer_rollup=defer, timeout=RECORD_TIMEOUT,
+                           jest_root=checkout.root)  # fmt: skip
         except cli.SiftwiseError as exc:
             report.problem = f"re-run {n} not recorded ({exc})"
             break
@@ -1185,9 +1187,14 @@ def _run_commands(
     return files, ""
 
 
-def _reported_paths(reports: Sequence[Path]) -> Callable[[], dict[str, str]]:
+def _reported_paths(
+    reports: Sequence[Path], root: Path | None = None
+) -> Callable[[], dict[str, str]]:
     """Test ID -> file from this leg's own JUnit reports (Jest's re-runs need the file; the
-    triage response doesn't carry it). Read once, when first needed."""
+    triage response doesn't carry it), and for Jest suites reported without one, the file
+    found in the checkout at ``root`` (``jestfiles``). Read once, when first needed."""
+    from siftwise.cli import jestfiles
+
     cache: dict[str, str] = {}
     done = False
 
@@ -1195,14 +1202,19 @@ def _reported_paths(reports: Sequence[Path]) -> Callable[[], dict[str, str]]:
         nonlocal done
         if not done:
             done = True
+            finder = jestfiles.finder(root) if root is not None else None
             for path in reports:
                 try:
-                    results = parse_junit(path.read_bytes())
+                    data = path.read_bytes()
+                    results = parse_junit(data)
                 except (OSError, JUnitParseError):
                     continue
                 for r in results:
                     if r.file_path:
                         cache.setdefault(r.test_id, r.file_path)
+                if finder is not None and any(not r.file_path for r in results):
+                    for test_id, file in jestfiles.resolve(data, finder)[0].files.items():
+                        cache.setdefault(test_id, file)
         return cache
 
     return paths

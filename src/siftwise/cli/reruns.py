@@ -6,7 +6,8 @@ and write a JUnit report whose test IDs match the recorded ones:
 * pytest: ``[prefix] pytest --junitxml=<out> -p no:cacheprovider <node IDs>``;
 * Go: ``gotestsum --junitfile <out> -- -count=1 -run '^(TestA|TestB)$' <package>`` per package
   when gotestsum is on PATH, else ``go test -json`` with the same flags, converted to JUnit
-  here (``go_json_to_junit``). Subtests re-run through their top-level test;
+  here (``go_json_to_junit``), in the directory of the package's module (a nested module, a
+  go.work workspace's). Subtests re-run through their top-level test;
 * Jest: ``[prefix] jest --ci --runTestsByPath <file> -t '^(<full name>|...)$'`` per file, from
   the nearest directory above it whose package.json (or jest.config.*) has Jest, with the
   jest-junit reporter writing to <out> (it must be installed, as for the CI run itself);
@@ -18,7 +19,7 @@ and write a JUnit report whose test IDs match the recorded ones:
   run wrote. (Surefire's reports directory has no user property: ``-D`` can't move it.)
 
 The runner of a test comes from its ID and file, and the checkout: a pytest node whose file
-exists; a Go import path (go.mod at the root, the package in its module); a JS/TS file (from the
+exists; a Go import path (the package in a module of the checkout); a JS/TS file (from the
 leg's own JUnit reports) under a Jest package; a Java class with pom.xml or build.gradle[.kts]
 at the root. Anything else isn't re-run, with the reason.
 
@@ -44,8 +45,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
 
+from siftwise.cli import javatests
+from siftwise.cli.gograph import find_go_modules
 from siftwise.cli.repoconfig import read_go_module
-from siftwise.core.selector import KnownTest, Runner, _classify, pytest_node
+from siftwise.core.selector import KnownTest, Runner, _classify, go_module_of, pytest_node
 
 PYTEST, GO, JEST, MAVEN, GRADLE = "pytest", "go", "jest", "maven", "gradle"
 # Never walked for Maven/Gradle reports.
@@ -60,6 +63,8 @@ _GO_META = frozenset("\\.+*?()|[]{}^$")
 _JS_META = frozenset("\\^$.*+?()[]{}|/")
 # Re-run failure output kept per converted Go test.
 _MAX_OUTPUT = 4096
+
+NO_RUNNER = "no runner found for it (pytest, Go, Jest, Maven or Gradle)"
 
 # Overridable in tests: where a tool is installed (None if it isn't).
 which: Callable[[str], str | None] = shutil.which
@@ -133,19 +138,24 @@ class Checkout:
     """What the checkout says about its runners (``root``: the working directory)."""
 
     root: Path
-    _go_module: str | None = None
-    _go_read: bool = False
+    _go_modules: dict[str, str] | None = None
     _jest_dirs: dict[Path, Path | None] = field(default_factory=dict)
-    _files: list[Path] | None = None  # the checkout's files, listed once (``find``)
+    _files: list[Path] | None = None  # the checkout's files, listed once (``files``)
+    _java: dict[Path, list[javatests.JavaClass]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.root = self.root.resolve()  # the Jest search stops here
 
     @property
-    def go_module(self) -> str | None:
-        if not self._go_read:
-            self._go_module, self._go_read = read_go_module(self.root), True
-        return self._go_module
+    def go_modules(self) -> dict[str, str]:
+        """Directory -> module path of the checkout's Go modules (go.mod files, go.work)."""
+        if self._go_modules is None:
+            try:
+                self._go_modules = find_go_modules(self.root)
+            except OSError:
+                module = read_go_module(self.root)
+                self._go_modules = {"": module} if module else {}
+        return self._go_modules
 
     def java_tool(self) -> str | None:
         """maven or gradle (from the root's build files), or None."""
@@ -166,14 +176,45 @@ class Checkout:
             return path if path.is_file() else None
         if (self.root / path).is_file():
             return self.root / path
+        suffix = "/" + path.as_posix().lstrip("/")
+        matches = [p for p in self.files() if p.as_posix().endswith(suffix)]
+        return matches[0] if len(matches) == 1 else None
+
+    def files(self) -> list[Path]:
+        """The checkout's files (dot-dirs, node_modules and virtualenvs pruned), listed once."""
         if self._files is None:
             self._files = []
             for dirpath, dirnames, filenames in os.walk(self.root):
                 dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
                 self._files += [Path(dirpath) / name for name in filenames]
-        suffix = "/" + path.as_posix().lstrip("/")
-        matches = [p for p in self._files if p.as_posix().endswith(suffix)]
-        return matches[0] if len(matches) == 1 else None
+        return self._files
+
+    def java_method(self, classname: str, name: str) -> tuple[str, str] | str | None:
+        """(class, method) a Java test's reported name is, from the class's source (JUnit 5
+        display names), a reason it can't be told, or None if the source doesn't say."""
+        outer = javatests.outer_class(classname)
+        if outer is not None:
+            suffix = "/" + outer.replace(".", "/") + ".java"
+            files = [p for p in self.files() if p.as_posix().endswith(suffix)]
+        else:  # a phrased classname (display names): any test class may carry it
+            files = [p for p in self.files()
+                     if p.suffix == ".java" and "/src/test/" in p.as_posix()]  # fmt: skip
+        answers = {javatests.find_method(self._java_classes(p), classname, name) for p in files}
+        answers.discard(None)
+        if not answers:
+            return None
+        if len(answers) > 1:
+            return f"its source files disagree on which method {name!r} is"
+        return answers.pop()
+
+    def _java_classes(self, path: Path) -> list[javatests.JavaClass]:
+        if path not in self._java:
+            try:
+                source = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                source = ""
+            self._java[path] = javatests.parse_test_classes(source)
+        return self._java[path]
 
     def jest_dir(self, file: Path) -> Path | None:
         """The nearest directory at or above ``file`` (within the root) that has Jest."""
@@ -206,13 +247,17 @@ def classify(test_id: str, file_path: str | None, checkout: Checkout) -> Target 
         return "its file isn't in the checkout"
     test = _classify(KnownTest(test_id, file_path))
     if test.runner is Runner.GO:
-        module = checkout.go_module
-        if module is None:
-            return "a Go test, but there's no go.mod at the checkout's root"
+        modules = checkout.go_modules
+        if not modules:
+            return "a Go test, but the checkout has no Go module (go.mod)"
         package = test.classname
-        if package != module and not package.startswith(module + "/"):
-            return f"its Go package isn't in this module ({module})"
-        return Target(test_id, GO, test.name.split("/", 1)[0], (package,))
+        owner = go_module_of(package, sorted(modules.items()))
+        if owner is None:
+            names = ", ".join(sorted(modules.values())[:3]) + (", ..." if len(modules) > 3 else "")
+            return f"its Go package isn't in a module of the checkout ({names})"
+        # The root's module: run from the root, as ever; another: from its directory.
+        group = (package, owner[0]) if owner[0] else (package,)
+        return Target(test_id, GO, test.name.split("/", 1)[0], group)
     if test.runner is Runner.JEST and test.file_path:
         found = checkout.find(test.file_path)
         if found is None:
@@ -225,12 +270,22 @@ def classify(test_id: str, file_path: str | None, checkout: Checkout) -> Target 
         return Target(test_id, JEST, test.name, (str(directory), relative))
     classname, _, name = test_id.partition("::")
     method = _JAVA_METHOD.match(name)
+    tool = checkout.java_tool()
+    if tool is None or not classname:
+        return NO_RUNNER
+    # JUnit 5 display names (Gradle's reports, Surefire's phrased ones): the method that
+    # carries the name, from the class's source.
+    resolved = checkout.java_method(classname, name)
+    if isinstance(resolved, tuple):
+        return Target(test_id, tool, f"{resolved[0]}\0{resolved[1]}")
+    if isinstance(resolved, str):
+        return f"a JUnit 5 display name siftwise can't map to one method: {resolved}"
     if _JAVA_CLASS.match(classname) and method:
-        tool = checkout.java_tool()
-        if tool is None:
-            return "no runner found for it (pytest, Go, Jest, Maven or Gradle)"
         return Target(test_id, tool, f"{classname}\0{method[1]}")
-    return "no runner found for it (pytest, Go, Jest, Maven or Gradle)"
+    if _JAVA_CLASS.match(classname):
+        return (f"{name!r} isn't a method name (a JUnit 5 display name?) and {classname}'s "
+                "source in the checkout doesn't say which method it is")  # fmt: skip
+    return NO_RUNNER
 
 
 def invocations(
@@ -259,17 +314,18 @@ def _go(targets: list[Target], out: Path, n: int, prefix: tuple[str, ...], root:
         ) -> list[Invocation]:  # fmt: skip
     gotestsum = which("gotestsum")
     result = []
-    for k, (package, names) in enumerate(_grouped(targets).items(), 1):
+    for k, (group, names) in enumerate(_grouped(targets).items(), 1):
         xml = out / f"rerun-{n}-go-{k}.xml"
-        flags = ["-count=1", "-run", go_run_pattern(names), package[0]]
+        flags = ["-count=1", "-run", go_run_pattern(names), group[0]]
+        cwd = root / group[1] if len(group) > 1 else None  # the package's module
         if gotestsum:
             argv = [gotestsum, "--junitfile", str(xml), "--format", "standard-verbose", "--",
                     *flags]  # fmt: skip
-            result.append(Invocation(GO, argv, report=xml))
+            result.append(Invocation(GO, argv, report=xml, cwd=cwd))
         else:
             argv = ["go", "test", "-json", *flags]
             stdout = out / f"rerun-{n}-go-{k}.json"
-            result.append(Invocation(GO, argv, report=xml, stdout=stdout))
+            result.append(Invocation(GO, argv, report=xml, stdout=stdout, cwd=cwd))
     return result
 
 

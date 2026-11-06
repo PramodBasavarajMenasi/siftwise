@@ -102,6 +102,13 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   `always_run`.
 - **Whole files and packages:** a changed or imported test file runs whole, and a changed Go
   package runs without `-run`, so tests added by the change run too.
+- **Several Go modules:** the CLI finds every module of the checkout (`go.mod` files, `go.work`
+  `use` lines; `cli/gograph.py`), runs `go list` in each module's directory (read-only:
+  `-mod=mod` becomes `-mod=readonly`) and merges the graphs; packages of another module of
+  the checkout (a local `replace`, a workspace module) link across modules. `/select` alone
+  gets `go_modules` (directory -> module path): a package then maps to its directory through
+  its module, and a nested module's package runs as `go test -C <dir> ./pkg`. An older
+  server's 422 on it gets the request again without it.
 - **Full-suite fallbacks**, when anything is uncertain: an unknown or empty diff, no history,
   a root build or CI file changed, a changed source file no signal covers, or a selected test
   with no known runner. Docs, lint-only configs and generated files never force it.
@@ -146,6 +153,21 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   A changed known test file that jest-junit reports from its project's root matches its tests
   the same way (and triage links it). `WouldRun` can't credit a new file's tests in shadow
   mode: no test IDs yet.
+- **Test files without `addFileAttribute`:** jest-junit writes one `<testsuite>` per test
+  file but no file unless asked. `core/junit.py` takes a suite named by a JS/TS test path
+  when the classname equals the name (jest-junit's `usePathForSuiteName` with its default
+  templates), and the name of a "Test suite failed to run" result; not a path-like
+  classname (Vitest writes those, and isn't Jest). For the default templates (classname = name = describe
+  titles + test title), `record` (`cli/jestfiles.py`) finds the one Jest test file in the
+  checkout whose string literals make up every test name of the suite (titles joined by
+  spaces; `test.each` placeholders match anything) and adds `file` to the testcases of the
+  report it uploads; re-runs use the same search. Two candidate files, or none, leave the
+  suite without a file, with a warning: never a guess. A placeholder-only title (`'%s'`)
+  matches nothing (it would make every suite ambiguous). One `JestFinder` per checkout per
+  command (`jestfiles.finder`) reads the Jest-project test files once, within
+  `TIME_LIMIT_S` (20 s, walk included); past it the search stops for good and no later suite
+  gets a file (a partial read could leave one wrong file as the only match), with one
+  warning per command.
 - **Depth:** recorded, not used by the risk order: like Python and Go imports, every JS
   import is an indirect link. Using depth 1 as direct is the import-depth issue's to decide
   for all three graphs.
@@ -409,7 +431,11 @@ The first rule that applies decides:
   round's reports are one upload (`rerun = n`); triage rule 1 then reads a pass as flaky.
   Maven's and Gradle's re-runs write into the CI run's report directories, so those reports
   are backed up first and put back after, whatever happened. A test that can't be matched (no runner, a different name in the re-run's report) keeps its
-  verdict.
+  verdict. Go tests re-run in their module's directory (a nested module, a `go.work`
+  workspace's). JUnit 5 display names (Gradle's names, Surefire's phrased ones) re-run by the
+  method that carries them, read from the class's source (`cli/javatests.py`: `@DisplayName`
+  literals, `@ParameterizedTest`/`@RepeatedTest` name templates, nested classes); a name two
+  methods may carry isn't re-run.
 
 ## Performance
 

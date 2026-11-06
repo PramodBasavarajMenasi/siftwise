@@ -8,7 +8,9 @@ handled here are:
 * ``classname`` may be missing: it falls back to the enclosing suite's ``package`` attribute
   (Go reporters that name suites after the top-level test, e.g. ipfs/kubo's CI), then to the
   suite's ``name``;
-* ``file`` may live on the testcase, the suite, or nowhere;
+* ``file`` may live on the testcase, the suite, or nowhere; without one, jest-junit's
+  path-named suites (``usePathForSuiteName``, with the default classname = name templates)
+  and its "Test suite failed to run" results give the file;
 * Surefire reruns are recorded as ``<flakyFailure>``/``<flakyError>`` (failed, then passed)
   and ``<rerunFailure>``/``<rerunError>`` (failed every time) children;
 * retry plugins (e.g. Gradle test-retry) repeat the whole ``<testcase>`` element.
@@ -19,6 +21,7 @@ flakiness within a single run is preserved rather than collapsed.
 
 from __future__ import annotations
 
+import posixpath
 from collections import Counter
 from dataclasses import dataclass
 from enum import StrEnum
@@ -138,7 +141,9 @@ def _parse_testcase(
     # each suite after the top-level test, so the name alone collides across packages.
     classname = _normalize(case.get("classname") or suite.package or suite.name)
     test_id = make_test_id(classname, name)
-    file_path = normalize_path(case.get("file") or suite.file)
+    file_path = normalize_path(case.get("file") or suite.file) or _reported_js_path(
+        suite.name, case.get("classname"), case.get("name")
+    )
     duration_ms = _parse_duration(case.get("time"))
 
     def emit(status: Status, message: str | None, duration: int | None) -> None:
@@ -179,6 +184,37 @@ def _parse_testcase(
     emit(outcome[0], outcome[1], duration_ms)
     for status, message in reruns:
         emit(status, message, None)
+
+
+_JS_EXTENSIONS = frozenset({".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"})
+# jest-junit's classname for a test file that failed to run (its name is then the file).
+_JEST_SUITE_FAILED = "Test suite failed to run"
+
+
+def is_js_test_path(text: str | None) -> bool:
+    """Whether a report's suite name or classname is a JS/TS test file's path, as jest-junit's
+    ``{filepath}`` / ``{filename}`` templates write it (Jest's default testMatch: ``*.test.*``,
+    ``*.spec.*``, ``__tests__/``)."""
+    if not text or any(c.isspace() for c in text):
+        return False
+    path = text.replace("\\", "/")
+    stem, ext = posixpath.splitext(posixpath.basename(path))
+    if ext not in _JS_EXTENSIONS:
+        return False
+    return stem.endswith((".test", ".spec")) or "__tests__" in path.split("/")[:-1]
+
+
+def _reported_js_path(suite_name: str, classname: str | None, name: str | None) -> str | None:
+    """jest-junit's test file where it names one without ``addFileAttribute``: a suite named
+    by its path (``usePathForSuiteName``, ``suiteNameTemplate: "{filepath}"``) with the default
+    classname and title templates (classname = name), or a file that failed to run. Nothing
+    else: Vitest names suites and classnames by path too, and isn't Jest."""
+    classname, name = _normalize(classname or ""), _normalize(name or "")
+    if classname == _JEST_SUITE_FAILED and is_js_test_path(name):
+        return normalize_path(name)
+    if classname and classname == name and is_js_test_path(suite_name):
+        return normalize_path(suite_name)
+    return None
 
 
 def _local(tag: str) -> str:

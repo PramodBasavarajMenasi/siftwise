@@ -5,7 +5,7 @@ import os
 import posixpath
 import re
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -16,7 +16,7 @@ import typer
 
 from siftwise import __version__, extras
 from siftwise.cli import gha, gitlab, server
-from siftwise.cli.gograph import build_graph, run_go_list
+from siftwise.cli.gograph import build_graph, find_go_modules, merge_graphs, run_go_list
 from siftwise.cli.javagraph import java_change
 from siftwise.cli.jsgraph import Affected, build_js_graph
 from siftwise.cli.pygraph import build_py_graph
@@ -244,7 +244,8 @@ def record_command(
         **recorded_change(base, head, go_list=go_list, py_imports=py_imports),
     }
     try:
-        result = upload_run(server, token, junit, metadata, defer_rollup=defer_rollup)
+        result = upload_run(server, token, junit, metadata, defer_rollup=defer_rollup,
+                            jest_root=git_toplevel() or Path.cwd(), warn=_err)  # fmt: skip
     except SiftwiseError as exc:
         _err(f"error: {exc}")
         raise typer.Exit(EXIT_API_ERROR) from exc
@@ -557,6 +558,21 @@ class LocalChange:
     js_graph: dict[str, Any] | None = None
     # /select's `java`: the Maven/Gradle build (modules, test classes) and the graph's details.
     java: dict[str, Any] | None = None
+    # /select's `go_modules`: directory -> module path, when the checkout has Go modules other
+    # than the root's (go.work, nested go.mod): Go commands run in the package's module.
+    go_modules: dict[str, str] | None = None
+
+    def select_only(self) -> dict[str, Any]:
+        """The fields only /select takes (an older server rejects them with a 422 naming
+        them: ``post_select`` then drops them, see OPTIONAL_SELECT_FIELDS)."""
+        extra: dict[str, Any] = {}
+        if self.js_graph:
+            extra["js_graph"] = self.js_graph
+        if self.java:
+            extra["java"] = self.java
+        if self.go_modules:
+            extra["go_modules"] = self.go_modules
+        return extra
 
     def graph(self) -> dict[str, Any] | None:
         """``runs.affected`` (schemas.ChangeGraph) to record, or None if the change's links are
@@ -610,14 +626,16 @@ def local_change(
     complete = True
     if diff and diff[1]:
         fields["deleted_files"] = diff[1]
-    go_module = read_go_module(root)
+    modules = go_modules_of(root, changed)
+    go_module = modules.get("")
     if go_module:
         fields["go_module"] = go_module
-        if changed:
-            packages = go_dependents(root, changed) if go_list else None
-            complete = packages is not None
-            if go_list:
-                fields["affected_packages"] = packages or {}
+    if modules and changed:
+        packages = go_dependents(root, changed, modules) if go_list else None
+        complete = packages is not None
+        if go_list:
+            fields["affected_packages"] = packages or {}
+    go_modules = modules if set(modules) - {""} else None
     if changed and any(p.endswith(".py") for p in changed):
         files = python_dependents(root, changed) if py_imports else None
         complete = complete and files is not None
@@ -643,7 +661,21 @@ def local_change(
             java = found.payload()
     elif changed and any(p.endswith(".java") for p in changed):
         complete = False  # --no-java-graph: the Java links are unknown
-    return LocalChange(fields, config, complete, js_graph, java)
+    return LocalChange(fields, config, complete, js_graph, java, go_modules)
+
+
+def go_modules_of(root: Path, changed: Sequence[str] | None) -> dict[str, str]:
+    """The checkout's Go modules (directory -> module path), looked for when the root has a
+    go.mod or go.work, or the change touches Go files; else none."""
+    go_files = any(p.endswith((".go", "/go.mod", "/go.work")) or p in ("go.mod", "go.work")
+                   for p in changed or ())  # fmt: skip
+    if not (go_files or (root / "go.mod").is_file() or (root / "go.work").is_file()):
+        return {}
+    try:
+        return find_go_modules(root)
+    except OSError:
+        module = read_go_module(root)
+        return {"": module} if module else {}
 
 
 def java_dependents(root: Path, changed: list[str], deleted: Sequence[str]) -> Any:
@@ -821,10 +853,7 @@ def selection_request(
         **change.fields,
         "always_run": list(change.config.always_run),
     }
-    if change.js_graph:
-        body["js_graph"] = change.js_graph
-    if change.java:
-        body["java"] = change.java
+    body.update(change.select_only())
     if junit_dir:
         body["junit_dir"] = junit_dir
     if order is not Order.RISK:
@@ -880,9 +909,10 @@ def junit_failures(paths: Sequence[Path]) -> list[dict[str, Any]]:
 def post_select(
     server: str, token: str, body: dict[str, Any], timeout: float = 60
 ) -> dict[str, Any]:
-    """``POST /select``. A server older than the JS/TS graph or the Java build rejects
-    ``js_graph`` or ``java``: then once more without them (the graphs' edges are in
-    affected_files, which every server takes; Java tests then run in full, as before)."""
+    """``POST /select``. A server older than the JS/TS graph, the Java build or Go
+    workspaces rejects ``js_graph``, ``java`` or ``go_modules``: then once more without them
+    (the graphs' edges are in affected_files/affected_packages, which every server takes; Java
+    tests then run in full and Go commands name packages as before)."""
     try:
         return post_json(server, token, "/select", body, timeout=timeout)
     except SiftwiseError as exc:
@@ -896,7 +926,7 @@ def post_select(
 
 
 # /select fields a server older than this client may not know; dropped on its 422.
-OPTIONAL_SELECT_FIELDS = ("js_graph", "java")
+OPTIONAL_SELECT_FIELDS = ("js_graph", "java", "go_modules")
 
 
 def post_json(
@@ -939,13 +969,31 @@ def upload_run(
     *,
     defer_rollup: bool = False,
     timeout: float = 300,
+    jest_root: Path | None = None,
+    warn: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """``POST /runs`` with these JUnit files. Raises SiftwiseError."""
+    """``POST /runs`` with these JUnit files. With ``jest_root`` (the checkout), Jest suites
+    reported without a file get it from the checkout (``jestfiles``), and ``warn`` hears about
+    those that can't. Raises SiftwiseError."""
+    reports = [(path.name, path.read_bytes()) for path in junit]
+    if jest_root is not None:
+        from siftwise.cli import jestfiles
+
+        finder = jestfiles.finder(jest_root)  # one per command: read once
+        unresolved: dict[str, str] = {}
+        for k, (name, data) in enumerate(reports):
+            data, found = jestfiles.with_files(data, finder)
+            reports[k] = (name, data)
+            unresolved.update(found.unresolved)
+        stop_only = all(why == jestfiles.STOPPED for why in unresolved.values())
+        if unresolved and warn is not None and not (stop_only and finder.stop_warned):
+            warn(jestfiles.unresolved_note(unresolved, finder.time_limit))
+            finder.stop_warned = finder.stop_warned or finder.stopped
     try:
         response = httpx.post(
             f"{server.rstrip('/')}/runs",
             params={"defer_rollup": "true"} if defer_rollup else None,
-            files=[("files", (path.name, path.read_bytes(), "application/xml")) for path in junit],
+            files=[("files", (name, data, "application/xml")) for name, data in reports],
             data={"metadata": json.dumps(metadata)},
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout,
@@ -1009,13 +1057,21 @@ def git_toplevel(cwd: Path | None = None) -> Path | None:
     return Path(proc.stdout.decode(errors="replace").strip())
 
 
-def go_dependents(root: Path, changed: list[str]) -> dict[str, list[str]] | None:
-    """Packages whose tests import a changed package; None (fallbacks apply) if go list fails."""
-    packages = run_go_list(root)
-    if packages is None:
-        _err("warning: `go list -deps -test -json ./...` failed; not selecting dependents")
-        return None
-    affected = build_graph(packages, root).affected(changed)
+def go_dependents(
+    root: Path, changed: list[str], modules: Mapping[str, str] | None = None
+) -> dict[str, list[str]] | None:
+    """Packages whose tests import a changed package, over every module of the checkout
+    (``go list`` in each module's directory); None (fallbacks apply) if any go list fails."""
+    graphs = []
+    for directory in sorted(modules or {"": ""}):
+        packages = run_go_list(root / directory if directory else root)
+        if packages is None:
+            where = f" in {directory}/" if directory else ""
+            _err(f"warning: `go list -deps -test -json ./...` failed{where}; not selecting "
+                 "dependents")  # fmt: skip
+            return None
+        graphs.append(build_graph(packages, root))
+    affected = merge_graphs(graphs, (modules or {}).get("")).affected(changed)
     if affected:
         _err(f"siftwise: go list: {len(affected)} package(s) depend on changed Go code")
     return affected

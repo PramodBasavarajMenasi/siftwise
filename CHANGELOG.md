@@ -96,8 +96,41 @@ All notable changes to siftwise. The format follows
   - Eval: recall and time to first failure under budgets of 10%, 25% and 50% of each run's
     measured time, on rdflib and substrate (docs/eval-results.md).
 
+- v0.2 follow-ups ([#46](https://github.com/PramodBasavarajMenasi/siftwise/issues/46)):
+  - **Jest without `addFileAttribute`:** jest-junit's default report names no test file, so
+    Jest tests couldn't be selected by file or re-run. A suite named by its test file's path
+    (jest-junit's `usePathForSuiteName`) now gives the file, and otherwise
+    `record` finds the one test file in the checkout whose string literals make up the
+    suite's test names and adds it to the report it uploads; re-runs do the same. Two files
+    that could both be it, or none, leave the suite without a file, with a warning. The
+    search reads the checkout's Jest test files once per command, within 20 seconds (about
+    3 s cold for jestjs/jest's 1,362 test files on Linux); past that, the remaining suites get
+    no file, with one warning.
+  - **JUnit 5 display names in re-runs:** Gradle names tests by their `@DisplayName` (and a
+    parameterized invocation by its name alone, `[1] 1`), and so does Surefire's phrased
+    reporter, so `rerun-unknown` couldn't re-run them. The method is now read from the class's
+    source (`@DisplayName`, `@ParameterizedTest`/`@RepeatedTest` name templates, nested
+    classes, phrased class names); a name more than one method may carry isn't re-run, with
+    the reason.
+  - **Several Go modules:** `go.work` workspaces and `go.mod` files below the root. `go list`
+    runs in each module and the graphs merge (a local `replace` or a workspace module links
+    tests across modules); `/select` takes an optional `go_modules`, so a nested module's
+    package runs as `go test -C <dir> ./pkg` (from the root it failed with "setup failed"),
+    and an older server gets the request without it. Go re-runs run in the package's module.
+  - **GitLab Tests tab:** `.siftwise-record` now declares `artifacts:reports:junit:
+    .siftwise-ci/junit/*.xml`, the directory siftwise's pytest commands write to: a test job
+    that only extended it showed no tests in the pipeline's Tests tab. The README says where
+    other runners' reports must go.
+
 ### Fixed
 
+- `go list` (selection's Go graph) ran with the user's GOFLAGS, so `-mod=mod` (from the
+  environment or `go env -w`) could rewrite go.mod or go.sum. It runs with `-mod=readonly`
+  now; `-mod=vendor` is kept ([#52](https://github.com/PramodBasavarajMenasi/siftwise/issues/52)).
+- A test of a Go module below the repo root was selected with `go test ./dir/pkg` (or its
+  import path) run from the root, which Go can't build; its changed files mapped only when
+  the module's path mirrored its directory, and `go list` never saw the module, so its
+  dependents were missed. See "Several Go modules" above.
 - A Surefire report with a class-level result (`<testcase name="" classname="...">`, written
   for a JUnit 5 `@Nested` class skipped or failing as a whole) made `POST /runs` reject the
   whole upload (400). It's recorded as the class's `(class)` result now: every Windows leg of

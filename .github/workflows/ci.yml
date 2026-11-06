@@ -122,7 +122,7 @@ jobs:
         run: uv sync --locked
 
       - name: Real-tool tests
-        run: uv run pytest tests/test_reruns.py tests/test_javagraph.py -k for_real --durations=0
+        run: uv run pytest tests/test_reruns.py tests/test_javagraph.py tests/test_gograph.py -k for_real --durations=0
 
   package:
     name: package (build, twine check, light/server/mcp installs)
