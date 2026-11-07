@@ -96,6 +96,16 @@ All notable changes to siftwise. The format follows
   - Eval: recall and time to first failure under budgets of 10%, 25% and 50% of each run's
     measured time, on rdflib and substrate (docs/eval-results.md).
 
+- JS/TS dynamic imports with a static directory are bounded
+  ([#51](https://github.com/PramodBasavarajMenasi/siftwise/issues/51)): templates and
+  concatenations like ``import(`./locales/${lang}.json`)`` or `require('./plugins/' + name)`,
+  `import.meta.glob` (Vite) and `require.context` (webpack) become imports of every file
+  below that directory that they can match (relative or through tsconfig `paths`), so their
+  tests run only when one of those files changes, not for every JS change. Anything siftwise
+  can't bound stays as before (no static directory, just `./` or `../`, a bare package,
+  outside the checkout, more than 500 matching files). On jestjs/jest, 2 of 40 such files
+  became bounded.
+
 - Import depth in the risk order ([#48](https://github.com/PramodBasavarajMenasi/siftwise/issues/48)):
   a test whose own file imports changed code now ranks as a direct link (6), above tests that
   reach it only through other files (3). The CLI sends an optional `import_depths` in
@@ -132,6 +142,11 @@ All notable changes to siftwise. The format follows
     other runners' reports must go.
 
 ### Fixed
+
+- JS/TS: `import('./a/' + x)` was read as a literal import of `./a/`, and `import.meta.glob`
+  and `require.context` were ignored, so the files they load had no edges and changing one
+  didn't select the tests that load it. They are bounded imports now, or dynamic when they
+  can't be bounded ([#51](https://github.com/PramodBasavarajMenasi/siftwise/issues/51)).
 
 - `go list` (selection's Go graph) ran with the user's GOFLAGS, so `-mod=mod` (from the
   environment or `go env -w`) could rewrite go.mod or go.sum. It runs with `-mod=readonly`

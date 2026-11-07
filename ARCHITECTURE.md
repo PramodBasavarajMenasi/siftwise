@@ -122,7 +122,25 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   `<` in an expression position in .js/.jsx/.tsx; never in .ts, where it is a type
   assertion). It finds `import ... from`, `import '...'`, `import type`, `export ... from`,
   `require('...')`, `require.resolve`, `import('...')` and `jest.mock`/`requireActual`/...
-  with a literal. A `require` or `import()` of anything else makes the file *dynamic*.
+  with a literal. A `require` or `import()` of anything else makes the file *dynamic*,
+  unless its target is bounded (below).
+- **Bounded non-literal imports** (`ContextImport`, `Resolver.context`, #51): a template or a
+  `+` concatenation whose static start names a directory (``import(`./locales/${l}.json`)``,
+  `require('./plugins/' + n)`, `require(require.resolve(...))`), `import.meta.glob` with
+  literals (Vite; `!` exclusions are ignored, so never fewer files) and `require.context`
+  with a literal directory (webpack; its regex literal is applied when Python can compile it,
+  else every file) become edges to every checkout file below the directory, at any depth,
+  that matches the static name start and end (Node's extensions, `/index.*`, `.js` → `.ts`),
+  the glob or the regex: as bundlers' context modules include. The directory resolves
+  relatively or through tsconfig `paths` (every target: TypeScript tries them in turn) or
+  `baseUrl`. It stays dynamic, never guessed, for: no static start; a directory of only
+  `./`/`../`; a bare package; outside the checkout or not a directory in it; the repo root;
+  a Jest `moduleNameMapper` matching it; root-relative globs (Vite's root isn't known),
+  braces or extglobs; a concatenation with anything but `+` and member access outside
+  brackets (`?:`, `||`, `-` could change the value); no matching file; more than
+  `MAX_CONTEXT_FILES` (500). Assumed, as bundlers do: the computed part doesn't climb out of
+  the directory with `..`. Before #51 `import('./a/' + x)` was read as a literal `./a/` and
+  `import.meta.glob`/`require.context` were ignored: their files had no edges at all.
 - **Resolution**, first that applies: a JSON Jest `moduleNameMapper` (`jest.config.json` or
   package.json `jest`; a match that maps outside the checkout, like a CSS stub, is no edge);
   relative paths (exact, TS ESM's `.js` → `.ts`, `.ts .tsx .js .jsx .mts .cts .mjs .cjs
