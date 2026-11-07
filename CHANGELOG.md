@@ -96,6 +96,22 @@ All notable changes to siftwise. The format follows
   - Eval: recall and time to first failure under budgets of 10%, 25% and 50% of each run's
     measured time, on rdflib and substrate (docs/eval-results.md).
 
+- Java selection follow-ups ([#54](https://github.com/PramodBasavarajMenasi/siftwise/issues/54)):
+  - **Module build files are scoped.** A change to a module's own `pom.xml` or
+    `build.gradle[.kts]` runs the tests of that module and of every module that depends on
+    it, transitively (the build model now reads Maven artifactId references and Gradle
+    `project(':x')`), instead of the full suite. Root build files, settings, version
+    catalogs, wrappers, parent/aggregator/BOM POMs, Gradle build files that configure other
+    projects, and builds whose dependencies siftwise can't read (`${...}` artifactIds,
+    typesafe `projects.x` accessors) still run everything. On dropwizard's 148 PR runs: 5
+    more selective (22), 74 of 74 failures still caught, time skipped 10.0% -> 11.9%.
+  - **One Maven or Gradle command** for every selected module: `mvn -B -pl a,b -am test
+    -Dtest=...` and `gradle :a:test --tests A :b:test --tests B` (checked with real Maven
+    and Gradle). A Maven module whose selected class has a fully qualified name another
+    module also has keeps its own command: one `-Dtest` list would run the copy too. Maven
+    runs one invocation in reactor order.
+  - **A Gradle replay**: naver/fixture-monkey (docs/eval-results.md), 3 of 3 failures caught.
+
 - JS/TS dynamic imports with a static directory are bounded
   ([#51](https://github.com/PramodBasavarajMenasi/siftwise/issues/51)): templates and
   concatenations like ``import(`./locales/${lang}.json`)`` or `require('./plugins/' + name)`,
@@ -143,6 +159,10 @@ All notable changes to siftwise. The format follows
 
 ### Fixed
 
+- Java: when two modules have a test class with the same fully qualified name, a change to
+  one module's test resources ran only the other module's copy (each class was kept under
+  one module). Each module's own classes run now
+  ([#54](https://github.com/PramodBasavarajMenasi/siftwise/issues/54)).
 - JS/TS: `import('./a/' + x)` was read as a literal import of `./a/`, and `import.meta.glob`
   and `require.context` were ignored, so the files they load had no edges and changing one
   didn't select the tests that load it. They are bounded imports now, or dynamic when they

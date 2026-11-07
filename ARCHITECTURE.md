@@ -227,15 +227,45 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   itself, else indirect: see "Import depth"). `src/test/resources` selects the module's test
   classes. Main resources, other JVM languages, unanalysed modules and an unsupported build
   run the full suite; so does a changed class nothing reaches.
-- **Commands**, one per module, classes and modules in risk order, packed by the budget like
-  any unit: Maven `./mvnw -B -pl <module> -am test -Dtest=A,B
-  -Dsurefire.failIfNoSpecifiedTests=false` (`-am` builds the modules it depends on, their
-  tests filtered out by the same `-Dtest`, so no installed snapshot is needed; `verify` with
+- **Module build files** (#54, `javagraph.build_scopes`): the build model also reads which
+  modules depend on which. Maven: any `<artifactId>` a POM names outside
+  `<dependencyManagement>` and comments (dependencies, plugins and their dependencies,
+  profiles, exclusions, its `<parent>`: more dependents, never fewer); a BOM's managed list
+  isn't a dependency (the BOM doesn't change when a module's POM does). Gradle:
+  `project(':x')` / `project(path: ':x')` in a project's build file, and in the root build
+  file or buildSrc for every project. A changed module `pom.xml` or `build.gradle[.kts]`
+  (never the root's) gets a scope: its module and every module depending on it,
+  transitively, sent as `java.build_scopes` (only when there is one: an older server rejects
+  the key and with it all of `java`, but it ran the full suite for any build file anyway).
+  The server runs every test class of the scope's modules (a class with no history as a new
+  one; `JavaBuildInfo.module_classes` keeps each module's own list, since `test_classes`
+  keeps one module per class) instead of the full suite. Unscoped, so the full suite as
+  before: a parent or aggregator POM (`packaging pom`, `<modules>`, a `<parent>` of another
+  module by relativePath or artifactId), a POM with `<dependencyManagement>` or
+  `<pluginManagement>`, an artifactId siftwise can't read, a Gradle build file that
+  configures other projects (`subprojects`, `allprojects`, `rootProject`, `childProjects`,
+  `configure`, `evaluationDependsOn`), a scope with a module whose tests the class lists may
+  miss (other languages, custom source dirs or sets, build-helper sources; an annotation
+  processor alone doesn't hide test classes), a build file the model doesn't place (a POM
+  under test resources), and every module when one POM names an artifactId by
+  `${property}` or a Gradle build uses `projects.x` or a non-literal `project(...)`.
+  Triage still links a module build file like a root build file (low, every test): recorded
+  runs keep no build model.
+- **Commands** (#54: one for all modules where that's safe), classes and modules in risk
+  order, packed by the budget like any unit (a unit is still a module's class): Maven
+  `./mvnw -B -pl a,b -am test -Dtest=A,B -Dsurefire.failIfNoSpecifiedTests=false` (no `-pl`
+  when the root project is one of them; `-am` builds the modules they depend on, their tests
+  filtered out by the same `-Dtest`, so no installed snapshot is needed; `verify` with
   `-Dit.test=... -Dit.failIfNoSpecifiedTests=false` when Failsafe's `*IT` classes are in it);
-  Gradle `./gradlew :<module>:test --tests A --tests B` (`:test` for the root project). Both
-  shapes were run for real on multi-module fixtures with Maven 3.9.9 and Gradle 8.10.2. The
-  full suite is `mvn -B verify` (with integration tests in history; else `test`) or
-  `gradle test`.
+  Gradle `./gradlew :a:test --tests A :b:test --tests B` (`:test` for the root project).
+  Checked for real (Maven 3.9.9, Gradle 8.10.2, `tests/test_java_commands_real.py`): one
+  Maven `-Dtest` list of fully qualified names runs exactly those classes in every module of
+  the invocation (a same-named class in another package doesn't run), so a class name two
+  modules share runs in both: such a module (`JavaBuildInfo.shared_classes`) keeps its own
+  command. Gradle's `--tests` filters only the task before it, so one command is always
+  safe. Maven runs one invocation in reactor (dependency) order: across modules the risk
+  order only orders the commands. The full suite is `mvn -B verify` (with integration tests
+  in history; else `test`) or `gradle test`.
 - **Triage** links Java tests without the build model (recorded runs keep only the edges): a
   changed test class (high), name mapping (high), a graph user (medium).
 - **Limits:** reflection by computed name (Spring component scanning, `ServiceLoader`),

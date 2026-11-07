@@ -974,7 +974,9 @@ class GraphProvider:
     ) -> tuple[JavaChange | None, str]:
         """The Java build, test classes and graph at ``sha`` (cached per commit), and what
         ``changed`` does to the test classes."""
-        cache = self.cache_dir / f"javagraph-{sha}.json"
+        # v2 (#54): snapshots carry the module dependencies for build file scoping; a v1 one
+        # would load as "nothing scoped", so they're rebuilt.
+        cache = self.cache_dir / f"javagraph-v2-{sha}.json"
         if cache.exists() and not deleted:
             build, classes, graph = snapshot_from_json(json.loads(cache.read_text()))
         else:

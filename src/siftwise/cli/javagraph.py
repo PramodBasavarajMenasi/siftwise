@@ -92,6 +92,14 @@ class JavaBuild:
     wrapper: bool
     modules: tuple[JavaModule, ...] = ()
     unsupported: str = ""  # why the build couldn't be read: every Java change runs everything
+    # For scoping a module's build file change (``build_scopes``): module path -> the modules
+    # that depend on it directly (Maven: their POM names its artifactId; Gradle: they name it
+    # in project(':x')), and module path -> why a change to its build file can't be scoped.
+    # ``scopes_known`` False (a build whose dependencies can't be read, or an older eval
+    # snapshot): no build file change is scoped.
+    dependents: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    unscoped: Mapping[str, str] = field(default_factory=dict)
+    scopes_known: bool = False
 
 
 def detect_build(root: Path) -> JavaBuild | None:
@@ -197,7 +205,67 @@ def _maven_build(root: Path, wrapper: bool) -> JavaBuild:
                 queue.append("" if child == "." else child)
     except (OSError, UnicodeDecodeError, ElementTree.ParseError) as exc:
         return JavaBuild(MAVEN, wrapper, unsupported=f"a pom.xml can't be read ({exc})")
-    return JavaBuild(MAVEN, wrapper, tuple(sorted(modules, key=lambda m: m.path)))
+    dependents, unscoped, known = _maven_scoping({d: poms[d] for d in seen})
+    return JavaBuild(MAVEN, wrapper, tuple(sorted(modules, key=lambda m: m.path)),
+                     dependents=dependents, unscoped=unscoped, scopes_known=known)  # fmt: skip
+
+
+_ARTIFACT = re.compile(r"<artifactId>\s*([^<]*?)\s*</artifactId>")
+
+
+def _maven_scoping(
+    poms: Mapping[str, tuple[Element, str]],
+) -> tuple[dict[str, tuple[str, ...]], dict[str, str], bool]:
+    """(module -> modules naming its artifactId, module -> why its POM can't be scoped,
+    whether dependencies could be read). Any ``<artifactId>`` in a POM counts (dependencies,
+    plugins, profiles, exclusions): more dependents, never fewer. One built from a property
+    (``${...}``) may name any module: nothing is scoped."""
+    artifact: dict[str, str] = {}
+    unscoped: dict[str, str] = {}
+    refs: dict[str, set[str]] = {}
+    for directory, (project, text) in poms.items():
+        own = _child(project, "artifactId")
+        name = (own.text or "").strip() if own is not None else ""
+        # Versions a POM manages (a BOM's list) aren't dependencies: a module's POM change
+        # doesn't change the BOM. A change to the managing POM itself is never scoped.
+        used = re.sub(r"<dependencyManagement\b.*?</dependencyManagement>", "",
+                      _xml_without_comments(text), flags=re.S)  # fmt: skip
+        found = set(_ARTIFACT.findall(used))
+        if any("${" in ref for ref in found):
+            return {}, {}, False
+        refs[directory] = found - {name}
+        if not name or "${" in name:
+            unscoped[directory] = "its pom.xml names no plain artifactId"
+            continue
+        artifact[directory] = name
+        packaging = _child(project, "packaging")
+        if not directory:
+            unscoped[directory] = "the root pom.xml"
+        elif (packaging is not None and (packaging.text or "").strip() == "pom") or (
+            re.search(r"<modules\b", text)
+        ):
+            unscoped[directory] = "a parent or aggregator POM (packaging pom, <modules>)"
+        elif re.search(r"<(dependencyManagement|pluginManagement)\b", text):
+            unscoped[directory] = "its POM manages versions or plugins others may use"
+    by_artifact: dict[str, list[str]] = defaultdict(list)
+    for directory, name in artifact.items():
+        by_artifact[name].append(directory)
+    dependents: dict[str, set[str]] = defaultdict(set)
+    for directory, (project, _) in poms.items():
+        parent = _child(project, "parent", "artifactId")
+        parent_name = (parent.text or "").strip() if parent is not None else ""
+        for target in [*by_artifact.get(parent_name, ()), _parent_dir(project, directory)]:
+            if target is not None and target in poms and target != directory:
+                unscoped.setdefault(target, f"the parent POM of {directory or '.'}")
+        for ref in refs[directory]:
+            for target in by_artifact.get(ref, ()):
+                if target != directory:
+                    dependents[target].add(directory)
+    return {m: tuple(sorted(d)) for m, d in dependents.items()}, unscoped, True
+
+
+def _xml_without_comments(text: str) -> str:
+    return re.sub(r"<!--.*?-->", "", text, flags=re.S)
 
 
 def _parent_dir(project: Element, directory: str) -> str | None:
@@ -317,7 +385,86 @@ def _gradle_build(root: Path, wrapper: bool) -> JavaBuild:
         flags += _language_dirs(root, path)
         name = ":" + path.replace("/", ":") if path else ""
         modules.append(JavaModule(path, name, tuple(dict.fromkeys(flags))))
-    return JavaBuild(GRADLE, wrapper, tuple(sorted(modules, key=lambda m: m.path)))
+    dependents, unscoped, known = _gradle_scoping(root, paths, shared)
+    return JavaBuild(GRADLE, wrapper, tuple(sorted(modules, key=lambda m: m.path)),
+                     dependents=dependents, unscoped=unscoped, scopes_known=known)  # fmt: skip
+
+
+_PROJECT_REF = re.compile(r"""\bproject\s*\(\s*(?:path\s*[:=]\s*)?(['"])(:[^'"]*)\1""")
+# A project reference siftwise can't read: typesafe accessors (projects.core), a non-literal.
+_UNREAD_PROJECT = re.compile(
+    r"""\bprojects\.[A-Za-z]|\bproject\s*\(\s*(?!(?:path\s*[:=]\s*)?['"])"""
+)
+# Build logic in a project's build file that configures other projects.
+_CONFIGURES_OTHERS = re.compile(
+    r"\b(subprojects|allprojects|rootProject|childProjects|evaluationDependsOn|configure)\b"
+)
+
+
+def _gradle_scoping(
+    root: Path, paths: Sequence[str], shared: str
+) -> tuple[dict[str, tuple[str, ...]], dict[str, str], bool]:
+    """Like ``_maven_scoping``, from ``project(':x')`` references in each project's build
+    file; references in the root build file or buildSrc (``shared``) count for every project."""
+    texts = {
+        p: _without_comments("".join(_read(root / p / n) for n in GRADLE_BUILD_FILES))
+        for p in paths
+    }
+    if any(_UNREAD_PROJECT.search(t) for t in [*texts.values(), shared]):
+        return {}, {}, False
+
+    def targets(text: str) -> set[str]:
+        return {m.group(2).strip(":").replace(":", "/") for m in _PROJECT_REF.finditer(text)}
+
+    everyone = targets(shared)
+    dependents: dict[str, set[str]] = defaultdict(set)
+    unscoped: dict[str, str] = {"": "the root build file"}
+    for path, text in texts.items():
+        if path and _CONFIGURES_OTHERS.search(text):
+            unscoped[path] = "its build file configures other projects"
+        for target in (targets(text) | everyone) - {path}:
+            if target in texts:
+                dependents[target].add(path)
+    return {m: tuple(sorted(d)) for m, d in dependents.items()}, unscoped, True
+
+
+def build_scopes(build: JavaBuild, changed: Iterable[str]) -> dict[str, list[str]]:
+    """Changed module build file (a module's ``pom.xml`` or ``build.gradle[.kts]``, never the
+    root's) -> the modules whose tests it can affect: its module and every module that
+    depends on it, transitively. Left out (the full suite, as for any build file): the root,
+    a module the build model doesn't place, an unscoped one (a parent POM, version or plugin
+    management, configuring other projects), one whose scope holds a module with tests the
+    class lists may miss (``_hides_tests``: other-language or custom test sources), and every
+    one when the build's dependencies can't be read."""
+    if not build.scopes_known or build.unsupported:
+        return {}
+    names = ("pom.xml",) if build.tool == MAVEN else GRADLE_BUILD_FILES
+    modules = {m.path: m for m in build.modules}
+    found: dict[str, list[str]] = {}
+    for path in sorted(set(changed)):
+        directory, base = posixpath.split(path)
+        if base not in names or not directory or directory not in modules:
+            continue
+        if directory in build.unscoped:
+            continue
+        scope = {directory}
+        queue = deque([directory])
+        while queue:
+            for user in build.dependents.get(queue.popleft(), ()):
+                if user not in scope:
+                    scope.add(user)
+                    queue.append(user)
+        if any(_hides_tests(modules[m]) for m in scope if m in modules):
+            continue
+        found[path] = sorted(scope)
+    return found
+
+
+def _hides_tests(module: JavaModule) -> bool:
+    """Whether a module may have tests its ``src/test/java`` file names don't list: other
+    languages' test sources, custom source directories or source sets, added sources. An
+    annotation processor alone doesn't: it generates code, not test classes."""
+    return any(not flag.startswith("annotation processors") for flag in module.unanalysed)
 
 
 def _gradle_shared(root: Path) -> str:
@@ -645,6 +792,8 @@ class JavaChange:
     nearest: dict[str, Nearest] = field(default_factory=dict)
     dynamic: dict[str, str] = field(default_factory=dict)
     notes: tuple[str, ...] = ()
+    # Changed module build file -> the modules to run (``build_scopes``).
+    build_scopes: dict[str, list[str]] = field(default_factory=dict)
 
     def payload(self) -> dict[str, Any]:
         """``/select``'s ``java``."""
@@ -663,6 +812,9 @@ class JavaChange:
             },
             "dynamic": dict(self.dynamic),
             "notes": list(self.notes),
+            # Only when there is one: an older server rejects the key (and then all of
+            # `java`), but it runs the full suite for any build file change anyway.
+            **({"build_scopes": dict(self.build_scopes)} if self.build_scopes else {}),
         }
 
 
@@ -676,7 +828,7 @@ def java_change(
         return None
     test_classes = test_classes_of(root, build)
     if build.unsupported or not any(p.endswith(".java") for p in changed):
-        return JavaChange(build, test_classes)
+        return change_from(build, test_classes, None, changed)
     graph = build_java_graph(root, build, [p for p in deleted if p.endswith(".java")])
     return change_from(build, test_classes, graph, changed)
 
@@ -703,10 +855,11 @@ def change_from(
 ) -> JavaChange:
     """What a change does to the test classes, given the build's graph (None: no Java file
     changed, so no graph is needed)."""
+    scopes = build_scopes(build, changed)
     if graph is None or build.unsupported or not any(p.endswith(".java") for p in changed):
-        return JavaChange(build, test_classes)
+        return JavaChange(build, test_classes, build_scopes=scopes)
     files, nearest, dynamic = graph.affected(changed)
-    return JavaChange(build, test_classes, files, nearest, dynamic, graph.notes)
+    return JavaChange(build, test_classes, files, nearest, dynamic, graph.notes, scopes)
 
 
 def snapshot_json(
@@ -719,6 +872,9 @@ def snapshot_json(
             "wrapper": build.wrapper,
             "unsupported": build.unsupported,
             "modules": [[m.path, m.name, list(m.unanalysed)] for m in build.modules],
+            "dependents": {m: list(d) for m, d in build.dependents.items()},
+            "unscoped": dict(build.unscoped),
+            "scopes_known": build.scopes_known,
         },
         "test_classes": {m: list(c) for m, c in test_classes.items()},
         "graph": None
@@ -741,6 +897,9 @@ def snapshot_from_json(
         b["wrapper"],
         tuple(JavaModule(path, name, tuple(flags)) for path, name, flags in b["modules"]),
         b["unsupported"],
+        {m: tuple(d) for m, d in (b.get("dependents") or {}).items()},
+        dict(b.get("unscoped") or {}),
+        bool(b.get("scopes_known")),  # an older snapshot: unknown, nothing scoped
     )
     g = data["graph"]
     graph = (

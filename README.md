@@ -1011,9 +1011,19 @@ jestjs/jest, 2 of its 40 files with computed imports became bounded: almost all 
 `require` a variable.
 
 For Java, siftwise reads `pom.xml` modules or `settings.gradle[.kts]` includes (no Maven,
-Gradle or JVM runs) and each module's `src/main/java` and `src/test/java`. It runs the full
-suite instead when a build file changes (`pom.xml`, `build.gradle*`, `settings.gradle*`,
-`gradle.properties`, `gradle/`, wrappers, `.mvn/`, `lombok.config`), when main resources
+Gradle or JVM runs) and each module's `src/main/java` and `src/test/java`. A change to a
+module's own build file (its `pom.xml` or `build.gradle[.kts]`) runs the test classes of that
+module and of every module that depends on it, transitively (Maven: a POM naming its
+artifactId outside `<dependencyManagement>`, its parent included; Gradle: `project(':x')`,
+the root build file's counting for every project). It runs the full suite instead when the
+root build file or another build file changes (`settings.gradle*`, `gradle.properties`,
+`gradle/`, wrappers, `.mvn/`, `lombok.config`), when the module's build file is one others
+inherit from or configure through (a parent or aggregator POM, `packaging pom`,
+`<dependencyManagement>`/`<pluginManagement>`, a Gradle build file with `subprojects`,
+`allprojects`, `configure(...)` or the like), when the build's dependencies can't be read
+(an artifactId built from a `${property}`, typesafe `projects.x` accessors, a non-literal
+`project(...)`), when the scope holds a module whose tests the class lists may miss (Kotlin,
+Groovy or Scala tests, custom source directories), when main resources
 change (any code may load them at runtime), when Kotlin, Groovy or Scala sources change, when
 a changed Java file is in a module it doesn't analyse (custom source directories, annotation
 processors that generate code; Lombok and checkers like ErrorProne don't count), or when it
@@ -1021,9 +1031,16 @@ can't read the build (`include` of non-literals, `includeBuild`, Android). Refle
 be seen statically (Spring component scanning, `ServiceLoader`, `Class.forName` of a computed
 name): declare those dependencies with `[[depends]]` rules. `--no-java-graph` turns the graph
 off.
+Selected classes run in one command: Maven `mvn -B -pl a,b -am test -Dtest=...` (one
+`-Dtest` list for every module of the invocation, so a module whose selected class has a
+fully qualified name another module also has runs on its own: the copy would run too),
+Gradle `gradle :a:test --tests A :b:test --tests B` (each `--tests` filters the task before
+it). Maven then runs the modules in reactor order, not risk order.
 On dropwizard's history (42 Maven modules) it caught 74 of 74 failures, and its selective
-runs skipped a median 91% of test time, but most of its PRs change a `pom.xml` and run
-everything ([eval results](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-results.md#java-dropwizarddropwizard-maven)).
+runs skipped a median 91% of test time; scoping module POMs made 5 more of its 148 PR runs
+selective (22), but most of its PRs bump the BOM and still run everything. On
+fixture-monkey (a Gradle build) it caught 3 of 3, a small history
+([eval results](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-results.md#java-dropwizarddropwizard-maven)).
 
 Jest selection needs each test's file. jest-junit writes it only with `addFileAttribute:
 "true"` (or `usePathForSuiteName`), so without it `record` finds it in
