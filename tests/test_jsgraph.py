@@ -13,7 +13,7 @@ import respx
 
 from siftwise.cli import jsgraph
 from siftwise.cli import main as cli
-from siftwise.cli.jsgraph import JsGraph, build_js_graph, imports, jsonc
+from siftwise.cli.jsgraph import ContextImport, Imports, JsGraph, build_js_graph, imports, jsonc
 from siftwise.core.risk import Order
 from siftwise.core.selector import (
     LINK_JS_IMPORT,
@@ -122,13 +122,56 @@ def test_ts_generics_are_not_jsx() -> None:
     "source",
     [
         "const m = require(name);",
-        "const m = require('./plugins/' + name);",
-        "const m = await import(`./locale/${lang}.js`);",
         "const m = import(path);",
+        "const m = require(a ? './x' : './y');",  # not a concatenation: can't tell
+        "const m = require(`${base}/x`);",
+        "const m = require(x + '/y.js');",  # no static start
+        "const m = require('./a/' + (b || c) - d);",
+        "const m = require.context(dir);",
+        "const m = import.meta.glob(patterns);",
+        "const m = import.meta.glob(['!./a/*.ts']);",  # only exclusions: no bound
     ],
 )
 def test_a_non_literal_require_or_import_is_dynamic(source: str) -> None:
     assert imports(source).dynamic is True
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("require('./plugins/' + name);", ContextImport("prefix", "./plugins/", "")),
+        ("import(`./locales/${lang}.json`);", ContextImport("prefix", "./locales/", ".json")),
+        ("import(`../pages/${p}`);", ContextImport("prefix", "../pages/", "")),
+        ("require('./a/' + 'b-' + x.y + '/' + z + '.js');",
+         ContextImport("prefix", "./a/b-", ".js")),
+        ("require(`./a/${x}` + '.js');", ContextImport("prefix", "./a/", ".js")),
+        ("require(require.resolve(`./plugins/${name}`));",
+         ContextImport("prefix", "./plugins/", "")),
+        ("import('./plugins/' + name);", ContextImport("prefix", "./plugins/", "")),
+        (r"require.context('./icons', false, /\.svg$/i);",
+         ContextImport("context", "./icons", recursive=False, regex=r"/\.svg$/i")),
+        ("require.context('./icons');", ContextImport("context", "./icons")),
+        ("import.meta.glob('./pages/*.tsx', { eager: true });",
+         ContextImport("glob", "./pages/*.tsx")),
+    ],
+)  # fmt: skip
+def test_bounded_non_literal_imports_are_read_as_contexts(
+    source: str, expected: ContextImport
+) -> None:
+    found = imports(source)
+    assert found.contexts == (expected,)
+    assert not found.dynamic  # the graph decides: dynamic only if it can't bound the context
+    assert found.specifiers == ()
+
+
+def test_globs_take_every_literal_and_skip_exclusions() -> None:
+    found = imports("const m = import.meta.glob(['./a/*.ts', '!./a/x.ts', './b/**/*.ts',]);")
+    assert found.contexts == (
+        ContextImport("glob", "./a/*.ts"),
+        ContextImport("glob", "./b/**/*.ts"),
+    )
+    # A concatenation of literals is a literal; other import.meta stays nothing.
+    assert imports("require('./a' + '/b'); import.meta.url;") == Imports(("./a/b",), False)
 
 
 def test_declarations_and_mocks_of_variables_are_not_dynamic() -> None:

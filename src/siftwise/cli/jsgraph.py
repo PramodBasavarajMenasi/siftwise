@@ -12,7 +12,10 @@ file, skipping comments, strings, template literals, regular expressions and JSX
 (type changes break compiles), ``export ... from``, ``require('...')``, ``import('...')`` and
 ``jest.mock('...')``-style calls. A ``require`` or ``import()`` of anything but a literal can
 load any file: the file is *dynamic*, and every test that reaches it is selected for any
-JS change (never counted as covering the change).
+JS change (never counted as covering the change). Unless it is bounded (``ContextImport``):
+a template or concatenation with a static directory (``import(`./locales/${l}.json`)``),
+``import.meta.glob`` or ``require.context`` with literals is an edge to every file below the
+directory that it can match (``Resolver.context``; dynamic again when it can't be bounded).
 
 Resolution, first that applies (``Resolver``):
 
@@ -33,6 +36,7 @@ Resolution, first that applies (``Resolver``):
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import os
@@ -71,6 +75,9 @@ _IDENT = re.compile(r"[\w$\u0080-\uffff]+")
 _BLANK = frozenset(" \t\r\n\ufeff\u00a0")
 _JSX_NAME = re.compile(r"[A-Za-z_$][\w$.:-]*")
 MAX_NOTES = 5
+# A bounded non-literal import (a context module) matching more files than this stays dynamic:
+# past it the "bound" is most of a project, and its edges would cost more than they save.
+MAX_CONTEXT_FILES = 500
 
 
 # --- tokenizer ------------------------------------------------------------------------------
@@ -79,8 +86,12 @@ MAX_NOTES = 5
 @dataclass(frozen=True)
 class Token:
     kind: str  # "id", "num", "str" (a string or a template without ${}), "tpl" (with ${}),
-    # "punct", "jsx"
+    # "re" (a regular expression literal), "punct", "jsx"
     value: str
+    # A "tpl": its static pieces around each ${} (one more than the substitutions), and how
+    # many tokens its ${} expressions left just before it.
+    parts: tuple[str, ...] = ()
+    inner: int = 0
 
 
 class _Scanner:
@@ -101,7 +112,7 @@ class _Scanner:
         if not self.tokens:
             return True
         last = self.tokens[-1]
-        if last.kind in ("num", "str", "tpl", "jsx"):
+        if last.kind in ("num", "str", "tpl", "re", "jsx"):
             return False
         if last.kind == "id":
             return last.value in _EXPRESSION_KEYWORDS
@@ -181,25 +192,35 @@ class _Scanner:
         s = self.s
         self.i += 1
         out: list[str] = []
-        substituted = False
+        parts: list[str] = []  # the static pieces before each ${}
+        piece: list[str] = []
+        start = len(self.tokens)
         while self.i < self.n:
             c = s[self.i]
             if c == "\\":
                 out.append(s[self.i + 1 : self.i + 2])
+                piece.append(s[self.i + 1 : self.i + 2])
                 self.i += 2
             elif c == "`":
                 self.i += 1
                 break
             elif c == "$" and s.startswith("${", self.i):
-                substituted = True
+                parts.append("".join(piece))
+                piece = []
                 self.i += 2
                 # The expression's own tokens matter (a require inside it), but not as part
-                # of the template: keep them, then mark the template.
+                # of the template: keep them (before the template's token, which counts
+                # them in `inner`), then mark the template.
                 self.code(until_brace=True)
             else:
                 out.append(c)
+                piece.append(c)
                 self.i += 1
-        self.tokens.append(Token("tpl" if substituted else "str", "".join(out)))
+        if not parts:
+            self.tokens.append(Token("str", "".join(out)))
+            return
+        inner = len(self.tokens) - start
+        self.tokens.append(Token("tpl", "".join(out), (*parts, "".join(piece)), inner))
 
     def _regex(self) -> None:
         s, i = self.s, self.i + 1
@@ -220,8 +241,8 @@ class _Scanner:
                 break
             i += 1
         m = _IDENT.match(s, i)  # flags
-        self.i = m.end() if m else i
-        self.tokens.append(Token("str", ""))  # an operand, like a string
+        start, self.i = self.i, m.end() if m else i
+        self.tokens.append(Token("re", s[start : self.i]))  # an operand, like a string
 
     # --- JSX: skipped as an operand; its {expressions} are scanned as code ----------------
 
@@ -322,16 +343,181 @@ def scan(source: str, jsx: bool = True) -> list[Token]:
 
 
 @dataclass(frozen=True)
+class ContextImport:
+    """A ``require``/``import()`` whose target isn't a literal but is bounded by a static
+    directory, like a bundler's context module (``Resolver.context`` finds its files):
+
+    * ``prefix``: a template or concatenation, ``pattern`` = its static start
+      (``./locales/``), ``suffix`` = its static end (``.json``, may be empty);
+    * ``glob``: ``import.meta.glob`` (Vite), ``pattern`` = one glob (``./pages/*.tsx``);
+    * ``context``: ``require.context`` (webpack), ``pattern`` = the directory, with
+      ``recursive`` and the ``regex`` literal (``/\\.js$/i``; None: every file).
+    """
+
+    kind: str
+    pattern: str
+    suffix: str = ""
+    recursive: bool = True
+    regex: str | None = None
+
+
+@dataclass(frozen=True)
 class Imports:
     specifiers: tuple[str, ...]  # what the file imports, in order, de-duplicated
-    dynamic: bool  # a require/import() of a non-literal: it may load any file
+    dynamic: bool  # a require/import() siftwise can't bound: it may load any file
+    contexts: tuple[ContextImport, ...] = ()  # bounded non-literal imports, de-duplicated
+
+
+def _call_args(tokens: Sequence[Token], k: int) -> list[list[Token]] | None:
+    """The arguments of the call whose ``(`` is at ``k``, each as its tokens (a template's
+    ``${}`` tokens left out: the template token stands for them); None if it doesn't close."""
+    args: list[list[Token]] = []
+    current: list[Token] = []
+    depth = 0
+    for j in range(k + 1, min(len(tokens), k + 2000)):
+        t = tokens[j]
+        if t.kind == "punct" and t.value in "([{":
+            depth += 1
+        elif t.kind == "punct" and t.value in ")]}":
+            if depth == 0:
+                if t.value != ")":
+                    return None
+                if current or args:
+                    args.append(current)
+                return [_collapse(arg) for arg in args]
+            depth -= 1
+        elif t.kind == "punct" and t.value == "," and depth == 0:
+            args.append(current)
+            current = []
+            continue
+        current.append(t)
+    return None
+
+
+def _collapse(tokens: Sequence[Token]) -> list[Token]:
+    """``tokens`` without the tokens of templates' ``${}`` expressions (just before each)."""
+    out: list[Token] = []
+    i = len(tokens) - 1
+    while i >= 0:
+        out.append(tokens[i])
+        i -= 1 + (tokens[i].inner if tokens[i].kind == "tpl" else 0)
+    return out[::-1]
+
+
+# Punctuation a concatenation may hold outside brackets: `'./a/' + x.y + '.js'`. Anything
+# else there (?:, ||, &&, -, !, ??) could make the value something else entirely.
+_CONCAT_PUNCT = frozenset("+.()[]{}")
+
+
+def _target(arg: Sequence[Token]) -> str | ContextImport | None:
+    """What a require/import() argument loads: a literal, a bounded pattern, or None (can't
+    tell: dynamic)."""
+    if len(arg) == 1 and arg[0].kind == "str":
+        return arg[0].value
+    if len(arg) == 1 and arg[0].kind == "tpl":
+        parts = arg[0].parts  # `${base}/x`: no static start, nothing bounds it
+        return ContextImport("prefix", parts[0], parts[-1]) if parts[0] else None
+    if (
+        len(arg) >= 5
+        and [t.value for t in arg[:4]] == ["require", ".", "resolve", "("]
+        and _closes_last(arg, 3)
+    ):
+        inner = _call_args(arg, 3)  # require(require.resolve(X)) loads what X names
+        return _target(inner[0]) if inner else None
+    terms: list[list[Token]] = [[]]
+    depth = 0
+    for t in arg:
+        if t.kind == "punct":
+            if depth == 0 and t.value not in _CONCAT_PUNCT:
+                return None
+            if t.value in "([{":
+                depth += 1
+            elif t.value in ")]}":
+                depth -= 1
+            elif t.value == "+" and depth == 0:
+                terms.append([])
+                continue
+        terms[-1].append(t)
+    if len(terms) < 2 or not all(terms):
+        return None
+
+    def literal(term: list[Token]) -> bool:
+        return len(term) == 1 and term[0].kind == "str"
+
+    if all(literal(term) for term in terms):
+        return "".join(term[0].value for term in terms)
+    first, last = terms[0], terms[-1]
+    if literal(first):
+        lead = len(list(_takewhile(literal, terms)))
+        prefix = "".join(term[0].value for term in terms[:lead])
+    elif len(first) == 1 and first[0].kind == "tpl":
+        prefix = first[0].parts[0]
+    else:
+        return None
+    if not prefix:
+        return None
+    if literal(last):
+        trail = len(list(_takewhile(literal, terms[::-1])))
+        suffix = "".join(term[0].value for term in terms[len(terms) - trail :])
+    elif len(last) == 1 and last[0].kind == "tpl":
+        suffix = last[0].parts[-1]
+    else:
+        suffix = ""
+    return ContextImport("prefix", prefix, suffix)
+
+
+def _closes_last(tokens: Sequence[Token], k: int) -> bool:
+    """Whether the bracket opened at ``k`` closes at the last token (nothing follows it)."""
+    depth = 0
+    for j in range(k, len(tokens)):
+        if tokens[j].kind == "punct" and tokens[j].value in "([{":
+            depth += 1
+        elif tokens[j].kind == "punct" and tokens[j].value in ")]}":
+            depth -= 1
+            if depth == 0:
+                return j == len(tokens) - 1
+    return False
+
+
+def _takewhile(test: Any, items: Sequence[list[Token]]) -> Iterable[list[Token]]:
+    for item in items:
+        if not test(item):
+            return
+        yield item
+
+
+def _glob_patterns(arg: Sequence[Token]) -> list[str] | None:
+    """``import.meta.glob``'s first argument: a literal or an array of literals."""
+    if len(arg) == 1 and arg[0].kind == "str":
+        return [arg[0].value]
+    if len(arg) < 2 or arg[0].value != "[" or arg[-1].value != "]":
+        return None
+    found = []
+    for n, t in enumerate(arg[1:-1]):
+        if n % 2 == 0 and t.kind == "str":
+            found.append(t.value)
+        elif n % 2 == 1 and t.kind == "punct" and t.value == ",":
+            continue
+        else:
+            return None
+    return found or None
 
 
 def imports(source: str, jsx: bool = True) -> Imports:
     """What a JS/TS file imports (see the module docstring)."""
     tokens = scan(source, jsx)
     found: list[str] = []
+    contexts: list[ContextImport] = []
     dynamic = False
+
+    def load(target: str | ContextImport | None) -> None:
+        nonlocal dynamic
+        if isinstance(target, str):
+            found.append(target)
+        elif target is not None:
+            contexts.append(target)
+        else:
+            dynamic = True
 
     def at(k: int) -> Token:
         return tokens[k] if k < len(tokens) else Token("eof", "")
@@ -357,25 +543,37 @@ def imports(source: str, jsx: bool = True) -> Imports:
             if k > 0 and at(k - 1).value == "function":
                 continue  # a declaration: `declare function require(id: string)`
             if is_(k + 1, "punct", "("):
-                if is_(k + 2, "str") and at(k + 3).value in (")", ","):
-                    found.append(at(k + 2).value)
-                elif not is_(k + 2, "punct", ")"):
-                    dynamic = True
-            elif (
-                is_(k + 1, "punct", ".")
-                and at(k + 2).value == "resolve"
-                and is_(k + 3, "punct", "(")
-                and is_(k + 4, "str")
-            ):
-                found.append(at(k + 4).value)  # require.resolve('m')
+                args = _call_args(tokens, k + 1)
+                if args:
+                    load(_target(args[0]))
+                elif args is None:
+                    dynamic = True  # never closes: can't tell what it loads
+            elif is_(k + 1, "punct", ".") and is_(k + 3, "punct", "("):
+                method = at(k + 2).value
+                args = _call_args(tokens, k + 3) if method in ("resolve", "context") else None
+                if method == "resolve" and args:
+                    # require.resolve('m'): a path, an edge when bounded; else nothing
+                    target = _target(args[0])
+                    if target is not None:
+                        load(target)
+                elif method == "context":
+                    load(_require_context(args))
         elif name == "import":
             if is_(k + 1, "punct", "("):
-                if is_(k + 2, "str"):
-                    found.append(at(k + 2).value)
-                else:
-                    dynamic = True
+                args = _call_args(tokens, k + 1)
+                load(_target(args[0]) if args else None)
             elif is_(k + 1, "punct", "."):
-                continue  # import.meta
+                # import.meta.glob('./pages/*.ts') (Vite); any other import.meta: nothing
+                glob = at(k + 2).value == "meta" and is_(k + 3, "punct", ".")
+                if glob and at(k + 4).value in ("glob", "globEager"):
+                    args = _call_args(tokens, k + 5) if is_(k + 5, "punct", "(") else None
+                    patterns = _glob_patterns(args[0]) if args else None
+                    wanted = [p for p in patterns or () if not p.startswith("!")]
+                    if wanted:
+                        contexts.extend(ContextImport("glob", p) for p in wanted)
+                    else:
+                        dynamic = True
+                continue
             elif is_(k + 1, "str"):
                 found.append(at(k + 1).value)  # import 'side-effect'
             else:
@@ -388,7 +586,18 @@ def imports(source: str, jsx: bool = True) -> Imports:
                 spec = _from_clause(tokens, k + 1, stop_at_equals=False)
                 if spec is not None:
                     found.append(spec)
-    return Imports(tuple(dict.fromkeys(found)), dynamic)
+    return Imports(tuple(dict.fromkeys(found)), dynamic, tuple(dict.fromkeys(contexts)))
+
+
+def _require_context(args: list[list[Token]] | None) -> ContextImport | None:
+    """``require.context(dir, recursive = true, regex = /^\\.\\/.*$/)`` (webpack) with a
+    literal directory; None otherwise."""
+    if not args or len(args[0]) != 1 or args[0][0].kind != "str":
+        return None
+    recursive = not (len(args) > 1 and [t.value for t in args[1]] == ["false"])
+    literal = len(args) > 2 and len(args[2]) == 1 and args[2][0].kind == "re"
+    regex = args[2][0].value if literal else None
+    return ContextImport("context", args[0][0].value, recursive=recursive, regex=regex)
 
 
 def _from_clause(tokens: Sequence[Token], k: int, stop_at_equals: bool) -> str | None:
@@ -608,6 +817,12 @@ def build_js_graph(root: Path, deleted: Iterable[str] = ()) -> JsGraph:
         targets: set[str] = set()
         for spec in found.specifiers:
             targets.update(resolver.resolve(spec, file))
+        for context in found.contexts:
+            matched = resolver.context(context, file)
+            if matched is None:
+                dynamic.add(file)  # can't bound it: it may load any file
+            else:
+                targets.update(matched)
         targets.discard(file)
         edges[file] = frozenset(targets)
     return JsGraph(edges, frozenset(dynamic), tuple(resolver.notes.items))
@@ -624,6 +839,8 @@ class Resolver:
         self._ts_cache: dict[str, TsPaths | None] = {}
         self._ts_for_dir: dict[str, TsPaths | None] = {}
         self._jest_for_dir: dict[str, JestConfig | None] = {}
+        self._every_dir: set[str] | None = None
+        self._sorted: list[str] | None = None
         self.jest_configs = self._jest_configs()
         self.packages = self._workspace_packages()
 
@@ -852,6 +1069,113 @@ class Resolver:
                 return found | {manifest_path}
         return {manifest_path}
 
+    # --- bounded non-literal imports (context modules) ---
+
+    def context(self, context: ContextImport, importer: str) -> set[str] | None:
+        """Every file of the checkout a bounded import from ``importer`` could load, at any
+        depth below its static directory (as bundlers' context modules include), or None
+        when siftwise can't bound it (the importer is then dynamic): no static directory, a
+        directory of just ``./`` or ``../``, a bare package, one outside the checkout or not
+        in it, an alias siftwise can't resolve to one directory, no file matching, or more
+        than ``MAX_CONTEXT_FILES`` files."""
+        directory = posixpath.dirname(importer)
+        found: set[str] = set()
+        if context.kind == "prefix":
+            head, slash, start = context.pattern.rpartition("/")
+            if not slash or (not start and all(p in (".", "..") for p in head.split("/"))):
+                return None  # `${x}`, 'pkg' + x, `./${x}`, '../' + x: anything may follow
+            bases = self._context_dirs(head, directory)
+            if not bases:
+                return None
+            suffix = context.suffix.split("?", 1)[0].split("#", 1)[0]
+            for base in bases:
+                found.update(f for f in self._under(base)
+                             if _bounded_match(f[len(base) + 1 :], start, suffix))  # fmt: skip
+        elif context.kind == "glob":
+            pattern = context.pattern
+            if not pattern.startswith(("./", "../")) or any(c in pattern for c in "{}[]()!+@"):
+                return None  # root-relative, an alias (from the Vite config) or extglobs
+            path = _clean(posixpath.join(directory, pattern))
+            if path is None:
+                return None
+            static = []
+            for part in path.split("/"):
+                if "*" in part or "?" in part:
+                    break
+                static.append(part)
+            base = "/".join(static[:-1] if len(static) == len(path.split("/")) else static)
+            if not base or base not in self._all_dirs:
+                return None
+            found = {f for f in self._under(base) if glob_match(f, path)}
+        elif context.kind == "context":
+            if not context.pattern.startswith((".", "/")) or context.pattern.startswith("/"):
+                return None  # webpack's own aliases can't be read
+            base_dir = _clean(posixpath.join(directory, context.pattern))
+            if not base_dir or base_dir not in self._all_dirs:
+                return None
+            regex = _js_regex(context.regex)
+            for f in self._under(base_dir):
+                rel = f[len(base_dir) + 1 :]
+                if not context.recursive and "/" in rel:
+                    continue
+                if regex is None or regex.search("./" + rel):
+                    found.add(f)
+        else:
+            return None
+        if not found or len(found) > MAX_CONTEXT_FILES:
+            return None
+        return found
+
+    def _context_dirs(self, head: str, directory: str) -> list[str]:
+        """The checkout directories a bounded import's static directory names: relative, or
+        through tsconfig ``paths``/``baseUrl``; [] when it can't be told (a bare package, a
+        Jest moduleNameMapper match, not a directory of the checkout, the repo root)."""
+        if head.startswith(("./", "../")) or head in (".", ".."):
+            candidates = [_clean(posixpath.join(directory, head))]
+        else:
+            jest = self._jest_for(directory)
+            if jest and any(p.search(head + "/") for p, _ in jest.mappers):
+                return []  # the mapper decides where it goes: can't bound it here
+            candidates = []
+            ts = self._tsconfig_for(directory)
+            if ts is not None:
+                for pattern, targets in sorted(ts.paths, key=lambda p: -len(p[0].split("*")[0])):
+                    star = _match_star(pattern, head + "/") if "*" in pattern else (
+                        "" if pattern == head else None)  # fmt: skip
+                    if star is None:
+                        continue
+                    base = ts.base_url if ts.base_url is not None else ts.paths_dir
+                    # TypeScript tries every target in turn: a file may come from any of them.
+                    candidates = [_clean(posixpath.join(base, t.replace("*", star, 1)))
+                                  for t in targets]  # fmt: skip
+                    break
+                if not candidates and ts.base_url is not None:
+                    candidates = [_clean(posixpath.join(ts.base_url, head))]
+        dirs = [d.rstrip("/") for d in candidates if d]
+        if not dirs or any(d not in self._all_dirs for d in dirs):
+            return []
+        return dirs
+
+    @property
+    def _all_dirs(self) -> set[str]:
+        if self._every_dir is None:
+            found: set[str] = set()
+            for f in self.files:
+                d = posixpath.dirname(f)
+                while d and d not in found:
+                    found.add(d)
+                    d = posixpath.dirname(d)
+            self._every_dir = found
+        return self._every_dir
+
+    def _under(self, base: str) -> list[str]:
+        """The checkout's files below ``base`` (at any depth)."""
+        if self._sorted is None:
+            self._sorted = sorted(self.files)
+        start = bisect.bisect_left(self._sorted, base + "/")
+        end = bisect.bisect_left(self._sorted, base + "0")  # "0" sorts right after "/"
+        return self._sorted[start:end]
+
     def _path(self, path: str | None) -> set[str]:
         """The file a path names: exact, TS ESM's emitted-name mapping, an extension, an
         index file."""
@@ -876,6 +1200,41 @@ class Resolver:
                 if index in self.files:
                     return {index}
         return set()
+
+
+def _bounded_match(rest: str, start: str, suffix: str) -> bool:
+    """Whether a file at ``rest`` below a bounded import's directory can be what it loads:
+    it starts with the import's static name start and ends with its static suffix, as Node
+    and TypeScript resolve it (an extension added, ``/index.*``, TS ESM's ``.js`` -> ``.ts``)."""
+    if not rest.startswith(start):
+        return False
+    tail = rest[len(start) :]
+    if not suffix or tail.endswith(suffix):
+        return True
+    if any(tail.endswith(suffix + ext) or tail.endswith(f"{suffix}/index{ext}")
+           for ext in EXTENSIONS):  # fmt: skip
+        return True
+    dot = suffix.rfind(".")  # not posixpath.splitext: it reads ".js" as a name, no extension
+    has_ext = dot >= 0 and "/" not in suffix[dot:]
+    stem, ext = (suffix[:dot], suffix[dot:]) if has_ext else (suffix, "")
+    return any(tail.endswith(stem + source) for source in _EMITTED.get(ext, ()))
+
+
+_JS_REGEX = re.compile(r"/(.*)/([a-z]*)", re.DOTALL)
+
+
+def _js_regex(literal: str | None) -> re.Pattern[str] | None:
+    r"""A JS regex literal (``/\.js$/i``) as a Python pattern; None (every file: never fewer)
+    for none, unknown flags or a pattern Python can't compile."""
+    m = _JS_REGEX.fullmatch(literal or "")
+    if not m or set(m.group(2)) - set("gimsuy"):
+        return None
+    flags = (re.IGNORECASE if "i" in m.group(2) else 0) | (re.DOTALL if "s" in m.group(2) else 0)
+    flags |= re.MULTILINE if "m" in m.group(2) else 0
+    try:
+        return re.compile(m.group(1), flags)
+    except re.error:
+        return None
 
 
 def _clean(path: str) -> str | None:

@@ -997,6 +997,19 @@ Jest, Babel and SWC configs, root manifests and lockfiles force it as before. A
 `jest.config.js`/`.ts` can't be read without Node: the selection's reasons say so, and
 resolution uses tsconfig and relative paths. `--no-js-imports` turns the graph off.
 
+A computed path with a static directory is bounded instead, like a bundler's context module:
+``import(`./locales/${lang}.json`)``, `require('./plugins/' + name)`, `import.meta.glob(
+'./pages/*.tsx')` (Vite) and `require.context('./icons', true, /\.svg$/)` (webpack) become
+imports of every checkout file below that directory (at any depth) that matches the static
+end, the glob or the regex, so their tests run only when one of those files changes. The
+directory may be relative or a tsconfig `paths`/`baseUrl` alias. It stays a computed path
+(today's run-for-everything) when there's no static directory, the directory is just `./` or
+`../`, a bare package, outside the checkout or missing, a Jest `moduleNameMapper` matches it,
+a glob is root-relative or uses braces or extglobs, nothing matches, or more than 500 files
+match. Like bundlers, this assumes the computed part doesn't climb out with `..`. On
+jestjs/jest, 2 of its 40 files with computed imports became bounded: almost all of them
+`require` a variable.
+
 For Java, siftwise reads `pom.xml` modules or `settings.gradle[.kts]` includes (no Maven,
 Gradle or JVM runs) and each module's `src/main/java` and `src/test/java`. It runs the full
 suite instead when a build file changes (`pom.xml`, `build.gradle*`, `settings.gradle*`,
