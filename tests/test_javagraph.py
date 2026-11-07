@@ -404,11 +404,10 @@ def test_a_change_runs_the_classes_that_use_it_per_module_in_risk_order() -> Non
         "uses changed class acme.core.Money (via acme.app.Cart)",
     )
     assert {t.runner for t in selection.tests} == {Runner.MAVEN}
-    # The directly mapped test's module first (risk order).
+    # One invocation; the directly mapped test's module first (risk order).
     assert selection.commands == (
-        "mvn -B -pl core -am test -Dtest=acme.core.MoneyTest "
-        "-Dsurefire.failIfNoSpecifiedTests=false",
-        "mvn -B -pl app -am verify -Dtest=acme.app.CartTest,acme.app.ReceiptTest "
+        "mvn -B -pl core,app -am verify "
+        "-Dtest=acme.core.MoneyTest,acme.app.CartTest,acme.app.ReceiptTest "
         "-Dsurefire.failIfNoSpecifiedTests=false -Dit.test=acme.app.CartIT "
         "-Dit.failIfNoSpecifiedTests=false",
     )
@@ -421,9 +420,10 @@ def test_the_gradle_fixture_selects_per_project() -> None:
         history(*ids), [MONEY], True, affected_files=files, java=java_info, order=Order.RISK
     )
     assert selection.commands == (
-        "gradle :core:test --tests acme.core.MoneyTest",
-        # ReceiptTest uses Money too but has no history: a new class, run first in its module.
-        "gradle :app:web:test --tests acme.web.ReceiptTest --tests acme.web.CartTest",
+        # One command: each --tests filters the task before it. ReceiptTest uses Money too
+        # but has no history: a new class, run first in its project.
+        "gradle :core:test --tests acme.core.MoneyTest "
+        ":app:web:test --tests acme.web.ReceiptTest --tests acme.web.CartTest",
     )
 
 

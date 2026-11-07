@@ -277,6 +277,13 @@ class JavaIn(BaseModel):
     notes: list[Annotated[str, StringConstraints(max_length=500)]] = Field(
         default_factory=list, max_length=20
     )
+    build_scopes: dict[Path4K, list[Path4K]] = Field(
+        default_factory=dict,
+        max_length=5_000,
+        description="Changed module build file (pom.xml, build.gradle[.kts]) -> the module "
+        "paths whose tests it can affect (its module and every module depending on it): their "
+        "test classes run instead of the full suite",
+    )
 
 
 class SelectRequest(ChangeRequest):

@@ -68,7 +68,7 @@ import functools
 import posixpath
 import re
 import shlex
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -428,6 +428,15 @@ class JavaBuildInfo:
     dynamic: Mapping[str, str] = field(default_factory=dict)  # test file -> file it reaches
     notes: tuple[str, ...] = ()
     unsupported: str = ""  # the build couldn't be read: every Java change runs everything
+    # Changed module build file (pom.xml, build.gradle[.kts]) -> the modules whose tests it
+    # can affect (its own and its dependents', as the CLI's build model reads them). A build
+    # file not listed runs the full suite, as before.
+    build_scopes: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    # Test classes whose fully qualified name is in more than one module: Maven's -Dtest would
+    # run each copy in every module of one invocation.
+    shared_classes: frozenset[str] = frozenset()
+    # Module path -> its test classes, as listed (test_classes keeps one module per class).
+    module_classes: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> JavaBuildInfo:
@@ -451,6 +460,14 @@ class JavaBuildInfo:
             dynamic=dict(data.get("dynamic") or {}),
             notes=tuple(data.get("notes") or ()),
             unsupported=data.get("unsupported") or "",
+            build_scopes={
+                path: tuple(modules) for path, modules in (data.get("build_scopes") or {}).items()
+            },
+            shared_classes=_shared_classes(data.get("test_classes") or {}),
+            module_classes={
+                module: tuple(sorted(classes))
+                for module, classes in (data.get("test_classes") or {}).items()
+            },
         )
 
     @property
@@ -464,6 +481,12 @@ class JavaBuildInfo:
         """The deepest module whose directory holds ``file``."""
         found = [m for m in self.modules if not m.path or file.startswith(m.path + "/")]
         return max(found, key=lambda m: len(m.path), default=None)
+
+
+def _shared_classes(test_classes: Mapping[str, Sequence[str]]) -> frozenset[str]:
+    """Classes listed under more than one module."""
+    counts = Counter(c for classes in test_classes.values() for c in set(classes))
+    return frozenset(c for c, n in counts.items() if n > 1)
 
 
 # --- selection ----------------------------------------------------------------------------
@@ -577,7 +600,12 @@ def _select(
         # to select on, so the full suite.
         return full(NO_NET_CHANGES)
     scoped_build = {p: d for p in paths if (d := build_file_scope(p)) is not None}
-    build = [p for p in paths if is_build_file(p) and p not in scoped_build]
+    # A Java module's build file the CLI could scope (its module and dependents): handled
+    # with the Java signals below, never the full suite.
+    java_scoped = {} if java is None else {
+        p: java.build_scopes[p] for p in paths if p in java.build_scopes}  # fmt: skip
+    build = [p for p in paths
+             if is_build_file(p) and p not in scoped_build and p not in java_scoped]  # fmt: skip
     if build:
         return full(f"build/config file changed: {_list(build)}")
     if history is None or not tests:
@@ -620,18 +648,28 @@ def _select(
         problem = _java_problem(relevant, java)
         if problem:
             return full(problem)
+
+    def run_module(module: str, reason: str) -> None:
+        """Every test class of a module. A class whose name another module also has is run
+        in this module as such (its known tests carry the other module)."""
+        assert java is not None
+        for cls in java.module_classes.get(module, ()):
+            for test in java_classes.get(cls, ()):
+                add(test.test_id, reason, Link.INDIRECT)
+            if not java_classes.get(cls) or java.test_classes.get(cls) != module:
+                java_new.add((module, cls))
+
+    for path, scope in sorted(java_scoped.items()):
+        assert java is not None
+        for scoped in scope:
+            run_module(scoped, java_build_reason(path, scoped, java))
     for path in relevant:
+        if path in java_scoped:
+            continue
         if java is not None and (module := java.module_of(path)) is not None:
             if path.startswith(module.prefix("src/test/resources")):
                 # Test resources: every test class of the module may read them.
-                for cls, owner in sorted(java.test_classes.items()):
-                    if owner != module.path:
-                        continue
-                    for test in java_classes.get(cls, ()):
-                        add(test.test_id, f"test resources changed in {module.name or '.'}: "
-                            f"{path}", Link.INDIRECT)  # fmt: skip
-                    if not java_classes.get(cls):
-                        java_new.add((owner, cls))
+                run_module(module.path, f"test resources changed in {module.name or '.'}: {path}")
                 continue
             located = java_class_of(path)
             if located is not None:
@@ -1975,11 +2013,13 @@ def _commands(
     for unit in units:
         if unit.runner in JAVA_RUNNERS and unit.java_module is not None:
             by_module[unit.java_module].append(unit)
-    for module, group in sorted(by_module.items()):
-        if java is None:
-            continue  # no build to run them with (a selection never gets here: no runner)
-        classes = [u.java_class for u in ordered(group) if u.java_class]
-        commands.append((best(group), java_command(java, module, classes)))
+    if java is not None:  # else no build to run them with (a selection never gets here)
+        groups = sorted(by_module.items())
+        if key is not None:
+            groups.sort(key=lambda pair: best(pair[1]))
+        for batch in _java_batches(java, groups):
+            argv = [(m, [u.java_class for u in ordered(g) if u.java_class]) for m, g in batch]
+            commands.append((min(best(g) for _, g in batch), java_command_for(java, argv)))
     if key is not None:
         commands.sort(key=lambda pair: pair[0])  # stable: same key keeps pytest, Go, Jest
     return tuple(command for _, command in commands)
@@ -2006,16 +2046,44 @@ def _is_test_class(cls: str) -> bool:
     )
 
 
+def _java_batches(
+    java: JavaBuildInfo, groups: Sequence[tuple[str, list[_Unit]]]
+) -> list[list[tuple[str, list[_Unit]]]]:
+    """The modules' test classes in as few commands as is safe. Gradle: one command (each
+    ``--tests`` filters the task just before it). Maven: one invocation for every module but
+    those whose classes have a fully qualified name another module also has (one ``-Dtest``
+    list applies to every module of the invocation: the copy would run too)."""
+    if java.tool != "maven":
+        return [list(groups)] if groups else []
+
+    def shared(group: list[_Unit]) -> bool:
+        return any(u.java_class in java.shared_classes for u in group)
+
+    alone = [[pair] for pair in groups if shared(pair[1])]
+    together = [pair for pair in groups if not shared(pair[1])]
+    batches = ([together] if together else []) + alone
+    order = {module: n for n, (module, _) in enumerate(groups)}
+    return sorted(batches, key=lambda batch: min(order[m] for m, _ in batch))
+
+
 def java_command(java: JavaBuildInfo, module: str, classes: Sequence[str]) -> str:
-    """One module's test classes: ``./mvnw -B -pl <module> -am test -Dtest=A,B ...`` (with
-    Failsafe's ``verify -Dit.test=`` for integration tests), ``./gradlew :<module>:test
-    --tests A --tests B``. Maven's ``-am`` builds the modules it depends on (their tests
-    filtered out by the same ``-Dtest``), so it works without an installed snapshot."""
-    info = java.module(module) or JavaModuleInfo(module, module)
+    """One module's test classes (``java_command_for``)."""
+    return java_command_for(java, [(module, classes)])
+
+
+def java_command_for(java: JavaBuildInfo, modules: Sequence[tuple[str, Sequence[str]]]) -> str:
+    """Modules' test classes in one command: ``./mvnw -B -pl a,b -am test -Dtest=A,B ...``
+    (with Failsafe's ``verify -Dit.test=`` for integration tests; no ``-pl`` when the root
+    project is one of them), ``./gradlew :a:test --tests A :b:test --tests B``. Maven's
+    ``-am`` builds the modules they depend on (their tests filtered out by the same
+    ``-Dtest``), so it works without an installed snapshot."""
     if java.tool == "maven":
         argv = ["./mvnw" if java.wrapper else "mvn", "-B"]
-        if module:
-            argv += ["-pl", info.name, "-am"]
+        paths = [module for module, _ in modules]
+        if "" not in paths:
+            names = [(java.module(m) or JavaModuleInfo(m, m)).name for m in paths]
+            argv += ["-pl", ",".join(names), "-am"]
+        classes = [c for _, group in modules for c in group]
         units = [c for c in classes if not is_integration_test(c)]
         its = [c for c in classes if is_integration_test(c)]
         argv += ["verify" if its else "test", f"-Dtest={','.join(units) or NO_UNIT_TESTS}",
@@ -2023,9 +2091,12 @@ def java_command(java: JavaBuildInfo, module: str, classes: Sequence[str]) -> st
         if its:
             argv += [f"-Dit.test={','.join(its)}", "-Dit.failIfNoSpecifiedTests=false"]
         return shlex.join(argv)
-    task = f"{info.name}:test" if info.name else ":test"
-    tests = [a for c in classes for a in ("--tests", c)]
-    return shlex.join(["./gradlew" if java.wrapper else "gradle", task, *tests])
+    argv = ["./gradlew" if java.wrapper else "gradle"]
+    for module, group in modules:
+        info = java.module(module) or JavaModuleInfo(module, module)
+        argv.append(f"{info.name}:test" if info.name else ":test")
+        argv += [a for c in group for a in ("--tests", c)]
+    return shlex.join(argv)
 
 
 def _java_full_command(java: JavaBuildInfo, tests: Mapping[str, _Test]) -> tuple[str, ...]:
@@ -2119,6 +2190,17 @@ def _java_path_hits(
         if not known:
             new.add((java.test_classes[candidate], candidate))
     return hits, new
+
+
+def java_build_reason(path: str, module: str, java: JavaBuildInfo) -> str:
+    """``build file core/pom.xml changed (module app uses core)``."""
+    changed = posixpath.dirname(path)
+    info = java.module(module)
+    name = (info.name if info else module) or "."
+    if module == changed:
+        return f"build file {path} changed (its module {name})"
+    owner = java.module(changed)
+    return f"build file {path} changed ({name} depends on {(owner.name if owner else changed)})"
 
 
 def java_use_reason(

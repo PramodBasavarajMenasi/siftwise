@@ -1047,7 +1047,35 @@ failures plus the 10 newest, each with the build, test classes and graph read at
 | Selective | 17 runs from 7 branches; median 91% of the estimated test time skipped (26% to 93%) |
 | Failures caught | 74 of 74 (34 runs with failures); in selective runs 7 of 7 |
 | Without fallbacks | the full-suite runs whose change some signal reaches would have caught 21 of 21; 46 more failures had only a fallback |
-| Time skipped over all runs | 10.6% (full runs count as 0%) |
+| Time skipped over all runs | 10.0% over the 148 targets (full runs count as 0%; 10.6% over the 140 runs with failures) |
+
+**Module build files scoped** (#54, re-run 2026-11-08 on the same 148 targets): a change to
+a module's own `pom.xml` now runs the test classes of that module and of every module that
+depends on it, instead of the full suite.
+
+| | before | after |
+|---|---|---|
+| Full suite | 131 (129 build file) | 126: 122 build file, 2 a changed file no test reaches, 2 a selected test with no runner |
+| Selective | 17 runs from 7 branches | 22 runs from 11 branches; median 90.6% of the estimated time skipped (26% to 93%) |
+| Failures caught | 74 of 74; selective 7 of 7 | 74 of 74; selective 8 of 8 |
+| Time skipped over all runs (148 targets) | 10.0% | 11.9% (12.6% over the 140 runs with failures) |
+
+- **7 runs left the build file fallback**: 5 became selective (`dropwizard-e2e`,
+  `dropwizard-servlets`, twice `dropwizard-testing`, and `dropwizard-e2e` with
+  `dropwizard-request-logging`), skipping 38% to 88% of the estimated time; one of them caught
+  its failure (`AssetServletTest`, in the scoped module). The other 2 still run everything,
+  for other fallbacks: a changed main class no test reaches (with a `dropwizard-benchmarks`
+  POM edit) and a selected class no test file is named after.
+- **The 122 that stay full** are what the rule keeps on purpose: 87 change the BOM
+  (`dropwizard-dependencies/pom.xml`: a version bump can reach every module), 24 a workflow,
+  6 the root `pom.xml`, 4 `dropwizard-example/pom.xml` (it has `<dependencyManagement>`), 1
+  `dropwizard-parent`. Most Renovate PRs bump the BOM, so they still get no savings.
+- **Scopes on this build** (read at a recent commit): 33 of 41 module POMs can be scoped; the
+  scope is the module alone for 7 (`dropwizard-json-logging`...), up to 36 modules for
+  `dropwizard-util`. The first version flagged every module: `dropwizard-bom` lists every
+  module in `<dependencyManagement>` and `dropwizard-parent` imports it, which made every
+  child a "dependent". Managed versions aren't dependencies (the BOM doesn't change when a
+  module's POM does), so they no longer count; a change to the BOM itself stays full.
 
 - **Recall in selective runs rests on one PR**: the 7 failures are 10 runs of
   `limit-json-logged-exceptions`. It's a real check (a failing test in a class with no
@@ -1079,6 +1107,54 @@ every test of a class run whole, in the eval and in shadow mode (`java_classes`,
 ```sh
 uv run python scripts/backfill.py --repo dropwizard/dropwizard --workflow maven.yml     --artifact-pattern "test-reports-*" --max-runs 400 --batch --workers 6
 uv run python -m scripts.eval.run_eval --repo dropwizard/dropwizard --language java     --source github --failing --resume dropwizard-java.jsonl
+```
+
+The #54 re-run took 47 minutes (the commits' sources downloaded again: the cached Java
+snapshots are `javagraph-v2-<sha>.json` now, with the module dependencies).
+
+## Java: naver/fixture-monkey (Gradle)
+
+Measured 2026-11-08: the first replay of a Gradle build. fixture-monkey is a multi-project
+Gradle build (28 projects: Java, plus Kotlin projects siftwise doesn't analyse) testing with
+JUnit 5; its `Run tests` workflow uploads `build/test-results` as `test-results`.
+
+**Finding a repo.** A code search for workflows uploading Gradle test results
+(`scripts.eval.find_candidates --language Java`, three `build/test-results` queries; 191 repos)
+left two with live artifacts, enough PRs and tests: naver/fixture-monkey and tamboui/tamboui.
+tamboui's settings include projects through a computed list and `projectDir` (siftwise can't
+read that build) and none of its failed runs had test failures. Of the Gradle repos the
+earlier Java search found, apple/servicetalk keeps artifacts for 9 runs (1 with test
+failures) and gorpipe/gor is a third Scala. fixture-monkey it is, with thin failure data:
+of its newest 150 test runs, 116 have artifacts and 4 of those failed.
+
+**Data.** 116 uploads (one per run) from `build.yml`, backfilled in 3 minutes; 11,763 tests.
+
+**Replay** (`run_eval --language java --source github --failing`, 6 minutes): the 10 newest
+PR runs plus every other PR run with failures.
+
+| | |
+|---|---|
+| Targets | 11 PR runs on 11 branches |
+| Full suite | 5, all for a changed build file: `gradle/libs.versions.toml` twice (the version catalog), a workflow, and two module `build.gradle.kts` (not scoped: the build uses typesafe project accessors, `projects.x`, which siftwise doesn't read, so no build file is scoped) |
+| Selective | 6 runs; median 57% of the tests and 13% of the estimated time skipped (one run 66%) |
+| Failures caught | 3 of 3 (2 runs with failures); in selective runs 1 of 1 |
+| Time skipped over all runs | 12.0% (full runs count as 0%) |
+
+- **Recall rests on 3 failures**, 2 of them in a full-suite run (a catalog bump): it says the
+  selector didn't miss these, not much more.
+- **Time to first failure** (the 1 selective run that caught one): risk order reached it at
+  test 392 of 1,888 (4.2 s), the default order at test 393 (90.2 s): 1.6% of the time against
+  33.7%. By count the same; by time the risk order runs the quick classes first.
+- **Commands**: one Gradle command per selection (`./gradlew :fixture-monkey:test --tests
+  ...` with one `:project:test --tests ...` group per project), as #54 builds them.
+- **The selective runs skip 57% of the tests but 13% of the time**: the classes they keep
+  carry most of the run's measured time.
+
+### Reproducing
+
+```sh
+uv run python scripts/backfill.py --repo naver/fixture-monkey --workflow build.yml     --artifact-pattern test-results --max-runs 300 --batch --workers 6
+uv run python -m scripts.eval.run_eval --repo naver/fixture-monkey --language java     --source github --failing --resume fixture-monkey-java.jsonl
 ```
 
 ## JS/TS import graph: performance and validation
