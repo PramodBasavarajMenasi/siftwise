@@ -181,6 +181,9 @@ All notable changes to siftwise. The format follows
   dropwizard's CI (781 uploads) was rejected for it.
 - A deleted Jest test file was still selected by path, so `jest <deleted file>` failed
   with "No tests found". Its tests are dropped now, as deleted Python test files are.
+- The eval header showed `(python)` for `--language java`
+  ([#61](https://github.com/PramodBasavarajMenasi/siftwise/issues/61)). It names the language
+  that runs now: go, java or python.
 
 ## [0.2.0] - 2026-10-27
 
