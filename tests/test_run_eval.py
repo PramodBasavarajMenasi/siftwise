@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import zipfile
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -664,6 +665,78 @@ def test_triage_cli_startup_path(
     [line] = [json.loads(text_line) for text_line in log.read_text().splitlines()]
     assert (line["key"], line["change"]) == (f"triage|{pr}", "known")
     assert line["failures"][0]["verdict"] == "new_regression"
+
+
+# --- the eval header: the language actually used ------------------------------------------
+
+
+class _EmptyRows:
+    """Empty query results; the ``FROM repos`` lookup still finds the repo."""
+
+    def __init__(self, repo: bool) -> None:
+        self._repo = repo
+
+    def scalar_one_or_none(self) -> int | None:
+        return 1 if self._repo else None
+
+    def all(self) -> list[object]:
+        return []
+
+    def __iter__(self) -> Iterator[object]:
+        return iter(())
+
+
+class _EmptySession:
+    """A session over an empty database: the repo exists, but no runs or tests."""
+
+    def __enter__(self) -> "_EmptySession":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        pass
+
+    def execute(self, statement: Any, *args: Any, **kwargs: Any) -> _EmptyRows:
+        return _EmptyRows("FROM repos WHERE" in str(statement))
+
+
+def cli_eval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *args: str) -> str:
+    """``run_eval``'s output against an empty repo: the header is all it prints."""
+    monkeypatch.setattr(ev, "get_sessionmaker", lambda: lambda: _EmptySession())
+    app = typer.Typer()
+    app.command()(ev.main)
+    result = CliRunner().invoke(
+        app, ["--repo", REPO, "--cache-dir", str(tmp_path / "cache"), *args]
+    )
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    return result.output
+
+
+@pytest.mark.parametrize(
+    ("language", "go_mod", "label"),
+    [
+        ("python", None, "python"),
+        ("go", None, "go"),
+        ("java", None, "java"),
+        ("auto", "module example.com/shop\n", "go"),
+        ("auto", None, "python"),
+    ],
+)
+def test_eval_header_shows_the_language_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, language: str, go_mod: str | None, label: str
+) -> None:
+    """The header names the language the eval runs ('# repo (java)'), not one fixed text (#61):
+    ``auto`` still resolves from the checkout's go.mod."""
+    args = ["--language", language]
+    if go_mod is not None:
+        checkout = tmp_path / "checkout"
+        checkout.mkdir()
+        (checkout / "go.mod").write_text(go_mod)
+        args += ["--checkout", str(checkout)]
+    header = next(
+        line for line in cli_eval(tmp_path, monkeypatch, *args).splitlines()
+        if line.startswith(f"# {REPO} (")
+    )  # fmt: skip
+    assert header.split(":")[0] == f"# {REPO} ({label})"
 
 
 # --- --replay-prs window ----------------------------------------------------------------------
