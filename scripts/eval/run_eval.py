@@ -2145,7 +2145,8 @@ def main(
         graph = "go list" if is_go else "python imports"
         if not graphs.has_source:
             graph += " (cached only, no --checkout or --source)"
-        typer.echo(f"# {repo} ({'go' if is_go else 'python'}): {rules}; import graph: {graph}")
+        lang = "go" if is_go else "java" if is_java else "python"
+        typer.echo(f"# {repo} ({lang}): {rules}; import graph: {graph}")
         started = time.perf_counter()
         index = HistoryIndex(session, repo_id)
         typer.echo(f"history index: {index} in {time.perf_counter() - started:.0f}s", err=True)
