@@ -230,9 +230,9 @@ if it fails, the full suite runs.
 
 | Install | What you get | Size |
 |---|---|---|
-| `pip install siftwise` | the CLI: `select`, `record`, `triage`, `report`, `rollup`, and the GitHub Action's steps | 9 MB |
+| `pip install siftwise` | the CLI: `select`, `record`, `triage`, `report`, `rollup`, and the GitHub Action's steps | 18 MB |
 | `pip install 'siftwise[server]'` | plus the API server: `siftwise server start` and `migrate` (FastAPI, SQLAlchemy, Postgres driver) | 50 MB |
-| `pip install 'siftwise[mcp]'` | plus `siftwise mcp`, for [coding agents](#coding-agents-mcp) | 49 MB |
+| `pip install 'siftwise[mcp]'` | plus `siftwise mcp`, for [coding agents](#coding-agents-mcp) | 50 MB |
 
 For a command-line tool, `uv tool install siftwise` (or `pipx install siftwise`) gives it its
 own environment; add the extras the same way (`uv tool install 'siftwise[mcp]'`). From a
@@ -1039,8 +1039,8 @@ fully qualified name another module also has runs on its own: the copy would run
 Gradle `gradle :a:test --tests A :b:test --tests B` (each `--tests` filters the task before
 it). Maven then runs the modules in reactor order, not risk order.
 On dropwizard's history (42 Maven modules) it caught 74 of 74 failures, and its selective
-runs skipped a median 91% of test time; scoping module POMs made 5 more of its 148 PR runs
-selective (22), but most of its PRs bump the BOM and still run everything. On
+runs (22 of its 148 PR runs, 5 more since module POMs are scoped) skipped a median 90.6% of
+the estimated test time, but most of its PRs bump the BOM and still run everything. On
 fixture-monkey (a Gradle build) it caught 3 of 3, a small history
 ([eval results](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-results.md#java-dropwizarddropwizard-maven)).
 

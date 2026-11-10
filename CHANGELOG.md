@@ -187,6 +187,13 @@ migrations (0011, 0012): see Upgrading.
     that only extended it showed no tests in the pipeline's Tests tab. The README says where
     other runners' reports must go.
 
+### Changed
+
+- The light install (`pip install siftwise`) now includes pydantic, because typer 0.29+
+  requires it (18 MB installed, was 9 MB). siftwise's own code doesn't import it; typer
+  0.29+ does, to parse command options. CI's package check fails if siftwise's modules
+  import pydantic or any server module.
+
 ### Fixed
 
 - Java: when two modules have a test class with the same fully qualified name, a change to

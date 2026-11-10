@@ -1,7 +1,8 @@
 """The optional extras: the modules each one brings, and how to install it when missing.
 
 ``pip install siftwise`` is the light CLI (select, record, triage, report, rollup, gha):
-typer, httpx and defusedxml only. ``siftwise[server]`` adds the API server and its database;
+typer, httpx and defusedxml only (typer 0.29+ also installs pydantic, which the CLI never
+imports). ``siftwise[server]`` adds the API server and its database;
 ``siftwise[mcp]`` the MCP server for coding agents. Pure (no imports of either), so the light
 CLI can check before importing.
 """

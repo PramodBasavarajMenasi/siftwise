@@ -1016,12 +1016,12 @@ results.
 
 ### Results
 
-"Runs that still fail" is the CI question: did the budget-limited run still go red? A run
-with several failures counts once. "Failures caught" counts every failing test, so a few runs
+"Runs whose failure is still caught" is the CI question: did the budget-limited run still go
+red? A run with several failures counts once. "Failures caught" counts every failing test, so a few runs
 with hundreds of failures dominate it; it's also shown without them. Time to first failure is
 over the runs whose budget caught one, as a share of the run's full time.
 
-| | Budget | Runs that still fail | Failures caught | Without the biggest runs | First failure (median) | Measured over budget |
+| | Budget | Runs whose failure is still caught | Failures caught | Without the biggest runs | First failure (median) | Measured over budget |
 |---|---|---|---|---|---|---|
 | RDFLib/rdflib, 31 runs | none | 30 of 31 | 1,903 of 1,904 | | | |
 | | 10% | 22 of 31 | 1,240 (65.1%) | 127 of 246 (52%) | 5.0 s, 1.5% of the run | 1 run (at most 3.9×) |
@@ -1045,7 +1045,8 @@ failures) and 3 substrate runs (1,810 of 2,044).
   their failures (119 of 333, 68 of 311 caught).
 - **substrate does badly by failures.** Its three biggest runs (about 603 failures each) are
   barely touched: the budget catches 31 of their 1,810 failures at 10% and 25%, 46 at 50%. By
-  runs it does better (about half of the runs still fail at 10%, three quarters at 50%), but
+  runs it does better (about half of the runs' failures are still caught at 10%, three
+  quarters at 50%), but
   its first failures come late (median 75 to 199 s). Most of its failing runs (52 of 72) are
   full-suite fallbacks, which a budget can only pack by history (every test ranked
   history-only), and its three biggest runs are among them.
@@ -1151,9 +1152,9 @@ depends on it, instead of the full suite.
 - **Time to first failure** (7 selective runs that caught one, all from that PR): risk order
   reached it after a median 9.7% of the tests and 1.3% of the time, against 100% for the
   default order (the failing class sorts last by path there).
-- **Under a time budget** (34 runs with failures; 27 are packed full suites): runs that still
-  fail 21, 23 and 27 of 34 at 10%, 25% and 50% (34 without a budget); failures caught 73%,
-  76% and 88%.
+- **Under a time budget** (34 runs with failures; 27 are packed full suites): runs whose
+  failure is still caught 21, 23 and 27 of 34 at 10%, 25% and 50% (34 with no budget);
+  failures caught 73%, 76% and 88%.
 - **Graph checked by hand** for a change to `EventJsonLayout.java` (that PR): the three test
   classes it selects all use it, directly or through `EventJsonLayoutBaseFactory` (an import,
   and a same-package reference with no import); a text search finds no other test naming it.
@@ -1278,23 +1279,23 @@ Measured 2026-11-10 from the dogfood workflow (`.github/workflows/dogfood.yml`),
 siftwise's own full suite on every PR and push to main as a shadow run: it stores what
 siftwise would have selected, runs everything, and compares
 ([ARCHITECTURE](../ARCHITECTURE.md#shadow-mode)). The numbers are
-`python -m scripts.dogfood_report report --since 2026-10-26`, over every run's summary
-artifact.
+`python -m scripts.dogfood_report report --since 2026-10-26 --exclude-forks`, over every
+run's summary artifact.
 
 | | |
 |---|---|
-| Workflow runs | 36, from 2026-10-26 to 2026-11-09: 17 PR runs, 19 pushes to main; 2 from fork PRs |
-| Shadow runs counted | 34 (2 had no selection stored) |
-| Selective | 11 of 34; the other 23 would have run the full suite: 20 for a changed build or config file (`Dockerfile` and `docker-compose.yml` 6 runs each, workflows, and the test fixtures' own `build.gradle.kts`, `tsconfig.json`, `jest.config.ts`), 3 for a changed file no test reaches (e.g. `glama.json`) |
+| Workflow runs | 36, from 2026-10-26 to 2026-11-09: 17 PR runs, 19 pushes to main; 2 of the PR runs are from forks (#62, #63; first-time contributors, so they ran once approved) |
+| Shadow runs counted | 32: the first 2 runs stored no selection (no history yet), and the 2 fork runs are left out (`--exclude-forks`) because code from the fork wrote their summaries; each fork change still counts once, as its push to main |
+| Selective | 9 of 32; the other 23 would have run the full suite: 20 for a changed build or config file (`Dockerfile` and `docker-compose.yml` 6 runs each, workflows, and the test fixtures' own `build.gradle.kts`, `tsconfig.json`, `jest.config.ts`), 3 for a changed file no test reaches (e.g. `glama.json`) |
 | Tests selected in the selective runs | 0 to 1,455 of 1,189 to 1,641 known tests (median 39% of them) |
-| Time saved, measured on the full runs | 20.0% of 24.6 minutes (14.7% of 23.0 minutes without the 2 fork runs) |
+| Time saved, measured on the full runs | 14.7% of 23.0 minutes over the 32 runs |
 | Failures | none: every run's suite passed, so recall can't be measured yet |
 
 - **Small and correlated:** a merged PR usually counts twice, once as its PR run and once as
-  the push to main of the same change, so the 11 selective runs are about 6 distinct changes.
+  the push to main of the same change, so the 9 selective runs are about 6 distinct changes.
   One of them changed no tested code (0 tests selected, 100% saved).
-- **Weekly:** 6, 20 and 8 counted runs in the weeks of 2026-10-26, 11-02 and 11-09; time saved
-  21%, 7% and 50%.
+- **Weekly:** 6, 20 and 6 counted runs in the weeks of 2026-10-26, 11-02 and 11-09; time saved
+  21%, 7% and 34%.
 - **Fixture build files count as build files:** a change to `tests/fixtures/java_gradle/
   build.gradle.kts` or the JS fixtures' `tsconfig.json` ran siftwise's own full suite,
   though they are test data, not siftwise's build. A `[[depends]]` rule can't narrow a build
