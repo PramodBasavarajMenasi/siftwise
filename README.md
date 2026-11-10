@@ -46,7 +46,7 @@ and Linear found that as development accelerates, CI becomes a bottleneck, becau
 still has to pass through it
 ([AI coding has made CI a bottleneck](https://linear.app/now/ci-bottleneck-reworked)).
 
-> **Status: alpha** (`0.2.0`). Evaluated on four real repos' CI history. APIs and the
+> **Status: alpha** (`0.3.0`). Evaluated on six real repos' CI history. APIs and the
 > database schema may change before 1.0.
 
 <p align="center">
@@ -93,10 +93,12 @@ The selected tests come riskiest first, so a likely failure shows up early. Each
 from how directly the change reaches it, how recently and how often it failed (flaky failures
 discounted), and whether it's new: a fixed, documented formula, no learning
 ([details and an example](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/ARCHITECTURE.md#risk-order)).
-A test whose own file imports changed code (a Python, Jest or Java test file, or a Go
-package or its tests) counts as directly reached, like a test named after the changed file;
-one that reaches it only through other files or packages counts as indirect. The CLI sends
-each import's depth (`import_depths`); with an older CLI or server, every import counts as
+A test whose own file imports changed code (a Python, Jest or Java test file) counts as
+directly reached, like a test named after the changed file; one that reaches it only through
+other files counts as indirect. Go packages that import a changed package stay indirect:
+Go's graph is per package, and most dependents import the changed package themselves, so
+"direct" would only lift them all over `[[depends]]` rules' tests. The CLI sends each
+import's depth (`import_depths`); with an older CLI or server, every import counts as
 indirect. The order never changes which tests run.
 
 | Runner | What the order guarantees |
@@ -165,7 +167,7 @@ cd siftwise
 ```
 
 **1. Start the server** with Postgres, from the published image
-(`ghcr.io/pramodbasavarajmenasi/siftwise:0.2.0`). The API token is a shared secret you choose;
+(`ghcr.io/pramodbasavarajmenasi/siftwise:0.3.0`). The API token is a shared secret you choose;
 it goes in `.env`, which `docker compose` reads:
 
 ```sh quickstart
@@ -244,7 +246,7 @@ With Docker, from the published image:
 ```sh
 docker run -d -p 8000:8000 -e SIFTWISE_API_TOKEN=... \
     -e SIFTWISE_DATABASE_URL=postgresql+psycopg://user:password@db-host:5432/siftwise \
-    ghcr.io/pramodbasavarajmenasi/siftwise:0.2.0
+    ghcr.io/pramodbasavarajmenasi/siftwise:0.3.0
 ```
 
 To build the image from a checkout instead: `docker build -t siftwise .`, then run `siftwise`
@@ -340,7 +342,7 @@ checkout and never block CI: if the server is unreachable, times out or returns 
   `pull-requests: write` (the comment).
 - **Full history:** check out with `fetch-depth: 0`. `select` fails with a clear message on a
   shallow clone, the only way it fails.
-- **Version:** the examples use `@main`; pin a release tag (`@v0.2.0`) or a commit SHA for
+- **Version:** the examples use `@main`; pin a release tag (`@v0.3.0`) or a commit SHA for
   reproducible CI. The actions install the CLI from their own checkout, so the CLI's version
   always matches the tag.
 
@@ -670,7 +672,7 @@ look.
 
 ```yaml
 include:
-  - remote: https://raw.githubusercontent.com/PramodBasavarajMenasi/siftwise/v0.2.0/gitlab/siftwise.gitlab-ci.yml
+  - remote: https://raw.githubusercontent.com/PramodBasavarajMenasi/siftwise/v0.3.0/gitlab/siftwise.gitlab-ci.yml
     integrity: sha256-<base64 SHA-256 of that file>
 
 workflow:  # merge request pipelines for open MRs, branch pipelines otherwise

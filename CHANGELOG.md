@@ -6,6 +6,29 @@ All notable changes to siftwise. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-10
+
+Risk order and time budgets for selected tests, Jest and Java (Maven and Gradle) selection,
+import depth in the risk order, and module build files scoped for Java. Two database
+migrations (0011, 0012): see Upgrading.
+
+### Upgrading
+
+- **Migrate the server.** `siftwise server start` runs the migrations before it serves
+  (unless `--no-migrate`); otherwise run `siftwise server migrate`. New since 0.2.0: 0011
+  (`shadow_selections.budget`, for time budgets in shadow mode) and 0012
+  (`shadow_selections.java_classes`, Java classes run whole). Both only add columns.
+- **Update the server and the clients together** (CLI, GitHub Action, GitLab template, MCP).
+  `/select` takes new fields: `js_graph`, `java`, `go_modules`, `import_depths` and
+  `budget_seconds`. A server older than the client rejects them; the clients then:
+  - send the request again without `js_graph`, `java`, `go_modules` or `import_depths`, so
+    selection works as on 0.2.0 (Jest and Java tests run in full, every import ranks as
+    indirect, Go commands name packages as before);
+  - for `budget_seconds`, fall back to the full suite with a warning (Action, GitLab, MCP) or
+    exit 1 (`siftwise select --budget`), since a budget can't be dropped silently.
+- An older client still works with a 0.3.0 server: every new field is optional, and new
+  response fields (`score`, `rank`, `rank_reason`, `budget`) are additions.
+
 ### Added
 
 - Risk order ([#42](https://github.com/PramodBasavarajMenasi/siftwise/issues/42)): every
@@ -123,13 +146,20 @@ All notable changes to siftwise. The format follows
   became bounded.
 
 - Import depth in the risk order ([#48](https://github.com/PramodBasavarajMenasi/siftwise/issues/48)):
-  a test whose own file imports changed code now ranks as a direct link (6), above tests that
-  reach it only through other files (3). The CLI sends an optional `import_depths` in
-  `/select`: the shortest depth per Python, Jest and Java test file and per Go package
-  (Python counts a `conftest.py` as one hop; Go uses `go list`'s `Imports`, `TestImports` and
-  `XTestImports`). Order only: the selected tests and `--order default` don't change. An
-  older server gets the request again without it, and an older client's imports stay
-  indirect.
+  a test whose own file (Python, Jest, Java) imports changed code now ranks as a direct link
+  (6), above tests that reach it only through other files (3). The CLI sends an optional
+  `import_depths` in `/select`: the shortest depth per test file and per Go package (Python
+  counts a `conftest.py` as one hop; Go uses `go list`'s `Imports`, `TestImports` and
+  `XTestImports`). Go packages are never promoted, whatever their depth: Go's graph is per
+  package, and most dependents import the changed package themselves, so promoting them
+  ranked nearly every importer above the tests a `[[depends]]` rule selects. Order only: the
+  selected tests and `--order default` don't change. An older server gets the request again
+  without it, and an older client's imports stay indirect.
+  Measured on the risk-order replays (docs/eval-results.md, "With import depths"): rdflib (17
+  runs) has the same medians and slightly lower means (by test count 12.8% -> 11.3%);
+  substrate (19 runs) is unchanged. Promoting Go packages too, as first built, made
+  substrate worse by test count (median 23.3% -> 34.4%; 6 runs later, 1 earlier). The eval
+  (`run_eval`) sends depths too now; `--no-import-depths` reproduces the earlier replays.
 
 - v0.2 follow-ups ([#46](https://github.com/PramodBasavarajMenasi/siftwise/issues/46)):
   - **Jest without `addFileAttribute`:** jest-junit's default report names no test file, so
@@ -393,6 +423,7 @@ test selection and failure triage in CI. Alpha: APIs and the database schema may
 - The server image is linux/amd64 only.
 - Renamed or moved tests start with no history.
 
-[Unreleased]: https://github.com/PramodBasavarajMenasi/siftwise/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/PramodBasavarajMenasi/siftwise/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/PramodBasavarajMenasi/siftwise/releases/tag/v0.3.0
 [0.2.0]: https://github.com/PramodBasavarajMenasi/siftwise/releases/tag/v0.2.0
 [0.1.0]: https://github.com/PramodBasavarajMenasi/siftwise/releases/tag/v0.1.0

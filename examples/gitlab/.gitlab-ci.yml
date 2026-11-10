@@ -36,8 +36,8 @@ stages:
   variables:
     # To test unreleased changes, build a wheel (uv build --wheel in the siftwise checkout),
     # copy it to wheels/ and point both specs at it (see README.md).
-    SIFTWISE_PIP_SPEC: "siftwise==0.2.0"
-    EXAMPLE_SERVER_PIP_SPEC: "siftwise[server]==0.2.0"
+    SIFTWISE_PIP_SPEC: "siftwise==0.3.0"
+    EXAMPLE_SERVER_PIP_SPEC: "siftwise[server]==0.3.0"
     # The database is reachable only inside this job's network: not a secret.
     POSTGRES_USER: siftwise
     POSTGRES_PASSWORD: siftwise

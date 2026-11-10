@@ -7,9 +7,11 @@ fixed, documented sum (no learning), from what the selection and ``test_stats`` 
 
 * ``link``: how the change reaches the test, its strongest reason: 6 direct (the test's own
   file changed, or path mapping: ``test_x.py`` for ``x.py``, the changed file's Go package, a
-  JS test named after it; or the test file / Go package imports changed code itself: import
-  depth 1), 3 indirect (imports changed code only through other files or packages, or at a
-  depth the client didn't send; a declared ``[[depends]]`` rule; a nested build file), 0
+  JS test named after it; or the test file (Python, Jest, Java) imports changed code itself:
+  import depth 1), 3 indirect (imports changed code only through other files, or at a depth
+  the client didn't send; a Go package importing a changed package, at any depth: Go's graph
+  is per package and depth 1 is its common case; a declared ``[[depends]]`` rule; a nested
+  build file), 0
   history only (co-change, recently failed or broken on main, always-run). The CLI sends each
   import's shortest depth (``import_depths``); an older CLI sends none: every import is then
   indirect.

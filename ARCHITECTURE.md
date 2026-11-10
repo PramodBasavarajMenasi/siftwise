@@ -290,7 +290,7 @@ score = link + 3 × recency × (1 − flaky) + 2 × failure_rate × (1 − flaky
 
 | Term | Value |
 |---|---|
-| `link` | the test's strongest reason: **6** direct (its own file changed; path mapping: `test_x.py` for `x.py`, the changed file's Go package, a JS test named after it; or its test file or Go package imports changed code itself, import depth 1); **3** indirect (an import of changed code through other files or packages, or of unknown depth; a `[[depends]]` rule; a nested build file); **0** history only (co-change, recently failed or broken on main, `always_run`) |
+| `link` | the test's strongest reason: **6** direct (its own file changed; path mapping: `test_x.py` for `x.py`, the changed file's Go package, a JS test named after it; or its test file (Python, Jest, Java) imports changed code itself, import depth 1); **3** indirect (an import of changed code through other files, or of unknown depth; a Go package importing a changed package, at any depth; a `[[depends]]` rule; a nested build file); **0** history only (co-change, recently failed or broken on main, `always_run`) |
 | `recency` | `0.5 ^ (days / 7)`: days from the test's last failure to the repo's newest run (not to now, so the answer doesn't drift with the clock); 0 if it hasn't failed in the window |
 | `failure_rate` | failures ÷ runs in the window |
 | `flaky` | `test_stats.flaky_score`: recency and rate count only failure evidence that isn't flakiness |
@@ -345,9 +345,16 @@ code itself. The CLI computes it with the graphs it already builds:
   its tests import a changed package. `Deps` (transitive) still decides what is affected.
 - **Jest, Java:** the graphs' `nearest.depth`.
 
-Depth 1 makes an import a direct link; deeper, or a test with no depth sent, stays indirect.
-Only the four import signals read it: path mapping stays direct and `[[depends]]`, nested
-build files and dynamic imports stay indirect whatever the depth. It is order only, so
+Depth 1 makes a test file's import a direct link (Python, Jest, Java); deeper, or a test with
+no depth sent, stays indirect. **Go packages are never promoted:** the CLI sends their depth,
+but the selector keeps every Go dependent indirect. Go's graph is package-level, and a
+package importing the changed package itself is the common case (83% of the import-linked
+packages in the substrate replays, against 16% of rdflib's test files at depth 1), so depth
+didn't single out the closest tests; it lifted every importer over the e2e suites a
+`[[depends]]` rule selects, which made substrate's risk order worse (docs/eval-results.md,
+"With import depths"). Only the three file-graph import signals read it: path mapping stays
+direct and Go imports, `[[depends]]`, nested build files and dynamic imports stay indirect
+whatever the depth. It is order only, so
 `order: default` and the selected tests are the same with or without it (a time budget does
 pack in risk order, so it can keep other tests). An older server rejects the field; the
 clients send the request again without it (`OPTIONAL_SELECT_FIELDS`), and every import is
@@ -355,8 +362,9 @@ indirect, as before. It isn't stored (`runs.affected`, shadow selections) and tr
 read it.
 
 **Limits:** depth counts import hops, not how much of the changed code a test exercises: a
-test that imports a large module for one constant is as "direct" as one testing it. The eval
-doesn't send depths, so the replays' risk-order figures are without them. Recency counts
+test that imports a large module for one constant is as "direct" as one testing it. Measured
+on Python (rdflib) and Go (substrate) only: the Jest and Java depths have no replay with
+failures to measure time to first failure on. Recency counts
 failures on any branch: the request doesn't say
 which branch it is on, and other PRs' failures count as well. Measured on rdflib and substrate
 PR runs in [eval results](docs/eval-results.md#risk-order-time-to-first-failure).

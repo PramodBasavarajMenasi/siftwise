@@ -559,8 +559,9 @@ def _select(
               if (path := normalize_path(key))}  # fmt: skip
 
     def import_link(key: str) -> Link:
-        """An import of changed code: direct when the test (file or Go package) imports it
-        itself, else (deeper, or no depth sent) indirect. Only the risk order reads it."""
+        """An import of changed code from a test FILE (Python, Jest, Java): direct when the
+        file imports it itself, else (deeper, or no depth sent) indirect. Only the risk order
+        reads it. Go packages don't use it: see the Go dependents below."""
         return Link.DIRECT if depths.get(key) == 1 else Link.INDIRECT
 
     affected_packages = affected_packages or {}
@@ -782,7 +783,11 @@ def _select(
         if imported:
             first = sorted(imported)[0]
             more = f" (+{len(imported) - 1} more)" if len(imported) > 1 else ""
-            add(test.test_id, f"imports changed package {first}{more}", import_link(test.classname))
+            # Always indirect, whatever its depth: Go's graph is package-level, and a
+            # package importing the changed package itself is the common case (83% of the
+            # import-linked packages in the substrate replays), not a sign the test is
+            # closer. Promoting them lifted every importer over [[depends]] rules' tests.
+            add(test.test_id, f"imports changed package {first}{more}", Link.INDIRECT)
             whole_packages.add(test.classname)
             covered_by_dependents.update(imported)
 

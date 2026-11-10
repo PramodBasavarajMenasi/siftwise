@@ -373,6 +373,52 @@ def test_evaluate_never_runs_a_deleted_test_file(db_session: Session, tmp_path: 
     assert result.selection.command == "pytest tests/test_keep.py"
 
 
+def test_evaluate_sends_import_depths_as_select_does(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#48: the eval sends each import's depth (from the graph at the commit), and
+    --no-import-depths sends none: the replays published before it."""
+    for ci, hour, changed in ((1, 1, ["src/a.py"]), (2, 2, ["shop/money.py"])):
+        results = [ParsedTestResult(f"tests.{m}::t", f"tests.{m}", "t", None, P, 1, 1)
+                   for m in ("test_near", "test_far")]  # fmt: skip
+        create_run(db_session, RunMetadata(
+            repo=REPO, commit_sha=f"{ci:040x}", branch="feature", is_main=False,
+            ci_run_id=str(ci), started_at=T0 + timedelta(hours=hour), changed_files=changed,
+        ), results)  # fmt: skip
+    repo_id = db_session.execute(
+        text("SELECT id FROM repos WHERE name = :n"), {"n": REPO}
+    ).scalar_one()
+    target = next(t for t in ev.pr_targets(db_session, repo_id, 10, False) if t.ci_run_id == "2")
+    edges = {
+        "shop/money.py": [],
+        "shop/cart.py": ["shop/money.py"],
+        "tests/test_near.py": ["shop/money.py"],
+        "tests/test_far.py": ["shop/cart.py"],
+    }
+    (tmp_path / f"pygraph-{target.commit_sha}.json").write_text(json.dumps({"edges": edges}))
+    (tmp_path / f"files-{target.commit_sha}.json").write_text(json.dumps(sorted(edges)))
+    sent: list[object] = []
+    real = ev.select_tests  # type: ignore[attr-defined]
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        sent.append(kwargs.get("import_depths"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(ev, "select_tests", spy)
+    index = ev.HistoryIndex(db_session, repo_id)
+    graphs = ev.GraphProvider(None, "go", tmp_path)
+
+    result = ev.evaluate(db_session, index, target, SelectorConfig(), graphs, {}, go=False)
+    assert sent[0] == {"tests/test_near.py": 1, "tests/test_far.py": 2}
+    ranks = {t.test_id: t.rank or 0 for t in result.selection.tests}
+    assert 0 < ranks["tests.test_near::t"] < ranks["tests.test_far::t"]  # the direct one first
+
+    sent.clear()
+    ev.evaluate(db_session, index, target, SelectorConfig(), graphs, {}, go=False,
+                import_depths=False)  # fmt: skip
+    assert set(sent) == {None}
+
+
 def iso(when: datetime) -> str:
     return when.isoformat().replace("+00:00", "Z")
 

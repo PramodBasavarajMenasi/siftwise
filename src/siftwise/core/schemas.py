@@ -328,7 +328,8 @@ class SelectRequest(ChangeRequest):
         max_length=100_000,
         description="Test file (Python, Jest, Java) or Go package -> the shortest import depth "
         "from it to a changed file, 1 = it imports changed code itself. Order only: depth 1 "
-        "ranks as a direct link, deeper as indirect; missing = indirect",
+        "ranks a test file's import as a direct link, deeper as indirect; missing = indirect. "
+        "Go packages' depths are accepted but don't change their link (always indirect)",
     )
     budget_seconds: float | None = Field(
         default=None,
