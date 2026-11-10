@@ -15,7 +15,8 @@ the week-2 code (its history isn't in the current database):
   packages) with real failures: recall, with and without a declared rule for its e2e suites.
 
 And of triage's verdicts, on rdflib and substrate: [Triage eval](#triage-eval). Server and
-eval speed-ups, with before/after numbers: [Performance](#performance).
+eval speed-ups, with before/after numbers: [Performance](#performance). Live numbers from
+siftwise's own CI, in shadow mode: [siftwise on itself](#siftwise-on-itself).
 
 ## ipfs/kubo
 
@@ -876,6 +877,67 @@ against the order named.
   rank high and run long, so a slow risky package can come before a quick failing one. In one
   run the first failure moved from 114 s to 1,292 s of a 1,293 s run.
 
+### With import depths (#48)
+
+Measured 2026-11-10 with the eval sending each import's depth, as `siftwise select` does
+since #48 (`run_eval`'s default now; `--no-import-depths` gives the numbers above). Depth 1
+(a test file imports the changed code itself) ranks as a direct link, deeper as indirect; it
+changes the order only. Same runs, same selections (checked on every run) and the same
+default order. Three versions: before #48, #48 as first built (depths for every graph, Go
+packages included), and as shipped (depths for test files only: Python, Jest, Java).
+
+| | Order | By test count | By measured time | vs default (count; time) |
+|---|---|---|---|---|
+| RDFLib/rdflib, 17 runs | risk, before #48 | 1.2% (12.8%) | 1.4% (12.1%) | 10/4/3; 10/4/3 |
+| | risk, depths for every graph | 1.2% (11.3%) | 1.4% (11.2%) | 10/4/3; 10/4/3 |
+| | **risk, depths for test files (shipped)** | **1.2%** (11.3%) | **1.4%** (11.2%) | 10/4/3; 10/4/3 |
+| agent-substrate/substrate, 19 runs | risk, before #48 | 23.3% (30.3%) | 25.6% (34.4%) | 16/2/1; 12/5/2 |
+| | risk, depths for every graph | 34.4% (39.0%) | 25.6% (34.9%) | 16/2/1; 12/5/2 |
+| | **risk, depths for test files (shipped)** | **23.3%** (30.3%) | **25.6%** (34.4%) | 16/2/1; 12/5/2 |
+
+**What went wrong with Go packages** (every graph, the first build): run for run against
+risk order without depths, substrate's first failure came earlier in 1 run, later in 6 and
+the same in 12 (by count and by time alike). Taken failure by failure in the 6 that got
+worse:
+- **Every one of the 32 packages that moved ahead of the first failure** was a Go package
+  importing the changed package itself (depth 1), promoted from indirect (3) to direct (6):
+  5 to 14 such packages per run.
+- **In 5 of the 6, the first failure is an e2e suite** (`internal/e2e/suites/...`) that only
+  the declared `[[depends]]` rule selects, with no import depth: it kept its indirect link
+  and a score of 5.8 to 6.0 (3 plus a recent failure), while the importers went from 3 to 5.7
+  (3, plus 2 if new) to 6 to 8.7. It moved from position 6, 9, 7 and 7 to 13, 14, 18 and 14,
+  and from 2 to 3 in the fifth.
+- **In the 6th** the failing package (`cmd/atelet`) was already direct (its own file
+  changed); one depth-1 importer with more history moved one place ahead of it (2 -> 3).
+- **Depth didn't tell Go packages apart:** in the 6 runs no selected package had depth 2 or
+  more, and over the 19 runs 83% of the import-linked packages are at depth 1 (59% to 100%
+  per run). rdflib's test files are the opposite: 16% at depth 1 (0% to 23% per run), 84%
+  deeper.
+
+So the "many Go packages import it directly" cause holds, with the precise mechanism: depth
+1 is the common case in a package-level graph, so it ranked nearly every importer above the
+tests a `[[depends]]` rule selects, which #48 never meant to reorder.
+
+**The rule shipped:** Go packages are never promoted by depth (they stay indirect, as before
+#48); test files' depth 1 still makes a direct link. The reason isn't these scores: a Go
+edge is package to package (a package imports another for any of its symbols, and its tests
+run whole), while a test file importing a module is a narrower statement about what that
+test uses. A smaller bump for depth 1 (between 3 and 6) was considered and not taken: it
+would still lift most Go importers over rule-selected tests with the same history (a new
+importer at 4.5 + 2 = 6.5 against the failing suites' 5.8 to 6.0), so it softens the cause
+instead of removing it. With the rule, substrate is exactly as before #48 (all 19 runs
+identical), and rdflib keeps its small gain (all 17 runs identical to depths for every
+graph: it has no Go). The Jest and Java depths stay on with no replay to measure them: no
+Jest replay exists, and dropwizard's and fixture-monkey's handful of runs with a first
+failure weren't re-measured.
+
+- **How it was run:** rdflib from the cached Python graphs (49 minutes for the whole replay,
+  13 for the 17 runs again with the rule). substrate's cached Go graphs predate the direct
+  edges depth needs, so the graphs of the 19 runs measured here were rebuilt with `go list`
+  (`--commits ... --jobs 4`, 41 minutes; 4 minutes again with the rule); the other runs only
+  matter for recall, which depth can't change. A first pass on the old graphs (no depths)
+  reproduced the published substrate numbers exactly.
+
 **Risk per unit of time (evaluated, not adopted).** This is the standard cost-aware order: each
 unit of work (a pytest argument, a Go package, a Jest file) by its best score divided by its
 estimated duration. The duration is the sum of its tests' mean durations, with an unknown one
@@ -938,6 +1000,9 @@ uv run python -m scripts.eval.run_eval --repo agent-substrate/substrate --langua
     --siftwise-toml scripts/eval/substrate.siftwise.toml --failing --resume substrate-risk.jsonl
 ```
 
+Add `--no-import-depths` for the numbers before #48. Go graphs cached before #48 have no
+direct edges (no depths): delete a commit's `.eval-cache/gograph-<sha>.json` to rebuild it.
+
 ## Time budget: recall within a budget
 
 What does a time budget (`--budget`, [ARCHITECTURE](../ARCHITECTURE.md#time-budget)) still
@@ -951,12 +1016,12 @@ results.
 
 ### Results
 
-"Runs that still fail" is the CI question: did the budget-limited run still go red? A run
-with several failures counts once. "Failures caught" counts every failing test, so a few runs
+"Runs whose failure is still caught" is the CI question: did the budget-limited run still go
+red? A run with several failures counts once. "Failures caught" counts every failing test, so a few runs
 with hundreds of failures dominate it; it's also shown without them. Time to first failure is
 over the runs whose budget caught one, as a share of the run's full time.
 
-| | Budget | Runs that still fail | Failures caught | Without the biggest runs | First failure (median) | Measured over budget |
+| | Budget | Runs whose failure is still caught | Failures caught | Without the biggest runs | First failure (median) | Measured over budget |
 |---|---|---|---|---|---|---|
 | RDFLib/rdflib, 31 runs | none | 30 of 31 | 1,903 of 1,904 | | | |
 | | 10% | 22 of 31 | 1,240 (65.1%) | 127 of 246 (52%) | 5.0 s, 1.5% of the run | 1 run (at most 3.9×) |
@@ -980,7 +1045,8 @@ failures) and 3 substrate runs (1,810 of 2,044).
   their failures (119 of 333, 68 of 311 caught).
 - **substrate does badly by failures.** Its three biggest runs (about 603 failures each) are
   barely touched: the budget catches 31 of their 1,810 failures at 10% and 25%, 46 at 50%. By
-  runs it does better (about half of the runs still fail at 10%, three quarters at 50%), but
+  runs it does better (about half of the runs' failures are still caught at 10%, three
+  quarters at 50%), but
   its first failures come late (median 75 to 199 s). Most of its failing runs (52 of 72) are
   full-suite fallbacks, which a budget can only pack by history (every test ranked
   history-only), and its three biggest runs are among them.
@@ -1086,9 +1152,9 @@ depends on it, instead of the full suite.
 - **Time to first failure** (7 selective runs that caught one, all from that PR): risk order
   reached it after a median 9.7% of the tests and 1.3% of the time, against 100% for the
   default order (the failing class sorts last by path there).
-- **Under a time budget** (34 runs with failures; 27 are packed full suites): runs that still
-  fail 21, 23 and 27 of 34 at 10%, 25% and 50% (34 without a budget); failures caught 73%,
-  76% and 88%.
+- **Under a time budget** (34 runs with failures; 27 are packed full suites): runs whose
+  failure is still caught 21, 23 and 27 of 34 at 10%, 25% and 50% (34 with no budget);
+  failures caught 73%, 76% and 88%.
 - **Graph checked by hand** for a change to `EventJsonLayout.java` (that PR): the three test
   classes it selects all use it, directly or through `EventJsonLayoutBaseFactory` (an import,
   and a same-package reference with no import); a text search finds no other test naming it.
@@ -1206,6 +1272,36 @@ files from the GitHub API, the graph as of the snapshot, not of each commit):
   it computes, and most of its tests reach that code, so 12 to 470 test files run on top of
   the import graph's for every change. That's the safe answer for a test runner's own
   source; most application repos have far fewer dynamic imports, but that isn't measured.
+
+## siftwise on itself
+
+Measured 2026-11-10 from the dogfood workflow (`.github/workflows/dogfood.yml`), which runs
+siftwise's own full suite on every PR and push to main as a shadow run: it stores what
+siftwise would have selected, runs everything, and compares
+([ARCHITECTURE](../ARCHITECTURE.md#shadow-mode)). The numbers are
+`python -m scripts.dogfood_report report --since 2026-10-26 --exclude-forks`, over every
+run's summary artifact.
+
+| | |
+|---|---|
+| Workflow runs | 36, from 2026-10-26 to 2026-11-09: 17 PR runs, 19 pushes to main; 2 of the PR runs are from forks (#62, #63; first-time contributors, so they ran once approved) |
+| Shadow runs counted | 32: the first 2 runs stored no selection (no history yet), and the 2 fork runs are left out (`--exclude-forks`) because code from the fork wrote their summaries; each fork change still counts once, as its push to main |
+| Selective | 9 of 32; the other 23 would have run the full suite: 20 for a changed build or config file (`Dockerfile` and `docker-compose.yml` 6 runs each, workflows, and the test fixtures' own `build.gradle.kts`, `tsconfig.json`, `jest.config.ts`), 3 for a changed file no test reaches (e.g. `glama.json`) |
+| Tests selected in the selective runs | 0 to 1,455 of 1,189 to 1,641 known tests (median 39% of them) |
+| Time saved, measured on the full runs | 14.7% of 23.0 minutes over the 32 runs |
+| Failures | none: every run's suite passed, so recall can't be measured yet |
+
+- **Small and correlated:** a merged PR usually counts twice, once as its PR run and once as
+  the push to main of the same change, so the 9 selective runs are about 6 distinct changes.
+  One of them changed no tested code (0 tests selected, 100% saved).
+- **Weekly:** 6, 20 and 6 counted runs in the weeks of 2026-10-26, 11-02 and 11-09; time saved
+  21%, 7% and 34%.
+- **Fixture build files count as build files:** a change to `tests/fixtures/java_gradle/
+  build.gradle.kts` or the JS fixtures' `tsconfig.json` ran siftwise's own full suite,
+  though they are test data, not siftwise's build. A `[[depends]]` rule can't narrow a build
+  file (build files are checked first); scoping test fixtures is left for later.
+- **No recall yet.** A dogfood failure would show up here as caught or missed; until there is
+  one, the recall numbers are the replays' above.
 
 ## Performance
 

@@ -32,7 +32,7 @@ haven't verified why, so the example no longer depends on it.
 ## Run it on gitlab.com
 
 1. **Copy the example** out of the siftwise checkout: `cp -r examples/gitlab
-   ~/siftwise-gitlab-example`. It installs siftwise 0.2.0 from PyPI. To test unreleased
+   ~/siftwise-gitlab-example`. It installs siftwise 0.3.0 from PyPI. To test unreleased
    changes, build a wheel in the siftwise checkout (`uv build --wheel`), copy
    `dist/siftwise-*-py3-none-any.whl` into the example's `wheels/` folder, and set
    `SIFTWISE_PIP_SPEC: "./wheels/<wheel file>"` and

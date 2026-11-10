@@ -6,14 +6,17 @@ release.yml).
 - ``twine check --strict`` on the sdist and wheel;
 - the sdist holds only ``src/siftwise``, README.md, LICENSE and pyproject.toml; the wheel holds
   the migrations;
-- the wheel in fresh venvs: light (``siftwise --help``, ``version`` and ``--version``, none of
-  the extras' modules importable, ``siftwise server start`` exits 2 with the install command),
+- the wheel in fresh venvs: light (``siftwise --help``, ``version`` and ``--version``; none of
+  the extras' modules installed but pydantic, which typer 0.29+ requires; siftwise's light
+  modules import none of them, pydantic included, and its commands load pydantic only through
+  typer (``light_cli_check``); ``siftwise server start`` exits 2 with the install command),
   ``[server]`` (the API imports, the migrations resolve) and ``[mcp]``; prints each install's
   size.
 
 Needs only the standard library and ``uv`` on PATH. Exit 1 on the first failed check.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -22,7 +25,114 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-SERVER_MODULES = ("fastapi", "uvicorn", "sqlalchemy", "alembic", "psycopg", "pydantic")
+SERVER_MODULES = ("fastapi", "uvicorn", "sqlalchemy", "alembic", "psycopg", "pydantic_settings")
+# Installed in the light venv since typer 0.29.0 requires it, and typer imports it whenever it
+# builds a command's parameters (typer/_adapters.py). siftwise itself must never import it.
+PYDANTIC = "pydantic"
+# Nothing the light CLI may load: the extras' modules and what they pull in.
+FORBIDDEN = (*SERVER_MODULES, PYDANTIC, "mcp", "starlette")
+# The light commands whose imports are checked: every command's --help, plus `version`.
+LIGHT_COMMANDS: tuple[list[str], ...] = (
+    [], ["select"], ["record"], ["triage"], ["report"], ["rollup"], ["mcp"], ["server"],
+    ["gha", "select"], ["gha", "record"], ["gha", "rollup"],
+    ["gitlab", "select"], ["gitlab", "record"], ["gitlab", "rollup"],
+)  # fmt: skip
+LIGHT_MODULES = (
+    "siftwise.cli.main", "siftwise.cli.gha", "siftwise.cli.gitlab", "siftwise.cli.reruns",
+    "siftwise.core.selector", "siftwise.core.junit", "siftwise.core.risk", "siftwise.extras",
+)  # fmt: skip
+# The rule both checks share (this script on the installed wheel, tests/test_packaging.py on
+# the dev install), as code for a fresh interpreter: `importer()` = the package whose code is
+# importing (the innermost frame outside importlib and these hooks); `allowed(top, importer)`:
+# an extras' module may only be imported by its own package, or pydantic by typer.
+IMPORT_RULE = """
+import os, sys, traceback
+
+ALLOWED_IMPORTERS = {"pydantic": {"typer", "pydantic"}}
+
+def package_of(filename):
+    parts = filename.replace(os.sep, "/").split("/")
+    if "site-packages" in parts:
+        return parts[parts.index("site-packages") + 1].removesuffix(".py")
+    return "siftwise" if "siftwise" in parts else filename
+
+def _ours(frame):
+    path = frame.filename.replace(os.sep, "/")
+    return (frame.filename.startswith("<frozen importlib")
+            or path.endswith("/importlib/__init__.py")
+            or (frame.filename == "<string>" and frame.name in ("find_spec", "importer")))
+
+def importer():
+    frames = [f for f in traceback.extract_stack() if not _ours(f)]
+    return package_of(frames[-1].filename) if frames else "?"
+
+def probing():
+    # importlib.util.find_spec (extras.missing) asks whether a module exists: not an import.
+    # importlib.util is frozen in some Pythons ("<frozen importlib.util>"), a file in others.
+    return any(f.name == "find_spec" and (f.filename == "<frozen importlib.util>"
+               or f.filename.replace(os.sep, "/").endswith("/importlib/util.py"))
+               for f in traceback.extract_stack())
+
+def allowed(top, by):
+    return by == top or by in ALLOWED_IMPORTERS.get(top, ())
+"""
+# Run in the interpreter being checked; prints JSON: `on_import` = forbidden modules loaded by
+# importing siftwise's light modules (pydantic included), `blamed` = forbidden modules the
+# commands then imported against IMPORT_RULE.
+_CHECK = """
+import importlib, json
+
+FORBIDDEN = set({forbidden!r})
+blamed = []
+
+class Watch:
+    def find_spec(self, name, path=None, target=None):
+        top = name.split(".")[0]
+        if top in FORBIDDEN and name not in sys.modules and not probing():
+            by = importer()
+            if not allowed(top, by):
+                blamed.append(f"{{name}} (imported by {{by}})")
+        return None
+
+for module in {modules!r}:
+    importlib.import_module(module)
+on_import = sorted({{m.split(".")[0] for m in sys.modules}} & FORBIDDEN)
+sys.meta_path.insert(0, Watch())
+from typer.testing import CliRunner
+from siftwise.cli.main import app
+for args in {invocations!r}:
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, (args, result.output, result.exception)
+print(json.dumps({{"on_import": on_import, "blamed": blamed}}))
+"""
+
+
+def light_cli_check() -> str:
+    """Python code that imports siftwise's light modules and runs the light commands, and prints
+    what it found as JSON (see ``_CHECK``); both lists must be empty."""
+    return IMPORT_RULE + _CHECK.format(
+        forbidden=FORBIDDEN,
+        modules=LIGHT_MODULES,
+        invocations=[[*args, "--help"] for args in LIGHT_COMMANDS] + [["version"]],
+    )
+
+
+# A prelude for code that runs with the extras missing (tests/test_packaging.py): pydantic
+# (installed with typer 0.29+) is importable only by typer, as IMPORT_RULE says; for any other
+# importer, siftwise included, its import fails as if it weren't installed.
+PYDANTIC_ONLY_FOR_TYPER = """
+class _PydanticGate:
+    def find_spec(self, name, path=None, target=None):
+        top = name.split(".")[0]
+        if top == "pydantic" and not probing() and not allowed(top, importer()):
+            raise ModuleNotFoundError(
+                f"No module named {name!r} (blocked: imported by {importer()})", name=name)
+        return None
+
+sys.meta_path.insert(0, _PydanticGate())
+"""
+
+
 # hatch always adds .gitignore to an sdist.
 SDIST_FILES = ("README.md", "LICENSE", "pyproject.toml", "PKG-INFO", ".gitignore")
 
@@ -112,6 +222,11 @@ def main() -> None:
         ).strip()  # fmt: skip
         if importable != "[]":
             fail(f"the light install has extras' modules: {importable}")
+        found = json.loads(run(bin_dir / "python", "-c", light_cli_check()).strip())
+        if found["on_import"]:
+            fail(f"importing the light CLI loads extras' modules: {found['on_import']}")
+        if found["blamed"]:
+            fail(f"the light commands import extras' modules: {found['blamed']}")
         out = run(siftwise, "server", "start", expect=2)
         if "pip install 'siftwise[server]'" not in out:
             fail(f"`siftwise server start` without the extra doesn't name it:\n{out}")

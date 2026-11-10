@@ -73,8 +73,9 @@ SIFTWISE_REAL_TOOL_TESTS=1 SIFTWISE_TEST_JEST_HOME=/path/to/jest-home   uv run p
 ```
 
 **The package checks** (CI's `package` job) build the sdist and wheel, run `twine check`,
-check the sdist's file list, and install the wheel in fresh venvs: the light install must
-import none of the server's or MCP's dependencies, and `[server]` and `[mcp]` must work.
+check the sdist's file list, and install the wheel in fresh venvs. The light install must
+not contain the server's or MCP's dependencies, except pydantic, which typer 0.29+ requires.
+Its commands must not import any of them, pydantic included. `[server]` and `[mcp]` must work.
 
 ```sh
 uv build && uv run --no-project python scripts/check_dist.py dist

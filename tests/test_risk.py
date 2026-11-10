@@ -330,23 +330,33 @@ def test_a_test_that_imports_changed_code_itself_ranks_as_a_direct_link() -> Non
     assert pick(Order.RISK, {"tests/test_near.py": 2}).tests == before.tests
 
 
-def test_go_packages_rank_by_their_import_depth() -> None:
+def test_go_packages_are_never_promoted_by_import_depth() -> None:
+    """Go's graph is package-level and depth 1 is the common case, so a package that imports
+    the changed one stays an indirect link: it doesn't jump over an e2e suite a [[depends]]
+    rule selects (substrate's 6 runs that got worse with depths in #48)."""
     hist = history(
-        KnownTest("example.com/m/b::TestB", **ESTABLISHED),  # type: ignore[arg-type]
-        KnownTest("example.com/m/c::TestC", **ESTABLISHED),  # type: ignore[arg-type]
+        KnownTest("example.com/m/b::TestB", runs=2, failures=0),  # new: +2
+        KnownTest(
+            "example.com/m/e2e::TestFlow",
+            runs=50,
+            failures=1,
+            last_failed_at=NOW - timedelta(hours=12),
+        ),
     )
-    config = SelectorConfig(go_module="example.com/m")
-    affected = {"example.com/m/b": ["example.com/m/a"], "example.com/m/c": ["example.com/m/a"]}
+    config = SelectorConfig(go_module="example.com/m",
+                            depends=(DependsRule("e2e/**", ("a/**",)),))  # fmt: skip
+    affected = {"example.com/m/b": ["example.com/m/a"]}
 
     def pick(order: Order, depths: dict[str, int] | None) -> Selection:
         return select_tests(hist, ["a/a.go"], True, config, affected_packages=affected,
                             order=order, import_depths=depths)  # fmt: skip
 
-    depths = {"example.com/m/b": 2, "example.com/m/c": 1}
-    assert pick(Order.RISK, None).commands == ("go test ./b", "go test ./c")  # a tie: by ID
-    assert pick(Order.RISK, depths).commands == ("go test ./c", "go test ./b")
-    assert pick(Order.DEFAULT, depths).commands == pick(Order.DEFAULT, None).commands
-    assert SelectionScope.of(pick(Order.RISK, depths)) == SelectionScope.of(pick(Order.RISK, None))
+    depths = {"example.com/m/b": 1}
+    scores = {t.test_id: t.score for t in pick(Order.RISK, depths).tests}
+    assert scores["example.com/m/b::TestB"] == 5.0  # indirect 3 + new 2, depth or not
+    assert (scores["example.com/m/e2e::TestFlow"] or 0) > 5.0  # indirect 3 + a recent failure
+    assert pick(Order.RISK, depths).commands == pick(Order.RISK, None).commands
+    assert pick(Order.RISK, depths).commands[0] == "go test ./e2e"
 
 
 def test_depth_never_touches_links_that_are_not_imports() -> None:

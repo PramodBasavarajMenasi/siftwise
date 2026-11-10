@@ -1246,12 +1246,13 @@ def counterfactual(
     deleted: tuple[str, ...],
     explain: Explainer,
     java: JavaBuildInfo | None = None,
+    depths: dict[str, int] | None = None,
 ) -> Counterfactual:
     """Select from only the changed files that are covered by a signal on their own."""
 
     def select(files: list[str]) -> Selection:
         return select_tests(history, files, True, config, affected, affected_files, deleted,
-                            java=java)  # fmt: skip
+                            java=java, import_depths=depths)  # fmt: skip
 
     mapped = [
         p
@@ -1293,12 +1294,16 @@ def evaluate(
     durations: dict[str, float],
     go: bool,
     java_mode: bool = False,
+    import_depths: bool = True,
 ) -> Result:
+    """``import_depths``: send each import's depth as ``siftwise select`` does (#48: order
+    only); False reproduces the replays published before it."""
     history = index.history_before(run, config)
     known = run.changed_files is not None
     changed = list(run.changed_files or ())
     graph: GoGraph | None = None
     affected_files: dict[str, list[str]] = {}
+    depths: dict[str, int] = {}
     if not known:
         graph_note = "diff unknown"
     elif go:
@@ -1316,8 +1321,11 @@ def evaluate(
             graph_note = f"python: no import graph at {run.commit_sha[:7]}"
         else:
             affected_files = py_graph.affected(changed)
+            depths.update(py_graph.depths(changed))
             graph_note = f"python imports at {run.commit_sha[:7]}"
     affected = graph.affected(changed) if graph else {}
+    if graph is not None:
+        depths.update(graph.depths(changed))  # {} for a graph cached before #48
     # As `siftwise select` does: changed files that no longer exist are never run.
     deleted = graphs.deleted_at(run.commit_sha, changed) if known else ()
     if deleted is None:
@@ -1331,16 +1339,27 @@ def evaluate(
         if change is not None:
             java = JavaBuildInfo.from_json(change.payload())
             affected_files = change.files
+            depths.update((test, n.depth) for test, n in change.nearest.items())
+    sent = depths if import_depths else None
     explain = Explainer(history, changed, config.go_module, go, graph, graphs, run.commit_sha)
     selection = select_tests(history, changed, known, config, affected, affected_files, deleted,
-                             java=java)  # fmt: skip
+                             java=java, import_depths=sent)  # fmt: skip
     failures = actual_failures(session, list(run.run_ids or (run.run_id,)))
     runs = WouldRun(selection)
     caught = [f for f in failures if runs(f)]
     missed = [explain(f) for f in failures if f not in caught]
     cf = (
         counterfactual(
-            history, changed, failures, config, affected, affected_files, deleted, explain, java
+            history,
+            changed,
+            failures,
+            config,
+            affected,
+            affected_files,
+            deleted,
+            explain,
+            java,
+            sent,
         )
         if failures and selection.mode is Mode.FULL and known
         else None
@@ -1358,7 +1377,8 @@ def evaluate(
         found = {Order.DEFAULT.value: first_failure(selection.commands, ran, config.go_module)}
         for order in EVAL_ORDERS:
             ordered = select_tests(timed, changed, known, config, affected, affected_files,
-                                   deleted, order=order, java=java)  # fmt: skip
+                                   deleted, order=order, java=java,
+                                   import_depths=sent)  # fmt: skip
             # An order never changes what's selected: only the commands' order.
             assert ordered.commands and SelectionScope.of(ordered) == SelectionScope.of(selection)
             found[order.value] = first_failure(ordered.commands, ran, config.go_module)
@@ -1367,7 +1387,7 @@ def evaluate(
 
     def select(timed: RepoHistory, **options: Any) -> Selection:
         return select_tests(timed, changed, known, config, affected, affected_files, deleted,
-                            java=java, **options)  # fmt: skip
+                            java=java, import_depths=sent, **options)  # fmt: skip
 
     budgets = budget_runs(session, index, run, history, select, failures, len(caught),
                           config.go_module)  # fmt: skip
@@ -2072,6 +2092,13 @@ def main(
             "only: each build unpacks its own tree). Selection modes; --triage builds lazily.",
         ),
     ] = 1,
+    import_depths: Annotated[
+        bool,
+        typer.Option(
+            help="Send import depths, as `siftwise select` does since #48 (order only); "
+            "--no-import-depths reproduces replays published before it.",
+        ),
+    ] = True,
     triage: Annotated[
         bool,
         typer.Option(
@@ -2171,7 +2198,7 @@ def main(
             results = []
             for target in todo:
                 result = evaluate(session, index, target, config, graphs, durations, is_go,
-                                  is_java)  # fmt: skip
+                                  is_java, import_depths)  # fmt: skip
                 print_result(result, verbose)
                 results.append(result)
                 if resume:  # one line per target as soon as it's done: a crash loses nothing

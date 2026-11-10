@@ -3,6 +3,7 @@ say how to install it. CI's package job checks the same against real wheels."""
 
 import importlib
 import importlib.resources
+import json
 import re
 import subprocess
 import sys
@@ -16,13 +17,17 @@ from packaging.version import Version
 from typer.testing import CliRunner
 
 import siftwise
+from scripts import check_dist
 from siftwise import extras
 from siftwise.cli import server
 from siftwise.cli.main import EXIT_USAGE, app
 
 ROOT = Path(__file__).resolve().parent.parent
-# Everything only the server and MCP extras bring, including what they pull in.
+# Everything only the server and MCP extras bring, including what they pull in. pydantic is
+# among them, but typer 0.29+ requires it and imports it to build a command's parameters, so
+# `without_extras` lets typer (only) import it, as scripts/check_dist.py does.
 NOT_IN_THE_LIGHT_INSTALL = (*extras.SERVER_MODULES, *extras.MCP_MODULES, "starlette")
+BLOCKED = tuple(m for m in NOT_IN_THE_LIGHT_INSTALL if m != "pydantic")
 LIGHT_COMMANDS = [
     [],
     ["select"],
@@ -44,8 +49,14 @@ LIGHT_COMMANDS = [
 def without_extras(code: str) -> subprocess.CompletedProcess[str]:
     """Run ``code`` in a fresh interpreter where none of the extras' modules can be imported:
     a ``None`` entry in ``sys.modules`` is what a missing package looks like to both ``import``
-    (ModuleNotFoundError) and ``importlib.util.find_spec`` (None)."""
-    prelude = f"import sys; sys.modules.update(dict.fromkeys({NOT_IN_THE_LIGHT_INSTALL!r}))\n"
+    (ModuleNotFoundError) and ``importlib.util.find_spec`` (None). pydantic is the exception:
+    only typer may import it (typer 0.29+ does); for anyone else, siftwise included, it is
+    missing (``check_dist.PYDANTIC_ONLY_FOR_TYPER``)."""
+    prelude = (
+        check_dist.IMPORT_RULE
+        + check_dist.PYDANTIC_ONLY_FOR_TYPER
+        + f"sys.modules.update(dict.fromkeys({BLOCKED!r}))\n"
+    )
     return subprocess.run(
         [sys.executable, "-c", prelude + textwrap.dedent(code)],
         capture_output=True,
@@ -62,9 +73,28 @@ def test_the_light_cli_imports_no_server_or_mcp_dependency() -> None:
         from siftwise.cli.main import app
         import siftwise.cli.gha, siftwise.core.selector, siftwise.core.junit
 
-        for args in {LIGHT_COMMANDS!r}:
-            outcome = CliRunner().invoke(app, [*args, "--help"])
+        for args in [[*a, "--help"] for a in {LIGHT_COMMANDS!r}] + [["version"]]:
+            outcome = CliRunner().invoke(app, args)
             assert outcome.exit_code == 0, (args, outcome.output, outcome.exception)
+        loaded = {{m.split(".")[0] for m, module in sys.modules.items() if module is not None}}
+        # pydantic may be here only through typer: the gate refuses every other importer.
+        assert not loaded & set({BLOCKED!r}), loaded
+        print("ok")
+        """
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
+def test_siftwise_modules_import_no_extras_module_not_even_pydantic() -> None:
+    """Importing (not running) the light CLI: nothing of the extras, pydantic included, whatever
+    typer's version."""
+    result = without_extras(
+        f"""
+        import importlib
+        for module in {check_dist.LIGHT_MODULES!r}:
+            importlib.import_module(module)
         loaded = {{m.split(".")[0] for m, module in sys.modules.items() if module is not None}}
         assert not loaded & set({NOT_IN_THE_LIGHT_INSTALL!r}), loaded
         print("ok")
@@ -73,6 +103,43 @@ def test_the_light_cli_imports_no_server_or_mcp_dependency() -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
+
+
+def test_without_extras_refuses_pydantic_to_anyone_but_typer() -> None:
+    result = without_extras("import pydantic")
+
+    assert result.returncode != 0
+    assert "No module named 'pydantic' (blocked: imported by <string>)" in result.stderr
+
+
+def run_light_cli_check(code: str) -> dict[str, list[str]]:
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    found: dict[str, list[str]] = json.loads(result.stdout)
+    return found
+
+
+def test_the_light_cli_loads_pydantic_only_through_typer() -> None:
+    """check_dist's check, here with the dev install: nothing blocked, so it holds whatever
+    typer does (0.29+ imports pydantic to build a command's parameters)."""
+    found = run_light_cli_check(check_dist.light_cli_check())
+
+    assert found == {"on_import": [], "blamed": []}
+
+
+def test_the_light_cli_check_blames_a_command_that_imports_a_server_module() -> None:
+    code = check_dist.light_cli_check().replace(
+        "for args in [",
+        "@app.command('zz')\ndef zz() -> None:\n    import fastapi\nfor args in [['zz'], ",
+        1,
+    )
+
+    found = run_light_cli_check(code)
+
+    assert found["on_import"] == []
+    assert found["blamed"][0] == "fastapi (imported by <string>)"
 
 
 @pytest.mark.parametrize("command", ["start", "migrate"])
