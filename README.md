@@ -78,10 +78,10 @@ Full details: [ARCHITECTURE.md](https://github.com/PramodBasavarajMenasi/siftwis
 
 - **Record.** CI uploads JUnit XML with the commit, branch, changed files and what the change
   links to. The server keeps every result and rolls up per-test history.
-- **Select.** The CLI diffs your branch and builds Go or Python import graphs locally; the
-  server returns the tests the change can affect, each with a reason, or the full suite when
-  the diff, a build file or the history leaves any doubt. The command runs the riskiest tests
-  first ([risk order](#risk-order)).
+- **Select.** The CLI diffs your branch and builds Go, Python, JS/TS (Jest) or Java import
+  graphs locally; the server returns the tests the change can affect, each with a reason, or
+  the full suite when the diff, a build file or the history leaves any doubt. The command runs
+  the riskiest tests first ([risk order](#risk-order)).
 - **Triage.** Each failure gets a verdict (new regression, pre-existing on main, flaky,
   unknown) with a confidence and its evidence, using only history from before the run.
 - **Measure.** Shadow runs run the full suite and report what the selection would have
@@ -1157,9 +1157,7 @@ public issue.
   (90) days before the repo's newest run; older raw results stay, but no longer feed stats.
 - **Limits to know:** merge-queue (`merge_group`), scheduled and manual runs always run the
   full suite (no diff base); the Action is tested on Linux runners only, and the GitLab
-  template with mocks and one example project on gitlab.com (Free); Java tests are
-  recorded but always run in full (`rerun-unknown` re-runs pytest, Go, Jest, Maven and Gradle
-  tests).
+  template with mocks and one example project on gitlab.com (Free).
 
 ## Roadmap
 
@@ -1172,10 +1170,13 @@ public issue.
 - **Done (v0.2):** MCP support for more clients (tested with Claude Code, GitHub Copilot in
   VS Code, Cursor, Codex CLI and Gemini CLI), `rerun-unknown` for Go, Jest, Maven and Gradle,
   and GitLab CI support ([changelog](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CHANGELOG.md)).
-- **Next:** a demo and the launch write-up; an arm64 server image.
-- **v0.3:** live dogfooding: every siftwise PR and push to main runs as a shadow run, with a
-  server inside the CI job ([dogfood.yml](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/.github/workflows/dogfood.yml)).
-  Running since 2026-10-26; recall and time-saved numbers with v0.3.
+- **Done (v0.3):** [risk order](#risk-order), time budgets, Jest and Java (Maven and Gradle)
+  selection, import depth in the risk order, module build-file scoping for Java, and live
+  dogfooding numbers: every siftwise PR and push to main runs as a shadow run, with a server
+  inside the CI job ([dogfood.yml](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/.github/workflows/dogfood.yml)).
+- **Next (v0.4):** scoping test-fixture build files (today a fixture's `build.gradle.kts` or
+  `tsconfig.json` runs the full suite), `-mod=readonly` for older Go versions, and more recall
+  numbers; a demo and the launch write-up; an arm64 server image.
 
 ## Contributing
 
