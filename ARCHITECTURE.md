@@ -104,11 +104,12 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   package runs without `-run`, so tests added by the change run too.
 - **Several Go modules:** the CLI finds every module of the checkout (`go.mod` files, `go.work`
   `use` lines; `cli/gograph.py`), runs `go list` in each module's directory (read-only:
-  `-mod=mod` becomes `-mod=readonly`) and merges the graphs; packages of another module of
-  the checkout (a local `replace`, a workspace module) link across modules. `/select` alone
-  gets `go_modules` (directory -> module path): a package then maps to its directory through
-  its module, and a nested module's package runs as `go test -C <dir> ./pkg`. An older
-  server's 422 on it gets the request again without it.
+  `-mod=mod` becomes `-mod=readonly`, and a `GOFLAGS` without a `-mod` setting gets
+  `-mod=readonly` too, unless the module is vendored) and merges the graphs; packages of
+  another module of the checkout (a local `replace`, a workspace module) link across modules.
+  `/select` alone gets `go_modules` (directory -> module path): a package then maps to its
+  directory through its module, and a nested module's package runs as `go test -C <dir> ./pkg`.
+  An older server's 422 on it gets the request again without it.
 - **Full-suite fallbacks**, when anything is uncertain: an unknown or empty diff, no history,
   a root build or CI file changed, a changed source file no signal covers, or a selected test
   with no known runner. Docs, lint-only configs and generated files never force it.

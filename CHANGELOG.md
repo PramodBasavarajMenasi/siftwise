@@ -6,6 +6,14 @@ All notable changes to siftwise. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Go: `go list` ran with Go's own default when GOFLAGS had no `-mod` setting, and that default
+  only became read-only in Go 1.16, so on Go 1.15 or older listing packages could write go.mod
+  and go.sum. `-mod=readonly` is passed now, unless the module is vendored (Go's default there
+  is `-mod=vendor`)
+  ([#67](https://github.com/PramodBasavarajMenasi/siftwise/issues/67)).
+
 ## [0.3.0] - 2026-11-10
 
 Risk order and time budgets for selected tests, Jest and Java (Maven and Gradle) selection,

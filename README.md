@@ -1066,7 +1066,8 @@ not even in a workspace), and the graphs are merged: a package of one module tha
 imports through a local `replace` or the workspace links their tests. A package of a module
 below the root runs as `go test -C <module dir> ./pkg` (from the root, Go can't build it).
 `go list` runs with `-mod=mod` turned into `-mod=readonly`, so selecting tests never edits
-`go.mod` or `go.sum`; `-mod=vendor` is kept.
+`go.mod` or `go.sum`; `-mod=vendor` is kept. A `GOFLAGS` without a `-mod` setting gets
+`-mod=readonly` too, unless the module is vendored (`vendor/modules.txt`).
 
 A Jest test file new in the change (`*.test.*`, `*.spec.*` or under `__tests__/`) runs first,
 by its path, once siftwise can tell the path Jest expects from a known Jest test in the same
@@ -1175,8 +1176,8 @@ public issue.
   dogfooding numbers: every siftwise PR and push to main runs as a shadow run, with a server
   inside the CI job ([dogfood.yml](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/.github/workflows/dogfood.yml)).
 - **Next (v0.4):** scoping test-fixture build files (today a fixture's `build.gradle.kts` or
-  `tsconfig.json` runs the full suite), `-mod=readonly` for older Go versions, and more recall
-  numbers; a demo and the launch write-up; an arm64 server image.
+  `tsconfig.json` runs the full suite), and more recall numbers; a demo and the launch
+  write-up; an arm64 server image.
 
 ## Contributing
 

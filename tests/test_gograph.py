@@ -8,6 +8,7 @@ import pytest
 
 from siftwise.cli.gograph import (
     GoGraph,
+    _is_vendored,
     build_graph,
     find_go_modules,
     merge_graphs,
@@ -171,17 +172,45 @@ def test_find_go_modules(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("flags", "expected"),
+    ("flags", "vendored", "expected"),
     [
-        ("", ""),
-        ("-mod=mod", "-mod=readonly"),
-        ("--mod=mod -tags=e2e", "-mod=readonly -tags=e2e"),
-        ("-mod=vendor", "-mod=vendor"),  # an explicit choice, and it writes nothing
-        ("-mod=readonly -modcacherw", "-mod=readonly -modcacherw"),
+        # No -mod setting: Go's default only became read-only in Go 1.16, so
+        # read-only is passed (unless the module is vendored).
+        ("", False, "-mod=readonly"),
+        ("-tags=e2e", False, "-tags=e2e -mod=readonly"),
+        ("", True, ""),
+        ("-tags=e2e", True, "-tags=e2e"),
+        # An explicit -mod=mod is turned into -mod=readonly.
+        ("-mod=mod", False, "-mod=readonly"),
+        ("-mod=mod", True, "-mod=readonly"),
+        ("--mod=mod -tags=e2e", False, "-mod=readonly -tags=e2e"),
+        # An explicit vendor or readonly choice is kept.
+        ("-mod=vendor", False, "-mod=vendor"),
+        ("-mod=vendor", True, "-mod=vendor"),
+        ("-mod=readonly -modcacherw", False, "-mod=readonly -modcacherw"),
+        ("-mod=readonly -modcacherw", True, "-mod=readonly -modcacherw"),
     ],
 )
-def test_go_list_never_writes_go_mod(flags: str, expected: str) -> None:
-    assert readonly_goflags(flags) == expected
+def test_go_list_never_writes_go_mod(flags: str, vendored: bool, expected: str) -> None:
+    assert readonly_goflags(flags, vendored) == expected
+
+
+def test_a_vendored_module_keeps_go_its_own_default(tmp_path: Path) -> None:
+    """A module with vendor/modules.txt is listed the way Go lists it: with -mod=vendor."""
+    module = tmp_path / "mod"
+    (module / "vendor").mkdir(parents=True)
+    (module / "vendor" / "modules.txt").write_text("# example.com/x v1.0.0\n", encoding="utf-8")
+
+    assert _is_vendored(module) is True
+    assert readonly_goflags("", _is_vendored(module)) == ""
+
+
+def test_a_module_without_a_vendor_directory_is_not_vendored(tmp_path: Path) -> None:
+    module = tmp_path / "mod"
+    module.mkdir()
+
+    assert _is_vendored(module) is False
+    assert readonly_goflags("", _is_vendored(module)) == "-mod=readonly"
 
 
 def test_packages_of_other_modules_in_the_checkout_link_across_modules(tmp_path: Path) -> None:

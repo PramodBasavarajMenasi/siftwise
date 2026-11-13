@@ -13,7 +13,8 @@ local directory, or a workspace module) counts as the checkout's own: a change t
 affects the tests that import it.
 
 ``go list`` runs with ``-mod=mod`` turned into ``-mod=readonly`` (``readonly_goflags``), so
-selecting tests never edits go.mod or go.sum; ``-mod=vendor`` is kept.
+selecting tests never edits go.mod or go.sum; ``-mod=vendor`` is kept. A GOFLAGS without a
+``-mod`` setting gets ``-mod=readonly`` too, unless the module is vendored.
 """
 
 from __future__ import annotations
@@ -175,16 +176,33 @@ def _work_uses(root: Path) -> list[str | None]:
     return uses
 
 
-def readonly_goflags(flags: str) -> str:
+def readonly_goflags(flags: str, vendored: bool = False) -> str:
     """GOFLAGS with ``-mod=mod`` made ``-mod=readonly`` (``-mod=vendor``/``readonly`` kept):
-    listing packages must never write go.mod or go.sum."""
+    listing packages must never write go.mod or go.sum.
+
+    A GOFLAGS without a ``-mod`` setting leaves Go's own default, and that
+    default only became read-only in Go 1.16, so ``-mod=readonly`` is added
+    for it. A vendored module keeps Go's default (``-mod=vendor``), so it is
+    left alone.
+    """
     words = []
+    has_mod = False
     for word in flags.split():
         name, _, value = word.lstrip("-").partition("=")
-        if name == "mod" and word.startswith("-") and value not in ("vendor", "readonly"):
-            word = "-mod=readonly"
+        if name == "mod" and word.startswith("-"):
+            has_mod = True
+            if value not in ("vendor", "readonly"):
+                word = "-mod=readonly"
         words.append(word)
+    if not has_mod and not vendored:
+        words.append("-mod=readonly")
     return " ".join(words)
+
+
+def _is_vendored(root: Path) -> bool:
+    """Whether the module in ``root`` has a vendor directory: Go's default there is
+    ``-mod=vendor``."""
+    return (root / "vendor" / "modules.txt").is_file()
 
 
 def _goflags(root: Path, go: str) -> str:
@@ -202,7 +220,7 @@ def _goflags(root: Path, go: str) -> str:
 def run_go_list(root: Path, go: str = "go", timeout: float = 900) -> list[Package] | None:
     """``go list -deps -test -json ./...`` in ``root`` (a module's directory), read-only, or
     None if it fails for any reason."""
-    env = {**os.environ, "GOFLAGS": readonly_goflags(_goflags(root, go))}
+    env = {**os.environ, "GOFLAGS": readonly_goflags(_goflags(root, go), _is_vendored(root))}
     try:
         proc = subprocess.run(
             [go, "list", "-deps", "-test", "-json", "./..."],
