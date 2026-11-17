@@ -8,6 +8,21 @@ All notable changes to siftwise. The format follows
 
 ### Added
 
+- Flaky-test tracking ([#72](https://github.com/PramodBasavarajMenasi/siftwise/issues/72)):
+  - `siftwise flaky --repo acme/shop [--days 30] [--min-runs N] [--until DATE] [--json]`
+    lists tests that failed and passed on the same commit and variant (retries, re-runs),
+    marks those `known_flaky` already lists (from the checkout's `.siftwise.toml`, else the
+    list the newest main run applied), and prints entries to paste for the rest. It changes
+    nothing and needs only a read token: new route `GET /repos/{repo}/flaky` (read scope).
+  - `known_flaky` entries can expire: `{ test = "tests/test_db.py::test_pool", until =
+    "2026-12-31" }` next to plain globs (which work as before). An entry applies through its
+    date, judged by the UTC date the CI run started (a local triage or an agent: today), and
+    after that the PR comment and GitLab note say "known_flaky entry expired: <test> (until
+    <date>)". A PR still runs with its base commit's list, so it can't add or extend an
+    entry for itself.
+  - Migration 0015 adds `runs.known_flaky_expired`. An older server rejects that field: the
+    run is then recorded without it (with a warning).
+
 - Test fixtures ([#73](https://github.com/PramodBasavarajMenasi/siftwise/issues/73)):
   `fixtures = ["tests/fixtures/**"]` in `.siftwise.toml` marks test data. A changed file
   there (a sample project's `pom.xml`, `build.gradle.kts`, `tsconfig.json`, `go.mod`, ...)

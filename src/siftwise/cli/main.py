@@ -7,6 +7,7 @@ import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
@@ -23,15 +24,17 @@ from siftwise.cli.jsgraph import Affected, build_js_graph
 from siftwise.cli.pygraph import build_py_graph
 from siftwise.cli.repoconfig import (
     FILE_NAME,
+    KnownFlakyEntry,
     RepoConfig,
     RepoConfigError,
+    active_known_flaky,
     load_repo_config,
     loads_repo_config,
     read_go_module,
 )
 from siftwise.core.junit import JUnitParseError, Status, parse_junit
 from siftwise.core.risk import OfferedOrder, Order
-from siftwise.core.selector import JS_EXTENSIONS, format_duration, is_ignorable
+from siftwise.core.selector import JS_EXTENSIONS, format_duration, is_ignorable, matching_glob
 
 app = typer.Typer(help="Siftwise: test impact analysis for CI.", no_args_is_help=True)
 app.add_typer(gha.app, name="gha")
@@ -342,6 +345,8 @@ def triage_command(
     flaky = known_flaky(change.config, base, known_flaky_source)
     if flaky.changed:
         _err("siftwise: known_flaky changes in this change apply after merge")
+    for entry in flaky.expired:
+        _err(f"siftwise: {expired_note(entry)}: it no longer applies")
     body: dict[str, Any] = {
         "repo": repo,
         **change.fields,
@@ -372,6 +377,145 @@ def triage_command(
     if hit:
         _err(f"siftwise: --fail-on matched: {', '.join(hit)}")
         raise typer.Exit(EXIT_FAIL_ON)
+
+
+SUGGESTED_DAYS = 90  # `siftwise flaky` suggests entries that expire this far out
+
+
+@app.command("flaky")
+def flaky_command(
+    repo: Annotated[str, typer.Option(help="Repository name in siftwise, e.g. acme/shop.")],
+    days: Annotated[
+        int, typer.Option(min=1, max=365, help="The N days before the repo's newest run.")
+    ] = 30,
+    min_runs: Annotated[
+        int, typer.Option(min=1, help="Only tests that ran in at least N runs of the window.")
+    ] = 1,
+    until: Annotated[
+        str | None,
+        typer.Option(
+            help=f"The suggested entries' expiry, YYYY-MM-DD (default: today + "
+            f"{SUGGESTED_DAYS} days; 'none' for no expiry)."
+        ),
+    ] = None,
+    server: ServerOption = DEFAULT_SERVER,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the server's list with known_flaky matches.")
+    ] = False,
+) -> None:
+    """Tests that both failed and passed on the same commit and variant (retries, re-runs),
+    most flaky first, whether known_flaky already lists them, and ready-to-paste known_flaky
+    entries for the rest. It only suggests: nothing is changed. known_flaky comes from this
+    checkout's .siftwise.toml if there is one, else from the list the repo's newest main run
+    applied. Needs a read token (SIFTWISE_API_TOKEN). Exit codes: 0 ok, 1 API error, 2 usage
+    error."""
+    expiry = _suggested_until(until)
+    token = _token()
+    try:
+        result = get_json(server, token, f"/repos/{repo}/flaky",
+                          {"days": days, "min_runs": min_runs})  # fmt: skip
+    except SiftwiseError as exc:
+        _err(f"error: {exc}")
+        raise typer.Exit(EXIT_API_ERROR) from exc
+    listed = _listed_known_flaky(result)
+    tests = []
+    for test in result["tests"]:
+        match = matching_glob(test["test_id"], test["file_path"], listed.globs)
+        path = test["file_path"]
+        gone = next((e for e in listed.expired if matching_glob(test["test_id"], path, [e.test])),
+                    None)  # fmt: skip
+        tests.append({**test, "known_flaky": match, "expired": gone.describe() if gone else None})
+    suggested = [t["test_id"] for t in tests if t["known_flaky"] is None]
+    if json_output:
+        typer.echo(json.dumps({**result, "tests": tests, "known_flaky_source": listed.source,
+                               "suggested": [_flaky_entry(t, expiry) for t in suggested]},
+                              indent=2))  # fmt: skip
+        return
+    for line in flaky_lines(result, tests, listed.source, expiry):
+        typer.echo(line)
+
+
+@dataclass(frozen=True)
+class _Listed:
+    globs: tuple[str, ...]
+    expired: tuple[KnownFlakyEntry, ...]
+    source: str  # where known_flaky was read from, for the output
+
+
+def _listed_known_flaky(result: dict[str, Any]) -> _Listed:
+    """The known_flaky list to compare with: this checkout's .siftwise.toml (as of today,
+    the same expiry rule as record), else the globs the newest main run applied."""
+    root = git_toplevel()
+    path = root / FILE_NAME if root else None
+    if path is not None and path.is_file():
+        try:
+            config = load_repo_config(path)
+        except RepoConfigError as exc:
+            _err(f"warning: {exc}: comparing with the server's list instead")
+        else:
+            active = active_known_flaky(config.known_flaky, known_flaky_date())
+            return _Listed(active.globs, active.expired, f"{path} (as of today, UTC)")
+    at = result.get("main_known_flaky_at")
+    when = f" ({str(at)[:10]})" if at else ""
+    return _Listed(tuple(result.get("main_known_flaky") or ()), (),
+                   f"the list the newest main run applied{when}")  # fmt: skip
+
+
+def _suggested_until(value: str | None) -> date | None:
+    if value is None:
+        return known_flaky_date() + timedelta(days=SUGGESTED_DAYS)
+    if value.strip().lower() == "none":
+        return None
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError:
+        _err(f"error: --until must be YYYY-MM-DD or 'none', not {value!r}")
+        raise typer.Exit(EXIT_USAGE) from None
+
+
+def _flaky_entry(test_id: str, until: date | None) -> str:
+    """A known_flaky entry as TOML (a JSON string is a valid TOML basic string)."""
+    if until is None:
+        return json.dumps(test_id)
+    return f"{{ test = {json.dumps(test_id)}, until = {json.dumps(until.isoformat())} }}"
+
+
+def flaky_lines(
+    result: dict[str, Any], tests: list[dict[str, Any]], source: str, until: date | None
+) -> list[str]:
+    """``siftwise flaky``'s text."""
+    start, end = (
+        str(result.get("window_start") or "")[:10],
+        str(result.get("window_end") or "")[:10],
+    )
+    window = f"{start} to {end}" if end else "no runs yet"
+    if not tests:
+        return [f"No flaky tests in {result['repo']} ({window}, the {result['days']} days "
+                "before its newest run)."]  # fmt: skip
+    lines = [
+        f"Flaky tests in {result['repo']}, {window} (the {result['days']} days before its "
+        f"newest run): {len(tests)}{'+' if result.get('truncated') else ''}",
+        "A test is flaky on a commit when it both failed and passed there (same variant; "
+        "retries and re-runs count).",
+        "",
+        f"  {'FLAKY':>9}  {'RUNS':>5}  {'LAST FLAKY':10}  TEST",
+    ]
+    for t in tests:
+        note = (f"  [known_flaky: {t['known_flaky']}]" if t["known_flaky"]
+                else f"  [expired: {t['expired']}]" if t["expired"] else "")  # fmt: skip
+        flaky = f"{t['flaky']}/{t['pairs']}"
+        lines.append(f"  {flaky:>9}  {t['runs']:>5}  {str(t['last_flaky_at'])[:10]:10}  "
+                     f"{t['test_id']}{note}")  # fmt: skip
+    lines += ["", f"FLAKY = commits (and variants) where it failed and passed / where it ran. "
+              f"known_flaky compared with {source}."]  # fmt: skip
+    missing = [t["test_id"] for t in tests if t["known_flaky"] is None]
+    if not missing:
+        lines.append("Every one is already in known_flaky.")
+        return lines
+    lines += ["", "Suggested known_flaky entries (paste into the list in .siftwise.toml; "
+              "nothing was changed):"]  # fmt: skip
+    lines += [f"    {_flaky_entry(test_id, until)}," for test_id in missing]
+    return lines
 
 
 @app.command("report")
@@ -763,8 +907,25 @@ def local_config(root: Path | None = None) -> RepoConfig:
 
 @dataclass(frozen=True)
 class KnownFlaky:
-    globs: tuple[str, ...]  # what triage applies
-    changed: bool  # the checkout's list differs from it (applies after merge)
+    globs: tuple[str, ...]  # what triage applies: the entries in force on the date
+    changed: bool  # the checkout's list (entries or their dates) differs (applies after merge)
+    expired: tuple[KnownFlakyEntry, ...] = ()  # entries of the applied list past their date
+
+
+def known_flaky_date(started_at: str | datetime | None = None) -> date:
+    """The date that decides a ``known_flaky`` entry's expiry: the UTC date the CI run started
+    (``started_at``, as recorded), else today in UTC (a local triage, an agent). A CI clock,
+    not a commit date: commit dates are whatever the author's git says, so a commit could
+    claim an earlier day."""
+    if isinstance(started_at, str):
+        try:
+            started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        except ValueError:
+            started_at = None
+    if isinstance(started_at, datetime):
+        moment = started_at if started_at.tzinfo else started_at.replace(tzinfo=UTC)
+        return moment.astimezone(UTC).date()
+    return datetime.now(UTC).date()
 
 
 def known_flaky(
@@ -772,23 +933,33 @@ def known_flaky(
     base: str | None,
     source: str = KnownFlakySource.BASE,
     cwd: Path | None = None,
+    on: date | None = None,
 ) -> KnownFlaky:
-    """The ``known_flaky`` globs triage applies. From BASE's .siftwise.toml by default, so a
-    change (a PR, an agent's edit) can't mark its own failures flaky. Without a base the diff
-    is unknown and triage never calls a listed test flaky anyway, so the checkout's list is
-    used. A missing or invalid file at BASE has no list."""
+    """The ``known_flaky`` globs triage applies, in force on ``on`` (``known_flaky_date()``
+    by default). From BASE's .siftwise.toml by default, so a change (a PR, an agent's edit)
+    can't mark its own failures flaky, nor add or extend an ``until`` for itself. Without a
+    base the diff is unknown and triage never calls a listed test flaky anyway, so the
+    checkout's list is used. A missing or invalid file at BASE has no list."""
+    day = on or known_flaky_date()
     head = config.known_flaky
     if source == KnownFlakySource.HEAD or not base:
-        return KnownFlaky(head, False)
+        active = active_known_flaky(head, day)
+        return KnownFlaky(active.globs, False, active.expired)
     content = git_output("show", f"{base}:{FILE_NAME}", cwd=cwd)
-    globs: tuple[str, ...] = ()
+    entries: tuple[KnownFlakyEntry, ...] = ()
     if content is not None:
         try:
-            globs = loads_repo_config(content.decode("utf-8", "replace"),
-                                      f"{base}:{FILE_NAME}").known_flaky  # fmt: skip
+            entries = loads_repo_config(content.decode("utf-8", "replace"),
+                                        f"{base}:{FILE_NAME}").known_flaky  # fmt: skip
         except RepoConfigError as exc:
             _err(f"siftwise: ignoring known_flaky at {base}: {exc}")
-    return KnownFlaky(globs, sorted(set(head)) != sorted(set(globs)))
+    active = active_known_flaky(entries, day)
+    return KnownFlaky(active.globs, set(head) != set(entries), active.expired)
+
+
+def expired_note(entry: KnownFlakyEntry) -> str:
+    """What every surface says about an expired entry, so it gets cleaned up."""
+    return f"{gha.EXPIRED_NOTE}: {entry.describe()}"
 
 
 # A budget: one or more <number><unit> parts, e.g. 90s, 5m, 1.5h, 1h30m.
@@ -1013,17 +1184,31 @@ def upload_run(
         if unresolved and warn is not None and not (stop_only and finder.stop_warned):
             warn(jestfiles.unresolved_note(unresolved, finder.time_limit))
             finder.stop_warned = finder.stop_warned or finder.stopped
-    try:
-        response = httpx.post(
-            f"{server.rstrip('/')}/runs",
-            params={"defer_rollup": "true"} if defer_rollup else None,
-            files=[("files", (name, data, "application/xml")) for name, data in reports],
-            data={"metadata": json.dumps(metadata)},
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=timeout,
-        )
-    except httpx.HTTPError as exc:
-        raise SiftwiseError(f"could not reach siftwise at {server}: {exc}") from exc
+
+    def post(meta: dict[str, Any]) -> httpx.Response:
+        try:
+            return httpx.post(
+                f"{server.rstrip('/')}/runs",
+                params={"defer_rollup": "true"} if defer_rollup else None,
+                files=[("files", (name, data, "application/xml")) for name, data in reports],
+                data={"metadata": json.dumps(meta)},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=timeout,
+            )
+        except httpx.HTTPError as exc:
+            raise SiftwiseError(f"could not reach siftwise at {server}: {exc}") from exc
+
+    response = post(metadata)
+    if (
+        response.status_code == httpx.codes.UNPROCESSABLE_ENTITY
+        and "known_flaky_expired" in metadata
+        and "known_flaky_expired" in _detail(response)
+    ):
+        # A server older than 0.4: the run counts the same, only the expiry note is lost.
+        if warn is not None:
+            warn("siftwise: the server doesn't take known_flaky_expired (older than 0.4): "
+                 "recorded without the expired-entry note")  # fmt: skip
+        response = post({k: v for k, v in metadata.items() if k != "known_flaky_expired"})
     return _ok(response)
 
 

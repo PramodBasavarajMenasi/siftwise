@@ -244,3 +244,24 @@ def test_0014_adds_fixture_files_and_the_fixture_cause(scratch_engine: tuple[Eng
         )).scalar()  # fmt: skip
     assert check is not None and "'fixture'" not in check and column is None
     command.upgrade(config, "head")
+
+
+def test_0015_adds_known_flaky_expired_and_drops_it_again(
+    scratch_engine: tuple[Engine, str],
+) -> None:
+    engine, url = scratch_engine
+    config = alembic_config(url)
+    command.upgrade(config, "0015")
+    column = text(
+        "SELECT column_default FROM information_schema.columns "
+        "WHERE table_name = 'runs' AND column_name = 'known_flaky_expired'"
+    )
+    with engine.connect() as connection:
+        default = connection.execute(column).scalar()
+    assert default is not None and "'[]'" in default
+
+    command.downgrade(config, "0014")
+
+    with engine.connect() as connection:
+        assert connection.execute(column).first() is None
+    command.upgrade(config, "head")

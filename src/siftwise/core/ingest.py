@@ -105,6 +105,7 @@ def create_run(
             affected=meta.affected.model_dump() if meta.affected is not None else None,
             known_flaky=meta.known_flaky,
             known_flaky_changed=meta.known_flaky_changed,
+            known_flaky_expired=[e.model_dump(mode="json") for e in meta.known_flaky_expired],
             rerun=meta.rerun,
         )
         session.add(run)

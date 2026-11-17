@@ -277,6 +277,14 @@ def glob_match(path: str, pattern: str) -> bool:
     return _glob_regex(pattern).match(path) is not None
 
 
+def matching_glob(test_id: str, file_path: str | None, patterns: Iterable[str]) -> str | None:
+    """The first glob matching a test's ID or its file path (``always_run``, ``known_flaky``)."""
+    return next(
+        (p for p in patterns if glob_match(test_id, p) or (file_path and glob_match(file_path, p))),
+        None,
+    )
+
+
 @dataclass(frozen=True)
 class KnownTest:
     test_id: str

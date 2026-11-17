@@ -34,6 +34,7 @@ LIGHT_COMMANDS = [
     ["record"],
     ["triage"],
     ["report"],
+    ["flaky"],
     ["rollup"],
     ["mcp"],
     ["server"],

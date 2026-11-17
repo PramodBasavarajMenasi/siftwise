@@ -559,6 +559,24 @@ Two ways to keep known flakes from reading as regressions, both in `record`:
   can't mark its own failures flaky; when the PR changes the list, the comment says
   "known_flaky changes in this PR apply after merge". `known-flaky-source: head` applies the
   PR's own list instead. A push always applies its own.
+- **Entries can expire:** `{ test = "tests/test_db.py::test_pool", until = "2026-12-31" }`
+  next to plain globs. An entry applies through its `until` date and stops applying the day
+  after. What decides is the **UTC date the CI run started** (the Actions API's
+  `run_started_at`; on GitLab, the pipeline's creation time), which `record` applies and
+  stores with the run, so the run's verdicts stay the same whenever they're triaged again. It
+  isn't a commit date, which a commit's author sets. A local `siftwise triage` and the MCP
+  tools use today in UTC. An expired entry is left out, and the PR comment (or GitLab note)
+  says "known_flaky entry expired: <test> (until <date>)" so it gets removed or renewed.
+  Because a PR runs with its base commit's list, a PR that adds an entry or extends an
+  `until` doesn't excuse its own failures: the change applies after merge.
+- **Finding candidates:** `siftwise flaky --repo acme/shop` lists the tests that failed and
+  passed on the same commit and variant (retries, re-runs) in the last 30 days of the repo's
+  history (`--days`, `--min-runs`), with how often and when, marks the ones `known_flaky`
+  already lists (or lists with an expired date), and prints entries to paste for the rest,
+  each with an `until` 90 days out (`--until`, or `--until none`). It only suggests; it
+  changes nothing. It compares with the `.siftwise.toml` of the checkout it runs in;
+  elsewhere, with the list the repo's newest main run applied. It needs only a
+  [read token](#tokens).
 - **`rerun-unknown: N`** (0 to 3, default 0): after uploading, `record` triages its own leg,
   re-runs failures whose verdict is in `rerun-verdicts` (`unknown`, or
   `unknown,new_regression`) with the test's own runner, and records each re-run (all of a
@@ -997,7 +1015,8 @@ MCP server:
 ```toml
 always_run = ["tests/smoke/**", "tests.test_health::*"]  # test file paths or test IDs
 generated = ["build/reports/**"]          # more files your test runs write (see below)
-known_flaky = ["tests/test_net.py"]       # triage: unlinked failures are flaky
+known_flaky = ["tests/test_net.py",       # triage: unlinked failures are flaky
+               { test = "tests/test_db.py::test_pool", until = "2026-12-31" }]  # expires
 fixtures = ["tests/fixtures/**"]          # test data: its build files don't force the full suite
 
 [[depends]]                               # dependencies no import graph can see
@@ -1014,7 +1033,10 @@ on = ["**/*.go", "!**/*_test.go"]         # ! excludes
   `.cursor/`, `.idea/`, `.mcp.json`, `.codex/` and `.gemini/`, all at any depth. `generated`
   adds to that list.
 - **`known_flaky`** is for triage only (selection still runs listed tests); CI applies a pull
-  request's base list ([Flaky tests](#flaky-tests)).
+  request's base list ([Flaky tests](#flaky-tests)). An entry is a glob, or a table with
+  `test` (the glob) and `until` (`YYYY-MM-DD`, or a TOML date): it applies through that date,
+  judged by the UTC date the CI run started. A bad date, an unknown field or a wrong type is
+  an error, like any invalid key.
 - **`fixtures`** are test data: sample projects and files your tests read. A sample
   project's `pom.xml`, `build.gradle.kts`, `tsconfig.json` or `go.mod` is not your build, so a
   change under a `fixtures` glob (same globs as `on`, `!` excludes) doesn't force the full

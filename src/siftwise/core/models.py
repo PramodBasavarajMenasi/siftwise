@@ -150,6 +150,11 @@ class Run(Base):
     # so a PR can't mark its own failures flaky); known_flaky_changed: the PR's list differs.
     known_flaky: Mapped[list[str]] = mapped_column(ARRAY(Text), server_default=text("'{}'::text[]"))
     known_flaky_changed: Mapped[bool] = mapped_column(Boolean, server_default=false())
+    # The entries left out because they had expired when the run started ([{test, until}],
+    # migration 0015): reported with the run's failures, so they get cleaned up.
+    known_flaky_expired: Mapped[list[dict[str, str]]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), default=list
+    )
     # 0 = the run itself; n = the Action's n-th re-run of its failing tests (same CI run
     # attempt, variant and commit). Attempt-level readers (triage and shadow compare of an
     # attempt, lookups) skip re-runs; as history they are ordinary runs of the commit.

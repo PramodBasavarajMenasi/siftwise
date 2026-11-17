@@ -46,7 +46,8 @@ def test_empty_config() -> None:
 def test_known_flaky() -> None:
     config = parse_repo_config({"known_flaky": ["tests/test_net.py", "**::TestDial"]})
 
-    assert config.known_flaky == ("tests/test_net.py", "**::TestDial")
+    assert [entry.test for entry in config.known_flaky] == ["tests/test_net.py", "**::TestDial"]
+    assert all(entry.until is None for entry in config.known_flaky)  # never expire
 
 
 @pytest.mark.parametrize(
@@ -56,8 +57,8 @@ def test_known_flaky() -> None:
         ({"always_run": "x"}, "always_run must be a list of strings"),
         ({"generated": "*.log"}, "generated must be a list of strings"),
         ({"generated": [""]}, "generated must be a list of strings"),
-        ({"known_flaky": "a::*"}, "known_flaky must be a list of strings"),
-        ({"known_flaky": [1]}, "known_flaky must be a list of strings"),
+        ({"known_flaky": "a::*"}, "known_flaky must be a list of globs"),
+        ({"known_flaky": [1]}, "must be a glob or a { test, until } table"),
         ({"depends": {"tests": "x"}}, "depends must be an array of tables"),
         ({"depends": ["x"]}, "#1 must be a table"),
         ({"depends": [{"tests": "x", "on": ["a"], "when": 1}]}, "only 'tests' and 'on'"),

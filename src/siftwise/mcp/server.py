@@ -435,13 +435,15 @@ def _triage(
         dirty = cli.git_is_dirty(root)
         # Tests ran on the working tree: with uncommitted changes, no earlier run tested it.
         commit = None if dirty or dirty is None else cli.git_head(root)
+        # The base's list, as of today (UTC): an agent's own edit to known_flaky must not
+        # excuse its failures, nor extend an entry's `until`.
+        flaky = cli.known_flaky(change.config, base, cwd=root)
         body = {
             "repo": repo,
             **change.fields,
             "commit_sha": commit,
             "variant": variant,
-            # The base's list: an agent's own edit to known_flaky must not excuse its failures.
-            "known_flaky": list(cli.known_flaky(change.config, base, cwd=root).globs),
+            "known_flaky": list(flaky.globs),
             "failures": found,
         }
         result = _post(config, "/triage", body)
@@ -461,6 +463,7 @@ def _triage(
         "next_step": _triage_next_step(result["counts"]),
         "tested_code": "uncommitted changes" if commit is None else f"commit {commit[:7]}",
         **noted,
+        **_expired(flaky),
         "results": [_compact_result(r) for r in results[:MAX_TRIAGE_RESULTS]],
     }
     if len(results) > MAX_TRIAGE_RESULTS:
@@ -484,11 +487,12 @@ def _explain(
             change = cli.local_change(base, "HEAD", working_tree=uncommitted, cwd=root)
         except RepoConfigError as exc:
             raise Unavailable(f"invalid .siftwise.toml ({exc})") from exc
+        flaky = cli.known_flaky(change.config, base, cwd=root)
         body = {
             "repo": repo,
             **change.fields,
             "always_run": list(change.config.always_run),
-            "known_flaky": list(cli.known_flaky(change.config, base, cwd=root).globs),
+            "known_flaky": list(flaky.globs),
             "test_id": test_id,
             "variant": variant,
         }
@@ -504,6 +508,7 @@ def _explain(
         "known": result["known"],
         "file_path": result["file_path"] or _derived_file(result["test_id"], root),
         **checkout.noted(),
+        **_expired(flaky),
         "selection": {
             "selected": selection["selected"],
             "mode": selection["mode"],
@@ -768,6 +773,12 @@ def _select_next_step(mode: str, command: str) -> str:
     if command:
         return "Run this command instead of the full suite: " + command
     return "No tests are affected by your change: there is nothing to run."
+
+
+def _expired(flaky: cli.KnownFlaky) -> dict[str, list[str]]:
+    """Expired known_flaky entries (not applied), worded as in the PR comment."""
+    return {"known_flaky_expired": [cli.expired_note(e) for e in flaky.expired]} if (
+        flaky.expired) else {}  # fmt: skip
 
 
 def _triage_next_step(counts: Mapping[str, int]) -> str:

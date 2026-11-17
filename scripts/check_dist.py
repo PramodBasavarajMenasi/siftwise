@@ -33,7 +33,7 @@ PYDANTIC = "pydantic"
 FORBIDDEN = (*SERVER_MODULES, PYDANTIC, "mcp", "starlette")
 # The light commands whose imports are checked: every command's --help, plus `version`.
 LIGHT_COMMANDS: tuple[list[str], ...] = (
-    [], ["select"], ["record"], ["triage"], ["report"], ["rollup"], ["mcp"], ["server"],
+    [], ["select"], ["record"], ["triage"], ["report"], ["flaky"], ["rollup"], ["mcp"], ["server"],
     ["gha", "select"], ["gha", "record"], ["gha", "rollup"],
     ["gitlab", "select"], ["gitlab", "record"], ["gitlab", "rollup"],
     ["token"], ["token", "create"], ["token", "list"], ["token", "revoke"],

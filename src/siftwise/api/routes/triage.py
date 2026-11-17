@@ -13,6 +13,7 @@ from siftwise.core.schemas import (
     EvidenceOut,
     FlakyEventOut,
     HistoryOut,
+    KnownFlakyExpiredIn,
     LinkOut,
     OtherVariantOut,
     PreExistingOut,
@@ -176,6 +177,7 @@ def _variant_out(v: VariantTriage) -> VariantTriageOut:
         counts={verdict.value: counts[verdict] for verdict in VERDICT_ORDER},
         reruns=v.reruns,
         known_flaky_changed=v.known_flaky_changed,
+        known_flaky_expired=[KnownFlakyExpiredIn.model_validate(e) for e in v.known_flaky_expired],
     )
 
 

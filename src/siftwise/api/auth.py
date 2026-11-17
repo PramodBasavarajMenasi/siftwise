@@ -35,6 +35,7 @@ ROUTE_SCOPES: dict[tuple[str, str], TokenScope] = {
     ("POST", "/repos/{repo:path}/triage"): READ,
     ("POST", "/explain"): READ,
     ("GET", "/repos/{repo:path}/recall"): READ,
+    ("GET", "/repos/{repo:path}/flaky"): READ,
     ("GET", "/tests/{test_id:path}/history"): READ,
     ("GET", "/runs/lookup"): READ,
     ("GET", "/runs/variants"): READ,
