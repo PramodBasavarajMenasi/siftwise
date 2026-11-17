@@ -74,6 +74,7 @@ def post_select(
         ),
         java=_java(body),
         import_depths=body.import_depths,
+        fixture_refs=body.fixture_refs,
     )
     shadow_reason = _store_shadow(session, body, selection) if body.shadow else None
     return SelectResponse(

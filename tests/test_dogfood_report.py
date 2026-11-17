@@ -165,6 +165,7 @@ def test_recall_time_saved_and_misses_add_up_like_the_servers_recall() -> None:
         "budget": 0,
         "new_test": 1,
         "flaky_history": 0,
+        "fixture": 0,
         "config_gap": 0,
         "no_link": 0,
         "unknown": 0,

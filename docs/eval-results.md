@@ -1299,7 +1299,12 @@ run's summary artifact.
 - **Fixture build files count as build files:** a change to `tests/fixtures/java_gradle/
   build.gradle.kts` or the JS fixtures' `tsconfig.json` ran siftwise's own full suite,
   though they are test data, not siftwise's build. A `[[depends]]` rule can't narrow a build
-  file (build files are checked first); scoping test fixtures is left for later.
+  file (build files are checked first). Since #73 (after these runs), siftwise's
+  `.siftwise.toml` lists `fixtures = ["tests/fixtures/**"]`. Re-selected at their own commits
+  (GitHub zipballs; one known test per test file standing in for history), the four runs
+  with fixture build files split two ways. #50's two runs would be selective: 32 of 40 test
+  files, with `tests/test_jsgraph.py` the one that references the changed fixture. #53's
+  two would still run everything: `.github/workflows/ci.yml` changed too.
 - **No recall yet.** A dogfood failure would show up here as caught or missed; until there is
   one, the recall numbers are the replays' above.
 

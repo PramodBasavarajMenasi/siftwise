@@ -137,7 +137,8 @@ def test_compare_and_recall(client: TestClient, db_session: Session) -> None:
     assert recall["all"] == recall["selective"] == {
         "runs": 1, "failures": 2, "flaky_excluded": 0, "caught": 1, "missed": 1, "recall": 0.5,
         "missed_by_verdict": {"new_regression": 0, "unknown": 1, "pre_existing": 0},
-        "missed_by_cause": {"budget": 0, "new_test": 0, "flaky_history": 0, "config_gap": 0,
+        "missed_by_cause": {"budget": 0, "new_test": 0, "flaky_history": 0, "fixture": 0,
+                            "config_gap": 0,
                             "no_link": 1, "unknown": 0},
         "budget_limited_runs": 0, "missed_by_budget": 0,
     }  # fmt: skip

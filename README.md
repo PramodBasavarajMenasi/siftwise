@@ -998,6 +998,7 @@ MCP server:
 always_run = ["tests/smoke/**", "tests.test_health::*"]  # test file paths or test IDs
 generated = ["build/reports/**"]          # more files your test runs write (see below)
 known_flaky = ["tests/test_net.py"]       # triage: unlinked failures are flaky
+fixtures = ["tests/fixtures/**"]          # test data: its build files don't force the full suite
 
 [[depends]]                               # dependencies no import graph can see
 tests = "test/cli/**"                     # test file paths, or <Go package dir>/<TestName>
@@ -1014,6 +1015,26 @@ on = ["**/*.go", "!**/*_test.go"]         # ! excludes
   adds to that list.
 - **`known_flaky`** is for triage only (selection still runs listed tests); CI applies a pull
   request's base list ([Flaky tests](#flaky-tests)).
+- **`fixtures`** are test data: sample projects and files your tests read. A sample
+  project's `pom.xml`, `build.gradle.kts`, `tsconfig.json` or `go.mod` is not your build, so a
+  change under a `fixtures` glob (same globs as `on`, `!` excludes) doesn't force the full
+  suite. It runs the test files that reference the fixture, plus any `[[depends]]` rule on it:
+  - **The fixture** is the first directory (or file) below the glob's fixed part:
+    `tests/fixtures/java_gradle` for `tests/fixtures/java_gradle/build.gradle.kts` and
+    `fixtures = ["tests/fixtures/**"]`.
+  - **A test file references it** when its text has the fixture's name as a whole word
+    (`"java_gradle"`, `FIXTURES / "java_gradle"`, `"tests/fixtures/java_gradle"`;
+    `java_gradle2` doesn't count). The CLI reads Python, Jest, Go and Java test files, plus
+    Python helpers (`conftest.py` and other modules in a `tests/` directory): a test that
+    imports a helper naming the fixture references it too.
+  - **Safety rule:** if nothing references a changed fixture and no `[[depends]]` rule covers
+    it, the full suite runs, naming the file. A name built at run time (`f"java_{kind}"`) or a
+    glob over the whole fixtures directory can't be seen: declare those with `[[depends]]`.
+  - **Real modules keep today's behaviour:** a file under `fixtures` that your own build
+    includes (a module of the root Maven or Gradle build, a `go.work` `use` directory, a
+    package of the root JS workspace, a `.go` file of a Go module that isn't the fixture's own)
+    is handled as before. So is everything when the server is older than 0.4 (it drops the
+    field and runs the full suite).
 
 | Variable | Used by | Default |
 |---|---|---|

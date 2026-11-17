@@ -16,6 +16,7 @@ import typer
 
 from siftwise import __version__, extras
 from siftwise.cli import gha, gitlab, server, token
+from siftwise.cli.fixtures import fixture_refs
 from siftwise.cli.gograph import build_graph, find_go_modules, merge_graphs, run_go_list
 from siftwise.cli.javagraph import java_change
 from siftwise.cli.jsgraph import Affected, build_js_graph
@@ -492,6 +493,7 @@ CAUSE_LABELS = {
     "budget": "left out by a time budget",
     "new_test": "new test",
     "flaky_history": "flaky history",
+    "fixture": "uses a changed fixture it doesn't name",
     "config_gap": "config gap",
     "no_link": "no link",
     "unknown": "unknown cause",
@@ -565,6 +567,9 @@ class LocalChange:
     # /select's `import_depths`: test file (Python, Jest, Java) or Go package -> the shortest
     # import depth to a changed file (1 = it imports changed code itself), for the risk order.
     import_depths: dict[str, int] | None = None
+    # /select's `fixture_refs`: changed fixture file (.siftwise.toml `fixtures`) -> the test
+    # files that reference it (cli/fixtures.py), so its build files don't force the full suite.
+    fixture_refs: dict[str, list[str]] | None = None
 
     def select_only(self) -> dict[str, Any]:
         """The fields only /select takes (an older server rejects them with a 422 naming
@@ -578,6 +583,8 @@ class LocalChange:
             extra["go_modules"] = self.go_modules
         if self.import_depths:
             extra["import_depths"] = self.import_depths
+        if self.fixture_refs:
+            extra["fixture_refs"] = self.fixture_refs
         return extra
 
     def graph(self) -> dict[str, Any] | None:
@@ -674,7 +681,10 @@ def local_change(
             java = found.payload()
     elif changed and any(p.endswith(".java") for p in changed):
         complete = False  # --no-java-graph: the Java links are unknown
-    return LocalChange(fields, config, complete, js_graph, java, go_modules, depths or None)
+    refs = fixture_refs(root, changed, config) if changed and config.fixtures else None
+    return LocalChange(
+        fields, config, complete, js_graph, java, go_modules, depths or None, refs or None
+    )
 
 
 def go_modules_of(root: Path, changed: Sequence[str] | None) -> dict[str, str]:
@@ -940,7 +950,7 @@ def post_select(
 
 
 # /select fields a server older than this client may not know; dropped on its 422.
-OPTIONAL_SELECT_FIELDS = ("js_graph", "java", "go_modules", "import_depths")
+OPTIONAL_SELECT_FIELDS = ("js_graph", "java", "go_modules", "import_depths", "fixture_refs")
 
 
 def post_json(

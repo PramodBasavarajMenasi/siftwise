@@ -1,0 +1,6 @@
+# siftwise's own selection settings (https://github.com/PramodBasavarajMenasi/siftwise#configuration).
+
+# Test data: sample JUnit reports and the Java and JS sample projects the graph tests read.
+# Their build files (pom.xml, build.gradle.kts, tsconfig.json, package.json, ...) aren't this
+# repo's build: a change there runs the tests that reference the fixture, not the full suite.
+fixtures = ["tests/fixtures/**"]
