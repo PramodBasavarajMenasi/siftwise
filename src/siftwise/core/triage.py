@@ -78,7 +78,7 @@ from siftwise.core.selector import (
     SelectorConfig,
     Strength,
     change_links,
-    glob_match,
+    matching_glob,
 )
 
 
@@ -303,15 +303,7 @@ def triage(
 
 def known_flaky_match(test: KnownTest, patterns: Sequence[str]) -> str | None:
     """The first ``known_flaky`` glob matching the test's ID or file path (as ``always_run``)."""
-    return next(
-        (
-            pattern
-            for pattern in patterns
-            if glob_match(test.test_id, pattern)
-            or (test.file_path and glob_match(test.file_path, pattern))
-        ),
-        None,
-    )
+    return matching_glob(test.test_id, test.file_path, patterns)
 
 
 def _verdict(
@@ -1377,6 +1369,8 @@ class VariantTriage:
     report: TriageReport | None  # None: no failing tests
     reruns: int = 0  # re-run uploads of this variant in the attempt
     known_flaky_changed: bool = False  # the PR's own known_flaky differs (applies after merge)
+    # known_flaky entries that had expired when the run started: [{test, until}]
+    known_flaky_expired: tuple[Mapping[str, str], ...] = ()
 
 
 def triage_ci_run(
@@ -1406,7 +1400,7 @@ def triage_ci_run(
         text(
             """
             SELECT id, variant, commit_sha, changed_files_known, affected, known_flaky,
-                   known_flaky_changed, rerun
+                   known_flaky_changed, known_flaky_expired, rerun
             FROM runs
             WHERE repo_id = :repo_id AND ci_run_id = :ci AND run_attempt = :attempt
             ORDER BY COALESCE(variant, ''), id
@@ -1454,7 +1448,7 @@ def triage_ci_run(
             report = TriageReport(h.cut_at, h.run_id, results_)
         results.append(VariantTriage(
             run.id, run.variant, run.commit_sha, run.changed_files_known, links_known, report,
-            reruns[run.variant], run.known_flaky_changed,
+            reruns[run.variant], run.known_flaky_changed, tuple(run.known_flaky_expired or ()),
         ))  # fmt: skip
     return results
 

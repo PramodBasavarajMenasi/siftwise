@@ -76,7 +76,7 @@ from local JUnit files, and `POST /explain` for one test.
 | Table | Holds | Key points |
 |---|---|---|
 | `repos` | one row per repository name | |
-| `runs` | one upload: a CI run attempt's matrix leg | unique `(repo, ci_run_id, run_attempt, variant, rerun)`; `commit_sha`, `branch`, `is_main`, `started_at`; `changed_files_known`; `affected` (the change's links, NULL if a graph failed or the run was backfilled); `known_flaky` (the globs triage applies to it) |
+| `runs` | one upload: a CI run attempt's matrix leg | unique `(repo, ci_run_id, run_attempt, variant, rerun)`; `commit_sha`, `branch`, `is_main`, `started_at`; `changed_files_known`; `affected` (the change's links, NULL if a graph failed or the run was backfilled); `known_flaky` (the globs triage applies to it) and `known_flaky_expired` (entries past their `until` when it started) |
 | `changed_files` | `(run_id, path)` | the run's diff |
 | `tests` | a test's identity, once per repo | `test_id` = `classname::name`; `file_path` with the time it was reported |
 | `test_results` | raw results, append-only | `(run_id, test_key, attempt)`; status, duration, message (4 KB max); partial indexes on failures, by run and by test |
@@ -469,6 +469,31 @@ The first rule that applies decides:
 - **Failure messages** are evidence only: normalised, a match raises confidence and a mismatch
   is noted, never decisive.
 - `unknown` always has low confidence. Triage never guesses.
+
+### known_flaky expiry and `siftwise flaky`
+
+- **One rule:** `repoconfig.active_known_flaky(entries, on)`: an entry applies while
+  `on <= until` (no `until` = always). Every reader goes through `cli.main.known_flaky`
+  (record via `gha.recorded_known_flaky`, `siftwise triage`, MCP triage and explain), which
+  picks BASE's list for a change and returns the globs in force, whether the checkout's
+  entries (globs or dates) differ, and the expired entries. The server only ever sees globs.
+- **The date:** `cli.main.known_flaky_date`: the UTC date the CI run started (record's
+  `started_at`: the Actions API's `run_started_at`, GitLab's pipeline creation), else today
+  in UTC (local triage, agents). A CI clock, not a commit date (author-set). Record stores
+  the globs it applied (`runs.known_flaky`) and the expired entries
+  (`runs.known_flaky_expired`, migration 0015; sent only when non-empty, and dropped on an
+  older server's 422), so re-triaging a run later gives the same verdicts and the failures
+  section (written by rollup, with no checkout) can say "known_flaky entry expired".
+- **`GET /repos/{repo}/flaky`** (read scope; `core/flaky.py`): per test, the (commit,
+  variant) pairs in the window (the days before the repo's newest run) where it both failed
+  and passed, across attempts and runs (re-run uploads included): `test_stats.flaky_score`'s
+  definition, counted. Failures come through `ix_test_results_failed`; passes and run counts
+  through primary-key probes of only the tests that failed (one key-array lookup per window
+  run, fenced with `OFFSET 0`: without the fence the planner sorted all 42M substrate
+  results). Measured 2026-11-18, warm: rdflib 0.09 s, dropwizard 0.06 s, substrate 3.2 s
+  (627 flaky tests, subtests included). It also returns the `known_flaky` the newest main
+  run applied, for `siftwise flaky` outside a checkout. `siftwise flaky` matches with
+  `selector.matching_glob`, the function triage's `known_flaky_match` uses.
 
 ## Shadow comparison
 

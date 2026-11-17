@@ -82,6 +82,7 @@ CALLS = {
     "run triage": Call("POST", "/repos/{repo}/triage", False, json={"ci_run_id": "1"}),
     "explain": Call("POST", "/explain", False, json={"repo": "{repo}", "test_id": "t::a"}),
     "recall": Call("GET", "/repos/{repo}/recall", False),
+    "flaky": Call("GET", "/repos/{repo}/flaky", False),
     "history": Call("GET", "/tests/t::a/history", False, query={"repo": "{repo}"}),
     "lookup": Call("GET", "/runs/lookup", False, query={"repo": "{repo}", "ci_run_id": "1"}),
     "variants": Call("GET", "/runs/variants", False, query={"repo": "{repo}", "ci_run_id": "1"}),

@@ -1,6 +1,6 @@
 """Pydantic request/response schemas."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Literal, Self
 
 from pydantic import (
@@ -68,6 +68,15 @@ class ChangeGraph(BaseModel):
     )
 
 
+class KnownFlakyExpiredIn(BaseModel):
+    """A known_flaky entry past its ``until`` on the day the run started: it no longer applies."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    test: Glob
+    until: date
+
+
 class RunMetadata(BaseModel):
     """JSON metadata sent alongside the JUnit files in ``POST /runs``."""
 
@@ -110,6 +119,12 @@ class RunMetadata(BaseModel):
     known_flaky_changed: bool = Field(
         default=False,
         description="The PR's own known_flaky differs from the list sent (it applies after merge)",
+    )
+    known_flaky_expired: list[KnownFlakyExpiredIn] = Field(
+        default_factory=list,
+        max_length=1000,
+        description="Entries of the applied known_flaky list past their `until` on the UTC "
+        "date the CI run started: left out of known_flaky, and reported so they get cleaned up",
     )
     rerun: int = Field(
         default=0,
@@ -679,6 +694,10 @@ class VariantTriageOut(BaseModel):
         default=False,
         description="The PR changes known_flaky; the change applies after merge",
     )
+    known_flaky_expired: list[KnownFlakyExpiredIn] = Field(
+        default_factory=list,
+        description="known_flaky entries that had expired when the run started (not applied)",
+    )
     counts: dict[str, int] = Field(description="This variant's failing tests per verdict")
 
 
@@ -923,3 +942,25 @@ class RecallResponse(BaseModel):
     periods: list[RecallPeriodOut] | None = Field(
         default=None, description="With by=week: each week, oldest first, empty ones included"
     )
+
+
+class FlakyTestOut(BaseModel):
+    test_id: str
+    file_path: str | None
+    runs: int = Field(description="Runs in the window where the test ran (not skipped)")
+    pairs: int = Field(description="(commit, variant) pairs in the window where it ran")
+    flaky: int = Field(description="Of those pairs, the ones where it both failed and passed")
+    last_flaky_at: datetime = Field(description="The newest run of its newest flaky pair")
+
+
+class FlakyResponse(BaseModel):
+    repo: str
+    days: int
+    window_start: datetime | None = Field(description="The window: days before the newest run")
+    window_end: datetime | None = Field(description="The repo's newest run")
+    tests: list[FlakyTestOut] = Field(description="Most flaky first")
+    truncated: bool = Field(description="More tests than `limit` were flaky")
+    main_known_flaky: list[str] = Field(
+        description="The known_flaky globs the newest main run applied (as record stored them)"
+    )
+    main_known_flaky_at: datetime | None = Field(description="That run's time")

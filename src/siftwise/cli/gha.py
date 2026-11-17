@@ -54,9 +54,9 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import httpx
 import typer
@@ -65,6 +65,9 @@ from siftwise.cli import reruns
 from siftwise.cli.repoconfig import RepoConfig, RepoConfigError
 from siftwise.core.junit import JUnitParseError, Status, parse_junit
 from siftwise.core.risk import OFFERED_ORDERS, Order
+
+if TYPE_CHECKING:
+    from siftwise.cli.main import KnownFlaky
 
 app = typer.Typer(help="GitHub Actions steps (used by actions/select, record and rollup).")
 
@@ -100,6 +103,8 @@ NOTHING_RECORDED = "nothing recorded for this attempt"
 NO_TOKEN = "no siftwise token (secrets aren't available to pull requests from forks)"
 SHADOW_REASON = "shadow run: the full suite runs, to check what siftwise would have caught"
 KNOWN_FLAKY_AFTER_MERGE = "known_flaky changes in this PR apply after merge"
+# cli.main.expired_note says the same in plain text (CLI, MCP, warnings).
+EXPIRED_NOTE = "known_flaky entry expired"
 # Re-runs (record's rerun-* inputs).
 RERUN_VERDICTS = frozenset({"unknown", "new_regression"})
 DEFAULT_RERUN_VERDICTS = frozenset({"unknown"})
@@ -491,7 +496,10 @@ def _record(
         _annotate("warning", f"siftwise: no JUnit files match {junit!r}"
                   f"{f' or {junit_dir}/*.xml' if junit_dir else ''}; nothing recorded")  # fmt: skip
         return f"{NOTHING_RECORDED} (no JUnit files)", None
-    known_flaky, changed = recorded_known_flaky(ctx, known_flaky_source)
+    started_at = ci.started_at(ctx, github_token, env)
+    flaky = recorded_known_flaky(ctx, known_flaky_source, started_at)
+    for entry in flaky.expired:
+        _annotate("warning", f"siftwise: {cli.expired_note(entry)}: it no longer applies")
     # Same diff as the select step, so a recorded run's changed files are what was selected on,
     # and its import graphs, so triage can later tell if a failure was related to the change.
     metadata = {
@@ -502,11 +510,15 @@ def _record(
         "ci_run_id": ctx.run_id or None,
         "run_attempt": ctx.run_attempt,
         "variant": variant or None,
-        "started_at": ci.started_at(ctx, github_token, env),
+        "started_at": started_at,
         **cli.recorded_change(ctx.base, ctx.head_sha or "HEAD"),
-        "known_flaky": known_flaky,
-        "known_flaky_changed": changed,
-    }
+        "known_flaky": list(flaky.globs),
+        "known_flaky_changed": flaky.changed,
+        # Only when there is one: a server older than 0.4 rejects the field (upload_run then
+        # sends the run without it).
+        **({"known_flaky_expired": [e.to_json() for e in flaky.expired]} if flaky.expired
+           else {}),
+    }  # fmt: skip
     try:
         result = cli.upload_run(server, token, files, metadata, defer_rollup=defer,
                                 timeout=RECORD_TIMEOUT, jest_root=Path.cwd(),
@@ -520,7 +532,7 @@ def _record(
             f"{' (stats update deferred to the rollup job)' if defer else ''}")  # fmt: skip
     ci.echo(line)
     _append_summary(env, f"\n{line}\n")
-    if changed:
+    if flaky.changed:
         ci.echo(f"siftwise: {KNOWN_FLAKY_AFTER_MERGE}")
     return "", metadata
 
@@ -959,21 +971,24 @@ def parse_known_flaky_source(value: str) -> str:
     return text
 
 
-def recorded_known_flaky(ctx: Context, source: str = "base") -> tuple[list[str], bool]:
-    """(``known_flaky`` globs triage applies to this run, whether the PR's own list differs).
-    A PR uses its base commit's list unless ``source`` is 'head', so a PR can't mark its own
-    failures flaky and get past fail-on; a push uses its own. An invalid checkout file has no
-    list (record warns about it with the change links)."""
+def recorded_known_flaky(
+    ctx: Context, source: str = "base", started_at: str | None = None
+) -> KnownFlaky:
+    """The ``known_flaky`` globs triage applies to this run, whether the PR's own list differs,
+    and the entries past their ``until`` on the day the run started (``started_at``). A PR
+    uses its base commit's list unless ``source`` is 'head', so a PR can't mark its own
+    failures flaky, or add or extend an expiry, and get past fail-on; a push uses its own. An
+    invalid checkout file has no list (record warns about it with the change links)."""
     from siftwise.cli import main as cli
 
     try:
         config = cli.local_config()
     except RepoConfigError:
         config = RepoConfig()
+    on = cli.known_flaky_date(started_at)
     if not ctx.change_request:
-        return list(config.known_flaky), False
-    flaky = cli.known_flaky(config, ctx.base, source)
-    return list(flaky.globs), flaky.changed
+        return cli.known_flaky(config, None, on=on)
+    return cli.known_flaky(config, ctx.base, source, on=on)
 
 
 @dataclass(frozen=True)
@@ -1407,6 +1422,14 @@ def failures_markdown(
         if any(v.get("known_flaky_changed") for v in response["variants"])
         else []
     )
+    # Entries past their `until` when the run started: they no longer excuse anything.
+    expired = sorted({(e["test"], e["until"]) for v in response["variants"]
+                      for e in v.get("known_flaky_expired") or ()})  # fmt: skip
+    if expired:
+        # `until` is a date the server validated (KnownFlakyExpiredIn), the glob is repo text.
+        note += [f"> {EXPIRED_NOTE}: {_code(test)} (until {date.fromisoformat(until)})."
+                 for test, until in expired]  # fmt: skip
+        note.append("")
     if not total:
         recorded = _plural(len(variants), "recorded variant")
         return "\n".join(["### Failures", "", *note, f"No failing tests in {recorded}.", ""])
