@@ -15,7 +15,7 @@ import httpx
 import typer
 
 from siftwise import __version__, extras
-from siftwise.cli import gha, gitlab, server
+from siftwise.cli import gha, gitlab, server, token
 from siftwise.cli.gograph import build_graph, find_go_modules, merge_graphs, run_go_list
 from siftwise.cli.javagraph import java_change
 from siftwise.cli.jsgraph import Affected, build_js_graph
@@ -36,6 +36,7 @@ app = typer.Typer(help="Siftwise: test impact analysis for CI.", no_args_is_help
 app.add_typer(gha.app, name="gha")
 app.add_typer(gitlab.app, name="gitlab")
 app.add_typer(server.app, name="server")
+app.add_typer(token.app, name="token")
 
 # `siftwise select` exit codes, besides 0 (success, including "no tests affected").
 EXIT_API_ERROR = 1

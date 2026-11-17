@@ -43,6 +43,10 @@ LIGHT_COMMANDS = [
     ["gitlab", "select"],
     ["gitlab", "record"],
     ["gitlab", "rollup"],
+    ["token"],
+    ["token", "create"],
+    ["token", "list"],
+    ["token", "revoke"],
 ]
 
 
@@ -301,3 +305,23 @@ def test_server_help_names_the_extra() -> None:
 
     assert result.exit_code == 0
     assert "'siftwise[server]'" in result.output
+
+
+@pytest.mark.parametrize("args", [["list"], ["revoke", "1"], ["create", "--repo", "a/b"]])
+def test_token_commands_without_the_extra_say_how_to_install_it(args: list[str]) -> None:
+    result = without_extras(
+        f"""
+        from typer.testing import CliRunner
+        from siftwise.cli.main import app
+
+        outcome = CliRunner().invoke(app, ["token", *{args!r}])
+        print(outcome.exit_code)
+        print(outcome.output)
+        """
+    )
+
+    assert result.returncode == 0, result.stderr
+    code, output = result.stdout.split("\n", 1)
+    assert int(code) == EXIT_USAGE
+    assert "`siftwise token` needs the server dependencies" in output
+    assert "pip install 'siftwise[server]'" in output

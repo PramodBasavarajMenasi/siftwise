@@ -7,7 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from siftwise.api.deps import get_app_settings
+from siftwise.api.deps import Caller, authorize, get_app_settings
 from siftwise.config import Settings
 from siftwise.core.schemas import (
     EvidenceOut,
@@ -47,11 +47,13 @@ router = APIRouter()
 @router.post("/triage", responses={404: {"description": "Unknown repo"}})
 def post_triage(
     body: TriageRequest,
+    caller: Caller,
     session: Annotated[Session, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_app_settings)],
 ) -> TriageResponse:
     """A verdict per failing test, with confidence, reasons and evidence. Uses only history
     from before the run (see core/triage.py)."""
+    authorize(caller, body.repo)
     change = Change(
         changed_files=tuple(body.changed_files),
         changed_files_known=body.changed_files_known,
@@ -100,6 +102,7 @@ _CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
 @router.post("/repos/{repo:path}/triage", responses={404: {"description": "Unknown repo or run"}})
 def post_run_triage(
     repo: str,
+    caller: Caller,
     body: RunTriageRequest,
     session: Annotated[Session, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_app_settings)],
@@ -108,6 +111,7 @@ def post_run_triage(
     its uploads stored: the failing tests, the changed files, the change links
     (``runs.affected``) and ``known_flaky``. A run without stored links is triaged as an
     unknown change. For the GitHub Action: after all legs, or one leg's own variant (re-runs)."""
+    authorize(caller, repo)
     variants = triage_ci_run(
         session, repo, body.ci_run_id, body.run_attempt, settings.stats_window_days,
         body.variants,

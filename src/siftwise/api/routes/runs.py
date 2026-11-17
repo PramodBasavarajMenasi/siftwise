@@ -18,7 +18,7 @@ from fastapi import (
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
-from siftwise.api.deps import get_app_settings
+from siftwise.api.deps import Caller, authorize, get_app_settings
 from siftwise.config import Settings
 from siftwise.core.ingest import (
     count_results,
@@ -36,7 +36,8 @@ from siftwise.core.schemas import (
 )
 from siftwise.db import get_session
 
-# Auth is enforced by BearerAuthMiddleware, before the request body is read.
+# Auth is enforced by BearerAuthMiddleware, before the request body is read; each route
+# checks its repo with `authorize` before any lookup.
 router = APIRouter()
 
 
@@ -45,6 +46,7 @@ router = APIRouter()
     responses={404: {"description": "No run recorded for this CI run attempt"}},
 )
 def lookup_run(
+    caller: Caller,
     session: Annotated[Session, Depends(get_session)],
     repo: Annotated[str, Query(min_length=1)],
     ci_run_id: Annotated[str, Query(min_length=1)],
@@ -55,6 +57,7 @@ def lookup_run(
     """Whether a CI run attempt (and matrix variant) is already ingested, so uploaders can
     skip the work. Omit ``variant`` for runs uploaded without one; ``rerun`` > 0 looks up a
     re-run upload instead of the run itself."""
+    authorize(caller, repo)
     variant = (variant.strip() or None) if variant is not None else None
     run = find_run(session, repo, ci_run_id, run_attempt, variant, rerun)
     if run is None:
@@ -76,6 +79,7 @@ def lookup_run(
 
 @router.get("/runs/variants")
 def run_variants(
+    caller: Caller,
     session: Annotated[Session, Depends(get_session)],
     repo: Annotated[str, Query(min_length=1)],
     ci_run_id: Annotated[str, Query(min_length=1)],
@@ -83,6 +87,7 @@ def run_variants(
 ) -> RunVariantsResponse:
     """Every variant stored for a CI run attempt (empty if none), so an uploader can tell
     whether another uploader already recorded the run under its own variant names."""
+    authorize(caller, repo)
     return RunVariantsResponse(
         repo=repo,
         ci_run_id=ci_run_id,
@@ -98,11 +103,13 @@ def run_variants(
         200: {"model": RunResponse, "description": "Run was already uploaded"},
         400: {"description": "Invalid JUnit XML"},
         401: {"description": "Missing or invalid bearer token"},
+        403: {"description": "Read-only token, or a token for another repo"},
         409: {"description": "Run already recorded for a different commit"},
         413: {"description": "Upload too large"},
     },
 )
 def post_run(
+    caller: Caller,
     response: Response,
     session: Annotated[Session, Depends(get_session)],
     files: Annotated[list[UploadFile], File(description="One or more JUnit XML files")],
@@ -127,6 +134,7 @@ def post_run(
                 for e in exc.errors()
             ],
         ) from exc
+    authorize(caller, meta.repo, write=True, what="uploading a run")
 
     # Re-uploads (e.g. re-running backfill) skip parsing entirely.
     existing = find_existing_run(session, meta)

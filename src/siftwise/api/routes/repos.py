@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from siftwise.api.deps import get_app_settings
+from siftwise.api.deps import Caller, authorize, get_app_settings
 from siftwise.config import Settings
 from siftwise.core.history import recompute_repo_stats
 from siftwise.core.models import Repo
@@ -24,6 +24,7 @@ router = APIRouter()
 )
 def rollup_repo(
     repo: str,
+    caller: Caller,
     session: Annotated[Session, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_app_settings)],
 ) -> RollupResponse:
@@ -32,6 +33,7 @@ def rollup_repo(
     Run once after uploading with ``POST /runs?defer_rollup=true``; until then the repo's
     stats (and the selector's broken-on-main signal) are stale.
     """
+    authorize(caller, repo, write=True, what="a rollup")
     repo_id = session.scalars(select(Repo.id).where(Repo.name == repo)).one_or_none()
     if repo_id is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown repo {repo!r}")

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from siftwise.api.deps import Caller, authorize
 from siftwise.core.risk import Order
 from siftwise.core.schemas import (
     BudgetOut,
@@ -34,10 +35,12 @@ router = APIRouter()
 
 @router.post("/select", responses={404: {"description": "Unknown repo"}})
 def post_select(
-    body: SelectRequest, session: Annotated[Session, Depends(get_session)]
+    body: SelectRequest, session: Annotated[Session, Depends(get_session)], caller: Caller
 ) -> SelectResponse:
     """Select tests for a change. Falls back to the full suite whenever unsure. With
-    ``shadow``, also stores the selection for that (full-suite) run's recall."""
+    ``shadow``, also stores the selection for that (full-suite) run's recall: that needs a
+    write token."""
+    authorize(caller, body.repo, write=body.shadow is not None, what="storing a shadow selection")
     config = SelectorConfig(
         always_run=tuple(body.always_run),
         depends=tuple(DependsRule(rule.tests, tuple(rule.on)) for rule in body.depends),
