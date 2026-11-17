@@ -6,6 +6,28 @@ All notable changes to siftwise. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Per-repo API tokens with `read` and `write` scopes
+  ([#71](https://github.com/PramodBasavarajMenasi/siftwise/issues/71)):
+  - `siftwise token create --repo acme/shop --scope read|write [--name ci]` prints a new
+    token (`sw_...`) once; `siftwise token list` shows ids, names, repos, scopes and when
+    each was created, last used (to 10 minutes) and revoked, never the tokens;
+    `siftwise token revoke <id>`. They use the database directly (`SIFTWISE_DATABASE_URL`,
+    the server extra), like `siftwise server migrate`: there is no API to make tokens.
+  - `read`: select, triage, explain, recall, test history and run lookups. `write`: also
+    uploads, rollups, shadow compares and storing a shadow run's selection (`/select` with
+    `shadow`). A token is for one repo or `*`.
+  - Auth is still checked before the request body is read: unknown or revoked tokens get
+    401, a read token on a write call or a token for another repo get 403 (the same whether
+    that repo exists or not). A route not listed in the scope table needs `write`.
+  - `SIFTWISE_API_TOKEN` keeps working as an admin token (every repo, write), so existing
+    setups don't change. The server can now run without it, on per-repo tokens alone; with
+    neither it still answers 503.
+  - Migration 0013 adds `api_tokens` (only each token's SHA-256 is stored).
+  - Clients are unchanged: they send a bearer token as before. The docs now recommend a
+    `write` token for CI and a `read` token for coding agents (docs/mcp-clients.md).
+
 ### Fixed
 
 - Go: `go list` ran with Go's own default when GOFLAGS had no `-mod` setting, and that default

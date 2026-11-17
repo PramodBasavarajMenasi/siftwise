@@ -36,6 +36,7 @@ LIGHT_COMMANDS: tuple[list[str], ...] = (
     [], ["select"], ["record"], ["triage"], ["report"], ["rollup"], ["mcp"], ["server"],
     ["gha", "select"], ["gha", "record"], ["gha", "rollup"],
     ["gitlab", "select"], ["gitlab", "record"], ["gitlab", "rollup"],
+    ["token"], ["token", "create"], ["token", "list"], ["token", "revoke"],
 )  # fmt: skip
 LIGHT_MODULES = (
     "siftwise.cli.main", "siftwise.cli.gha", "siftwise.cli.gitlab", "siftwise.cli.reruns",

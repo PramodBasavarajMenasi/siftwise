@@ -181,3 +181,35 @@ def test_migrate_waits_for_another_replica_holding_the_lock(
         replica.result(timeout=120)  # then runs, and raises if it failed
 
     assert revision(engine) == HEAD
+
+
+def test_0013_adds_api_tokens_and_drops_them_again(scratch_engine: tuple[Engine, str]) -> None:
+    engine, url = scratch_engine
+    config = alembic_config(url)
+    command.upgrade(config, "0013")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO api_tokens (token_hash, repo, scope) VALUES (:h, 'acme/shop', 'read')"
+            ),
+            {"h": "0" * 64},
+        )
+        row = connection.execute(
+            text("SELECT name, created_at, last_used_at FROM api_tokens")
+        ).one()
+        assert row.name == "" and row.created_at is not None and row.last_used_at is None
+        with pytest.raises(Exception, match="ck_api_tokens_scope"), connection.begin_nested():
+            connection.execute(
+                text("INSERT INTO api_tokens (token_hash, repo, scope) VALUES ('1', 'x', 'admin')")
+            )
+        with pytest.raises(Exception, match="uq_api_tokens_token_hash"), connection.begin_nested():
+            connection.execute(
+                text("INSERT INTO api_tokens (token_hash, repo, scope) VALUES (:h, 'x', 'write')"),
+                {"h": "0" * 64},
+            )
+
+    command.downgrade(config, "0012")
+
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT to_regclass('api_tokens')")).scalar() is None
+    command.upgrade(config, "head")

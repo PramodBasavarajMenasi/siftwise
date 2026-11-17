@@ -269,6 +269,43 @@ in place of the image name.
   checkout (`--build`), rebuild after every pull for the same reason. A few migrations need a
   step after them: see [the migration notes](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CONTRIBUTING.md#upgrade-notes).
 
+### Tokens
+
+Every request but `/healthz` and the API docs needs `Authorization: Bearer <token>`. There
+are two kinds of token:
+
+- **The admin token**, `SIFTWISE_API_TOKEN` on the server: every repo, read and write. Setups
+  from before 0.4 keep working with it unchanged.
+- **Per-repo tokens**, made on the server host with the server extra installed: each one is
+  for one repo (or `*` for all) and is `read` or `write`.
+
+```sh
+siftwise token create --repo acme/shop --scope write --name ci     # prints the token once
+siftwise token create --repo acme/shop --scope read --name agents
+siftwise token list                                                 # never prints tokens
+siftwise token revoke 2                                             # 401 from the next request
+```
+
+| Scope | Can |
+|---|---|
+| `read` | `select`, `triage` (also of a recorded CI run), `explain`, `report` (recall), test history and run lookups |
+| `write` | all of that, plus uploading runs (`record`, backfill), rollups, shadow compares, and storing a shadow run's selection |
+
+- **Which to use:** CI (the Action, the GitLab template, `siftwise record`, backfill) needs a
+  `write` token for its repo: it uploads runs and `rerun-unknown`'s re-runs, rolls up, and in
+  shadow mode stores the selection and compares the run. Coding agents (`siftwise mcp`) and
+  `siftwise select`/`triage` on a laptop need only `read`: they never upload or store
+  anything.
+- **What goes wrong:** an unknown or revoked token gets 401; a read token on a write call, or
+  a token for another repo, gets 403 (the same answer whether that repo exists or not).
+  Uploads are refused before their body is read.
+- **Where tokens live:** the server stores only each token's SHA-256, its repo, scope, name
+  and when it was created, last used (to 10 minutes) and revoked. `siftwise token` reads and
+  writes the database (`SIFTWISE_DATABASE_URL`) directly, so only whoever runs the server can
+  make tokens: there is no API for it, and the admin token can't mint new ones.
+- **No admin token:** the server works with per-repo tokens alone. With neither, every request
+  gets 503.
+
 ### Seed history from past CI runs
 
 Backfill a repo's past GitHub Actions runs (here rdflib, which uploads one JUnit artifact per
@@ -337,7 +374,8 @@ checkout and never block CI: if the server is unreachable, times out or returns 
 | `actions/rollup` | once after a matrix | [triages the failures](#failure-verdicts) of every leg and reports a [shadow run](#shadow-mode), then updates test stats once for all legs |
 
 **Setup:**
-- **Secrets:** `SIFTWISE_URL` (your server) and `SIFTWISE_TOKEN` (its `SIFTWISE_API_TOKEN`).
+- **Secrets:** `SIFTWISE_URL` (your server) and `SIFTWISE_TOKEN` (a [write token](#tokens)
+  for the repo, or the server's admin `SIFTWISE_API_TOKEN`).
 - **Permissions:** `contents: read`, `actions: read` (the run's start time) and
   `pull-requests: write` (the comment).
 - **Full history:** check out with `fetch-depth: 0`. `select` fails with a clear message on a
@@ -525,7 +563,8 @@ Two ways to keep known flakes from reading as regressions, both in `record`:
   re-runs failures whose verdict is in `rerun-verdicts` (`unknown`, or
   `unknown,new_regression`) with the test's own runner, and records each re-run (all of a
   round's reports in one upload). A test that passes on one is **flaky**, high; one that fails
-  again keeps its verdict, with a note.
+  again keeps its verdict, with a note. The re-runs are uploads, so `record`'s token must be a
+  [write token](#tokens), as for the run itself.
 - **Runners**, chosen per failing test from its ID and file and the checkout:
 
   | Runner | When | Re-run command | Report |
@@ -660,7 +699,8 @@ look.
    installs its own release (`pip install siftwise==<version>`). Or copy the file into your
    repository and `include: local:` it.
 2. **CI/CD variables** (Settings > CI/CD > Variables): `SIFTWISE_SERVER` (your server, https),
-   `SIFTWISE_TOKEN` (its `SIFTWISE_API_TOKEN`; Masked and hidden) and, for the note,
+   `SIFTWISE_TOKEN` (a [write token](#tokens) for the project, or the server's admin
+   `SIFTWISE_API_TOKEN`; Masked and hidden) and, for the note,
    `SIFTWISE_GITLAB_TOKEN` (Masked and hidden). Choosing between protected and not:
    [protected or unprotected](#protected-or-unprotected-variables).
 3. **Full history:** the select and test jobs set `GIT_DEPTH: "0"`; new GitLab projects clone
@@ -861,9 +901,11 @@ uv tool dir --bin                # prints the directory, for a full path in the 
 
 The server reads `SIFTWISE_SERVER` and `SIFTWISE_API_TOKEN`, and optionally `SIFTWISE_REPO`
 (default: `owner/name` from the `origin` remote), `SIFTWISE_BASE_REF` (default: the branch
-`origin/HEAD` points to, else `main`) and `SIFTWISE_REPO_PATH`. Keep the token out of files
-you commit: use your user-level config, or environment-variable expansion where the client has
-it.
+`origin/HEAD` points to, else `main`) and `SIFTWISE_REPO_PATH`. Give agents a **read token**
+for their repo (`siftwise token create --repo acme/shop --scope read`, [Tokens](#tokens)):
+the three tools only read, and a leaked read token can't change history. Keep the token out of
+files you commit: use your user-level config, or environment-variable expansion where the
+client has it.
 
 **Which repository:** the first that applies of the tool's `repo_path` argument (an absolute
 path the agent can pass), `SIFTWISE_REPO_PATH`, `CLAUDE_PROJECT_DIR` (set by Claude Code), the
@@ -975,7 +1017,7 @@ on = ["**/*.go", "!**/*_test.go"]         # ! excludes
 
 | Variable | Used by | Default |
 |---|---|---|
-| `SIFTWISE_API_TOKEN` | server (required: if unset, every endpoint but `/healthz` returns 503) and clients | none |
+| `SIFTWISE_API_TOKEN` | server: the admin token (every repo, write); without it and without [per-repo tokens](#tokens), every endpoint but `/healthz` returns 503. Clients: the token they send (admin or per-repo) | none |
 | `SIFTWISE_SERVER` | clients: the CLI's `--server`, MCP, the Action's steps | `http://localhost:8000` |
 | `SIFTWISE_REPO_PATH` | MCP: the repository, when the client starts the server elsewhere ([which repository](#coding-agents-mcp)) | none |
 | `SIFTWISE_DATABASE_URL` | server | `postgresql+psycopg://siftwise:siftwise@localhost:5432/siftwise` |
@@ -1137,11 +1179,13 @@ the fallbacks and `.siftwise.toml` cover it.
 Found a vulnerability? Report it privately, as [SECURITY.md](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/SECURITY.md) describes, not in a
 public issue.
 
-- **One token per server, with full access.** `SIFTWISE_API_TOKEN` is a single shared secret:
-  every client (CI, the CLI, the MCP server) uses it, and it can read and write the history of
-  **every repo** on the server. There are no per-repo, read-only or per-user tokens. Run a
-  separate server for repos whose owners shouldn't see each other's history, and rotate the
-  token by changing it on the server and in each secret.
+- **Per-repo tokens, read or write.** Give each repo's CI a `write` token for that repo and
+  agents a `read` one ([Tokens](#tokens)): a token can't touch another repo, and a read token
+  can't change history. The admin `SIFTWISE_API_TOKEN` still reads and writes **every repo**:
+  keep it for operators, or unset it once each client has its own token. Revoke a token with
+  `siftwise token revoke`; the admin token rotates by changing it on the server and in each
+  secret. Tokens aren't per user, and a `*` token reaches every repo, as the admin token does.
+  Every repo's tokens are managed by whoever runs the server.
 - **Keep the token out of fork PRs.** Use `pull_request`, never `pull_request_target`: a
   fork's code must never run with the token. On GitLab, never run untrusted forks' merge
   request pipelines in the parent project ([Forks](#forks)).

@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from siftwise.api.deps import get_app_settings
+from siftwise.api.deps import Caller, authorize, get_app_settings
 from siftwise.api.routes.triage import flaky_event_out, link_out
 from siftwise.config import Settings
 from siftwise.core.history import get_recent_results, get_test, get_test_stats
@@ -46,11 +46,13 @@ _RECENT_RUNS = 10
 @router.post("/explain", responses={404: {"description": "Unknown repo"}})
 def post_explain(
     body: ExplainRequest,
+    caller: Caller,
     session: Annotated[Session, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_app_settings)],
 ) -> ExplainResponse:
     """Explain one test: its recent outcomes and stats, flaky evidence (as triage counts it),
     broken-on-main status, and whether and why the selection for this change runs it."""
+    authorize(caller, body.repo)
     config = SelectorConfig(
         always_run=tuple(body.always_run),
         depends=tuple(DependsRule(rule.tests, tuple(rule.on)) for rule in body.depends),

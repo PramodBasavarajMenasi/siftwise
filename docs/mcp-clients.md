@@ -40,10 +40,21 @@ siftwise. Gemini CLI's docs say it removes inherited variables whose names conta
 | Variable | | |
 |---|---|---|
 | `SIFTWISE_SERVER` | required unless it's `http://localhost:8000` | your siftwise API |
-| `SIFTWISE_API_TOKEN` | required | the server's token: keep it out of committed files |
+| `SIFTWISE_API_TOKEN` | required | a **read token** for the repo (see below): keep it out of committed files |
 | `SIFTWISE_REPO` | optional | `owner/name` in siftwise; default from the `origin` remote |
 | `SIFTWISE_BASE_REF` | optional | the base branch; default `origin/HEAD`, else `main` |
 | `SIFTWISE_REPO_PATH` | optional | the repository, when the client starts the server elsewhere |
+
+**Use a read token.** `select_tests`, `triage_failure` and `explain` only read, so an agent
+needs no more than a `read` token for its repo. Whoever runs the server makes one:
+
+```sh
+siftwise token create --repo acme/shop --scope read --name agents   # prints the token once
+```
+
+A read token can't upload runs or change history, and can't reach another repo: those calls
+get 403. Don't give an agent the server's admin `SIFTWISE_API_TOKEN` or a CI write token. See
+[Tokens](../README.md#tokens) for scopes and revoking.
 
 **The repository.** Each tool works on a git checkout, the first of these that applies:
 

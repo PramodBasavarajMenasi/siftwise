@@ -19,11 +19,11 @@ app = typer.Typer(
 )
 
 
-def require_server() -> None:
+def require_server(command: str = "siftwise server") -> None:
     missing = extras.missing(extras.SERVER_MODULES)
     if missing:
         typer.echo(
-            "error: `siftwise server` needs the server dependencies "
+            f"error: `{command}` needs the server dependencies "
             f"(missing: {', '.join(missing)}): {extras.install_hint('server')}",
             err=True,
         )
@@ -64,7 +64,8 @@ def start_command(
     settings = get_settings()
     if not settings.api_token:
         typer.echo(
-            "warning: SIFTWISE_API_TOKEN is not set: every request except /healthz gets 503",
+            "warning: SIFTWISE_API_TOKEN is not set: only tokens made with `siftwise token "
+            "create` get in, and with none every request except /healthz gets 503",
             err=True,
         )
     if run_migrations:

@@ -8,7 +8,7 @@ how the evals measure, [eval methodology](docs/eval-methodology.md).
 
 | Component | Runs | Does | Install |
 |---|---|---|---|
-| **CLI** (`siftwise`) | on a laptop or a CI runner, in the checkout | `select`, `record`, `triage`, `report`, `rollup`: computes the git diff and the Go/Python import graphs, then calls the API | `pip install siftwise` (typer, httpx, defusedxml) |
+| **CLI** (`siftwise`) | on a laptop or a CI runner, in the checkout; `siftwise token` on the server host | `select`, `record`, `triage`, `report`, `rollup` (`siftwise token` manages API tokens in the database): computes the git diff and the Go/Python import graphs, then calls the API | `pip install siftwise` (typer, httpx, defusedxml) |
 | **GitHub Action** (`actions/select`, `record`, `rollup`) | in GitHub Actions jobs | composite actions around `siftwise gha ...` (`cli/gha.py`): run metadata, the sticky PR comment, job summaries, re-runs, `fail-on` | installs the light CLI from the action's checkout |
 | **GitLab CI template** (`gitlab/siftwise.gitlab-ci.yml`) | in GitLab CI jobs | hidden jobs around `siftwise gitlab ...` (`cli/gitlab.py`): the same steps, with dotenv outputs, `.siftwise-ci/` reports and the sticky merge request note | `pip install siftwise==<the template's release>` |
 | **MCP server** (`siftwise mcp`) | started by a coding agent, over stdio | `select_tests`, `triage_failure`, `explain`: the same change computation as the CLI, including uncommitted work | `siftwise[mcp]` |
@@ -83,6 +83,7 @@ from local JUnit files, and `POST /explain` for one test.
 | `test_stats` | per-test rollup, recomputed, never incremented | only tests seen in the stats window |
 | `shadow_selections` | what siftwise would have run, per attempt and variant | the selection scope `WouldRun` reads |
 | `shadow_results`, `shadow_failures` | each compared run, and each of its failing tests | caught or missed, verdict, miss cause, suggested rule |
+| `api_tokens` | per-repo API tokens (`siftwise token create`) | the token's SHA-256 only (unique); `repo` (a name or `*`, not a foreign key: a token can come before the repo's first upload); `scope` `read` or `write`; `last_used_at` (to 10 minutes), `revoked_at` |
 
 - **Run time** is `COALESCE(started_at, created_at)` everywhere "latest" matters: backfill
   ingests old runs late.
@@ -488,8 +489,20 @@ The first rule that applies decides:
   concurrent duplicate upload loses a unique-index race and returns the winner's run.
 - **Deferred rollups.** A matrix leg's upload skips the rollup (`defer_rollup=true`); one repo
   rollup runs after all legs, under a per-repo advisory lock, in memory-bounded batches.
-- **One token, failing closed.** Every path but `/healthz` and the API docs needs the bearer
-  token, checked before the body is read; an unset `SIFTWISE_API_TOKEN` returns 503.
+- **Tokens checked before the body, failing closed.** Every path but `/healthz` and the API
+  docs needs a bearer token: the admin `SIFTWISE_API_TOKEN` (every repo, write) or a stored
+  per-repo token (`api_tokens`, looked up by its SHA-256; only `sw_` tokens are looked up).
+  `BearerAuthMiddleware` (`api/auth.py`) resolves it and checks the route's scope
+  (`ROUTE_SCOPES`, by method and path template; an unlisted route needs `write`) and, for
+  `/repos/{repo}/...` routes, the repo, all before the body is read: unknown or revoked = 401,
+  read token on a write route or another repo = 403. Routes with the repo in the body or the
+  query call `deps.authorize` before any lookup, so a token for another repo gets the same 403
+  whether the repo exists or not. `/select` is a read, except that storing a shadow selection
+  (`shadow` in the body) needs `write`. With no admin token and no active stored token: 503;
+  a failing token lookup: 503. No token cache: a revocation applies to the next request, and
+  each stored-token request costs one indexed lookup, plus an UPDATE of `last_used_at` at most
+  every 10 minutes per token. Tokens are made with `siftwise token` against the database
+  directly, never over the API, so the admin token can't mint tokens.
 - **Migrations at start, once.** `siftwise server start` migrates under a Postgres advisory
   lock, so replicas starting together migrate once.
 - **One CI flow, two providers.** `select`, `record` and `rollup` are the same code for GitHub

@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from siftwise import __version__
 from siftwise.api.auth import BearerAuthMiddleware
+from siftwise.api.deps import SessionTokenStore, app_sessions
 from siftwise.api.limits import BodySizeLimitMiddleware
 from siftwise.api.routes import explain, history, repos, runs, select, shadow, triage
 from siftwise.config import Settings, get_settings
@@ -15,7 +16,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings  # read by routes through siftwise.api.deps.get_app_settings
     # Starlette runs the last-added middleware first: auth rejects before any body is read.
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_upload_bytes)
-    app.add_middleware(BearerAuthMiddleware, token=settings.api_token)
+    app.add_middleware(
+        BearerAuthMiddleware,
+        token=settings.api_token,
+        tokens=SessionTokenStore(app_sessions(app)),
+    )
     app.include_router(runs.router)
     app.include_router(history.router)
     app.include_router(select.router)

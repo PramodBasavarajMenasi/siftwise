@@ -366,3 +366,28 @@ class ShadowFailure(Base):
     cause: Mapped[str | None] = mapped_column(String(32))
     cause_detail: Mapped[str | None] = mapped_column(Text)
     suggestion: Mapped[str | None] = mapped_column(Text)
+
+
+TOKEN_SCOPES = ("read", "write")
+
+
+class ApiToken(Base):
+    """A per-repo API token (``siftwise token create``). Only the SHA-256 of the token is
+    stored; the token itself is shown once, when it's created. ``repo`` is a repo name or
+    ``*`` (every repo), not a foreign key: a token can exist before its repo's first upload."""
+
+    __tablename__ = "api_tokens"
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN (" + ", ".join(f"'{s}'" for s in TOKEN_SCOPES) + ")", name="scope"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), server_default="")
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)  # sha256, hex
+    repo: Mapped[str] = mapped_column(String(255))
+    scope: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

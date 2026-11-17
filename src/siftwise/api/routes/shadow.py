@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from siftwise.api.deps import get_app_settings
+from siftwise.api.deps import Caller, authorize, get_app_settings
 from siftwise.config import Settings
 from siftwise.core.schemas import (
     EstimatedMs,
@@ -42,6 +42,7 @@ router = APIRouter()
 @router.post("/repos/{repo:path}/shadow", responses={404: {"description": "Unknown repo"}})
 def post_shadow_compare(
     repo: str,
+    caller: Caller,
     body: ShadowCompareRequest,
     session: Annotated[Session, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_app_settings)],
@@ -50,6 +51,7 @@ def post_shadow_compare(
     for it: each failure caught, missed, or flaky (not counted). Idempotent: a re-call
     replaces the stored comparison. ``shadow: false`` when the attempt wasn't a shadow run.
     For the GitHub Action, after all legs."""
+    authorize(caller, repo, write=True, what="a shadow compare")
     result = compare_ci_run(
         session, repo, body.ci_run_id, body.run_attempt, settings.stats_window_days
     )
@@ -106,6 +108,7 @@ def post_shadow_compare(
 @router.get("/repos/{repo:path}/recall", responses={404: {"description": "Unknown repo"}})
 def get_recall(
     repo: str,
+    caller: Caller,
     session: Annotated[Session, Depends(get_session)],
     days: Annotated[int, Query(ge=1, le=365, description="Shadow runs of the last N days")] = 30,
     by: Annotated[
@@ -115,6 +118,7 @@ def get_recall(
     """Live recall from shadow runs: failures the selection would have caught or missed (flaky
     ones excluded), over every shadow run and over selective ones only, the measured time the
     selection would have saved, why each failure was missed, and rules to consider."""
+    authorize(caller, repo)
     report = shadow_recall(session, repo, days, by_week=by == "week")
     if report is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown repo {repo!r}")

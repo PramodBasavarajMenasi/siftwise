@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from siftwise.api.deps import Caller, authorize
 from siftwise.core.history import get_recent_results, get_test, get_test_stats
 from siftwise.core.schemas import TestHistoryResponse, TestResultOut, TestStatsOut
 from siftwise.db import get_session
@@ -21,10 +22,12 @@ HISTORY_LIMIT = 20
     responses={404: {"description": "No history for this test in this repo"}},
 )
 def get_test_history(
+    caller: Caller,
     test_id: str,
     repo: Annotated[str, Query(min_length=1, description="Repository name, e.g. acme/shop")],
     session: Annotated[Session, Depends(get_session)],
 ) -> TestHistoryResponse:
+    authorize(caller, repo)
     test = get_test(session, repo, test_id)
     if test is None:
         raise HTTPException(
