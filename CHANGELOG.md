@@ -8,6 +8,19 @@ All notable changes to siftwise. The format follows
 
 ### Added
 
+- Test fixtures ([#73](https://github.com/PramodBasavarajMenasi/siftwise/issues/73)):
+  `fixtures = ["tests/fixtures/**"]` in `.siftwise.toml` marks test data. A changed file
+  there (a sample project's `pom.xml`, `build.gradle.kts`, `tsconfig.json`, `go.mod`, ...)
+  no longer forces the full suite: the test files that name the fixture run (the CLI reads
+  them, and Python helpers they import), plus `[[depends]]` rules on it. If nothing
+  references it, the full suite runs, naming the file. Files your own build includes
+  (Maven/Gradle modules, `go.work` uses, JS workspace packages) keep today's behaviour.
+  Shadow mode has a new miss cause, `fixture`. Migration 0014 adds
+  `shadow_selections.fixture_files` and the cause. siftwise's own `.siftwise.toml` lists
+  `tests/fixtures/**`: of the dogfood runs from 2026-10-26 to 2026-11-09, the two of #50
+  (fixture build files only) would now run 32 of the 40 test files instead of everything;
+  the two of #53 still run the full suite (`.github/workflows/ci.yml` changed too).
+
 - Per-repo API tokens with `read` and `write` scopes
   ([#71](https://github.com/PramodBasavarajMenasi/siftwise/issues/71)):
   - `siftwise token create --repo acme/shop --scope read|write [--name ci]` prints a new

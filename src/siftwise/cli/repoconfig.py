@@ -3,6 +3,7 @@
 always_run = ["tests/smoke/**"]
 generated = ["build/reports/**"]    # more generated files (siftwise ignores reports by default)
 known_flaky = ["tests/test_net.py::*"]   # triage: failing + not linked to the change -> flaky
+fixtures = ["tests/fixtures/**"]    # test data: its build files select the tests that use it
 
 [[depends]]                         # binary-level suites with no import edge to the code
 tests = "test/cli/**"
@@ -33,6 +34,12 @@ class RepoConfig:
     generated: tuple[str, ...] = ()
     # Test ID / file path globs triage calls flaky when they fail unlinked to the change.
     known_flaky: tuple[str, ...] = ()
+    # Globs of test data (``!`` excludes, as in [[depends]] ``on``): a change there selects
+    # the tests that reference it instead of forcing the full suite (cli/fixtures.py).
+    fixtures: tuple[str, ...] = ()
+
+    def is_fixture(self, path: str) -> bool:
+        return bool(self.fixtures) and DependsRule("", self.fixtures).matches_file(path)
 
 
 def load_repo_config(path: Path) -> RepoConfig:
@@ -52,7 +59,7 @@ def loads_repo_config(content: str, source: str = FILE_NAME) -> RepoConfig:
 
 
 def parse_repo_config(data: dict[str, Any], source: str = FILE_NAME) -> RepoConfig:
-    unknown = set(data) - {"depends", "always_run", "generated", "known_flaky"}
+    unknown = set(data) - {"depends", "always_run", "generated", "known_flaky", "fixtures"}
     if unknown:
         raise RepoConfigError(f"{source}: unknown key(s): {', '.join(sorted(unknown))}")
 
@@ -65,6 +72,11 @@ def parse_repo_config(data: dict[str, Any], source: str = FILE_NAME) -> RepoConf
     known_flaky = data.get("known_flaky", [])
     if not _is_str_list(known_flaky):
         raise RepoConfigError(f"{source}: known_flaky must be a list of strings")
+    fixtures = data.get("fixtures", [])
+    if not _is_str_list(fixtures) or (fixtures and all(p.startswith("!") for p in fixtures)):
+        raise RepoConfigError(
+            f"{source}: fixtures must be a list of globs with at least one non-'!' glob"
+        )
 
     rules = data.get("depends", [])
     if not isinstance(rules, list):
@@ -84,7 +96,9 @@ def parse_repo_config(data: dict[str, Any], source: str = FILE_NAME) -> RepoConf
         if not _is_str_list(on) or not on or all(p.startswith("!") for p in on):
             raise RepoConfigError(f"{where}: 'on' needs at least one non-'!' glob")
         depends.append(DependsRule(tests, tuple(on)))
-    return RepoConfig(tuple(depends), tuple(always_run), tuple(generated), tuple(known_flaky))
+    return RepoConfig(
+        tuple(depends), tuple(always_run), tuple(generated), tuple(known_flaky), tuple(fixtures)
+    )
 
 
 def _is_str_list(value: object) -> bool:

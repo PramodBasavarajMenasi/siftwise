@@ -288,11 +288,14 @@ jobs:
       # rollup then counts the failures that selection caught or missed. Its own variant: this
       # is the same CI run attempt as the steps above (a step can't change GITHUB_RUN_ID). On a
       # PR no signal reliably selects the always-failing test (recently-failed reads main runs
-      # only), so an untracked .siftwise.toml pins it with always_run; select diffs commits, so
-      # the file is never part of the change. A new failing test that no signal reaches is the
-      # miss. A full selection (e.g. a commit touching a workflow) catches both.
+      # only), so an uncommitted line in .siftwise.toml pins it with always_run (the file is
+      # saved first and put back after: the repo's own one lists its fixtures); select diffs
+      # commits, so the edit is never part of the change. A new failing test that no signal
+      # reaches is the miss. A full selection (e.g. a commit touching a workflow) catches both.
       - name: Shadow - pin the always-failing test
-        run: printf 'always_run = ["test_e2e_failing::*"]\n' > .siftwise.toml
+        run: |
+          cp .siftwise.toml "$RUNNER_TEMP/siftwise.toml.orig"
+          printf '\nalways_run = ["test_e2e_failing::*"]\n' >> .siftwise.toml
 
       - name: Shadow - select (shadow always)
         id: shadow
@@ -312,7 +315,7 @@ jobs:
           FIRST_JUNIT: ${{ steps.first.outputs.junit-dir }}
           JUNIT_DIR: ${{ steps.shadow.outputs.junit-dir }}
         run: |
-          rm .siftwise.toml
+          cp "$RUNNER_TEMP/siftwise.toml.orig" .siftwise.toml
           test "$SHADOW" = true
           test "$MODE" = full     # a shadow run never selects
           test -z "$COMMAND"      # the workflow runs its own full suite
@@ -411,7 +414,7 @@ jobs:
           grep -F -- '- **Mode:** full (shadow run)' <<< "$body"
           grep -F '**Shadow run:** would have run' <<< "$body"
 
-      # known_flaky: the always-failing test, listed in an untracked .siftwise.toml. Its own
+      # known_flaky: the always-failing test, listed in .siftwise.toml (uncommitted). Its own
       # variants of this attempt, checked through the API (verdicts per variant, no comment).
       # known-flaky-source: head applies the checkout's list; the default (base) applies the PR
       # base commit's, which has none: a PR can't mark its own failures flaky. A change to a root
@@ -420,7 +423,8 @@ jobs:
         env:
           FIRST_JUNIT: ${{ steps.first.outputs.junit-dir }}
         run: |
-          printf 'known_flaky = ["test_e2e_failing::*"]\n' > .siftwise.toml
+          cp .siftwise.toml "$RUNNER_TEMP/siftwise.toml.orig"
+          printf '\nknown_flaky = ["test_e2e_failing::*"]\n' >> .siftwise.toml
           mkdir -p "$RUNNER_TEMP/known-flaky-junit"
           cp "$FIRST_JUNIT/e2e-failing.xml" "$RUNNER_TEMP/known-flaky-junit/"
 
@@ -443,7 +447,7 @@ jobs:
 
       - name: Check the known-flaky verdicts
         run: |
-          rm .siftwise.toml
+          cp "$RUNNER_TEMP/siftwise.toml.orig" .siftwise.toml
           git status --porcelain
           test -z "$(git status --porcelain)"
           triage() {

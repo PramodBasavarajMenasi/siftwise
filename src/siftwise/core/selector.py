@@ -347,6 +347,9 @@ class Selection:
     # Java test classes the commands run whole (outer class names): every test in them runs,
     # new ones too (a test class with no history among them).
     java_classes_run: tuple[str, ...] = ()
+    # Changed fixture files (.siftwise.toml `fixtures`) this selection handled as test data:
+    # shadow mode stores them, so a miss among their tests is a `fixture` miss.
+    fixture_files: tuple[str, ...] = ()
     # Estimated test time from history: all known tests, and the ones the commands would run
     # (see WouldRun). Go subtests are left out: their time is inside their parent's.
     estimated_ms_total: float = 0.0
@@ -506,6 +509,7 @@ def select_tests(
     js_imports: JsImports | None = None,
     java: JavaBuildInfo | None = None,
     import_depths: Mapping[str, int] | None = None,
+    fixture_refs: Mapping[str, Sequence[str]] | None = None,
 ) -> Selection:
     """Select tests for a change.
 
@@ -525,6 +529,9 @@ def select_tests(
     ``import_depths``: test file (Python, Jest, Java) or Go package -> the shortest import
     depth from it to a changed file (1 = it imports changed code itself). Order only: a test
     selected by an import at depth 1 ranks as a direct link, deeper (or unknown) as indirect.
+    ``fixture_refs``: changed fixture file -> the test files that reference it (the CLI's
+    cli/fixtures.py). Those files never force the full suite: the referencing test files run
+    whole, and [[depends]] rules on them apply; one that selects nothing runs the full suite.
     """
     # Every known test classified once, for the selection and its time estimate.
     tests = _index(history.tests.values() if history else ())
@@ -533,7 +540,7 @@ def select_tests(
     selection = _select(
         history, changed_files, changed_files_known, config or SelectorConfig(),
         affected_packages, affected_files, deleted_files, junit_dir, tests, order, budget_ms,
-        js_imports or JsImports(), java, import_depths,
+        js_imports or JsImports(), java, import_depths, fixture_refs,
     )  # fmt: skip
     return _with_estimate(selection, history, tests)
 
@@ -553,6 +560,7 @@ def _select(
     js_imports: JsImports | None = None,
     java: JavaBuildInfo | None = None,
     import_depths: Mapping[str, int] | None = None,
+    fixture_refs: Mapping[str, Sequence[str]] | None = None,
 ) -> Selection:
     js_imports = js_imports or JsImports()
     depths = {path: depth for key, depth in (import_depths or {}).items()
@@ -600,13 +608,23 @@ def _select(
         # A known but empty diff: e.g. a PR whose commits cancel out. Still "unsure": nothing
         # to select on, so the full suite.
         return full(NO_NET_CHANGES)
-    scoped_build = {p: d for p in paths if (d := build_file_scope(p)) is not None}
+    # Changed test data (.siftwise.toml `fixtures`, sent by the CLI with the test files that
+    # reference it): never a build file, never the full suite by itself.
+    refs = {
+        path: sorted({r for ref in found if (r := normalize_path(ref))})
+        for file, found in (fixture_refs or {}).items()
+        if (path := normalize_path(file))
+    }
+    fixtures = {p: refs[p] for p in paths if p in refs}
+    scoped_build = {
+        p: d for p in paths if (d := build_file_scope(p)) is not None and p not in fixtures
+    }
     # A Java module's build file the CLI could scope (its module and dependents): handled
     # with the Java signals below, never the full suite.
     java_scoped = {} if java is None else {
         p: java.build_scopes[p] for p in paths if p in java.build_scopes}  # fmt: skip
-    build = [p for p in paths
-             if is_build_file(p) and p not in scoped_build and p not in java_scoped]  # fmt: skip
+    build = [p for p in paths if is_build_file(p) and p not in scoped_build
+             and p not in java_scoped and p not in fixtures]  # fmt: skip
     if build:
         return full(f"build/config file changed: {_list(build)}")
     if history is None or not tests:
@@ -646,7 +664,7 @@ def _select(
             java_classes[test.java_class].append(test)
     java_new: set[tuple[str, str]] = set()  # (module, class) with no known test: run it
     if java is not None:
-        problem = _java_problem(relevant, java)
+        problem = _java_problem([p for p in relevant if p not in fixtures], java)
         if problem:
             return full(problem)
 
@@ -807,6 +825,26 @@ def _select(
             if test.runner is Runner.GO:
                 whole_packages.add(test.classname)
 
+    # Changed fixture files: the test files that reference their fixture run (whole).
+    fixture_hits: dict[str, list[str]] = {}  # fixture file -> referencing files that ran
+    for path, ref_files in sorted(fixtures.items()):
+        for ref in ref_files:
+            if ref not in deleted and _run_referencing(
+                ref, f"fixture {path}, referenced by {ref}", tests, py_test_files, jest_files,
+                java_classes, java, config, add, py_whole_files, js_new_files, whole_packages,
+                java_new,
+            ):  # fmt: skip
+                fixture_hits.setdefault(path, []).append(ref)
+    unreferenced = [
+        p for p in sorted(fixtures)
+        if p not in fixture_hits and p not in covered_by_rules and p in unmapped
+    ]  # fmt: skip
+    if unreferenced:
+        return full(
+            "fixture file changed and no test references its fixture (no [[depends]] rule "
+            f"on it either): {_list(unreferenced)}"
+        )
+
     # A changed file is covered if its own tests, its package's dependents' tests, test files
     # importing it or a declared rule selected something; anything else forces the full suite.
     unmapped = [
@@ -814,6 +852,7 @@ def _select(
         for p in unmapped
         if p not in covered_by_rules
         and p not in covered_by_imports
+        and p not in fixtures
         and not (
             p.endswith(".go")
             and any(
@@ -901,6 +940,8 @@ def _select(
         summary += f"; new test file: {_list(sorted(js_new_files.values()))}"
     if java_new:
         summary += f"; test class with no history: {_list(sorted(c for _, c in java_new))}"
+    for path, used in sorted(fixture_hits.items()):
+        summary += f"; fixture {path}, referenced by {_list(used, 2)}"
     ranks = rank(
         (_risk_inputs(history.tests[t.test_id], links[t.test_id]) for t in chosen),
         history.newest_run_at,
@@ -929,6 +970,7 @@ def _select(
         go_packages_run_whole=tuple(sorted(whole_packages)),
         python_files_run_whole=tuple(sorted(files_run_whole)),
         java_classes_run=_java_classes_run(units),
+        fixture_files=tuple(sorted(fixtures)),
         order=order,
     )
     if budget_ms is None:
@@ -939,6 +981,63 @@ def _select(
         return dataclasses.replace(selection, budget=Budget(budget_ms, applied=False, note=note))
     return _pack(selection, units, ranked, costs, budget_ms, _GoLayout.of(config), junit_dir,
                  java=java)  # fmt: skip
+
+
+def _run_referencing(
+    ref: str,
+    reason: str,
+    tests: Mapping[str, _Test],
+    py_test_files: Mapping[str, list[_Test]],
+    jest_files: _JestFiles,
+    java_classes: Mapping[str, list[_Test]],
+    java: JavaBuildInfo | None,
+    config: SelectorConfig,
+    add: Callable[[str, str, Link], None],
+    py_whole_files: set[str],
+    js_new_files: dict[str, str],
+    whole_packages: set[str],
+    java_new: set[tuple[str, str]],
+) -> bool:
+    """Select a test file that references a changed fixture, whole (new tests in it too).
+    False if it's no test file siftwise can run: no known tests and no runnable new file."""
+    if ref.endswith(".py"):
+        for test in py_test_files.get(ref, ()):
+            add(test.test_id, reason, Link.INDIRECT)
+        if ref in py_test_files or is_python_test_file(ref):
+            py_whole_files.add(ref)
+            return True
+        return False
+    if posixpath.splitext(ref)[1] in JS_EXTENSIONS:
+        known = jest_files.tests_for(ref)
+        for test in known:
+            add(test.test_id, reason, Link.INDIRECT)
+        if known:
+            return True
+        runnable = jest_files.runnable(ref) if is_jest_test_file(ref) else None
+        if runnable is not None:
+            js_new_files[runnable] = ref
+        return runnable is not None
+    if ref.endswith("_test.go"):
+        directory = posixpath.dirname(ref)
+        found = False
+        for test in tests.values():
+            if test.runner is Runner.GO and _go_package_matches(
+                test.classname, directory, config.go_module, config.go_modules
+            ):
+                add(test.test_id, reason, Link.INDIRECT)
+                whole_packages.add(test.classname)
+                found = True
+        return found
+    located = java_class_of(ref) if ref.endswith(".java") else None
+    if located is None:
+        return False
+    known_java = java_classes.get(located[1], [])
+    for test in known_java:
+        add(test.test_id, reason, Link.INDIRECT)
+    if not known_java and java is not None and located[1] in java.test_classes:
+        java_new.add((java.test_classes[located[1]], located[1]))
+        return True
+    return bool(known_java)
 
 
 def _ranked(

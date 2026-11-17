@@ -278,6 +278,29 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   falls back to the full suite. Shadow mode credits every test of a class it runs
   (`java_classes`, migration 0012), new ones too.
 
+### Test fixtures
+
+`.siftwise.toml` `fixtures` (globs) marks test data. The CLI (`cli/fixtures.py`) sends
+`/select`'s `fixture_refs`: each changed file under a fixture glob -> the test files that
+reference its fixture. The fixture is the path component after the glob's literal prefix
+(`tests/fixtures/java_gradle`, or a file directly there); a file references it when its text
+contains the fixture's name as a token (not preceded by `[A-Za-z0-9_.-]` nor followed by
+`[A-Za-z0-9_-]`). Read: Python test files and helpers (`conftest.py`, non-test modules in a
+`tests`/`test`/`testing` directory), Jest test files, `_test.go` and `src/test/**.java`, never
+inside the fixtures. A helper's importers count through the Python graph. Files the root build
+includes (a Maven/Gradle module, a `go.work` `use`, a JS workspace package, a `.go` file of a
+module other than the fixture's own; or any file when the root Java build is unreadable) are
+not sent, so they stay build files.
+
+The selector takes those files out of the build-file, nested-manifest and Java checks; they
+still go through path mapping and `[[depends]]`. Each referencing test file runs whole
+(`fixture X, referenced by Y`, an indirect link; the summary names them too). A fixture file
+nothing covers runs the full suite with a reason naming it. The selection keeps its
+`fixture_files`, which shadow mode stores (`shadow_selections.fixture_files`, migration
+0014); a failure such a selection missed, linked to nothing but those files, gets the miss
+cause `fixture` with a `[[depends]]` suggestion. `fixture_refs` is `/select`-only (an older
+server's 422 drops it: the full suite, as before); triage's `change_links` doesn't read it.
+
 ## Risk order
 
 Every selected test gets a risk score, a rank and a short reason (`core/risk.py`). With

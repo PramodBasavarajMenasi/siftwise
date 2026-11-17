@@ -213,3 +213,34 @@ def test_0013_adds_api_tokens_and_drops_them_again(scratch_engine: tuple[Engine,
     with engine.connect() as connection:
         assert connection.execute(text("SELECT to_regclass('api_tokens')")).scalar() is None
     command.upgrade(config, "head")
+
+
+def test_0014_adds_fixture_files_and_the_fixture_cause(scratch_engine: tuple[Engine, str]) -> None:
+    engine, url = scratch_engine
+    config = alembic_config(url)
+    command.upgrade(config, "0014")
+    with engine.connect() as connection:
+        default = connection.execute(text(
+            "SELECT column_default FROM information_schema.columns "
+            "WHERE table_name = 'shadow_selections' AND column_name = 'fixture_files'"
+        )).scalar()  # fmt: skip
+        check = connection.execute(text(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conname = 'ck_shadow_failures_cause'"
+        )).scalar()  # fmt: skip
+    assert default is not None and "'{}'" in default
+    assert check is not None and "'fixture'" in check
+
+    command.downgrade(config, "0013")
+
+    with engine.connect() as connection:
+        check = connection.execute(text(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conname = 'ck_shadow_failures_cause'"
+        )).scalar()  # fmt: skip
+        column = connection.execute(text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'shadow_selections' AND column_name = 'fixture_files'"
+        )).scalar()  # fmt: skip
+    assert check is not None and "'fixture'" not in check and column is None
+    command.upgrade(config, "head")

@@ -263,7 +263,9 @@ SHADOW_STATUSES = (
 )
 SHADOW_UNIQUE_INDEX = "uq_shadow_selections_repo_ci_run_attempt_variant"
 # Why a failure was missed (core/shadow.py CAUSES, most specific first).
-MISS_CAUSES = ("budget", "new_test", "flaky_history", "config_gap", "no_link", "unknown")
+MISS_CAUSES = (
+    "budget", "new_test", "flaky_history", "fixture", "config_gap", "no_link", "unknown"
+)  # fmt: skip
 
 
 class ShadowSelection(Base):
@@ -304,6 +306,11 @@ class ShadowSelection(Base):
     python_files: Mapped[list[str]] = mapped_column(ARRAY(Text))
     # Java test classes run whole (their every test runs, new ones too).
     java_classes: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), server_default=text("'{}'::text[]"), default=list
+    )
+    # Changed fixture files (.siftwise.toml `fixtures`) the selection handled as test data
+    # (migration 0014): a failure it missed is a `fixture` miss.
+    fixture_files: Mapped[list[str]] = mapped_column(
         ARRAY(Text), server_default=text("'{}'::text[]"), default=list
     )
     selected_count: Mapped[int] = mapped_column(Integer)

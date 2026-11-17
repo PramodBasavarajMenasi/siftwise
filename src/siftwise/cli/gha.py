@@ -1331,6 +1331,7 @@ _CAUSE_LABELS = {
     "budget": "left out by the time budget",
     "new_test": "new test",
     "flaky_history": "flaky history",
+    "fixture": "uses a changed fixture it doesn't name",
     "config_gap": "config gap",
     "no_link": "no link to the change",
     "unknown": "unknown cause",

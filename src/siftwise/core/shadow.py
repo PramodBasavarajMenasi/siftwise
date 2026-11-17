@@ -79,10 +79,11 @@ STORAGE_ERROR = "storage_error"  # the database failed (set by the /select route
 BUDGET = "budget"  # the selection had it, a time budget left it out
 NEW_TEST = "new_test"  # no result before the run
 FLAKY_HISTORY = "flaky_history"  # flaky before, but not called flaky now
+FIXTURE = "fixture"  # the selection treated changed fixture files; the test doesn't name them
 CONFIG_GAP = "config_gap"  # a non-code file in the test's own directory changed
 NO_LINK = "no_link"  # the change is known and nothing in it links to the test
 UNKNOWN_CAUSE = "unknown"
-CAUSES = (BUDGET, NEW_TEST, FLAKY_HISTORY, CONFIG_GAP, NO_LINK, UNKNOWN_CAUSE)
+CAUSES = (BUDGET, NEW_TEST, FLAKY_HISTORY, FIXTURE, CONFIG_GAP, NO_LINK, UNKNOWN_CAUSE)
 UNCLASSIFIED = "unclassified"  # compared before causes existed (migration 0009): re-compare
 LINKED_NOT_SELECTED = (
     "linked to the change but not selected (selector didn't know the test at select time?)"
@@ -154,6 +155,7 @@ def store_selection(
             go_packages=sorted(scope.go_packages),
             python_files=sorted(scope.python_files),
             java_classes=sorted(scope.java_classes),
+            fixture_files=list(selection.fixture_files),
             selected_count=selection.selected_count,
             total_known=selection.total_known,
             estimated_ms_total=selection.estimated_ms_total,
@@ -313,10 +315,17 @@ class RunChange:
     generated: tuple[str, ...] = ()
 
 
-def miss_cause(result: TriageResult, change: RunChange, file_path: str | None = None) -> MissCause:
+def miss_cause(
+    result: TriageResult,
+    change: RunChange,
+    file_path: str | None = None,
+    fixtures: Sequence[str] = (),
+) -> MissCause:
     """Why the selection missed this failure, from evidence only; ``unknown`` when it doesn't
     say. First that applies: a test new in this run; a test with flaky history (but not called
-    flaky now); unknown change links, or links the selection didn't act on (unknown); a
+    flaky now); the selection treated changed ``fixtures`` as test data and the test links to
+    nothing but them (fixture: it uses a fixture without naming it, with a ``[[depends]]`` rule
+    to consider); unknown change links, or links the selection didn't act on (unknown); a
     non-code file changed in the test's own directory (config gap, with a ``[[depends]]`` rule
     to consider); otherwise nothing in the known change links to it (no link)."""
     history = result.history
@@ -328,6 +337,15 @@ def miss_cause(result: TriageResult, change: RunChange, file_path: str | None = 
         return MissCause(FLAKY_HISTORY, f"flaky {len(history.flaky)} time(s) before ({same} "
                          f"same-commit, {other} unrelated fail-then-pass), but not called flaky "
                          "now")  # fmt: skip
+    if fixtures and all(link.changed in fixtures for link in result.links):
+        location = locate_test(result.test_id, file_path or history.file_path, change.go_module)
+        suggestion = None
+        if location and result.verdict is not Verdict.PRE_EXISTING:
+            dirs = sorted({posixpath.dirname(path) or "." for path in fixtures})
+            suggestion = depends_rule(location[1], [f"{d}/**" for d in dirs])
+        return MissCause(FIXTURE, f"fixture file(s) changed and this test doesn't name their "
+                         f"fixture (it wasn't among the tests referencing it): "
+                         f"{_shown(sorted(fixtures))}", suggestion)  # fmt: skip
     if not change.links_known:
         return MissCause(UNKNOWN_CAUSE, "the run's change links weren't recorded (unknown diff, "
                          "or an import graph failed or was skipped)")  # fmt: skip
@@ -535,7 +553,7 @@ def _compare(
             if missed and before is not None and before(r.test_id):
                 cause = MissCause(BUDGET, _budget_detail(selection.budget or {}))
             elif missed:
-                cause = miss_cause(r, change, paths.get(r.test_id))
+                cause = miss_cause(r, change, paths.get(r.test_id), selection.fixture_files)
             variant_rows.append(FailureRow(r.test_id, v.variant, runs_it, r.verdict.value,
                                            selective, cause))  # fmt: skip
         rows.extend(variant_rows)

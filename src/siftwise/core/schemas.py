@@ -331,6 +331,14 @@ class SelectRequest(ChangeRequest):
         "ranks a test file's import as a direct link, deeper as indirect; missing = indirect. "
         "Go packages' depths are accepted but don't change their link (always indirect)",
     )
+    fixture_refs: dict[Path4K, Annotated[list[Path4K], Field(max_length=10_000)]] | None = Field(
+        default=None,
+        max_length=10_000,
+        description="Changed files under .siftwise.toml `fixtures` (test data) -> the test files "
+        "that reference their fixture. These files never force the full suite by themselves: "
+        "the listed test files run, plus [[depends]] rules on them; a fixture file neither "
+        "finds a test for runs the full suite. Files the project's build includes are not sent",
+    )
     budget_seconds: float | None = Field(
         default=None,
         gt=0,
@@ -802,7 +810,8 @@ class ShadowMissOut(BaseModel):
     cause: str | None = Field(
         default=None,
         description="Why it was missed: 'budget' (a time budget left it out), 'new_test', "
-        "'flaky_history', 'config_gap', 'no_link' or 'unknown'",
+        "'flaky_history', 'fixture' (changed fixture files the test doesn't name), "
+        "'config_gap', 'no_link' or 'unknown'",
     )
     cause_detail: str | None = Field(default=None, description="The evidence, in a line")
 
@@ -842,7 +851,8 @@ class RecallStatsOut(BaseModel):
     recall: float | None = Field(description="caught / (caught + missed); null with neither")
     missed_by_verdict: dict[str, int]
     missed_by_cause: dict[str, int] = Field(
-        description="budget, new_test, flaky_history, config_gap, no_link, unknown; plus "
+        description="budget, new_test, flaky_history, fixture, config_gap, no_link, unknown; "
+        "plus "
         "'unclassified' for misses compared before causes existed"
     )
     budget_limited_runs: int = Field(
