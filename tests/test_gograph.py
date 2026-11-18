@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -125,14 +126,19 @@ def test_run_go_list_parses_output(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
         calls.append(args)
         if args[1] == "env":  # `go env -w GOFLAGS=-mod=mod`: go.mod may be rewritten
-            return subprocess.CompletedProcess(args, 0, b"-mod=mod -tags=e2e\n", b"")
+            return subprocess.CompletedProcess(
+                args, 0, b'{"GOFLAGS": "-mod=mod -tags=e2e", "GOWORK": ""}', b""
+            )
         flags.append(kwargs["env"]["GOFLAGS"])  # type: ignore[index]
         return subprocess.CompletedProcess(args, 0, go_list_output(tmp_path).encode(), b"")
 
     monkeypatch.setattr("siftwise.cli.gograph.subprocess.run", fake_run)
     packages = run_go_list(tmp_path)
 
-    assert calls == [["go", "env", "GOFLAGS"], ["go", "list", "-deps", "-test", "-json", "./..."]]
+    assert calls == [
+        ["go", "env", "-json", "GOFLAGS", "GOWORK"],
+        ["go", "list", "-deps", "-test", "-json", "./..."],
+    ]
     assert flags == ["-mod=readonly -tags=e2e"]  # never edits go.mod; other flags kept
     assert packages is not None and len(packages) == len(go_list_packages(tmp_path))
 
@@ -385,3 +391,106 @@ func TestF(t *testing.T) {{ _ = c.C() }}
     assert graph.affected(["a/a.go"]).keys() == {f"{m}/{p}" for p in "abcdef"}
     assert graph.depths(["a/a.go"]) == {
         f"{m}/a": 1, f"{m}/b": 1, f"{m}/c": 2, f"{m}/d": 1, f"{m}/e": 1, f"{m}/f": 3}  # fmt: skip
+
+
+def test_workspace_vendor_takes_precedence_over_module_vendor(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    module = workspace / "module"
+    write(module / "vendor" / "modules.txt", "module vendor\n")
+    workfile = workspace / "go.work"
+    write(workfile, "go 1.22\nuse ./module\n")
+    assert not _is_vendored(module, str(workfile))
+    write(workspace / "vendor" / "modules.txt", "## workspace\n")
+    assert _is_vendored(module, str(workfile))
+    assert _is_vendored(module, "off")
+
+
+def test_go_list_uses_the_active_workspace_vendor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The Go-selected workspace may be outside the module's ancestor chain (GOWORK).
+    workspace = tmp_path / "workspace"
+    module = tmp_path / "module"
+    module.mkdir()
+    write(workspace / "vendor" / "modules.txt", "## workspace\n")
+    workfile = workspace / "go.work"
+    write(workfile, "go 1.22\nuse ../module\n")
+    flags: list[str] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if args[1] == "env":
+            if "-json" not in args:
+                return subprocess.CompletedProcess(args, 0, b"-tags=e2e\n", b"")
+            output = json.dumps({"GOFLAGS": "-tags=e2e", "GOWORK": str(workfile)}).encode()
+            return subprocess.CompletedProcess(args, 0, output, b"")
+        flags.append(kwargs["env"]["GOFLAGS"])  # type: ignore[index]
+        return subprocess.CompletedProcess(args, 0, b"{}", b"")
+
+    monkeypatch.setattr("siftwise.cli.gograph.subprocess.run", fake_run)
+    assert run_go_list(module) == [{}]
+    assert flags == ["-tags=e2e"]
+
+
+@pytest.mark.parametrize("gowork", ["", "off", "nested/go.work"])
+def test_inactive_ancestor_vendor_is_ignored(tmp_path: Path, gowork: str) -> None:
+    module = tmp_path / "nested" / "module"
+    module.mkdir(parents=True)
+    write(tmp_path / "go.work", "go 1.22\nuse ./nested/module\n")
+    write(tmp_path / "vendor" / "modules.txt", "## workspace\n")
+    work = str(tmp_path / gowork) if gowork.endswith("go.work") else gowork
+    assert not _is_vendored(module, work)
+
+
+@pytest.mark.parametrize("flags", ["", "-mod=vendor", "-mod=readonly", "-mod=mod"])
+def test_workspace_vendor_respects_explicit_mod_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flags: str
+) -> None:
+    write(tmp_path / "vendor" / "modules.txt", "## workspace\n")
+    workfile = tmp_path / "go.work"
+    write(workfile, "go 1.22\nuse ./module\n")
+    seen: list[str] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if args[1] == "env":
+            output = json.dumps({"GOFLAGS": flags, "GOWORK": str(workfile)}).encode()
+            return subprocess.CompletedProcess(args, 0, output, b"")
+        seen.append(kwargs["env"]["GOFLAGS"])  # type: ignore[index]
+        return subprocess.CompletedProcess(args, 0, b"{}", b"")
+
+    monkeypatch.setattr("siftwise.cli.gograph.subprocess.run", fake_run)
+    assert run_go_list(tmp_path) == [{}]
+    assert seen == ["-mod=readonly" if flags == "-mod=mod" else flags]
+
+
+@pytest.mark.parametrize("output", [b"not json", b"[]", b"{}", b'{"GOFLAGS": null}'])
+def test_go_settings_failure_preserves_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output: bytes
+) -> None:
+    from siftwise.cli.gograph import _go_settings
+
+    monkeypatch.setenv("GOFLAGS", "-mod=vendor")
+    monkeypatch.setenv("GOWORK", "off")
+    monkeypatch.setattr(
+        "siftwise.cli.gograph.subprocess.run",
+        lambda args, **kw: subprocess.CompletedProcess(args, 0, output, b""),
+    )
+    assert _go_settings(tmp_path, "go") == ("-mod=vendor", "off")
+
+
+@pytest.mark.parametrize("flags", ["-mod=mod -tags=e2e", "-mod=vendor"])
+def test_go_list_uses_environment_when_go_env_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flags: str
+) -> None:
+    monkeypatch.setenv("GOFLAGS", flags)
+    monkeypatch.setenv("GOWORK", "off")
+    seen: list[str] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if args[1] == "env":
+            return subprocess.CompletedProcess(args, 1, b"", b"env failed")
+        seen.append(kwargs["env"]["GOFLAGS"])  # type: ignore[index]
+        return subprocess.CompletedProcess(args, 0, b'{"ImportPath":"example.com/m"}', b"")
+
+    monkeypatch.setattr("siftwise.cli.gograph.subprocess.run", fake_run)
+    assert run_go_list(tmp_path) == [{"ImportPath": "example.com/m"}]
+    assert seen == [flags.replace("-mod=mod", "-mod=readonly")]
