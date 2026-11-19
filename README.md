@@ -1178,6 +1178,7 @@ full numbers: [eval results](https://github.com/PramodBasavarajMenasi/siftwise/b
   little. rdflib's `__init__.py` and plugin registry connect nearly every module to nearly
   every test, so safe file-level selection still runs ~99% of its suite (its 10.4% comes from
   lint-only PRs). Bigger savings need codebases with independent parts, or per-test coverage.
+- **Mutation recall:** bugs planted on the lines real PRs changed were caught by every selection whose full suite catches them: rdflib 26 of 26, Cirq 63 of 63 (13 of 13 in its 5 narrow selections), mobx (Jest, one seeded history run) 40 of 40 (6 of 6 in 3 narrow ones); [details](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/docs/eval-results.md#mutation-based-recall).
 - **The misses:** substrate's are end-to-end suites that drive a deployed system (no import
   edge reaches them; a declared dependency catches them at the cost of most of the savings)
   and flaky tests. rdflib's one miss, `test_service_with_bound_solutions`, calls a remote

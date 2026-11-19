@@ -131,6 +131,8 @@ class TargetRun:
     diff_label: str = ""
     # Every stored run (one per matrix variant) of this CI run attempt; run_id is the first.
     run_ids: tuple[int, ...] = ()
+    # --replay-prs: the PR's base commit (its diff is base...head).
+    base_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -743,6 +745,7 @@ def merged_pr_targets(
                 _iso(when),
                 changed_files=compare.files(repo, base, head),
                 diff_label=f"PR #{pr['number']} {base[:7]}...{head[:7]}",
+                base_sha=base,
             )
         )
     return targets

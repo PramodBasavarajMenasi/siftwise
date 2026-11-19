@@ -17,6 +17,8 @@ the week-2 code (its history isn't in the current database):
 And of triage's verdicts, on rdflib and substrate: [Triage eval](#triage-eval). Server and
 eval speed-ups, with before/after numbers: [Performance](#performance). Live numbers from
 siftwise's own CI, in shadow mode: [siftwise on itself](#siftwise-on-itself).
+Recall on planted bugs (mutants on the lines real PRs changed), on rdflib, Cirq and mobx
+(Jest): [Mutation-based recall](#mutation-based-recall).
 
 ## ipfs/kubo
 
@@ -1352,3 +1354,225 @@ and after, and the tests compare the new code with the old.
 Through `localhost`, every query whose parameters exceed about 8 KB stalls about 45 ms (two
 1,100-integer arrays: 48 ms against 5 ms), which hides batching gains. All numbers above are
 through `127.0.0.1`.
+
+## Mutation-based recall
+
+Replays measure recall only on failures CI happened to record, and most recorded failures
+are in tests any selection runs. This eval makes the failures: it plants small bugs
+(mutants) on the lines a real merged PR changed, and asks whether siftwise's selection for
+that PR runs a test that catches each one ([#74](https://github.com/PramodBasavarajMenasi/siftwise/issues/74);
+`scripts/eval/mutation.py`, `scripts/eval/mutation_jest.py`; run in November 2026).
+
+### Summary
+
+| Repo | Platform | Mutants caught by the selection (of those the full suite kills) | In narrow selections | Time skipped by the selections |
+|---|---|---|---|---|
+| RDFLib/rdflib (pytest) | Windows | 26 of 26 (95% CI 87.1-100%) | none: every selection ran ~99% of the suite | median 0.3%, mean 0.4% |
+| quantumlib/Cirq (pytest) | Linux | 63 of 63 (94.3-100%) | 13 of 13 in 5 selections skipping 93-98% (77.2-100%) | median 1.3%, mean 19.6% |
+| mobxjs/mobx (Jest) | Linux | 40 of 40 (91.2-100%), one seeded history run per change | 6 of 6 in 3 selections skipping 54-92% of test files (61.0-100%) | median 11.6%, mean 22.5% |
+
+**No mutant was missed.** The 100% is an observed rate on a few dozen mutants: read the
+intervals, not the point estimate. The narrow-selection figures are the meaningful test of
+the selector, and their samples are small (13 and 6). Most selections were wide, which tests
+the tool (selection, commands, the kill rule) more than the selector's judgement; see
+[Why most selections are wide](#why-most-selections-are-wide).
+
+### Method
+
+For each sampled change (a merged PR: its base...head diff, the tree at its head):
+
+1. **Selection, no peeking.** The selection `siftwise select` would make for the PR, made
+   once before any test runs: history as of just before the PR's head commit (pytest repos:
+   the recorded CI history, through `run_eval.HistoryIndex`; mobx: see below), the PR's diff,
+   and the static import graph at the head.
+2. **Mutants.** Every candidate on the changed lines of non-test source files (Python: 5
+   operators on the AST: flip a comparison, negate a condition, integer + 1, replace a
+   return value, remove a call; JS/TS: 3 token-level operators: flip a comparison, integer
+   + 1, replace a return value), then up to 3 per change, spread over operators with a fixed
+   seed (74). Python mutants that don't compile and TS mutants that add a `tsc --noEmit`
+   error to their package are dropped (ts-jest would fail every importing file before a
+   test ran: a compile error, not a caught bug).
+3. **Kill rule.** A test kills a mutant if it fails with the mutant, fails again when re-run
+   with it (a failure that doesn't repeat is flaky and drops out), and passes on the
+   unmutated commit. A re-run that doesn't execute the test (no result, or skipped: a `-t`
+   name filter that matches nothing) is never a pass: the test is re-run by its file, and if
+   that doesn't execute it either, the mutant is **undecided**.
+4. **Cheaper order.** The selection's tests run first with the mutant. If a selected test
+   kills it, it is **caught**. Only otherwise does the rest of the suite run: a kill there is
+   a **miss**. No kill anywhere: **not killed**, reported apart and never in recall (the
+   suite can't see the mutant; some are equivalent to the original). A full-suite selection
+   runs the suite once.
+5. **Recall** = caught / (caught + missed), with a 95% Wilson score interval (it stays inside
+   [0, 1] and isn't zero-width at 100%). Each miss would get a shadow-style cause (new test,
+   flaky history, no import link, linked but not selected); there were none.
+
+Runs use a private clone, virtualenv or `node_modules`, and state directory per repo; every
+result is appended to JSONL as it finishes, so a stopped run resumes. Per test 120 s
+(pytest-timeout), per run 1,800 s, 8 hours per repo. pytest runs block the network
+(pytest-socket, localhost allowed) and deselect the tests that need it; Jest runs don't block
+it. Sizes: Cirq 7 pytest processes (16 ran out of memory in the 7.57 GiB Docker VM), mobx
+`jest -w 3 --workerIdleMemoryLimit=1GB` (CI runs `-i`; in this VM one process ran out of V8
+heap after 38 files).
+
+### RDFLib/rdflib (Windows)
+
+- **Changes:** 24 merged PRs sampled; 12 had a mutable changed line. 34 mutants from 1,441
+  compiling candidates.
+- **Outcomes:** caught 26, missed 0, not killed 8, timeout 0. Recall 26 of 26 (87.1-100%).
+- **Selections:** 10 selective, 2 full (#3484: changed inference files no test maps to;
+  #3523: `pyproject.toml` and `uv.lock`). The selective ones ran about 99% of the suite:
+  time skipped median 0.3%, mean 0.4%. So rdflib checks the tool more than the selector.
+- **By operator:** negate_condition 10 of 10 caught, remove_call 4 of 4, flip_comparison 7 of
+  10, replace_return 5 of 7, int_plus_one 0 of 3 (the rest not killed).
+- **Not killed (8):** `graph.py:2340`, `xsd_datetime.py:98`,
+  `plugins/serializers/longturtle.py:332`, `graphabstraction.py:344` and `:411`,
+  `restricteddatatype.py:194`, `compare.py:430` and `:490`.
+- **Baseline failures:** 29 tests fail on Windows without any mutant (10 `test_w3c_spec`
+  suites, trix, 9 `TestContainer` cases, `test_prefix_types`, `test_plugins`'
+  parser/sparqleval, `test_swap_n3`, `test_store_sparqlstore_query`,
+  `TestN3Case::test_parse`, the infixowl tests, `test_guess_format_for_parse[None]`, and
+  the package docstring's doctest `rdflib.__init__::rdflib`). They can't count as killers.
+  rdflib ran on Windows; Cirq and mobx in Linux containers.
+- **Re-decided under the final re-run rule:** the 8 not-killed mutants had candidates that
+  "passed when re-run". The first re-decision left all 8 undecided: their one unexplained
+  candidate, `rdflib.__init__::rdflib`, was never re-run (pytest reports a package
+  docstring's doctest that way, and the selector's doctest classifier doesn't map it to a
+  file: its known "`__init__` doctests have no runner" gap). The eval now re-runs it from
+  `rdflib/__init__.py` (rdflib's pytest config collects doctests): it fails without the
+  mutant too, so all 8 stay **not killed**. The 13 `test_literal` gYearMonth candidates of 3
+  of them did run again and passed (flaky under the full run).
+- **Time:** 1.83 h (with the re-decided mutants' latest runs); setup per change median 32 s;
+  per mutant median 131 s (max 430 s).
+
+### quantumlib/Cirq (Linux)
+
+Run in `scripts/eval/mutation-linux.Dockerfile` (Python 3.12, Cirq's
+`apt-system-requirements.txt` packages), the profile installing the nine packages plus
+`contrib` and dev-tools requirements as `ci-monitoring.yml` does; slow and weekly tests skip
+as in CI, pytest-randomly off (a re-run must repeat the first run). On Windows its
+multiprocessing and subprocess tests hang.
+
+- **Changes:** 64 merged PRs sampled; 25 had a mutable changed line. 71 mutants from 466
+  compiling candidates.
+- **Outcomes:** caught 63, missed 0, not killed 8, timeout 0, undecided 0. Recall 63 of 63
+  (94.3-100%).
+- **Selections:** 18 selective, 7 full (6: a changed `json_test_data` file no test maps to;
+  1: `pyproject.toml`). Time skipped median 1.3%, mean 19.6%: bimodal.
+  - **5 narrow selections** skip 93-98% of the time (#8388 98.4%, #8185 94.0%, #8265 93.6%,
+    #8321 93.5%, #8244 93.4%): **13 of 13 caught (77.2-100%)**.
+  - 13 selective ones ran about 41,200 of 41,400 known tests (1.3% skipped), 31 of 36 caught,
+    5 not killed; the 7 full ones 19 of 22 caught, 3 not killed.
+- **By operator:** flip_comparison 11 of 11, negate_condition 15 of 15, replace_return 16 of
+  17, int_plus_one 16 of 18, remove_call 5 of 10.
+- **Not killed (8):** `experiments/n_qubit_tomography.py:101` and `:147`,
+  `sim/state_vector_simulator.py:131`, `sim/simulation_product_state.py:97`,
+  `ops/if_op.py:256`, `transformers/circuit_operations.py:82`, `value/random_state.py:42`
+  (a `document(...)` call), `cirq_google/ops/no_sync_tag.py:92`.
+- **Baseline failures:** 1, a collection error in `cirq_google/api/v2/sweeps_test`. Four
+  environment-only failures in the timing run (`dev_tools/cloned_env_test`,
+  `bash_scripts_test`) were fixed by running tests with the virtualenv activated, as CI does.
+- **Re-decided under the final re-run rule:** `simulation_product_state.py:97`, whose one
+  unconfirmed candidate was the timing test `circuits/circuit_test::test_append_speed`: this
+  time no test failed with the mutant, so it stays **not killed**.
+- **Time:** 6.98 h (one full suite: 447 s with 8 processes, 337 s median in the eval); peak
+  memory 7.39 GB including page cache, no OOM kill.
+
+### mobxjs/mobx (Linux, Jest)
+
+A TypeScript monorepo (6 npm workspace packages; Jest 30 with ts-jest; 84 test files, 1,264
+tests, full suite 100 s here). Chosen because it's still on Jest (Lexical and Docusaurus moved
+to Vitest), its full suite is short, and its packages give narrow selections (a change to
+`mobx-react-lite` links 25 of 84 test files, `mobx-undecorate` 1; react-hook-form sends most PRs
+through one file every test reaches).
+
+- **History: one seeded run per change, not CI history.** mobx uploads no JUnit, so each
+  change's history is ONE full-suite run at the PR's base commit, recorded through siftwise's
+  own ingest and read back with `load_history`, in a database of its own: one-run history, as
+  for a newly installed siftwise. Co-change and flakiness signals have nothing to work with.
+- **As in CI:** `npm ci --ignore-scripts`, `npm run build:test`, then Jest. mobx-react and
+  mobx-react-lite tests import mobx's built `dist`, so a mutant in `packages/mobx/src` is
+  followed by a rebuild (13 s) and the unmutated `dist` is put back afterwards.
+- **Test IDs:** `JEST_JUNIT_CLASSNAME="{filepath} [{displayName}]"`. With jest-junit's default
+  templates 141 test IDs collide (one test name in several files), and eslint-plugin-mobx runs
+  its files under two Jest projects. A test counts as selected when its file is in the
+  selection's `jest <files>` command (Jest runs whole files; the selector's `WouldRun`
+  credits named tests only, so tests new in a PR would look missed).
+- **Changes:** all 120 merged PRs of the year before 2026-11-19: 119 sampled, 17 with a
+  mutable changed line (102 changed no non-test source line the operators apply to).
+  44 mutants from 381 candidates; 5 candidates failed `tsc` and were replaced.
+- **Outcomes:** caught 40, missed 0, not killed 4, timeout 0, undecided 0. Recall 40 of 40
+  (91.2-100%).
+- **Selections:** 12 selective, 5 full (`package-lock.json` in 3, a workflow, a test
+  tsconfig). Time skipped median 11.6%, mean 22.5% (the seeded run's durations, by test file).
+  - **3 narrow selections** (#4729 eslint-plugin-mobx: 92% of test files skipped; #4767
+    mobx-react-plugin: 88%; #4709 mobx-react-lite: 54%): **6 of 6 caught (61.0-100%)**.
+  - The 9 other selective ones change `packages/mobx/src` and run 61-81 of 63-83 test files.
+- **Not killed (4):** `mobx-react-plugin/src/options.ts:121`, `precheck.ts:4`,
+  `plugin.ts:67`, `mobx/src/mobx.ts:22`.
+- **Baseline failures:** 4, in `packages/mobx/__tests__/base` (`action.js` "error logging,
+  #1836" 1 and 2, `errorhandling.js`, `map.js` "issue 940"); no seed run had a failure.
+- **Skipped (not counted):** #4652: base uses yarn (no `package-lock.json`). mobx moved from
+  yarn to npm in May 2026; only changes with mutants are checked, and this was the only one.
+- **Targeted second sample:** decided before the results (if fewer than 5 random selections
+  skip >= 30% of test files: up to 10 changes whose source is all outside `packages/mobx/src`).
+  It applied (3 < 5), but every such change in the window was already in the random sample:
+  it is empty.
+- **Fixed during the run:** a re-run whose `-t` pattern matched none of the ESLint RuleTester
+  tests (names are code snippets) counted the failing tests as "passed when re-run": the
+  three mutants of #4699 were reported not killed / undecided. Re-decided with the by-file
+  fallback: all three caught (the numbers above). The 9 rdflib and Cirq mutants that relied on
+  a "passed when re-run" candidate were re-decided under the same rule (see their sections):
+  none changed, so all three repos' numbers come from one rule.
+- **Time:** 1.38 h; setup per change median 140 s (two installs and builds, the seed run);
+  per mutant median 46 s (max 116 s); peak memory 5.8 GB, no OOM kill.
+
+### Why most selections are wide
+
+Checked on one change each (the import graph at its commit):
+
+- **Cirq: `__init__.py` re-exports.** #8373 changes `cirq/sim/simulator.py`; the graph links
+  476 test files (70,627 of 70,850 known tests). An unrelated test's chain:
+  `cirq-google/cirq_google/api/v2/ndarrays_test.py` -> `cirq_google/__init__.py` ->
+  `cirq/__init__.py` -> `cirq/sim/__init__.py` -> `sim/simulator.py`. No single edge carries
+  it (there are parallel paths); without `cirq/__init__.py`'s imports 162 files (44,839 tests)
+  drop out, and without every `__init__.py` re-export only 24 files (1,012 tests) stay linked,
+  through real imports (`circuit.py` -> `sim/mux.py` -> `sim/sparse_simulator.py`).
+- **rdflib: the plugin registry's strings.** #3501 changes
+  `plugins/serializers/patch.py`; 323 test files (39,414 of 40,145 tests) link to it through
+  one edge: `rdflib/plugin.py` names every plugin as a string literal
+  (`"rdflib.plugins.serializers.patch"`), which the graph follows (plugins are loaded that
+  way), and `graph.py` and `query.py` import `plugin.py`.
+- **mobx: one core package.** A change in `packages/mobx/src` links 61 of 84 test files (the
+  React packages' tests import `mobx`).
+
+### Limits
+
+- Mutants are small and local (one token or one statement); real regressions can be larger,
+  span files, or live in config and data, which aren't mutated.
+- Not-killed mutants are outside recall: some are equivalent to the original, others show
+  untested code. They say nothing about the selector.
+- Samples are small, and narrow selections smaller still (5 changes on Cirq, 3 on mobx);
+  mutants of one change share one selection, so they aren't independent samples of it.
+- mobx's history is one seeded run, not CI history; mobx runs Jest with 3 workers, not CI's
+  `-i`. rdflib ran on Windows (29 baseline failures; their tests can't be killers).
+- Jest runs don't block the network (not checked whether any mobx test uses it).
+- Time skipped is estimated from history durations (pytest repos: `test_stats`; mobx: the
+  seed run), not measured per selection.
+
+### Reproducing
+
+```sh
+# rdflib (Windows or Linux; history from SIFTWISE_DATABASE_URL, merged PRs via GITHUB_TOKEN)
+uv run python -m scripts.eval.mutation --repo RDFLib/rdflib --mutants-per-commit 3
+# Cirq and mobx in the Linux image: repo read-only, state in a volume, Postgres via compose
+docker build -t siftwise-mutation-eval -f scripts/eval/mutation-linux.Dockerfile scripts/eval
+docker run -d --name siftwise-eval-cirq --network siftwise_default \
+  -v "$PWD:/repo:ro" -v siftwise-eval-state:/state \
+  -e SIFTWISE_DATABASE_URL=postgresql+psycopg://siftwise:siftwise@postgres:5432/siftwise \
+  siftwise-mutation-eval bash -c 'uv sync -q --frozen && /state/siftwise-venv/bin/python -m \
+  scripts.eval.mutation --repo quantumlib/Cirq --state-dir /state/mutation \
+  --mutants-per-commit 3 --max-commits 25 --workers 7 --time-cap-hours 8'
+# mobx: the same, with a database of its own for the seeded histories (create it, then
+# `siftwise server migrate` with that URL), and --repo mobxjs/mobx (no --workers: Jest's own)
+# Any repo: the same command with --report prints the summary from the state directory.
+```
