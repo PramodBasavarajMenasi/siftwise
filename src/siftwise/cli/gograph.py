@@ -14,7 +14,7 @@ affects the tests that import it.
 
 ``go list`` runs with ``-mod=mod`` turned into ``-mod=readonly`` (``readonly_goflags``), so
 selecting tests never edits go.mod or go.sum; ``-mod=vendor`` is kept. A GOFLAGS without a
-``-mod`` setting gets ``-mod=readonly`` too, unless the module is vendored.
+``-mod`` setting gets ``-mod=readonly`` too, unless the module or its active workspace is vendored.
 """
 
 from __future__ import annotations
@@ -199,28 +199,34 @@ def readonly_goflags(flags: str, vendored: bool = False) -> str:
     return " ".join(words)
 
 
-def _is_vendored(root: Path) -> bool:
-    """Whether the module in ``root`` has a vendor directory: Go's default there is
-    ``-mod=vendor``."""
-    return (root / "vendor" / "modules.txt").is_file()
+def _is_vendored(root: Path, gowork: str = "") -> bool:
+    """Use the active workspace's vendor directory, or the module's in single-module mode."""
+    vendor_root = Path(gowork).parent if gowork and gowork != "off" else root
+    return (vendor_root / "vendor" / "modules.txt").is_file()
 
 
-def _goflags(root: Path, go: str) -> str:
-    """The GOFLAGS go would use in ``root`` (the environment's, else ``go env -w``'s)."""
+def _go_settings(root: Path, go: str) -> tuple[str, str]:
+    """Go's effective GOFLAGS and GOWORK, including go.env and workspace discovery."""
+    fallback = (os.environ.get("GOFLAGS", ""), os.environ.get("GOWORK", ""))
     try:
-        proc = subprocess.run([go, "env", "GOFLAGS"], cwd=root, capture_output=True,
-                              timeout=60, check=False)  # fmt: skip
-    except (OSError, subprocess.TimeoutExpired):
-        return os.environ.get("GOFLAGS", "")
-    if proc.returncode == 0:
-        return proc.stdout.decode(errors="replace").strip()
-    return os.environ.get("GOFLAGS", "")
+        proc = subprocess.run([go, "env", "-json", "GOFLAGS", "GOWORK"], cwd=root,
+                              capture_output=True, timeout=60, check=False)  # fmt: skip
+        if proc.returncode == 0:
+            settings = json.loads(proc.stdout)
+            if isinstance(settings, dict):
+                flags, work = settings.get("GOFLAGS"), settings.get("GOWORK")
+                if isinstance(flags, str) and isinstance(work, str):
+                    return flags, work
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return fallback
 
 
 def run_go_list(root: Path, go: str = "go", timeout: float = 900) -> list[Package] | None:
     """``go list -deps -test -json ./...`` in ``root`` (a module's directory), read-only, or
     None if it fails for any reason."""
-    env = {**os.environ, "GOFLAGS": readonly_goflags(_goflags(root, go), _is_vendored(root))}
+    flags, gowork = _go_settings(root, go)
+    env = {**os.environ, "GOFLAGS": readonly_goflags(flags, _is_vendored(root, gowork))}
     try:
         proc = subprocess.run(
             [go, "list", "-deps", "-test", "-json", "./..."],
