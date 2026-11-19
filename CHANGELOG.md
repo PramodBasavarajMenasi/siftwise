@@ -8,6 +8,15 @@ All notable changes to siftwise. The format follows
 
 ### Added
 
+- Mutation-based recall eval ([#74](https://github.com/PramodBasavarajMenasi/siftwise/issues/74)):
+  `python -m scripts.eval.mutation` plants mutants on the lines a merged PR changed and checks
+  whether the selection siftwise would have made runs a test that catches each (kill rule: fails
+  with the mutant, fails again on a re-run, passes without it; 95% Wilson intervals). pytest
+  repos replay CI history; Jest repos (`scripts/eval/mutation_jest.py`) seed one full run at
+  each PR's base. A Linux runner image (`scripts/eval/mutation-linux.Dockerfile`, Python 3.12
+  and Node 24). Results: rdflib 26 of 26, Cirq 63 of 63 (13 of 13 in narrow selections), mobx
+  40 of 40 (6 of 6); docs/eval-results.md#mutation-based-recall.
+
 - Flaky-test tracking ([#72](https://github.com/PramodBasavarajMenasi/siftwise/issues/72)):
   - `siftwise flaky --repo acme/shop [--days 30] [--min-runs N] [--until DATE] [--json]`
     lists tests that failed and passed on the same commit and variant (retries, re-runs),
