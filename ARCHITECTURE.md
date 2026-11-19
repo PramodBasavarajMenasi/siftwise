@@ -106,7 +106,8 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
 - **Several Go modules:** the CLI finds every module of the checkout (`go.mod` files, `go.work`
   `use` lines; `cli/gograph.py`), runs `go list` in each module's directory (read-only:
   `-mod=mod` becomes `-mod=readonly`, and a `GOFLAGS` without a `-mod` setting gets
-  `-mod=readonly` too, unless the module is vendored) and merges the graphs; packages of
+  `-mod=readonly` too, unless the module is vendored; in workspace mode, this checks for
+  `vendor/modules.txt` next to the active `go.work` instead) and merges the graphs; packages of
   another module of the checkout (a local `replace`, a workspace module) link across modules.
   `/select` alone gets `go_modules` (directory -> module path): a package then maps to its
   directory through its module, and a nested module's package runs as `go test -C <dir> ./pkg`.
