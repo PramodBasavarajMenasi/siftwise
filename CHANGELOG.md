@@ -58,6 +58,9 @@ All notable changes to siftwise. The format follows
 
 ### Fixed
 
+- Go: preserve workspace vendoring when listing packages by checking for
+  `vendor/modules.txt` next to the active `go.work`
+  ([#78](https://github.com/PramodBasavarajMenasi/siftwise/issues/78)).
 - Go: `go list` ran with Go's own default when GOFLAGS had no `-mod` setting, and that default
   only became read-only in Go 1.16, so on Go 1.15 or older listing packages could write go.mod
   and go.sum. `-mod=readonly` is passed now, unless the module is vendored (Go's default there

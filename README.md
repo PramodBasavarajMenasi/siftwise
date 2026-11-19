@@ -1152,7 +1152,8 @@ imports through a local `replace` or the workspace links their tests. A package 
 below the root runs as `go test -C <module dir> ./pkg` (from the root, Go can't build it).
 `go list` runs with `-mod=mod` turned into `-mod=readonly`, so selecting tests never edits
 `go.mod` or `go.sum`; `-mod=vendor` is kept. A `GOFLAGS` without a `-mod` setting gets
-`-mod=readonly` too, unless the module is vendored (`vendor/modules.txt`).
+`-mod=readonly` too, unless the module is vendored (`vendor/modules.txt`). In workspace
+mode, this checks for `vendor/modules.txt` next to the active `go.work` instead.
 
 A Jest test file new in the change (`*.test.*`, `*.spec.*` or under `__tests__/`) runs first,
 by its path, once siftwise can tell the path Jest expects from a known Jest test in the same
