@@ -23,7 +23,7 @@ from siftwise.cli.main import app as cli_app
 from siftwise.config import Settings
 from siftwise.core import tokens
 from siftwise.core.models import ApiToken
-from siftwise.core.tokens import ADMIN, Principal, Revoked
+from siftwise.core.tokens import ADMIN, ALL_REPOS, Principal, Revoked
 from siftwise.core.tokens import Scope as TokenScope
 from siftwise.db import get_session
 
@@ -95,14 +95,26 @@ CALLS = {
 def test_every_route_has_an_explicit_scope() -> None:
     """A new route must be added to ROUTE_SCOPES (and to CALLS here): otherwise it would
     silently need a write token, the fail-closed default."""
-    app = create_app(Settings(_env_file=None, api_token=ADMIN_TOKEN))
+    app = create_app(Settings(_env_file=None, api_token=ADMIN_TOKEN, dashboard=True))
     routes = {
         (method.upper(), path)
         for path, item in app.openapi()["paths"].items()
         if path not in DEFAULT_PUBLIC_PATHS
         for method in item
     }  # OpenAPI paths drop the ":path" convertor
-    assert routes == {(m, t.replace(":path", "")) for m, t in ROUTE_SCOPES}
+    api_scopes = {(m, t) for m, t in ROUTE_SCOPES if not t.startswith("/ui")}
+    assert routes == {(m, t.replace(":path", "")) for m, t in api_scopes}
+    # The dashboard's pages aren't in the OpenAPI schema: its router lists them. Every one is
+    # a read (its own session check, never a Bearer token).
+    from siftwise.api.dashboard import pages
+
+    ui_routes = {
+        (method, getattr(route, "path", ""))
+        for route in pages.router.routes
+        for method in getattr(route, "methods", set()) - {"HEAD"}
+    }
+    assert ui_routes == {(m, t) for m, t in ROUTE_SCOPES if t.startswith("/ui")}
+    assert all(s is TokenScope.READ for (m, t), s in ROUTE_SCOPES.items() if t.startswith("/ui"))
     assert {(c.method, _template(c.path)) for c in CALLS.values()} == routes
     assert {
         (m, t.replace(":path", "")) for (m, t), s in ROUTE_SCOPES.items() if s is TokenScope.WRITE
@@ -486,10 +498,23 @@ def test_token_create_prints_the_token_once(cli_db: Session) -> None:
     assert (found.repo, found.scope, found.name) == (REPO, TokenScope.WRITE, "ci")
 
 
+@pytest.mark.parametrize("args", [["--all-repos"], ["--repo", "*"]], ids=["all-repos", "star"])
+def test_token_create_for_every_repo(cli_db: Session, args: list[str]) -> None:
+    # --all-repos because on Windows Click expands a '*' argument into the folder's file names
+    # (quoted or not): "Got unexpected extra argument(s) (alembic.ini ARCHITECTURE.md ...)".
+    result = CliRunner().invoke(cli_app, ["token", "create", *args, "--scope", "read"])
+
+    assert result.exit_code == 0, result.output
+    assert "repo *" in result.stderr
+    found = tokens.resolve(cli_db, result.stdout.strip())
+    assert isinstance(found, Principal)
+    assert (found.repo, found.scope) == (ALL_REPOS, TokenScope.READ)
+
+
 @pytest.mark.parametrize(
     "args",
-    [["--repo", REPO, "--scope", "admin"], ["--repo", " "]],
-    ids=["bad-scope", "blank-repo"],
+    [["--repo", REPO, "--scope", "admin"], ["--repo", " "], [], ["--repo", REPO, "--all-repos"]],
+    ids=["bad-scope", "blank-repo", "no-repo", "both"],
 )
 def test_token_create_rejects_bad_options(cli_db: Session, args: list[str]) -> None:
     result = CliRunner().invoke(cli_app, ["token", "create", *args])

@@ -24,10 +24,12 @@ from siftwise.cli.jsgraph import Affected, build_js_graph
 from siftwise.cli.pygraph import build_py_graph
 from siftwise.cli.repoconfig import (
     FILE_NAME,
+    SUGGESTED_FLAKY_DAYS,
     KnownFlakyEntry,
     RepoConfig,
     RepoConfigError,
     active_known_flaky,
+    known_flaky_entry,
     load_repo_config,
     loads_repo_config,
     read_go_module,
@@ -379,7 +381,7 @@ def triage_command(
         raise typer.Exit(EXIT_FAIL_ON)
 
 
-SUGGESTED_DAYS = 90  # `siftwise flaky` suggests entries that expire this far out
+SUGGESTED_DAYS = SUGGESTED_FLAKY_DAYS  # `siftwise flaky` suggests entries that expire this far out
 
 
 @app.command("flaky")
@@ -428,7 +430,7 @@ def flaky_command(
     suggested = [t["test_id"] for t in tests if t["known_flaky"] is None]
     if json_output:
         typer.echo(json.dumps({**result, "tests": tests, "known_flaky_source": listed.source,
-                               "suggested": [_flaky_entry(t, expiry) for t in suggested]},
+                               "suggested": [known_flaky_entry(t, expiry) for t in suggested]},
                               indent=2))  # fmt: skip
         return
     for line in flaky_lines(result, tests, listed.source, expiry):
@@ -473,13 +475,6 @@ def _suggested_until(value: str | None) -> date | None:
         raise typer.Exit(EXIT_USAGE) from None
 
 
-def _flaky_entry(test_id: str, until: date | None) -> str:
-    """A known_flaky entry as TOML (a JSON string is a valid TOML basic string)."""
-    if until is None:
-        return json.dumps(test_id)
-    return f"{{ test = {json.dumps(test_id)}, until = {json.dumps(until.isoformat())} }}"
-
-
 def flaky_lines(
     result: dict[str, Any], tests: list[dict[str, Any]], source: str, until: date | None
 ) -> list[str]:
@@ -514,7 +509,7 @@ def flaky_lines(
         return lines
     lines += ["", "Suggested known_flaky entries (paste into the list in .siftwise.toml; "
               "nothing was changed):"]  # fmt: skip
-    lines += [f"    {_flaky_entry(test_id, until)}," for test_id in missing]
+    lines += [f"    {known_flaky_entry(test_id, until)}," for test_id in missing]
     return lines
 
 

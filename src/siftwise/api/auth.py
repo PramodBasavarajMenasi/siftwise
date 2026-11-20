@@ -42,7 +42,21 @@ ROUTE_SCOPES: dict[tuple[str, str], TokenScope] = {
     ("POST", "/runs"): WRITE,
     ("POST", "/repos/{repo:path}/rollup"): WRITE,
     ("POST", "/repos/{repo:path}/shadow"): WRITE,
+    # The dashboard (SIFTWISE_DASHBOARD=1): read-only pages behind its own session cookie,
+    # checked by api/dashboard/auth.py, never by a Bearer token. Login, logout and the
+    # stylesheet are listed too: every /ui route is a read.
+    ("GET", "/ui"): READ,
+    ("GET", "/ui/"): READ,
+    ("GET", "/ui/login"): READ,
+    ("POST", "/ui/login"): READ,  # the one body read before auth: a form of at most 4 KB
+    ("POST", "/ui/logout"): READ,
+    ("GET", "/ui/static/{name}"): READ,
+    ("GET", "/ui/repos/{repo:path}"): READ,
+    ("GET", "/ui/repos/{repo:path}/-/runs"): READ,
+    ("GET", "/ui/repos/{repo:path}/-/flaky"): READ,
+    ("GET", "/ui/repos/{repo:path}/-/runs/{ci_run_id}/{attempt:int}"): READ,
 }
+DASHBOARD_PREFIX = "/ui"
 
 NOT_CONFIGURED = "server has no SIFTWISE_API_TOKEN and no API tokens (siftwise token create)"
 
@@ -106,6 +120,12 @@ class BearerAuthMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or scope["path"] in self.public_paths:
+            await self.app(scope, receive, send)
+            return
+        path = scope["path"]
+        if path == DASHBOARD_PREFIX or path.startswith(DASHBOARD_PREFIX + "/"):
+            # The dashboard checks its own session cookie (api/dashboard/auth.py), and its
+            # routes exist only with SIFTWISE_DASHBOARD=1: when off, /ui answers 404.
             await self.app(scope, receive, send)
             return
 

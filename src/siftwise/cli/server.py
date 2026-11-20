@@ -4,6 +4,7 @@ The light CLI registers these commands too, so they import the server modules on
 after checking they're installed: without the extra they exit 2 with the install command.
 """
 
+import os
 from typing import Annotated
 
 import typer
@@ -50,6 +51,14 @@ def start_command(
     run_migrations: Annotated[
         bool, typer.Option("--migrate/--no-migrate", help="Apply migrations first.")
     ] = True,
+    forwarded_allow_ips: Annotated[
+        str | None,
+        typer.Option(
+            help="Proxies whose X-Forwarded-Proto/-For/-Host to believe (comma-separated "
+            "IPs or networks, '*' for any; default 127.0.0.1, or SIFTWISE_FORWARDED_ALLOW_IPS). "
+            "Behind a TLS proxy, the dashboard needs it for its cookie and Origin checks."
+        ),
+    ] = None,
 ) -> None:
     """Apply the migrations, then serve the API.
 
@@ -68,6 +77,12 @@ def start_command(
             "create` get in, and with none every request except /healthz gets 503",
             err=True,
         )
+    if forwarded_allow_ips is not None:
+        # The app reads it when uvicorn imports it (siftwise.api.main), from the environment.
+        os.environ["SIFTWISE_FORWARDED_ALLOW_IPS"] = forwarded_allow_ips
+        get_settings.cache_clear()
     if run_migrations:
         migrate.upgrade(settings.database_url)
-    uvicorn.run("siftwise.api.main:app", host=host, port=port)
+    # The app handles forwarded headers itself (api/forwarded.py: the host too), with the
+    # same trust list; uvicorn's own copy would hide the proxy's address from it.
+    uvicorn.run("siftwise.api.main:app", host=host, port=port, proxy_headers=False)

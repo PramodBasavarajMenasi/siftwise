@@ -198,9 +198,36 @@ def test_server_start_migrates_then_serves(monkeypatch: pytest.MonkeyPatch) -> N
     assert "warning" not in result.output
     assert calls == [
         ("migrate", "postgresql+psycopg://u:p@db:5432/x"),
-        ("serve", ("siftwise.api.main:app", {"host": "0.0.0.0", "port": 9})),
-        ("serve", ("siftwise.api.main:app", {"host": "127.0.0.1", "port": 8000})),
-    ]
+        # The app reads forwarded headers itself (api/forwarded.py), so uvicorn's copy is off.
+        ("serve", ("siftwise.api.main:app", {"host": "0.0.0.0", "port": 9,
+                                             "proxy_headers": False})),
+        ("serve", ("siftwise.api.main:app", {"host": "127.0.0.1", "port": 8000,
+                                             "proxy_headers": False})),
+    ]  # fmt: skip
+
+
+def test_server_start_passes_the_trusted_proxies_to_the_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uvicorn
+
+    from siftwise import migrate
+
+    seen: list[str] = []
+    monkeypatch.setenv("SIFTWISE_API_TOKEN", "t")
+    monkeypatch.setattr(migrate, "upgrade", lambda url: None)
+    get_settings = importlib.import_module("siftwise.config").get_settings
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.append(
+        get_settings().forwarded_allow_ips))  # fmt: skip
+    get_settings.cache_clear()
+    try:
+        result = CliRunner().invoke(app, ["server", "start", "--forwarded-allow-ips",
+                                          "10.0.0.0/8"])  # fmt: skip
+    finally:
+        monkeypatch.delenv("SIFTWISE_FORWARDED_ALLOW_IPS", raising=False)
+        get_settings.cache_clear()
+    assert result.exit_code == 0, result.output
+    assert seen == ["10.0.0.0/8"]
 
 
 def test_server_start_warns_without_a_token(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -13,6 +13,7 @@ how the evals measure, [eval methodology](docs/eval-methodology.md).
 | **GitLab CI template** (`gitlab/siftwise.gitlab-ci.yml`) | in GitLab CI jobs | hidden jobs around `siftwise gitlab ...` (`cli/gitlab.py`): the same steps, with dotenv outputs, `.siftwise-ci/` reports and the sticky merge request note | `pip install siftwise==<the template's release>` |
 | **MCP server** (`siftwise mcp`) | started by a coding agent, over stdio | `select_tests`, `triage_failure`, `explain`: the same change computation as the CLI, including uncommitted work | `siftwise[mcp]` |
 | **API server** (FastAPI) | one or more stateless workers | ingest, rollups, selection, triage, shadow comparison, recall | `siftwise[server]`, or the Docker image |
+| **Dashboard** (`/ui`, `api/dashboard/`) | in the API server, only with `SIFTWISE_DASHBOARD=1` | read-only HTML pages: recall by week, misses by cause, recent runs and each run's verdicts, flaky tests; a token login with a server-side session | part of `siftwise[server]` (Jinja2) |
 | **Postgres** | one database | every raw result and every derived table; the only state | Postgres 16 in the compose file |
 
 The split is deliberate: **graphs are computed by the client, in the checkout, never by the
@@ -509,6 +510,51 @@ The first rule that applies decides:
 - A run counts as selective only if every compared leg's selection was; full-suite fallbacks
   catch everything, so the report always shows the selective-only recall next to the overall
   one.
+
+## Dashboard
+
+```mermaid
+flowchart LR
+    B[Browser] -->|HTTPS| P[TLS proxy]
+    P -->|X-Forwarded-Proto/-Host| F[ForwardedMiddleware]
+    F --> A[BearerAuthMiddleware]
+    A -->|/ui paths| D[DashboardAuthMiddleware]
+    A -->|API paths: Bearer only| R[API routes]
+    D -->|valid session| U[/ui pages]
+    D -->|no session| L[303 to /ui/login]
+    U --> C[core: shadow.recall, flaky.flaky_tests, triage.triage_ci_run]
+    D -.->|every request| S[(ui_sessions + api_tokens)]
+```
+
+- **Its own auth, before any body is read.** `BearerAuthMiddleware` leaves `/ui` paths to
+  `DashboardAuthMiddleware`, which needs a session cookie on every page but the login page,
+  the login POST and the stylesheet. The login POST is the one body read before auth: a form
+  of at most 4 KB. The API never accepts the cookie, so a browser session can't be used for a
+  cross-site API call. Every `/ui` route is in `ROUTE_SCOPES` as a read.
+- **Server-side sessions** (`core/ui_sessions.py`, migration 0016): the cookie holds a random
+  ID, `ui_sessions` its SHA-256 plus the token that signed in (`api_tokens.id`, or a salted
+  digest of the admin token). Every request checks that token again, so revoking it (or
+  changing `SIFTWISE_API_TOKEN`) ends the session at once. Chosen over a signed cookie: the
+  workers keep no state but Postgres, a signed cookie can't be revoked before it expires, and
+  it would need a new shared secret.
+- **Repo binding:** a page of a repo the token can't see answers the same 404 as a repo that
+  doesn't exist; the repos page lists other repos only for admin and `*` tokens.
+- **One window rule:** every page's window is the last N days back from now (`?days=7|30|90|
+  all`), like `GET /recall`. The flaky page passes `end=now` to `flaky.flaky_tests`, whose
+  default (the API route, `siftwise flaky`) ends at the repo's newest run. Counts come from
+  one query per page (`data.activity`: CI runs in all and in the window, newest and oldest
+  run, the same for shadow runs), which also tells an empty window from an empty repo.
+- **The public origin:** `ForwardedMiddleware` (`api/forwarded.py`) applies a trusted proxy's
+  `X-Forwarded-Proto`, `-For` and `-Host` (`--forwarded-allow-ips`); the login and logout
+  forms check `Origin` against that public origin, and the cookie is Secure unless the page
+  is plain HTTP on localhost (anything else on plain HTTP is refused).
+- **No maths of its own:** recall and weeks come from `shadow.recall`, flaky tests from
+  `flaky.flaky_tests` (entries to paste formatted like `siftwise flaky`'s), a run's verdicts
+  from `triage.triage_ci_run`. The runs list shows failing tests only: counting 20 runs'
+  verdicts in one batched load (`triage.triage_ci_runs`) took 11 s on rdflib's history.
+- **Rendering:** Jinja2 with autoescape forced on, no `|safe` on data; a Content-Security-
+  Policy with no scripts and no inline styles (`default-src 'none'; style-src 'self'`), one
+  versioned stylesheet, inline SVG bars with the numbers beside them.
 
 ## Design rules
 

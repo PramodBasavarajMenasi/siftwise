@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% from "_macros.html" import recall_cell, bar, older, test_id %}
+{% block content %}
+<h1>Recall</h1>
+<p class="lede">Failures the selection would have caught, on shadow runs of {{ days|window }}.</p>
+{% if report is none %}
+<p class="empty">No runs recorded for <span class="mono">{{ repo }}</span> yet. Record CI results with the record action or <code>siftwise record</code>. <a href="{{ readme }}#github-action">GitHub Action</a></p>
+{% elif not report.all.runs %}
+{% if recorded.shadow_total %}
+{{ older(repo_url(repo), days, "shadow runs", recorded.shadow_total, recorded.newest_shadow_at) }}
+{% else %}
+<p class="stats"><strong>{{ recorded.runs_total|num }}</strong> CI runs recorded{% if recorded.newest_run_at %}, the newest <strong>{{ recorded.newest_run_at|ago }}</strong>{% endif %} · no shadow runs yet</p>
+<p class="empty">No shadow runs in {{ days|window }}: recall is measured on shadow runs, which run the full suite and compare it with what siftwise would have selected. Set <code>shadow: 10%</code> on the select action (GitLab: <code>SIFTWISE_SHADOW</code>). <a href="{{ readme }}#shadow-mode">Shadow mode</a></p>
+{% endif %}
+{% else %}
+{% set all_counted = report.all.caught + report.all.missed %}
+{% set sel_counted = report.selective.caught + report.selective.missed %}
+<p class="stats"><strong>{{ report.all.runs|num }}</strong> shadow runs · <strong>{{ report.all.caught|num }}</strong> of <strong>{{ all_counted|num }}</strong> failures caught (<strong>{{ report.all.recall|recall }}</strong>) · selective runs <strong>{{ report.selective.caught|num }}</strong> of <strong>{{ sel_counted|num }}</strong> (<strong>{{ report.selective.recall|recall }}</strong>){% if report.time.saved is not none %} · <strong>{{ report.time.saved|pct }}</strong> of test time saved{% endif %}</p>
+<h2>All and selective runs <span class="muted">(shadow runs only: the server stores what siftwise selected only for shadow runs)</span></h2>
+<div class="scroll"><table>
+<thead><tr><th scope="col">Shadow runs</th><th scope="col" class="n">Runs</th><th scope="col" class="n">Failures</th><th scope="col" class="n">Caught</th><th scope="col" class="n">Missed</th><th scope="col" class="n">Flaky (not counted)</th><th scope="col" class="n">Recall</th></tr></thead>
+<tbody>
+<tr><th scope="row" class="grow">All</th><td class="n">{{ report.all.runs|num }}</td><td class="n">{{ report.all.failures|num }}</td><td class="n">{{ report.all.caught|num }}</td><td class="n">{{ report.all.missed|num }}</td><td class="n">{{ report.all.flaky_excluded|num }}</td><td class="n">{{ recall_cell(report.all) }}</td></tr>
+<tr><th scope="row" class="grow">Selective only</th><td class="n">{{ report.selective.runs|num }}</td><td class="n">{{ report.selective.failures|num }}</td><td class="n">{{ report.selective.caught|num }}</td><td class="n">{{ report.selective.missed|num }}</td><td class="n">{{ report.selective.flaky_excluded|num }}</td><td class="n">{{ recall_cell(report.selective) }}</td></tr>
+</tbody></table></div>
+<p class="facts">
+{% if report.time.saved is not none %}Time saved: <strong>{{ report.time.saved|pct }}</strong> of {{ report.time.total_ms|minutes }} ({{ report.all.runs|num }} shadow runs, measured on their full-suite runs).{% else %}Time saved: n/a (no durations recorded).{% endif %} 
+Full-suite selections (siftwise would have run everything): {{ report.full_runs|num }} of {{ report.all.runs|num }}.
+{% if report.in_progress %}In progress: {{ report.in_progress|num }}.{% endif %} 
+{% for reason, n in report.not_counted|dictsort if n %}{% if loop.first %}Not counted: {% endif %}{{ n|num }} {{ reason|replace("_", " ") }}{{ ", " if not loop.last else "." }}{% endfor %}
+</p>
+{% if report.linked_not_selected %}<p class="warn" role="note">Warning: {{ report.linked_not_selected|num }} missed test(s) linked to the change but not selected: this may be a selector bug.</p>{% endif %}
+
+<h2>By week <span class="muted">(Monday 00:00 UTC, by selection time; empty weeks included)</span></h2>
+<div class="scroll"><table>
+<thead><tr><th scope="col">Week of</th><th scope="col" class="n">Shadow runs</th><th scope="col" class="n">Selective</th><th scope="col" class="n">Full</th><th scope="col">Time saved</th><th scope="col" class="n">Caught</th><th scope="col" class="n">Missed</th><th scope="col" class="n">Recall (all)</th><th scope="col" class="n">Recall (selective)</th></tr></thead>
+<tbody>
+{% for p in report.periods %}
+{% if p.all.runs %}
+<tr><td class="fit"><span class="mono">{{ p.start|day }}</span></td><td class="n">{{ p.all.runs|num }}</td><td class="n">{{ p.selective.runs|num }}</td><td class="n">{{ p.full_runs|num }}</td>
+<td class="grow">{% if p.time.saved is not none %}{{ bar(p.time.saved, label=(p.time.saved|pct) ~ " saved") }} {{ p.time.saved|pct }} <span class="muted">of {{ p.time.total_ms|minutes }}</span>{% endif %}</td>
+<td class="n">{{ p.all.caught|num }}</td><td class="n">{{ p.all.missed|num }}</td><td class="n">{{ recall_cell(p.all) }}</td><td class="n">{{ recall_cell(p.selective) }}</td></tr>
+{% else %}{# an empty week: its row stays (no gaps in time), its cells blank #}
+<tr class="quiet-row"><td class="fit"><span class="mono">{{ p.start|day }}</span></td><td class="n">0</td><td class="n"></td><td class="n"></td><td class="grow"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td></tr>
+{% endif %}
+{% endfor %}
+</tbody></table></div>
+
+<h2>Misses by cause</h2>
+{% if not report.all.missed %}
+<p class="empty">No misses: every failure the shadow runs saw was in the selection (flaky ones aside).</p>
+{% else %}
+<div class="scroll"><table>
+<thead><tr><th scope="col">Cause</th><th scope="col" class="n">All runs</th><th scope="col" class="n">Selective runs</th></tr></thead>
+<tbody>
+{% for cause, n in report.all.missed_by_cause.items() if n %}
+<tr><td class="grow">{{ cause_labels.get(cause, cause) }} <span class="mono muted">{{ cause }}</span></td><td class="n">{{ n|num }}</td><td class="n">{{ report.selective.missed_by_cause[cause]|num }}</td></tr>
+{% endfor %}
+</tbody></table></div>
+<h2>Misses, newest first <span class="muted">({{ [report.misses|length, 50]|min }} of {{ report.misses|length|num }})</span></h2>
+<div class="scroll"><table>
+<thead><tr><th scope="col">When (UTC)</th><th scope="col">Verdict</th><th scope="col">Test</th><th scope="col">Run</th><th scope="col">Cause</th></tr></thead>
+<tbody>
+{% for m in report.misses[:50] %}
+<tr><td class="fit"><span class="mono">{{ m.at|day }}</span></td><td class="fit">{{ m.verdict|replace("_", " ") }}</td><td class="grow">{{ test_id(m.test_id) }}</td>
+<td class="fit"><a href="{{ repo_url(repo, "runs/" ~ m.ci_run_id ~ "/" ~ m.run_attempt) }}"><span class="mono">{{ m.ci_run_id }}</span> #{{ m.run_attempt }}</a> <span class="mono muted">{{ m.commit_sha[:7] }}</span></td>
+<td class="wrap">{% if m.cause %}{{ cause_labels.get(m.cause.cause, m.cause.cause) }}{% if m.cause.detail %}<br><span class="muted">{{ m.cause.detail }}</span>{% endif %}{% else %}{{ cause_labels["unclassified"] }}{% endif %}</td></tr>
+{% endfor %}
+</tbody></table></div>
+{% endif %}
+{% if report.suggestions %}
+<h2>Suggested .siftwise.toml rules <span class="muted">(review before adding; siftwise never applies them)</span></h2>
+{% for s in report.suggestions %}
+<p class="muted">Would have caught {{ s.misses|num }} miss(es): <span class="mono">{{ s.test_ids|sort|join(", ") }}</span></p>
+<pre>{{ s.rule }}</pre>
+{% endfor %}
+{% endif %}
+{% endif %}
+{% endblock %}

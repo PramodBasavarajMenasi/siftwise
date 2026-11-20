@@ -13,6 +13,7 @@ on = ["**/*.go", "!**/*_test.go"]
 
 from __future__ import annotations
 
+import json
 import re
 import tomllib
 from dataclasses import dataclass
@@ -197,3 +198,14 @@ def read_go_module(root: Path) -> str | None:
         if len(parts) == 2 and parts[0] == "module":
             return parts[1].strip('"')
     return None
+
+
+SUGGESTED_FLAKY_DAYS = 90  # suggested known_flaky entries expire this far out
+
+
+def known_flaky_entry(test_id: str, until: date | None) -> str:
+    """A known_flaky entry as TOML, as ``siftwise flaky`` and the dashboard suggest it (a JSON
+    string is a valid TOML basic string)."""
+    if until is None:
+        return json.dumps(test_id)
+    return f"{{ test = {json.dumps(test_id)}, until = {json.dumps(until.isoformat())} }}"

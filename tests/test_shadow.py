@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
-from sqlalchemy import event, func, select, update
+from sqlalchemy import event, func, select, text, update
 from sqlalchemy.orm import Session
 
 from siftwise.core import shadow
@@ -780,3 +780,23 @@ def test_recall_by_week(db_session: Session) -> None:
     assert report.all.runs == sum(p.all.runs for p in report.periods) == 3
     plain = recall(db_session, REPO, 30, now)
     assert plain is not None and plain.periods is None  # not asked for
+
+
+@pytest.mark.parametrize("plan_cache_mode", ["auto", "force_generic_plan"])
+@pytest.mark.usefixtures("seeded")
+def test_a_long_lived_connection_keeps_storing_selections(
+    db_session: Session, plan_cache_mode: str
+) -> None:
+    # Found in a replay: from the 11th store on one connection, psycopg's auto-prepare plus
+    # Postgres's generic plan made the bound '' in coalesce(variant, '') stop matching the
+    # unique index, and every store failed ("no unique or exclusion constraint matching the
+    # ON CONFLICT specification"). Auto-prepare stays on, as on the API's pooled connections.
+    connection = db_session.connection().connection.driver_connection
+    assert connection is not None and connection.prepare_threshold is not None
+    db_session.execute(text(f"SET plan_cache_mode = {plan_cache_mode}"))
+    for n in range(12):
+        assert store(db_session, selection(TEST), ci=f"shadow-{n}"), n
+    assert store(db_session, selection(TEST), ci="shadow-0")  # a repeat: already stored
+    assert store(db_session, selection(TEST), ci="shadow-0", variant="mac")
+    count = db_session.scalar(select(func.count()).select_from(ShadowSelection))
+    assert count == 13

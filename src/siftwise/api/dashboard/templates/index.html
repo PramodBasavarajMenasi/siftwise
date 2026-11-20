@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Repos</h1>
+<p class="lede">CI runs recorded for each repo this token can see.</p>
+{% if not repos %}
+<p class="empty">No repos yet: a repo appears with its first upload (<code>siftwise record</code> or the record action). <a href="{{ readme }}#github-action">GitHub Action</a></p>
+{% else %}
+{% set times = repos|selectattr("newest_run_at")|map(attribute="newest_run_at")|list %}
+{% set newest = times|max if times else none %}
+<p class="stats"><strong>{{ repos|length|num }}</strong> repo{{ "s" if repos|length != 1 else "" }} · <strong>{{ repos|sum(attribute="runs_total")|num }}</strong> CI runs recorded{% if days is not none %} · <strong>{{ repos|sum(attribute="runs_window")|num }}</strong> in {{ days|window }}{% endif %} · {% if newest %}newest run <strong>{{ newest|ago }}</strong>{% else %}no runs yet{% endif %}</p>
+<div class="scroll"><table>
+<thead><tr><th scope="col">Repo</th><th scope="col" class="fit">Newest run (UTC)</th><th scope="col" class="n">CI runs</th>{% if days is not none %}<th scope="col" class="n">CI runs, last {{ days }} days</th><th scope="col" class="n">Shadow runs, last {{ days }} days</th>{% else %}<th scope="col" class="n">Shadow runs</th>{% endif %}</tr></thead>
+<tbody>
+{% for r in repos %}
+<tr><td><a href="{{ repo_url(r.name) }}">{{ r.name }}</a></td>
+<td class="fit">{% if r.newest_run_at %}<span class="mono">{{ r.newest_run_at|when }}</span> <span class="muted">· {{ r.newest_run_at|ago }}</span>{% else %}<span class="muted">no runs yet</span>{% endif %}</td>
+<td class="n">{{ r.runs_total|num }}</td>{% if days is not none %}<td class="n">{{ r.runs_window|num }}</td><td class="n">{{ r.shadow_window|num }}</td>{% else %}<td class="n">{{ r.shadow_total|num }}</td>{% endif %}</tr>
+{% endfor %}
+</tbody></table></div>
+{% set quiet = repos|selectattr("runs_total")|rejectattr("runs_window")|list %}
+{% if days is not none and quiet %}
+<p class="notice">{{ quiet|length }} of {{ repos|length }} repo{{ "s have" if repos|length != 1 else " has" }} no CI runs in {{ days|window }}, only older ones. Show {% if days < 90 %}<a href="{{ with_days(prefix ~ "/", 90) }}">90 days</a> or {% endif %}<a href="{{ with_days(prefix ~ "/", none) }}">all</a>.</p>
+{% endif %}
+{% endif %}
+{% endblock %}

@@ -1,0 +1,305 @@
+/* siftwise dashboard: system fonts, neutral greys, one accent (#4fc79e). No images, no
+   scripts. Light-mode link text uses a darker shade of the accent for WCAG AA contrast.
+   Every line box is 20px (body line-height in px, inherited as is), so text, monospace and
+   tags in one row share a baseline; table rows are 8 + 20 + 8 px = 36 px. Served under a
+   name with a hash of this file (pages.stylesheet_file), so any change is a new URL. */
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --bg-alt: #f6f7f8;
+  --fg: #1f2328;
+  --head: #3d444d;
+  --muted: #59636e;
+  --line-strong: #afb8c1;
+  --line: #d1d9e0;
+  --line-soft: #e6eaef;
+  --accent: #4fc79e;
+  --accent-ink: #062b1f; /* text on the accent: 9:1 */
+  --accent-soft: #e3f5ee; /* the active window, subtly filled */
+  --link: #1d7556;
+  --track: #e6eaef;
+  --bad: #b3261e;
+  --warn: #8a5a00;
+  --code-bg: #f6f7f8;
+  --page-width: 1200px;
+  --gutter: 24px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1216;
+    --bg-alt: #161a1f;
+    --fg: #e6e8eb;
+    --head: #c9d1d9;
+    --muted: #9aa3ad;
+    --line-strong: #4a535d;
+    --line: #2f363d;
+    --line-soft: #22282e;
+    --accent-soft: #17332a;
+    --link: #4fc79e;
+    --track: #2a3138;
+    --bad: #ff7b72;
+    --warn: #e3b341;
+    --code-bg: #161a1f;
+  }
+}
+@media (max-width: 600px) {
+  :root { --gutter: 16px; }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/20px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, "Noto Sans", sans-serif;
+}
+a { color: var(--link); text-decoration: none; }
+a:hover, a:focus-visible { text-decoration: underline; }
+:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+/* Monospace (dates, SHAs, test IDs) at the body's visual size, on the same line box. Always
+   on an inline span inside a cell, never on the cell: a smaller cell font moves its baseline. */
+code, pre, .mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+  font-size: 0.92em;
+  line-height: inherit;
+}
+code { background: var(--code-bg); padding: 1px 4px; border-radius: 3px; }
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  padding: 8px 12px;
+  overflow-x: auto;
+  margin: 8px 0 12px;
+}
+h1 { font-size: 20px; line-height: 28px; margin: 28px 0 4px; font-weight: 600; }
+h1 .mono { font-size: 0.9em; }
+h2 { font-size: 15px; line-height: 20px; margin: 32px 0 8px; font-weight: 600; }
+h2 .muted { font-weight: 400; font-size: 14px; }
+p { margin: 8px 0; }
+.muted { color: var(--muted); }
+
+/* the page: one centred column; the top bar spans the width, its contents in the column */
+.page {
+  max-width: calc(var(--page-width) + 2 * var(--gutter));
+  margin: 0 auto;
+  padding-left: var(--gutter);
+  padding-right: var(--gutter);
+}
+main.page { padding-bottom: 32px; min-height: calc(100vh - 49px - 53px); }
+.top { border-bottom: 1px solid var(--line); background: var(--bg-alt); }
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  height: 48px;
+  white-space: nowrap;
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: auto; /* everything after it goes to the right */
+  color: var(--fg);
+  font-weight: 600;
+  font-size: 16px;
+  line-height: 24px;
+}
+.brand:hover { text-decoration: none; }
+.mark { flex: none; display: block; width: 22px; height: 24px; }
+.mark-in { fill: var(--muted); }
+.mark-funnel { fill: none; stroke: var(--accent); stroke-width: 9; stroke-linejoin: round; }
+.mark-out { fill: var(--accent); }
+.topbar .who {
+  color: var(--muted);
+  font-size: 13px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+form.inline { display: inline; margin: 0; }
+button {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 5px 14px;
+  cursor: pointer;
+}
+button:hover { border-color: var(--muted); }
+/* Sign out: a quiet text button, the size and colour of the bar's other text */
+button.quiet {
+  border: 0;
+  background: none;
+  padding: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+button.quiet:hover, button.quiet:focus-visible { color: var(--fg); text-decoration: underline; }
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+button.primary:hover { filter: brightness(0.95); border-color: var(--accent); }
+.foot {
+  border-top: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: 12px;
+  padding-top: 16px;
+  padding-bottom: 16px;
+  text-align: right;
+}
+
+/* above every title: the breadcrumbs, then the tab row with the window on its right */
+.crumbs { margin: 16px 0 0; min-height: 20px; color: var(--muted); font-size: 13px; }
+.crumbs .sep { margin: 0 6px; }
+.crumbs [aria-current] { color: var(--fg); }
+.tabrow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  min-height: 41px;
+  margin-top: 8px;
+  border-bottom: 1px solid var(--line);
+}
+/* no tabs (sign in, not found): the row's height stays, so titles line up, without its rule */
+.tabrow.bare { border-bottom-color: transparent; }
+.tabs { display: flex; gap: 4px; align-self: stretch; align-items: flex-end; margin-right: auto; }
+.tabs > a {
+  padding: 8px 12px 10px;
+  color: var(--muted);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tabs > a:first-child { padding-left: 0; }
+.tabs > a[aria-current="page"] { color: var(--fg); border-bottom-color: var(--accent); }
+/* the window: a small segmented control */
+.days {
+  display: inline-flex;
+  align-items: center;
+  margin: 6px 0 6px auto;
+  font-size: 13px;
+  line-height: 18px;
+}
+.days-label { color: var(--muted); margin-right: 8px; }
+.days a {
+  padding: 3px 10px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  margin-left: -1px;
+}
+.days a:first-of-type { border-radius: 4px 0 0 4px; margin-left: 0; }
+.days a:last-of-type { border-radius: 0 4px 4px 0; }
+.days a:hover { color: var(--fg); text-decoration: none; background: var(--bg-alt); }
+.days a[aria-current="true"] {
+  color: var(--fg);
+  font-weight: 600;
+  background: var(--accent-soft);
+  border-color: var(--line-strong);
+  position: relative; /* its border over its neighbours' */
+}
+
+/* page heading: title, one short line on what it shows, the key numbers */
+.lede { color: var(--muted); margin: 0 0 4px; }
+.stats { margin: 8px 0 16px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.stats strong { color: var(--fg); font-weight: 600; }
+
+/* tables: header and cells share padding, so right-aligned numbers line up exactly */
+.scroll { overflow-x: auto; margin: 8px 0 12px; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+th, td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+th:first-child, td:first-child { padding-left: 0; }
+th:last-child, td:last-child { padding-right: 0; }
+thead th {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--head);
+  border-bottom: 2px solid var(--line-strong);
+}
+tbody th { font-weight: 400; }
+tbody tr:hover > * { background: var(--bg-alt); }
+tr.quiet-row { color: var(--muted); }
+/* numbers right-aligned and narrow; .fit = narrow text; the rest (names) take the space */
+th.n, td.n { text-align: right; width: 1%; }
+th.fit, td.fit { width: 1%; }
+td.wrap, .wrap { white-space: normal; overflow-wrap: anywhere; }
+/* a wrapping cell keeps a readable width: on a phone the table scrolls instead */
+td.wrap { min-width: 28ch; }
+/* long text cut with an ellipsis (the full value in its title). The box is one 20px line and
+   sits at the top of it: an inline-block with hidden overflow has its baseline at its bottom
+   edge, which would push the row's other cells down. */
+.trunc {
+  display: inline-block;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+/* small facts and states */
+.facts { color: var(--fg); }
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0 12px; }
+dl.facts dt { color: var(--muted); }
+dl.facts dd { margin: 0; min-width: 0; }
+.empty {
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: 4px;
+  padding: 12px 16px;
+  max-width: 880px;
+}
+.notice, .error, .warn { padding: 8px 12px; border-left: 3px solid var(--line-strong); max-width: 880px; }
+.error { border-left-color: var(--bad); color: var(--bad); }
+.warn { border-left-color: var(--warn); }
+.tag {
+  font-size: 12px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+/* verdicts and outcomes: colour plus the word, never colour alone */
+.v { font-weight: 600; }
+.v-new_regression, .v-missed { color: var(--bad); }
+.v-flaky, .v-pre_existing { color: var(--warn); }
+.v-unknown { color: var(--fg); }
+.v-caught { color: var(--link); }
+
+/* bars: inline SVG, numbers always printed beside them */
+svg.meter { vertical-align: 0; margin-right: 4px; }
+svg.meter .track { fill: var(--track); }
+svg.meter .bar { fill: var(--accent); }
+svg.meter .bad { fill: var(--bad); }
+
+/* login: the same column and heading position as every page */
+.login { max-width: 460px; }
+.login form { display: grid; gap: 8px; margin: 16px 0; }
+.login label { font-weight: 600; }
+.login input[type="password"] {
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+.login button { justify-self: start; }

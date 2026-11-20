@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% from "_macros.html" import verdict, verdict_counts, test_id, branch %}
+{% block content %}
+<h1>CI run <span class="mono">{{ meta.ci_run_id }}</span> #{{ meta.run_attempt }}</h1>
+<p class="lede">Each failing test's verdict, as the PR comment gives it.</p>
+<p class="stats">Started <strong>{{ meta.at|when }}</strong> UTC ({{ meta.at|ago }}) · <strong>{{ meta.variants|num }}</strong> variant{{ "s" if meta.variants != 1 else "" }} · <strong>{{ (rows|length + more)|num }}</strong> failing test{{ "s" if rows|length + more != 1 else "" }}{% if rows %}: {{ verdict_counts(counts) }}{% endif %}</p>
+<dl class="facts">
+<dt>Branch</dt><dd>{{ branch(meta.branch, meta.is_main) }}</dd>
+<dt>Commit</dt><dd><span class="mono">{{ meta.commit_sha }}</span></dd>
+<dt>Variants</dt><dd>{% if variant_names|select|list %}<span class="mono">{{ variant_names|map("default", "(unnamed)", true)|join(", ") }}</span>{% else %}<span class="muted">one, unnamed</span>{% endif %}</dd>
+</dl>
+{% if shadow.variants %}
+<h2>Shadow run</h2>
+<div class="scroll"><table>
+<thead><tr><th scope="col">Variant</th><th scope="col">Selection</th><th scope="col" class="n">Would have run</th><th scope="col" class="n">Time saved</th><th scope="col" class="n">Failing</th><th scope="col" class="n">Caught</th><th scope="col" class="n">Missed</th><th scope="col" class="n">Flaky (not counted)</th></tr></thead>
+<tbody>
+{% for v in shadow.variants %}
+<tr><td class="grow"><span class="mono">{{ v.variant or "" }}</span></td><td class="fit">{{ v.mode }}</td><td class="n">{{ v.tests_would_run|num }} of {{ v.tests_total|num }}</td>
+<td class="n">{% if v.ms_total %}{{ (1 - v.ms_would_run / v.ms_total)|pct }} <span class="muted">of {{ v.ms_total|minutes }}</span>{% endif %}</td>
+<td class="n">{{ v.failing|num }}</td><td class="n">{{ v.caught|num }}</td><td class="n">{% if v.missed %}<span class="v v-missed">{{ v.missed|num }}</span>{% else %}0{% endif %}</td><td class="n">{{ v.flaky|num }}</td></tr>
+{% endfor %}
+</tbody></table></div>
+{% if shadow.misses %}
+<div class="scroll"><table>
+<thead><tr><th scope="col">Missed test</th><th scope="col">Variant</th><th scope="col">Verdict</th><th scope="col">Cause</th></tr></thead>
+<tbody>
+{% for m in shadow.misses %}
+<tr><td class="grow">{{ test_id(m.test_id) }}</td><td class="fit"><span class="mono">{{ m.variant or "" }}</span></td><td class="fit">{{ m.verdict|replace("_", " ") }}</td><td class="wrap">{{ cause_labels.get(m.cause or "unclassified", m.cause) }}{% if m.cause_detail %}<br><span class="muted">{{ m.cause_detail }}</span>{% endif %}</td></tr>
+{% endfor %}
+</tbody></table></div>
+{% endif %}
+{% endif %}
+<h2>Verdicts</h2>
+{% if not rows %}
+<p class="empty">No failing tests in this run attempt.</p>
+{% else %}
+<div class="scroll"><table>
+<thead><tr><th scope="col">Test</th><th scope="col">Verdict</th><th scope="col">Confidence</th>{% if multi %}<th scope="col">Variants</th>{% endif %}<th scope="col">Why</th></tr></thead>
+<tbody>
+{% for r in rows %}
+<tr><td class="grow">{{ test_id(r.test_id) }}</td><td class="fit">{{ verdict(r.verdict) }}</td><td class="fit">{{ r.confidence }}</td>{% if multi %}<td class="fit"><span class="mono">{{ r.variants|map("default", "", true)|join(", ") }}</span></td>{% endif %}<td class="wrap">{{ r.reason }}</td></tr>
+{% endfor %}
+</tbody></table></div>
+{% if more %}<p class="muted">+{{ more|num }} more failing tests not shown.</p>{% endif %}
+{% endif %}
+{% endblock %}
