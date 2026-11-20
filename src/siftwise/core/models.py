@@ -403,3 +403,24 @@ class ApiToken(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class UiSession(Base):
+    """A dashboard login (``/ui``). The browser's cookie holds a random session ID; only its
+    SHA-256 is stored. The session points at the token it was made with (``api_token_id``),
+    or, for the admin token, at a salted digest of it, and every request checks that token
+    again: a revoked token, or a changed ``SIFTWISE_API_TOKEN``, ends the session at once."""
+
+    __tablename__ = "ui_sessions"
+
+    id_hash: Mapped[str] = mapped_column(String(64), primary_key=True)  # sha256, hex
+    api_token_id: Mapped[int | None] = mapped_column(
+        ForeignKey("api_tokens.id", ondelete="CASCADE"), index=True
+    )
+    admin_salt: Mapped[str | None] = mapped_column(String(64))
+    admin_digest: Mapped[str | None] = mapped_column(String(64))
+    repo: Mapped[str] = mapped_column(String(255))
+    scope: Mapped[str] = mapped_column(String(16))
+    csrf: Mapped[str] = mapped_column(String(64))  # the logout form's token
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

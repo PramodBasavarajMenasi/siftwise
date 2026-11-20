@@ -8,6 +8,23 @@ All notable changes to siftwise. The format follows
 
 ### Added
 
+- A read-only dashboard ([#75](https://github.com/PramodBasavarajMenasi/siftwise/issues/75)),
+  off unless `SIFTWISE_DASHBOARD=1`: server-rendered pages at `/ui` (no JavaScript) for each
+  repo a token can see: shadow-mode recall (all runs and selective runs, by week, misses by
+  cause, suggested rules), recent CI runs with their failing tests and each run's verdicts
+  (and its shadow comparison), and flaky tests with `known_flaky` entries to paste. Windows
+  count back from now (7, 30 or 90 days, or all history) on every page. Sign in by
+  pasting any API token (a read token is enough): a server-side session of 4 hours in an
+  HttpOnly, SameSite=Strict cookie on `/ui`; a revoked token, or a changed admin token, ends it
+  at the next request. Every page escapes test names, branches and repo names, and is served
+  with a strict Content-Security-Policy (no scripts), `frame-ancestors 'none'` and
+  `Cache-Control: no-store`; login and logout are CSRF-protected. New dependency in the server
+  extra: Jinja2. README: [Dashboard](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/README.md#dashboard).
+- `siftwise server start --forwarded-allow-ips IPS` (or `SIFTWISE_FORWARDED_ALLOW_IPS`,
+  default `127.0.0.1`): the proxies whose `X-Forwarded-Proto`, `-For` and `-Host` the server
+  believes. The server now reads these headers itself (`X-Forwarded-Host` too, which uvicorn
+  ignores), with the same trust rule uvicorn applied, and starts uvicorn with its own copy off.
+
 - Mutation-based recall eval ([#74](https://github.com/PramodBasavarajMenasi/siftwise/issues/74)):
   `python -m scripts.eval.mutation` plants mutants on the lines a merged PR changed and checks
   whether the selection siftwise would have made runs a test that catches each (kill rule: fails
@@ -54,7 +71,8 @@ All notable changes to siftwise. The format follows
     the server extra), like `siftwise server migrate`: there is no API to make tokens.
   - `read`: select, triage, explain, recall, test history and run lookups. `write`: also
     uploads, rollups, shadow compares and storing a shadow run's selection (`/select` with
-    `shadow`). A token is for one repo or `*`.
+    `shadow`). A token is for one repo or `*` (`--all-repos`, which also works on Windows,
+    where Click expands a `*` argument into file names even when it is quoted).
   - Auth is still checked before the request body is read: unknown or revoked tokens get
     401, a read token on a write call or a token for another repo get 403 (the same whether
     that repo exists or not). A route not listed in the scope table needs `write`.
@@ -64,6 +82,16 @@ All notable changes to siftwise. The format follows
   - Migration 0013 adds `api_tokens` (only each token's SHA-256 is stored).
   - Clients are unchanged: they send a bearer token as before. The docs now recommend a
     `write` token for CI and a `read` token for coding agents (docs/mcp-clients.md).
+
+### Upgrading
+
+- **Migration 0016** adds `ui_sessions` (dashboard logins: the SHA-256 of each session ID, the
+  token it was made with, and its expiry). A new table: nothing is rewritten, and it stays
+  empty unless the dashboard is turned on. `siftwise server start` applies it (with 0013 to
+  0015 if they're new to you).
+- **The dashboard is off by default.** To use it, set `SIFTWISE_DASHBOARD=1` and serve it over
+  HTTPS (plain HTTP only on localhost); behind a TLS proxy, also set `--forwarded-allow-ips`
+  to the proxy's address ([Dashboard](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/README.md#dashboard)).
 
 ### Fixed
 
@@ -75,6 +103,12 @@ All notable changes to siftwise. The format follows
   and go.sum. `-mod=readonly` is passed now, unless the module is vendored (Go's default there
   is `-mod=vendor`)
   ([#67](https://github.com/PramodBasavarajMenasi/siftwise/issues/67)).
+- Shadow mode: shadow selections stopped being stored after 10 on a long-lived database
+  connection, so shadow recall was undercounted. After psycopg prepared the insert and Postgres
+  switched to a generic plan, the `ON CONFLICT` target's bound `''` (in `coalesce(variant,
+  '')`) no longer matched the unique index: every later `/select` with `shadow` answered
+  `shadow_stored: false` (`storage_error`) on that API worker until it restarted. The `''` is
+  now part of the SQL.
 
 ## [0.3.0] - 2026-11-10
 

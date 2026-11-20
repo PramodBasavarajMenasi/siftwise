@@ -28,7 +28,18 @@ app = typer.Typer(
 
 @app.command("create")
 def create_command(
-    repo: Annotated[str, typer.Option(help="The repo it is for, e.g. acme/shop, or '*' for all.")],
+    repo: Annotated[
+        str | None,
+        typer.Option(help="The repo it is for, e.g. acme/shop ('*' = all repos: see --all-repos)."),
+    ] = None,
+    all_repos: Annotated[
+        bool,
+        typer.Option(
+            "--all-repos",
+            help="For every repo, the same as --repo '*'. Use it on Windows, where Click "
+            "expands a '*' argument into file names even when it is quoted.",
+        ),
+    ] = False,
     scope: Annotated[
         str, typer.Option(help="read: select, triage, explain, report. write: also uploads.")
     ] = "read",
@@ -36,13 +47,18 @@ def create_command(
 ) -> None:
     """Create a token and print it once: only its hash is stored."""
     require_server("siftwise token")
-    from siftwise.core.tokens import Scope, create_token
+    from siftwise.core.tokens import ALL_REPOS, Scope, create_token
 
     if scope not in {s.value for s in Scope}:
         typer.echo(f"error: --scope must be read or write, not {scope!r}", err=True)
         raise typer.Exit(EXIT_USAGE)
-    if not repo.strip():
-        typer.echo("error: --repo must be a repo name or '*'", err=True)
+    if all_repos and repo is not None:
+        typer.echo("error: give --repo or --all-repos, not both", err=True)
+        raise typer.Exit(EXIT_USAGE)
+    if all_repos:
+        repo = ALL_REPOS
+    if repo is None or not repo.strip():
+        typer.echo("error: --repo must be a repo name (or use --all-repos)", err=True)
         raise typer.Exit(EXIT_USAGE)
     with _session() as session:
         token_id, token = create_token(session, repo, Scope(scope), name)

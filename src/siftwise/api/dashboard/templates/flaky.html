@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% from "_macros.html" import older, test_id %}
+{% block content %}
+<h1>Flaky tests</h1>
+<p class="lede">Tests that failed and passed on one commit and variant, in {{ days|window }}.</p>
+{% if report is none %}
+<p class="empty">No runs recorded for <span class="mono">{{ repo }}</span> yet. <a href="{{ readme }}#github-action">GitHub Action</a></p>
+{% elif recorded.runs_total and not recorded.runs_window %}
+{{ older(repo_url(repo, "flaky"), days, "CI runs", recorded.runs_total, recorded.newest_run_at) }}
+{% elif not rows %}
+<p class="stats"><strong>{{ recorded.runs_window|num }}</strong> CI runs in {{ days|window }} · no flaky tests</p>
+<p class="empty">No flaky tests in {{ days|window }}{% if report.window_end %} ({{ report.window_start|day }} to {{ report.window_end|day }}){% endif %}: no test both failed and passed on the same commit and variant. Retries, re-runs and <code>rerun-unknown</code> are what show it. <a href="{{ readme }}#flaky-tests">Flaky tests</a></p>
+{% else %}
+<p class="stats"><strong>{{ (rows|length + more)|num }}{{ "+" if report.truncated else "" }}</strong> flaky tests in <strong>{{ recorded.runs_window|num }}</strong> CI runs · <strong>{{ suggested|length|num }}</strong> of the {{ rows|length|num }} listed not in known_flaky</p>
+<h2>{{ report.window_start|day }} to {{ report.window_end|day }} <span class="muted">({{ (rows|length + more)|num }}{{ "+" if report.truncated else "" }} tests, most flaky first)</span></h2>
+<div class="scroll"><table>
+<thead><tr><th scope="col">Test</th><th scope="col" class="n">Flaky</th><th scope="col" class="n">Runs</th><th scope="col">Last flaky (UTC)</th><th scope="col">known_flaky</th></tr></thead>
+<tbody>
+{% for row in rows %}
+<tr><td class="grow">{{ test_id(row.test.test_id) }}</td><td class="n">{{ row.test.flaky|num }}/{{ row.test.pairs|num }}</td><td class="n">{{ row.test.runs|num }}</td><td class="fit"><span class="mono">{{ row.test.last_flaky_at|day }}</span></td>
+<td class="fit">{% if row.known_flaky %}<span class="v v-flaky">listed</span> <span class="mono muted">{{ row.known_flaky }}</span>{% else %}<span class="muted">not listed</span>{% endif %}</td></tr>
+{% endfor %}
+</tbody></table></div>
+{% if more %}<p class="muted">+{{ more|num }}{{ "+" if report.truncated else "" }} more not shown, and no entries suggested for them here: <code>siftwise flaky --repo {{ repo }} --days {{ span }}</code> lists every one (its window ends at the repo's newest run, not now).</p>{% endif %}
+<p class="muted">Flaky = commits (and variants) where it failed and passed / where it ran. known_flaky compared with the list the newest main run applied{% if report.main_known_flaky_at %} ({{ report.main_known_flaky_at|day }}){% endif %}.</p>
+{% if suggested %}
+<h2>Suggested known_flaky entries <span class="muted">(paste into the list in .siftwise.toml; nothing was changed)</span></h2>
+<pre>{% for entry in suggested %}{{ entry }},
+{% endfor %}</pre>
+<p class="muted">Each expires on {{ until.isoformat() }} ({{ 90 }} days from today), like <code>siftwise flaky</code>'s. <a href="{{ readme }}#flaky-tests">Flaky tests</a></p>
+{% else %}
+<p>Every one is already in known_flaky.</p>
+{% endif %}
+{% endif %}
+{% endblock %}

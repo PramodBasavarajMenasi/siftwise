@@ -18,15 +18,13 @@ from sqlalchemy.orm import Session
 from siftwise.core.codes import FAILED_CODES_SQL, PASSED_CODE, SKIPPED_CODE
 
 _FLAKY_SQL = f"""
-WITH bounds AS (
-    SELECT max(COALESCE(started_at, created_at)) AS newest FROM runs WHERE repo_id = :repo_id
-),
-win AS MATERIALIZED (
+WITH win AS MATERIALIZED (
     SELECT r.id, r.commit_sha, COALESCE(r.variant, '') AS variant,
            COALESCE(r.started_at, r.created_at) AS run_at
-    FROM runs r CROSS JOIN bounds
+    FROM runs r
     WHERE r.repo_id = :repo_id
-      AND COALESCE(r.started_at, r.created_at) >= bounds.newest - make_interval(days => :days)
+      AND COALESCE(r.started_at, r.created_at) >= :window_start
+      AND COALESCE(r.started_at, r.created_at) <= :window_end
 ),
 failed AS MATERIALIZED (  -- (test, commit, variant) where some attempt failed or errored
     SELECT DISTINCT tr.test_key, w.commit_sha, w.variant
@@ -94,10 +92,17 @@ class FlakyReport:
 
 
 def flaky_tests(
-    session: Session, repo: str, days: int, min_runs: int = 1, limit: int = 200
+    session: Session,
+    repo: str,
+    days: int,
+    min_runs: int = 1,
+    limit: int = 200,
+    *,
+    end: datetime | None = None,
 ) -> FlakyReport | None:
-    """The repo's flaky tests over the ``days`` before its newest run, most flaky first.
-    None for an unknown repo."""
+    """The repo's flaky tests over the ``days`` before ``end`` (default: its newest run, as
+    ``siftwise flaky`` counts; the dashboard passes now), most flaky first. None for an
+    unknown repo."""
     repo_id = session.execute(
         text("SELECT id FROM repos WHERE name = :name"), {"name": repo}
     ).scalar_one_or_none()
@@ -107,11 +112,14 @@ def flaky_tests(
         text("SELECT max(COALESCE(started_at, created_at)) FROM runs WHERE repo_id = :r"),
         {"r": repo_id},
     ).scalar_one_or_none()
+    window_end = end if end is not None else newest
+    window_start = window_end - timedelta(days=days) if window_end else None
     session.execute(text("SET LOCAL jit = off"))  # compiling costs more than these queries
     rows = session.execute(
         text(_FLAKY_SQL),
-        {"repo_id": repo_id, "days": days, "min_runs": min_runs, "limit": limit + 1},
-    ).all()
+        {"repo_id": repo_id, "window_start": window_start, "window_end": window_end,
+         "min_runs": min_runs, "limit": limit + 1},
+    ).all() if window_end else []  # fmt: skip
     main = session.execute(
         text(
             "SELECT known_flaky, COALESCE(started_at, created_at) AS at FROM runs "
@@ -120,8 +128,8 @@ def flaky_tests(
         {"r": repo_id},
     ).one_or_none()
     return FlakyReport(
-        window_start=newest - timedelta(days=days) if newest else None,
-        window_end=newest,
+        window_start=window_start if newest else None,
+        window_end=window_end if newest else None,
         tests=[
             FlakyTest(r.test_id, r.file_path, r.runs, r.pairs, r.flaky, r.last_flaky_at)
             for r in rows[:limit]

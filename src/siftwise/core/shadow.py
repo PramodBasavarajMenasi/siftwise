@@ -163,12 +163,15 @@ def store_selection(
             budget=stored_budget,
         )
         .on_conflict_do_nothing(
-            # SHADOW_UNIQUE_INDEX: one selection per attempt and variant.
+            # SHADOW_UNIQUE_INDEX: one selection per attempt and variant. The '' is written
+            # into the SQL, never bound: once psycopg auto-prepares the statement and Postgres
+            # picks a generic plan, a bound '' no longer matches the index expression and
+            # every store fails (from the 11th on one connection).
             index_elements=[
                 ShadowSelection.repo_id,
                 ShadowSelection.ci_run_id,
                 ShadowSelection.run_attempt,
-                func.coalesce(ShadowSelection.variant, ""),
+                text("coalesce(variant, '')"),
             ]
         )
         .returning(ShadowSelection.id)

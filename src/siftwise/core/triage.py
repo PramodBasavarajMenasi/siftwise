@@ -1391,27 +1391,49 @@ def triage_ci_run(
     variant's run, and no upload of this CI run attempt is history, except the variant's own
     re-runs for rule 1. Re-run uploads (``runs.rerun`` > 0) are never variants themselves.
     """
+    found = triage_ci_runs(session, repo, [(ci_run_id, run_attempt)], window_days, variants)
+    return None if found is None else found[(ci_run_id, run_attempt)]
+
+
+def triage_ci_runs(
+    session: Session,
+    repo: str,
+    attempts: Sequence[tuple[str, int]],
+    window_days: int = 90,
+    variants: Collection[str | None] | None = None,
+) -> dict[tuple[str, int], list[VariantTriage]] | None:
+    """``triage_ci_run`` for several CI run attempts at once (the dashboard's recent runs):
+    every failing variant of every attempt in ONE batched history load, so the query count
+    grows with none of them. Each attempt's result is exactly what ``triage_ci_run`` returns
+    for it. None if the repo is unknown."""
     repo_id = session.execute(
         text("SELECT id FROM repos WHERE name = :name"), {"name": repo}
     ).scalar_one_or_none()
     if repo_id is None:
         return None
+    keys = list(dict.fromkeys(attempts))
+    out: dict[tuple[str, int], list[VariantTriage]] = {key: [] for key in keys}
+    if not keys:
+        return out
     rows = session.execute(
         text(
             """
-            SELECT id, variant, commit_sha, changed_files_known, affected, known_flaky,
-                   known_flaky_changed, known_flaky_expired, rerun
-            FROM runs
-            WHERE repo_id = :repo_id AND ci_run_id = :ci AND run_attempt = :attempt
-            ORDER BY COALESCE(variant, ''), id
+            SELECT r.id, r.ci_run_id, r.run_attempt, r.variant, r.commit_sha,
+                   r.changed_files_known, r.affected, r.known_flaky, r.known_flaky_changed,
+                   r.known_flaky_expired, r.rerun
+            FROM runs r
+            JOIN unnest(CAST(:ci AS text[]), CAST(:attempt AS integer[])) AS a(ci, attempt)
+              ON r.ci_run_id = a.ci AND r.run_attempt = a.attempt
+            WHERE r.repo_id = :repo_id
+            ORDER BY r.ci_run_id, r.run_attempt, COALESCE(r.variant, ''), r.id
             """
         ),
-        {"repo_id": repo_id, "ci": ci_run_id, "attempt": run_attempt},
+        {"repo_id": repo_id, "ci": [k[0] for k in keys], "attempt": [k[1] for k in keys]},
     ).all()
-    reruns = Counter(row.variant for row in rows if row.rerun)
+    reruns = Counter((row.ci_run_id, row.run_attempt, row.variant) for row in rows if row.rerun)
     runs = [row for row in rows if not row.rerun and (variants is None or row.variant in variants)]
     if not runs:
-        return []
+        return out
     run_ids = [run.id for run in runs]
     changed: dict[int, list[str]] = defaultdict(list)
     for run_id, path in session.execute(
@@ -1421,12 +1443,12 @@ def triage_ci_run(
         changed[run_id].append(path)
     failures = recorded_failures(session, run_ids)
     # Every failing variant's histories in one batched load: the query count doesn't grow
-    # with the number of variants.
+    # with the number of variants (or attempts).
     failing = [run for run in runs if failures[run.id]]
     loaded = load_histories_many(
         session,
         [
-            (Target(repo, run.commit_sha, run.variant, ci_run_id, run_attempt),
+            (Target(repo, run.commit_sha, run.variant, run.ci_run_id, run.run_attempt),
              [f.test_id for f in failures[run.id]])
             for run in failing
         ],
@@ -1434,7 +1456,6 @@ def triage_ci_run(
     )  # fmt: skip
     histories = dict(zip((run.id for run in failing), loaded or [], strict=True))
 
-    results = []
     for run in runs:
         links_known = run.changed_files_known and run.affected is not None
         change = (
@@ -1446,11 +1467,26 @@ def triage_ci_run(
             results_ = triage(failures[run.id], h.tests, change, window_days,
                               known_flaky=run.known_flaky)  # fmt: skip
             report = TriageReport(h.cut_at, h.run_id, results_)
-        results.append(VariantTriage(
+        out[(run.ci_run_id, run.run_attempt)].append(VariantTriage(
             run.id, run.variant, run.commit_sha, run.changed_files_known, links_known, report,
-            reruns[run.variant], run.known_flaky_changed, tuple(run.known_flaky_expired or ()),
+            reruns[(run.ci_run_id, run.run_attempt, run.variant)], run.known_flaky_changed,
+            tuple(run.known_flaky_expired or ()),
         ))  # fmt: skip
-    return results
+    return out
+
+
+def worst_verdicts(variants: Sequence[VariantTriage]) -> dict[str, Verdict]:
+    """Each failing test of a CI run attempt under its worst verdict over the variants, in
+    the PR comment's order (new regression, unknown, flaky, pre-existing): what its counts
+    count."""
+    order = [Verdict.NEW_REGRESSION, Verdict.UNKNOWN, Verdict.FLAKY, Verdict.PRE_EXISTING]
+    worst: dict[str, Verdict] = {}
+    for v in variants:
+        for result in v.report.results if v.report else ():
+            old = worst.get(result.test_id)
+            if old is None or order.index(result.verdict) < order.index(old):
+                worst[result.test_id] = result.verdict
+    return worst
 
 
 def recorded_failures(session: Session, run_ids: Sequence[int]) -> dict[int, list[Failure]]:

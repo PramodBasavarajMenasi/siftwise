@@ -49,7 +49,14 @@ The dev file builds the API image from your checkout as `siftwise:dev`, so it ne
 the published image the quickstart uses. Rebuild with `--build` after pulling: an old API image
 can't find newer migrations, fails with `Can't locate revision ...` and restarts in a loop. For
 the same reason, don't point plain `docker compose up` (the released image) at a dev database
-that has newer migrations.
+that has newer migrations. If the build stops at `additional privileges requested: pass
+"--allow=fs.read=Dockerfile"` (Compose builds through Bake), build the image directly and
+recreate only the API container:
+
+```sh
+docker build -t siftwise:dev .
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --no-deps --no-build api
+```
 
 ## Checks
 

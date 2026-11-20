@@ -14,6 +14,13 @@ class Settings(BaseSettings):
     max_upload_bytes: int = 50 * 1024 * 1024
     # test_stats are computed over this many days up to a repo's newest run (0 = all history).
     stats_window_days: int = Field(default=90, ge=0)
+    # The read-only dashboard at /ui (README "Dashboard"): off unless set. Its routes aren't
+    # mounted when off.
+    dashboard: bool = False
+    # Proxies whose X-Forwarded-Proto/-For/-Host are believed (comma-separated IPs or networks,
+    # "*" for any): what `siftwise server start --forwarded-allow-ips` sets. The dashboard's
+    # Origin check and cookie flags use the forwarded public scheme and host.
+    forwarded_allow_ips: str = "127.0.0.1"
 
 
 @lru_cache

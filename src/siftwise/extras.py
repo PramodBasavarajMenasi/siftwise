@@ -11,6 +11,7 @@ import importlib.util
 
 SERVER_MODULES = (
     "fastapi",
+    "jinja2",
     "uvicorn",
     "sqlalchemy",
     "alembic",

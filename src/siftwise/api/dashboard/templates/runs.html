@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% from "_macros.html" import branch %}
+{% block content %}
+<h1>CI runs</h1>
+<p class="lede">The newest {{ limit }} CI runs on any branch, newest first.</p>
+{% if not known %}
+<p class="empty">No runs recorded for <span class="mono">{{ repo }}</span> yet. Record CI results with the record action or <code>siftwise record</code>. <a href="{{ readme }}#github-action">GitHub Action</a></p>
+{% elif not runs %}
+<p class="empty">No CI runs with a CI run ID recorded yet (uploads without one aren't listed). <a href="{{ readme }}#github-action">GitHub Action</a></p>
+{% else %}
+<p class="stats"><strong>{{ recorded.runs_total|num }}</strong> CI runs recorded{% if recorded.newest_run_at %}, the newest <strong>{{ recorded.newest_run_at|ago }}</strong>{% endif %} · <strong>{{ runs|selectattr("failing")|list|length }}</strong> of these {{ runs|length }} with failing tests · <strong>{{ runs|selectattr("shadow_mode")|list|length }}</strong> shadow runs</p>
+<div class="scroll"><table>
+<thead><tr><th scope="col" class="fit">Started (UTC)</th><th scope="col" class="fit">CI run</th><th scope="col">Branch</th><th scope="col" class="fit">Commit</th><th scope="col" class="n">Variants</th><th scope="col" class="n">Failing tests</th><th scope="col" class="fit">Verdicts</th><th scope="col" class="fit">Shadow</th></tr></thead>
+<tbody>
+{% for r in runs %}
+{% set page = repo_url(repo, "runs/" ~ r.ci_run_id ~ "/" ~ r.run_attempt) %}
+<tr><td class="fit"><span class="mono">{{ r.at|when }}</span></td>
+<td class="fit"><a href="{{ page }}"><span class="mono">{{ r.ci_run_id }}</span> #{{ r.run_attempt }}</a></td>
+<td>{{ branch(r.branch, r.is_main) }}</td>
+<td class="fit"><span class="mono">{{ r.commit_sha[:7] }}</span></td><td class="n">{{ r.variants|num }}</td><td class="n">{% if r.failing %}{{ r.failing|num }}{% endif %}</td>
+<td class="fit">{% if r.failing %}<a href="{{ page }}" title="verdicts of the {{ r.failing|num }} failing tests">view</a>{% endif %}</td>
+<td class="fit">{{ r.shadow_mode or "" }}</td></tr>
+{% endfor %}
+</tbody></table></div>
+<p class="muted">Verdicts are on each run's page, as the PR comment gives them. <a href="{{ readme }}#failure-verdicts">Failure verdicts</a></p>
+{% endif %}
+{% endblock %}

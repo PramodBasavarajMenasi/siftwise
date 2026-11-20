@@ -260,7 +260,9 @@ in place of the image name.
   0.0.0.0` (`siftwise server migrate` applies the migrations alone).
 - **Reaching it from CI:** the quickstart's `docker-compose.yml` publishes the API on
   `127.0.0.1` only (port `SIFTWISE_PORT`, default 8000) and keeps Postgres inside Docker. Put
-  the server behind a reverse proxy with TLS: the token travels in a request header.
+  the server behind a reverse proxy with TLS: the token travels in a request header. Tell the
+  server the proxy's address with `--forwarded-allow-ips` (default `127.0.0.1`) so it sees the
+  client's scheme and host ([Dashboard](#dashboard)).
 - **Upgrading:** change the image tag to the new version (the quickstart's
   `docker-compose.yml` names it; a newer checkout already has it), then `docker compose up -d`:
   the new image migrates the database when it starts. Never go back to an older image: once
@@ -277,11 +279,13 @@ are two kinds of token:
 - **The admin token**, `SIFTWISE_API_TOKEN` on the server: every repo, read and write. Setups
   from before 0.4 keep working with it unchanged.
 - **Per-repo tokens**, made on the server host with the server extra installed: each one is
-  for one repo (or `*` for all) and is `read` or `write`.
+  for one repo (or `*` for all) and is `read` or `write`. On Windows use `--all-repos`
+  instead of `--repo '*'`: Click expands a `*` argument into file names there, even quoted.
 
 ```sh
 siftwise token create --repo acme/shop --scope write --name ci     # prints the token once
 siftwise token create --repo acme/shop --scope read --name agents
+siftwise token create --all-repos --scope read --name dashboard   # every repo (= --repo '*')
 siftwise token list                                                 # never prints tokens
 siftwise token revoke 2                                             # 401 from the next request
 ```
@@ -305,6 +309,60 @@ siftwise token revoke 2                                             # 401 from t
   make tokens: there is no API for it, and the admin token can't mint new ones.
 - **No admin token:** the server works with per-repo tokens alone. With neither, every request
   gets 503.
+- **In a browser:** the [dashboard](#dashboard) signs in with any of these tokens; a read token
+  is enough.
+
+### Dashboard
+
+A read-only view of what the server knows, for people rather than CI: per repo, shadow-mode
+recall (all runs and selective runs, week by week, misses by cause), recent CI runs with their
+failing tests and each run's verdicts, and flaky tests with `known_flaky` entries to paste.
+Server-rendered pages, no JavaScript. Off unless you turn it on:
+
+```sh
+SIFTWISE_DASHBOARD=1 siftwise server start            # then open http://localhost:8000/ui/
+```
+
+- **Signing in:** paste an API token ([Tokens](#tokens)); a `read` token is enough, and the
+  dashboard never writes. A token for one repo sees only that repo (another repo's pages say
+  "not found", whether it exists or not); the admin token and `*` tokens see every repo.
+- **The pages:** *Repos* lists the CI runs recorded per repo (a CI run is one run attempt
+  with its matrix legs; re-run uploads don't count). *Overview* is recall on shadow runs, which
+  run the full suite and store what siftwise would have selected, so a failure outside the
+  selection is a miss. *Runs* lists the newest 20 CI runs on any branch; each run's page gives
+  every failing test's verdict as the PR comment does, from what its uploads stored and with
+  no peeking at later runs, plus its shadow comparison. *Flaky tests* are tests that failed and
+  passed on one commit and variant (retries, re-runs). Long test IDs and branches are cut with
+  an ellipsis; hover for the full value.
+- **Windows:** every page counts back from now (7, 30 or 90 days, or all history), as
+  `siftwise report` does; `siftwise flaky` instead ends its window at the repo's newest run.
+  A window with nothing in it while older data exists says so and links to wider ones.
+- **The session:** the browser gets a random session ID in a cookie (HttpOnly, SameSite=Strict,
+  `Path=/ui`, Secure, 4 hours); the server stores only its SHA-256 and which token signed in,
+  never the token. Every page checks that token again, so `siftwise token revoke` (or a new
+  `SIFTWISE_API_TOKEN`) ends the session at the next click. Sign out deletes it. The API
+  doesn't accept the cookie: scripts and CI still need a Bearer token.
+- **HTTPS:** the cookie is Secure, so the dashboard needs HTTPS, except on `localhost`
+  (plain HTTP works there, for a quick look). Behind a TLS reverse proxy, start the server
+  with the proxy's address, so it believes the proxy's `X-Forwarded-Proto` and
+  `X-Forwarded-Host` (the login form checks the page's public origin, and the cookie needs to
+  know it's on HTTPS):
+
+  ```sh
+  SIFTWISE_DASHBOARD=1 siftwise server start --host 0.0.0.0 --forwarded-allow-ips 10.0.0.2
+  ```
+
+  (or `SIFTWISE_FORWARDED_ALLOW_IPS`; `*` trusts any peer, only safe when nothing but the proxy
+  can reach the server). Headers from any other peer are ignored.
+- **What it shows, and what it can't:** recall and time saved come from shadow runs only: the
+  server stores what siftwise selected only for those ([Shadow mode](#shadow-mode)). Without
+  shadow runs the overview says so. Verdicts are computed when a run's page opens, as the PR
+  comment computes them (a few seconds for a big matrix with thousands of failures).
+- **Safety:** test names, branches and repo names are escaped everywhere; pages are sent with a
+  Content-Security-Policy that allows no scripts, `frame-ancestors 'none'` and
+  `Cache-Control: no-store`; sign-in and sign-out are protected against cross-site requests.
+  There is no rate limit on sign-in: stored tokens are 256-bit random, but the admin token is
+  as strong as you made it.
 
 ### Seed history from past CI runs
 
@@ -1231,6 +1289,9 @@ public issue.
   `siftwise token revoke`; the admin token rotates by changing it on the server and in each
   secret. Tokens aren't per user, and a `*` token reaches every repo, as the admin token does.
   Every repo's tokens are managed by whoever runs the server.
+- **The dashboard is off unless `SIFTWISE_DASHBOARD=1`.** When on, it's read-only and signs in
+  with the same tokens; serve it over HTTPS, and set `--forwarded-allow-ips` behind a proxy
+  ([Dashboard](#dashboard)).
 - **Keep the token out of fork PRs.** Use `pull_request`, never `pull_request_target`: a
   fork's code must never run with the token. On GitLab, never run untrusted forks' merge
   request pipelines in the parent project ([Forks](#forks)).

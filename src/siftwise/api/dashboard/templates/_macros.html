@@ -1,0 +1,36 @@
+{% macro recall_cell(t) -%}
+{%- set counted = t.caught + t.missed -%}
+{%- if counted -%}{{ t.recall|recall }} <span class="muted">({{ t.caught|num }} of {{ counted|num }})</span>{%- else -%}<span class="muted" title="no failures">–</span>{%- endif -%}
+{%- endmacro %}
+{% macro bar(share, width=80, cls="bar", label="") -%}
+<svg class="meter" width="{{ width }}" height="8" viewBox="0 0 {{ width }} 8" role="img" aria-label="{{ label }}"><rect class="track" width="{{ width }}" height="8"></rect>{% if share %}<rect class="{{ cls }}" width="{{ [[share, 0]|max, 1]|min * width }}" height="8"></rect>{% endif %}</svg>
+{%- endmacro %}
+{% macro verdict(name) -%}
+<span class="v v-{{ name }}">{{ {"new_regression": "new regression", "pre_existing": "pre-existing"}.get(name, name) }}</span>
+{%- endmacro %}
+{# The siftwise mark: many tests in, the funnel, a few through (assets/logo-*.svg). #}
+{% macro mark() -%}
+<svg class="mark" width="22" height="24" viewBox="0 0 96 106" aria-hidden="true" focusable="false"><g class="mark-in"><circle cx="26" cy="9" r="9"></circle><circle cx="48" cy="9" r="9"></circle><circle cx="70" cy="9" r="9"></circle></g><path class="mark-funnel" d="M8 32 H88 L57 64 V80 H39 V64 Z"></path><circle class="mark-out" cx="48" cy="96" r="9"></circle></svg>
+{%- endmacro %}
+{# The window switcher: a segmented control on the right of the tab row. #}
+{% macro days_nav(base, current) -%}
+<nav class="days" aria-label="Window" title="Windows count back from now"><span class="days-label">Window</span>{% for d in days_options %}<a href="{{ with_days(base, d) }}"{% if d == current %} aria-current="true"{% endif %}>{{ "all" if d is none else d ~ "d" }}</a>{% endfor %}</nav>
+{%- endmacro %}
+{# A window with nothing in it while older data exists: say so, and link to wider windows. #}
+{% macro older(base, current, what, total, newest) -%}
+<p class="notice">Nothing in {{ current|window }}, but {{ total|num }} older {{ what }} exist (the newest {{ newest|ago }}, {{ newest|day }}). Show {% if current is not none and current < 90 %}<a href="{{ with_days(base, 90) }}">90 days</a> or {% endif %}<a href="{{ with_days(base, none) }}">all</a>.</p>
+{%- endmacro %}
+{# Verdict counts as small coloured words: "1 new · 2 flaky · 1 pre-existing". #}
+{% macro verdict_counts(counts) -%}
+{%- set short = {"new_regression": "new", "pre_existing": "pre-existing"} -%}
+{%- for name in verdicts if counts[name] %}{% if not loop.first %}<span class="muted"> · </span>{% endif %}<span class="v v-{{ name }}">{{ counts[name]|num }} {{ short.get(name, name) }}</span>{% endfor -%}
+{%- endmacro %}
+{# A test ID: shortened in the middle when long, the whole of it in the title. #}
+{% macro test_id(value) -%}
+<span class="mono" title="{{ value }}">{{ value|short }}</span>
+{%- endmacro %}
+{# A branch: cut with an ellipsis past 320 px; "main" once (the badge) for the main branch. #}
+{% macro branch(name, is_main) -%}
+{%- if is_main and name == "main" -%}<span class="tag">main</span>
+{%- else -%}<span class="mono trunc" title="{{ name }}">{{ name }}</span>{% if is_main %} <span class="tag">main</span>{% endif %}{%- endif -%}
+{%- endmacro %}

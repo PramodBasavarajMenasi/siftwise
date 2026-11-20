@@ -1,0 +1,46 @@
+{% from "_macros.html" import mark, days_nav %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>{{ title }} · siftwise</title>
+<link rel="stylesheet" href="{{ prefix }}/static/{{ stylesheet() }}">
+</head>
+<body>
+<header class="top">
+<div class="page topbar">
+  <a class="brand" href="{{ prefix }}/">{{ mark() }}<span>siftwise</span></a>
+  {% if principal %}
+  <span class="who" title="{{ "every repo" if principal.is_admin or principal.repo == "*" else principal.repo }}">{% if principal.is_admin %}admin token · write{% else %}{{ principal.name or "unnamed token" }} · {{ principal.scope.value }}{% endif %}</span>
+  <form method="post" action="{{ prefix }}/logout" class="inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit" class="quiet">Sign out</button>
+  </form>
+  {% endif %}
+</div>
+</header>
+<main class="page">
+{# Every page has the same two rows above its title, so titles sit at the same height. #}
+<nav class="crumbs" aria-label="Breadcrumbs">
+  {% for label, href in crumbs %}{% if not loop.first %}<span class="sep" aria-hidden="true">›</span>{% endif %}{% if href and not loop.last %}<a href="{{ href }}">{{ label }}</a>{% else %}<span aria-current="page">{{ label }}</span>{% endif %}{% endfor %}
+</nav>
+{# The repos page has no tabs (its title says Repos), only the window, right-aligned. #}
+<div class="tabrow{% if not (repo and tab is defined) and days is not defined %} bare{% endif %}">
+  {% if repo and tab is defined %}
+  <nav class="tabs" aria-label="Repo pages">
+    <a href="{{ repo_url(repo) }}"{% if tab == "overview" %} aria-current="page"{% endif %}>Overview</a>
+    <a href="{{ repo_url(repo, "runs") }}"{% if tab == "runs" %} aria-current="page"{% endif %}>Runs</a>
+    <a href="{{ repo_url(repo, "flaky") }}"{% if tab == "flaky" %} aria-current="page"{% endif %}>Flaky tests</a>
+  </nav>
+  {% endif %}
+  {% if days is defined %}
+  {{ days_nav(repo_url(repo, "" if tab == "overview" else tab) if repo else prefix ~ "/", days) }}
+  {% endif %}
+</div>
+{% block content %}{% endblock %}
+</main>
+<footer class="page"><div class="foot">siftwise v{{ version }}</div></footer>
+</body>
+</html>
