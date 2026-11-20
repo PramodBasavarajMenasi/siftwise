@@ -428,7 +428,7 @@ def test_select_takes_fixture_refs_and_shadow_stores_the_fixture_files(
 
     from siftwise.api.main import create_app
     from siftwise.config import Settings
-    from siftwise.core.models import ShadowSelection
+    from siftwise.core.models import CiSelection
     from siftwise.db import get_session
 
     app = create_app(Settings(_env_file=None, api_token="t"))
@@ -464,5 +464,5 @@ def test_select_takes_fixture_refs_and_shadow_stores_the_fixture_files(
     assert response["mode"] == "selective"
     assert response["command"].startswith("pytest tests/test_math.py")  # + recently failed
     assert response["shadow_stored"] is True
-    stored = db_session.scalars(select(ShadowSelection.fixture_files)).one()
+    stored = db_session.scalars(select(CiSelection.fixture_files)).one()
     assert stored == [GRADLE]

@@ -2,17 +2,51 @@
 {% from "_macros.html" import verdict, verdict_counts, test_id, branch %}
 {% block content %}
 <h1>CI run <span class="mono">{{ meta.ci_run_id }}</span> #{{ meta.run_attempt }}</h1>
-<p class="lede">Each failing test's verdict, as the PR comment gives it.</p>
+<p class="lede">What siftwise selected for this run, and each failing test's verdict.</p>
 <p class="stats">Started <strong>{{ meta.at|when }}</strong> UTC ({{ meta.at|ago }}) · <strong>{{ meta.variants|num }}</strong> variant{{ "s" if meta.variants != 1 else "" }} · <strong>{{ (rows|length + more)|num }}</strong> failing test{{ "s" if rows|length + more != 1 else "" }}{% if rows %}: {{ verdict_counts(counts) }}{% endif %}</p>
 <dl class="facts">
 <dt>Branch</dt><dd>{{ branch(meta.branch, meta.is_main) }}</dd>
 <dt>Commit</dt><dd><span class="mono">{{ meta.commit_sha }}</span></dd>
 <dt>Variants</dt><dd>{% if variant_names|select|list %}<span class="mono">{{ variant_names|map("default", "(unnamed)", true)|join(", ") }}</span>{% else %}<span class="muted">one, unnamed</span>{% endif %}</dd>
 </dl>
+<h2>What siftwise did</h2>
+{% if not selected.selections %}
+<p class="notice">{{ selected.missing }} {% if selected.upgrade %}<a href="{{ changelog }}#upgrading">How to upgrade</a>{% else %}<a href="{{ readme }}#dashboard">How selections are recorded</a>{% endif %}</p>
+{% else %}
+{% for s in selected.selections %}
+{% set row = s.row %}
+{% if selected.selections|length > 1 %}<h3>{% if row.variant %}Variant <span class="mono">{{ row.variant }}</span>{% else %}Every other variant{% endif %}</h3>{% endif %}
+<dl class="facts">
+<dt title="What /select returned for this run, recorded when the select step ran">Selection</dt>
+<dd>{% if row.shadow %}<strong>shadow run</strong>: the full suite ran; siftwise would have run <strong>{{ row.selected_count|num }}</strong> of {{ row.total_known|num }} <span title="the tests siftwise knows from history (seen in the last 50 CI runs), over every variant">tests in history</span>{% if row.mode == "full" %} (the full suite){% endif %}
+{%- elif row.mode == "selective" %}<strong>selective</strong>: <strong>{{ row.selected_count|num }}</strong> of {{ row.total_known|num }} <span title="the tests siftwise knows from history (seen in the last 50 CI runs), over every variant">tests in history</span>
+{%- else %}<strong>full suite</strong> ({{ row.total_known|num }} <span title="the tests siftwise knows from history (seen in the last 50 CI runs), over every variant">tests in history</span>){% if row.reason_code %}: {{ reason_labels.get(row.reason_code, row.reason_code) }}{% endif %}{% endif %}</dd>
+{% if row.mode == "full" %}{# a selective run's reason only repeats the selection #}
+<dt>Reason</dt><dd class="wrap">{{ row.reason }}{% if row.reason_items %}<br><span class="muted">Caused by:</span> {% for item in row.reason_items %}<span class="mono">{{ item }}</span>{{ ", " if not loop.last }}{% endfor %}{% endif %}</dd>
+{% endif %}
+<dt title="Estimated from each test's mean duration in history; measured = the sum of the uploaded tests' durations (final attempts, Go subtests left out). Both are test time, not wall-clock CI time.">Test time</dt>
+<dd>{% if row.estimated_ms_total %}estimated <strong>{{ row.estimated_ms_would_run|minutes }}</strong> of <strong>{{ row.estimated_ms_total|minutes }}</strong> for the full suite{% elif row.shadow and shadow.variants %}<span class="muted">not estimated at select time (no test durations in history then); the shadow run below measures what it would have saved from this run's own durations</span>{% else %}<span class="muted">not estimated (no test durations in history)</span>{% endif %}{% if s.measured_ms is not none %} · measured <strong>{{ s.measured_ms|minutes }}</strong>{% if s.legs|length > 1 %} over {{ s.legs|length }} variants{% endif %}{% elif not s.legs %} · <span class="muted">no upload for it yet</span>{% endif %}{% if s.saved_ms is not none %} · test time saved (estimated) <strong>{{ s.saved_ms|minutes }}</strong>{% endif %}</dd>
+<dt>Time budget</dt>
+<dd>{% if not row.budget %}<span class="muted">none</span>{% else %}{{ (row.budget.seconds * 1000)|minutes }} target · {% if row.budget.limited %}<strong>budget-limited</strong>: {{ row.budget.left_out|num }} test{{ "s" if row.budget.left_out != 1 else "" }} left out ({{ row.budget.left_out_ms|minutes }} estimated){% elif row.budget.applied is false %}not applied: {{ row.budget.note }}{% else %}everything fit{% endif %}{% endif %}</dd>
+<dt title="How the commands list the selected tests: risk = likely failures first">Order</dt><dd>{{ row.command_order or "not recorded" }}</dd>
+<dt>Changed files</dt><dd>{% if row.changed_count is not none %}{{ row.changed_count|num }}{% else %}<span class="muted">not recorded</span>{% endif %}</dd>
+<dt>Recorded</dt><dd><span class="mono">{{ row.created_at|when }}</span> UTC{% if row.client_version %} · siftwise {{ row.client_version }}{% endif %}{% if row.provider %} · {{ row.provider }}{% endif %}{% if row.event %} <span class="mono">{{ row.event }}</span>{% endif %}{% if row.pr_number %} · #{{ row.pr_number }}{% endif %}</dd>
+</dl>
+{% if s.risky %}
+<div class="scroll"><table class="stack">
+<thead><tr><th scope="col" class="n" title="Risk rank in this selection: 1 = the most likely to fail">Rank</th><th scope="col">Highest-risk tests</th><th scope="col">Why ranked there</th><th scope="col">Why selected</th></tr></thead>
+<tbody>
+{% for t in s.risky %}
+<tr><td class="n fact" data-label="Rank">{{ t.rank|num }}</td><td class="grow name"><span class="id-short">{{ test_id(t.test_id) }}</span><span class="id-full mono">{{ t.test_id|breakable }}</span></td><td class="wrap" data-label="Why ranked there">{{ t.why }}</td><td class="wrap" data-label="Why selected">{{ t.reasons|join("; ") }}</td></tr>
+{% endfor %}
+</tbody></table></div>
+{% endif %}
+{% endfor %}
+{% endif %}
 {% if shadow.variants %}
 <h2>Shadow run</h2>
 <div class="scroll"><table>
-<thead><tr><th scope="col">Variant</th><th scope="col">Selection</th><th scope="col" class="n">Would have run</th><th scope="col" class="n">Time saved</th><th scope="col" class="n">Failing</th><th scope="col" class="n">Caught</th><th scope="col" class="n">Missed</th><th scope="col" class="n">Flaky (not counted)</th></tr></thead>
+<thead><tr><th scope="col">Variant</th><th scope="col">Selection</th><th scope="col" class="n" title="Of the tests that ran in this variant (Go subtests left out), those the selection would have run. The selection above counts the tests in history over every variant.">Would have run, of the tests that ran here</th><th scope="col" class="n" title="Measured: 1 - (the measured time of the tests it would have run) / (the measured time of the whole variant)">Time saved (measured)</th><th scope="col" class="n">Failing</th><th scope="col" class="n">Caught</th><th scope="col" class="n">Missed</th><th scope="col" class="n">Flaky (not counted)</th></tr></thead>
 <tbody>
 {% for v in shadow.variants %}
 <tr><td class="grow"><span class="mono">{{ v.variant or "" }}</span></td><td class="fit">{{ v.mode }}</td><td class="n">{{ v.tests_would_run|num }} of {{ v.tests_total|num }}</td>
@@ -34,11 +68,13 @@
 {% if not rows %}
 <p class="empty">No failing tests in this run attempt.</p>
 {% else %}
-<div class="scroll"><table>
-<thead><tr><th scope="col">Test</th><th scope="col">Verdict</th><th scope="col">Confidence</th>{% if multi %}<th scope="col">Variants</th>{% endif %}<th scope="col">Why</th></tr></thead>
+{# Below 640 px each failure is stacked (the stack class): name, then the facts, then why. #}
+<div class="scroll"><table class="stack">
+{% set with_selection = selected.selections|length > 0 %}
+<thead><tr><th scope="col">Test</th><th scope="col">Verdict</th><th scope="col">Confidence</th>{% if multi %}<th scope="col">Variants</th>{% endif %}{% if with_selection %}<th scope="col" class="fit" title="selected: the selection named it; run whole: its file, package or class ran whole; not selected: it ran outside the selection (or, in a shadow run, the selection would have missed it)">In the selection</th><th scope="col" class="n" title="Its risk rank in the selection (1 = run first)">Rank</th>{% endif %}<th scope="col">Why</th></tr></thead>
 <tbody>
 {% for r in rows %}
-<tr><td class="grow">{{ test_id(r.test_id) }}</td><td class="fit">{{ verdict(r.verdict) }}</td><td class="fit">{{ r.confidence }}</td>{% if multi %}<td class="fit"><span class="mono">{{ r.variants|map("default", "", true)|join(", ") }}</span></td>{% endif %}<td class="wrap">{{ r.reason }}</td></tr>
+<tr><td class="grow name"><span class="id-short">{{ test_id(r.test_id) }}</span><span class="id-full mono">{{ r.test_id|breakable }}</span></td><td class="fit fact" data-label="Verdict">{{ verdict(r.verdict) }}</td><td class="fit fact" data-label="Confidence">{{ r.confidence }}</td>{% if multi %}<td class="fit fact" data-label="Variants"><span class="mono">{{ r.variants|map("default", "", true)|join(", ") }}</span></td>{% endif %}{% if with_selection %}<td class="fit fact" data-label="In the selection">{% if r.place == "not selected" %}<span class="v v-missed">not selected</span>{% else %}{{ r.place or "–" }}{% endif %}</td><td class="n fact" data-label="Rank">{% if r.rank is not none %}{{ r.rank|num }}{% else %}<span class="stack-only">–</span>{% endif %}</td>{% endif %}<td class="wrap" data-label="Why">{{ r.reason }}</td></tr>
 {% endfor %}
 </tbody></table></div>
 {% if more %}<p class="muted">+{{ more|num }} more failing tests not shown.</p>{% endif %}

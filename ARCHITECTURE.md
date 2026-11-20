@@ -31,10 +31,10 @@ sequenceDiagram
     participant DB as Postgres
     CI->>CLI: select (base...head)
     CLI->>CLI: git diff + Go/Python import graphs + .siftwise.toml
-    CLI->>API: POST /select (changed files, links, shadow?)
+    CLI->>API: POST /select (changed files, links, ci, shadow?)
     API->>DB: history: known tests, recent failures, co-change
     API-->>CLI: mode, tests with reasons, command
-    Note over API,DB: shadow run: the selection is stored, the full suite runs
+    Note over API,DB: from CI: the selection is recorded (ci_selections); a shadow run runs the full suite
     CI->>CI: run the command (or the full suite)
     CI->>CLI: record JUnit
     CLI->>API: POST /runs?defer_rollup=true (one per matrix leg)
@@ -45,16 +45,21 @@ sequenceDiagram
     CLI->>API: POST /repos/{repo}/triage
     API->>DB: history before the run's cut-off
     API-->>CLI: a verdict per failing test → PR comment, fail-on
-    CLI->>API: POST /repos/{repo}/shadow
-    API->>DB: failures vs the stored selection → caught / missed, with causes
+    CLI->>API: POST /repos/{repo}/outcome (fail-on verdicts)
+    API->>DB: each leg's verdicts vs its selection (rank, ran or not); shadow: caught / missed
 ```
 
 1. **Select** (`POST /select`). The client sends the changed files, what they link to (Go
    `affected_packages`, Python `affected_files`, `[[depends]]` rules, generated globs) and
    `.siftwise.toml`'s `always_run`. The server loads history from `test_stats` and the failed
    results, and returns `mode` (`selective` or `full`), every selected test with its reasons,
-   counts, an estimated time and a ready-to-run command. With `shadow` set, it also stores the
-   selection (`shadow_selections`) for the comparison in step 6.
+   counts, an estimated time and a ready-to-run command. From CI (`ci`: the Action and the
+   GitLab template send the run ID, attempt, variant, commit, branch, PR and event) and with a
+   write token, it records the selection under that run (`ci_selections`): its mode, the
+   full-suite reason as a code and the files behind it, the selected test keys in risk order,
+   the estimates, the budget, the five highest-risk tests. A read token still gets its
+   selection (`recorded: false`). With `shadow`, the row is a shadow run's (the full suite
+   runs; the row is what siftwise would have run). Laptop and MCP calls are never recorded.
 2. **Run.** The CI job runs the command, or its own full-suite command when `mode` is `full`.
 3. **Record** (`POST /runs`). One upload per matrix leg (`variant`): JUnit files plus the run's
    metadata, changed files and the change's links (`runs.affected`) as the CLI computed them.
@@ -65,9 +70,15 @@ sequenceDiagram
 5. **Triage** (`POST /repos/{repo}/triage`). Every failing test of the CI run attempt, per
    variant, gets a verdict from history before the run. The Action writes them into the PR
    comment and applies `fail-on`.
-6. **Shadow compare** (`POST /repos/{repo}/shadow`). For a shadow run, each failure is checked
-   against the stored selection: caught, missed (with a cause), or flaky (counted apart).
-   `GET /repos/{repo}/recall` and `siftwise report` aggregate the results.
+6. **Outcome** (`POST /repos/{repo}/outcome`, after the attempt's last upload). The attempt
+   is triaged once and each leg's outcome stored (`run_outcomes`, `run_failures`): failures by
+   verdict, whether the leg's recorded selection runs each (`WouldRun`) and its rank, the best
+   rank; plus the client's `fail-on` verdicts (`attempt_outcomes`). Computed once here, not on
+   every page view: triage costs 0.2 to 1 s an attempt, and the stored rows make the
+   dashboard's numbers cheap sums. For a shadow run, each failure is also caught, missed (with
+   a cause), or flaky (counted apart); `GET /repos/{repo}/recall` and `siftwise report`
+   aggregate those. `POST /repos/{repo}/shadow` does the same for clients older than 0.4 (they
+   send no `fail-on`); a 0.4 client picks `/outcome` when `/healthz` reports a version.
 
 The MCP server and `siftwise triage` use the stateless variants: `POST /triage` with failures
 from local JUnit files, and `POST /explain` for one test.
@@ -77,13 +88,14 @@ from local JUnit files, and `POST /explain` for one test.
 | Table | Holds | Key points |
 |---|---|---|
 | `repos` | one row per repository name | |
-| `runs` | one upload: a CI run attempt's matrix leg | unique `(repo, ci_run_id, run_attempt, variant, rerun)`; `commit_sha`, `branch`, `is_main`, `started_at`; `changed_files_known`; `affected` (the change's links, NULL if a graph failed or the run was backfilled); `known_flaky` (the globs triage applies to it) and `known_flaky_expired` (entries past their `until` when it started) |
+| `runs` | one upload: a CI run attempt's matrix leg | unique `(repo, ci_run_id, run_attempt, variant, rerun)`; `commit_sha`, `branch`, `is_main`, `started_at`; `changed_files_known`; `affected` (the change's links, NULL if a graph failed or the run was backfilled); `known_flaky` (the globs triage applies to it) and `known_flaky_expired` (entries past their `until` when it started); `tests_run`, `measured_ms` (measured test time, computed at ingest: final attempts, Go subtests left out); `client_version` |
 | `changed_files` | `(run_id, path)` | the run's diff |
 | `tests` | a test's identity, once per repo | `test_id` = `classname::name`; `file_path` with the time it was reported |
 | `test_results` | raw results, append-only | `(run_id, test_key, attempt)`; status, duration, message (4 KB max); partial indexes on failures, by run and by test |
 | `test_stats` | per-test rollup, recomputed, never incremented | only tests seen in the stats window |
-| `shadow_selections` | what siftwise would have run, per attempt and variant | the selection scope `WouldRun` reads |
-| `shadow_results`, `shadow_failures` | each compared run, and each of its failing tests | caught or missed, verdict, miss cause, suggested rule |
+| `ci_selections` | what /select returned in CI, per attempt and variant (NULL = every leg); `shadow` for a shadow run's | the scope `WouldRun` reads; `selected_keys` in risk order when `ranked`; `reason_code` + `reason_items`; budget, order, CI context, `top_risk`; 4 bytes per selected test |
+| `run_outcomes`, `run_failures` | each triaged leg, and each of its failing tests | verdict counts, `failures_selected`, `first_failure_rank`; per failure the verdict, `would_run` (NULL without a selection), `rank`; shadow runs: caught or missed, miss cause, suggested rule |
+| `attempt_outcomes` | one per triaged CI run attempt | `fail_on`: the verdicts the client gates on |
 | `api_tokens` | per-repo API tokens (`siftwise token create`) | the token's SHA-256 only (unique); `repo` (a name or `*`, not a foreign key: a token can come before the repo's first upload); `scope` `read` or `write`; `last_used_at` (to 10 minutes), `revoked_at` |
 
 - **Run time** is `COALESCE(started_at, created_at)` everywhere "latest" matters: backfill
@@ -298,7 +310,7 @@ The selector takes those files out of the build-file, nested-manifest and Java c
 still go through path mapping and `[[depends]]`. Each referencing test file runs whole
 (`fixture X, referenced by Y`, an indirect link; the summary names them too). A fixture file
 nothing covers runs the full suite with a reason naming it. The selection keeps its
-`fixture_files`, which shadow mode stores (`shadow_selections.fixture_files`, migration
+`fixture_files`, which shadow mode stores (`ci_selections.fixture_files`, migration
 0014); a failure such a selection missed, linked to nothing but those files, gets the miss
 cause `fixture` with a `[[depends]]` suggestion. `fixture_refs` is `/select`-only (an older
 server's 422 drops it: the full suite, as before); triage's `change_links` doesn't read it.
@@ -434,7 +446,7 @@ left out").
   "budget-limited (estimated X of a Y target): N tests left out" line, the CLI prints it on
   stderr, and MCP returns it (`budget`) and adds it to the next step. A budget-limited run is never called a complete check.
 - **Shadow mode.** A budget-limited shadow selection is stored as what would have run, plus
-  the selection the budget cut (`shadow_selections.budget`). A miss that selection would have
+  the selection the budget cut (`ci_selections.budget`). A miss that selection would have
   run gets the cause `budget`, ahead of every other cause, and recall counts it like any miss.
   `/recall` and `siftwise report` show the budget-limited runs and their misses separately.
 - **Older servers.** `/select` forbids unknown fields, so a server from before budgets

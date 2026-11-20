@@ -14,6 +14,7 @@ import pytest
 import respx
 from typer.testing import CliRunner, Result
 
+import siftwise
 from siftwise.cli import gha, reruns
 from siftwise.cli.main import app
 
@@ -55,6 +56,9 @@ def api() -> Iterator[respx.MockRouter]:
         # rollup (and record where it triages) ask whether the run was a shadow run: by
         # default it wasn't. Tests about shadow mode replace this route.
         router.post(f"{SERVER}/repos/{REPO}/shadow").respond(json={"shadow": False})
+        # A server older than 0.4 by default (/healthz without a version): /shadow, not
+        # /outcome. Tests about recording outcomes replace this route.
+        router.get(f"{SERVER}/healthz").respond(json={"status": "ok"})
         yield router
 
 
@@ -420,6 +424,8 @@ def test_record_uploads_with_run_metadata(
                      "go_module": None, "generated": []},
         "known_flaky": [],  # the PR base's .siftwise.toml has none
         "known_flaky_changed": False,
+        "client_version": siftwise.__version__,
+        "client": "github",
     }  # fmt: skip
     assert sorted(names) == ["junit.xml", "siftwise-1.xml"]
     assert url.params["defer_rollup"] == "true"  # a variant: one rollup job after the matrix
@@ -1818,8 +1824,9 @@ def test_a_failed_shadow_comparison_only_warns(
     result = gh.run("rollup", "push", {}, SIFTWISE_FAIL_ON=fail_on)
 
     assert result.exit_code == 0, result.output  # no verdict matched: the comparison can't fail it
-    assert ("::warning::siftwise: shadow comparison failed: siftwise returned 500: boom; this "
-            "run won't be counted in recall") in result.output  # fmt: skip
+    assert ("::warning::siftwise: run outcome not stored: siftwise returned 500: boom; the "
+            "dashboard won't show this run's verdicts, and a shadow run won't be counted in "
+            "recall") in result.output  # fmt: skip
     assert gh.outputs()["shadow"] == "false"
 
 
@@ -2051,3 +2058,140 @@ def test_an_older_servers_422_without_a_budget_is_reported_as_it_is(
     assert result.exit_code == 0 and gh.outputs()["mode"] == "full"
     assert "siftwise returned 422: something else; running the full suite" in result.output
     assert "time budgets" not in result.output
+
+
+# --- recording every CI selection (#85) ---------------------------------------------------
+
+
+def test_select_sends_its_ci_run_so_the_server_records_the_selection(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    select = api.post(f"{SERVER}/select").respond(json=selection(recorded=True))
+    no_comments(api)
+
+    result = gh.run("select", "pull_request", pr_event(repo), SIFTWISE_VARIANT="linux")
+
+    assert result.exit_code == 0, result.output
+    sent = json.loads(select.calls.last.request.content)["ci"]
+    assert sent == {
+        "provider": "github", "ci_run_id": "555", "run_attempt": 2, "variant": "linux",
+        "commit_sha": repo["head"], "branch": "feature", "is_main": False, "pr_number": 7,
+        "event": "pull_request", "client_version": siftwise.__version__,
+    }  # fmt: skip
+    assert "selection not recorded" not in result.output and "::warning::" not in result.output
+
+
+def test_a_selection_a_read_token_could_not_record_warns_once(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    api.post(f"{SERVER}/select").respond(
+        json=selection(recorded=False, record_reason="read_only_token"))  # fmt: skip
+    no_comments(api)
+
+    result = gh.run("select", "pull_request", pr_event(repo))
+
+    assert result.exit_code == 0 and gh.outputs()["mode"] == "selective"
+    assert result.output.count("::warning::") == 1
+    assert ("::warning::siftwise: selection not recorded: the token is read-only (a write token "
+            "records selections for the dashboard)") in result.output  # fmt: skip
+
+
+def test_an_older_server_rejecting_ci_still_selects(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    old_422 = {"detail": [{"type": "extra_forbidden", "loc": ["body", "ci"],
+                           "msg": "Extra inputs are not permitted", "input": {}}]}  # fmt: skip
+    select = api.post(f"{SERVER}/select")
+    select.side_effect = [httpx.Response(422, json=old_422), httpx.Response(200, json=selection())]
+    no_comments(api)
+
+    result = gh.run("select", "pull_request", pr_event(repo))
+
+    assert result.exit_code == 0, result.output
+    assert gh.outputs()["mode"] == "selective"
+    assert "ci" not in json.loads(select.calls.last.request.content)
+    assert "the server is older than 0.4 and doesn't record selections" in result.output
+    assert "::warning::" not in result.output
+
+
+def test_rollup_stores_the_outcome_with_fail_on_on_a_04_server(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    api.get(f"{SERVER}/healthz").respond(json={"status": "ok", "version": "0.4.0"})
+    old = api.post(f"{SERVER}/repos/{REPO}/shadow").respond(json={"shadow": False})
+    outcome = api.post(f"{SERVER}/repos/{REPO}/outcome").respond(
+        json={"recorded": True, "legs": [], "fail_on": ["new_regression"],
+              "shadow": compare_response()})  # fmt: skip
+    api.post(f"{SERVER}/repos/{REPO}/triage").respond(json=triage_response())
+    api.post(f"{SERVER}/repos/{REPO}/rollup").respond(json={})
+    pr_routes(api, repo["head"])
+
+    result = gh.run("rollup", "pull_request", pr_event(repo), SIFTWISE_FAIL_ON="new_regression")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(outcome.calls.last.request.content) == {
+        "ci_run_id": "555", "run_attempt": 2, "fail_on": ["new_regression"]}  # fmt: skip
+    assert not old.called
+    assert gh.outputs()["shadow"] == "true"  # the nested shadow comparison, as /shadow gave it
+
+
+def test_rollup_against_an_older_server_uses_shadow(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    shadow = api.post(f"{SERVER}/repos/{REPO}/shadow").respond(json=compare_response())
+    outcome = api.post(f"{SERVER}/repos/{REPO}/outcome").respond(404)
+    api.post(f"{SERVER}/repos/{REPO}/triage").respond(json=triage_response())
+    api.post(f"{SERVER}/repos/{REPO}/rollup").respond(json={})
+
+    assert gh.run("rollup", "push", {}, SIFTWISE_FAIL_ON="unknown").exit_code == 0
+
+    assert shadow.called and not outcome.called
+    assert json.loads(shadow.calls.last.request.content) == {"ci_run_id": "555", "run_attempt": 2}
+    assert gh.outputs()["shadow"] == "true"
+
+
+def test_record_sends_its_client_version_and_drops_it_for_an_older_server(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    Path("junit.xml").write_text("<testsuite/>")
+    api.get(f"{GH}/repos/{REPO}/actions/runs/555").respond(404)
+    old_422 = {
+        "detail": [
+            {"type": "extra_forbidden", "loc": ["metadata", "client_version"]},
+            {"type": "extra_forbidden", "loc": ["metadata", "client"]},
+        ]
+    }
+    upload = api.post(f"{SERVER}/runs")
+    upload.side_effect = [httpx.Response(422, json=old_422),
+                          httpx.Response(201, json={"run_id": 9, "created": True})]  # fmt: skip
+
+    result = gh.run("record", "push", {}, SIFTWISE_TRIAGE="false")
+
+    assert result.exit_code == 0, result.output
+    first, second = (json.loads(_metadata(call.request)) for call in upload.calls)
+    assert (first["client_version"], first["client"]) == (siftwise.__version__, "github")
+    assert "client_version" not in second and "client" not in second
+    assert "::warning::" not in result.output
+
+
+def _metadata(request: httpx.Request) -> str:
+    body = request.content.decode()
+    start = body.index('name="metadata"')
+    return body[body.index("\r\n\r\n", start) + 4 : body.index("\r\n--", start)]
+
+
+def test_a_real_validation_error_is_not_retried_without_ci(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    bad = {"detail": [{"type": "string_type", "loc": ["body", "changed_files", 0],
+                       "msg": "Input should be a valid string", "input": 7}]}  # fmt: skip
+    select = api.post(f"{SERVER}/select").respond(422, json=bad)
+    no_comments(api)
+
+    result = gh.run("select", "pull_request", pr_event(repo))
+
+    assert result.exit_code == 0 and gh.outputs()["mode"] == "full"  # fails open, as before
+    assert select.call_count == 1  # not sent again without ci
+    assert "::warning::siftwise: siftwise returned 422: " in result.output
+    assert "Input should be a valid string" in result.output
+    assert "older than 0.4" not in result.output

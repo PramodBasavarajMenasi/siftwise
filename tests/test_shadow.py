@@ -16,10 +16,10 @@ from siftwise.core.models import (
     SHADOW_COMPARED,
     SHADOW_NO_UPLOAD,
     SHADOW_PENDING,
+    CiSelection,
     Run,
-    ShadowFailure,
-    ShadowResult,
-    ShadowSelection,
+    RunFailure,
+    RunOutcome,
     Test,
 )
 from siftwise.core.selector import ChangeLink, Mode, Runner, SelectedTest, Selection, Strength
@@ -166,11 +166,11 @@ def test_failures_are_caught_missed_or_flaky(db_session: Session) -> None:
     assert variant.ms_total == 5 * variant.ms_would_run > 0
     assert result.time.saved == pytest.approx(0.8)
 
-    stored = db_session.scalars(select(ShadowSelection)).one()
+    stored = db_session.scalars(select(CiSelection)).one()
     assert stored.status == SHADOW_COMPARED and stored.compared_at is not None
-    row = db_session.get(ShadowResult, run.id)
+    row = db_session.get(RunOutcome, run.id)
     assert row is not None and (row.caught, row.missed, row.flaky) == (1, 2, 1)
-    failures = db_session.scalars(select(ShadowFailure).where(ShadowFailure.run_id == run.id))
+    failures = db_session.scalars(select(RunFailure).where(RunFailure.run_id == run.id))
     assert sorted((f.would_run, f.verdict) for f in failures) == [
         (False, "flaky"),
         (False, "unknown"),
@@ -287,7 +287,10 @@ def test_runs_that_cannot_be_compared(db_session: Session) -> None:
     assert (mismatch.counted, mismatch.mode) == (False, None)
     assert [v.status for v in mismatch.variants] == [SHADOW_COMMIT_MISMATCH]
     assert [s.status for s in mismatch.selections] == [SHADOW_COMMIT_MISMATCH]
-    assert db_session.scalars(select(ShadowResult)).all() == []
+    # The leg's outcome is still stored, as a leg with no selection of its own.
+    outcome = db_session.scalars(select(RunOutcome)).one()
+    assert (outcome.selection_id, outcome.failing, outcome.caught) == (None, 1, None)
+    assert [leg.selection for leg in mismatch.legs] == [None]
 
     # A selection for one leg only; another leg was recorded.
     assert store(db_session, selection(TEST), ci="shadow-2", variant="windows")
@@ -317,8 +320,8 @@ def test_comparing_again_replaces_the_comparison(db_session: Session) -> None:
     second = compare(db_session)
 
     assert first.units == second.units
-    assert db_session.scalar(select(func.count()).select_from(ShadowResult)) == 1
-    assert db_session.scalar(select(func.count()).select_from(ShadowFailure)) == 4
+    assert db_session.scalar(select(func.count()).select_from(RunOutcome)) == 1
+    assert db_session.scalar(select(func.count()).select_from(RunFailure)) == 4
 
 
 @pytest.mark.usefixtures("seeded")
@@ -333,8 +336,8 @@ def test_a_compare_error_is_recorded(db_session: Session, monkeypatch: pytest.Mo
     with pytest.raises(RuntimeError):
         compare(db_session)
 
-    assert db_session.scalars(select(ShadowSelection.status)).one() == SHADOW_COMPARE_ERROR
-    assert db_session.scalars(select(ShadowResult)).all() == []
+    assert db_session.scalars(select(CiSelection.status)).one() == SHADOW_COMPARE_ERROR
+    assert db_session.scalars(select(RunOutcome)).all() == []
 
 
 # --- storing --------------------------------------------------------------------------------
@@ -345,7 +348,7 @@ def test_storing_a_selection(db_session: Session) -> None:
     sel = selection(TEST, (f"{GO}::TestA", Runner.GO), go_packages=[GO], python_files=["a.py"])
     assert store(db_session, sel)
 
-    row = db_session.scalars(select(ShadowSelection)).one()
+    row = db_session.scalars(select(CiSelection)).one()
     assert (row.ci_run_id, row.run_attempt, row.variant, row.commit_sha) == (
         SHADOW, 1, None, sha(50))  # fmt: skip
     assert (row.mode, row.status, row.selected_count, row.total_known) == (
@@ -363,7 +366,7 @@ def test_the_first_leg_to_store_wins(db_session: Session) -> None:
     assert store_selection(db_session, REPO, conflict, selection(TEST)) == "commit_conflict"
     assert store(db_session, selection(TEST), variant="mac")  # another variant: its own row
 
-    rows = db_session.scalars(select(ShadowSelection).order_by(ShadowSelection.id)).all()
+    rows = db_session.scalars(select(CiSelection).order_by(CiSelection.id)).all()
     assert [(r.variant, r.selected_count, r.commit_sha) for r in rows] == [
         (None, 1, sha(50)), ("mac", 1, sha(50))]  # fmt: skip
     test_key = db_session.scalars(select(Test.id).where(Test.test_id == TEST)).one()
@@ -376,7 +379,7 @@ def test_a_selection_naming_unknown_tests_or_repos_is_not_stored(db_session: Ses
     ghost = selection("tests.test_ghost::test_x")
     assert store_selection(db_session, REPO, target, ghost) == "incomplete_selection"
     assert store_selection(db_session, "nobody/nothing", target, selection()) == "unknown_repo"
-    assert db_session.scalars(select(ShadowSelection)).all() == []
+    assert db_session.scalars(select(CiSelection)).all() == []
 
 
 # --- recall ---------------------------------------------------------------------------------
@@ -395,7 +398,7 @@ def test_recall_over_shadow_runs(db_session: Session) -> None:
     # Not counted: never compared (old: cancelled; recent: in progress), no upload, mismatch.
     for ci in ("cancelled", "running", "no-upload", "mismatch"):
         assert store(db_session, selection(TEST), ci=ci)
-    db_session.execute(update(ShadowSelection).where(ShadowSelection.ci_run_id == "cancelled")
+    db_session.execute(update(CiSelection).where(CiSelection.ci_run_id == "cancelled")
                        .values(created_at=func.now() - timedelta(hours=7)))  # fmt: skip
     compare(db_session, "no-upload")
     shadow_run(db_session, {TEST: F}, ci="mismatch", commit=51, hour=8)
@@ -404,7 +407,7 @@ def test_recall_over_shadow_runs(db_session: Session) -> None:
     assert store(db_session, selection(TEST), ci="old")
     shadow_run(db_session, {OTHER: F}, ci="old", hour=9)
     compare(db_session, "old")
-    db_session.execute(update(ShadowSelection).where(ShadowSelection.ci_run_id == "old")
+    db_session.execute(update(CiSelection).where(CiSelection.ci_run_id == "old")
                        .values(created_at=func.now() - timedelta(days=31)))  # fmt: skip
 
     report = recall(db_session, REPO, 30)
@@ -506,7 +509,9 @@ def test_compare_query_count_does_not_grow_with_failures(db_session: Session) ->
     few, lots = count_compare_queries(db_session, "few"), count_compare_queries(db_session, "lots")
 
     assert few == lots
-    assert lots <= 24, lots  # one variant: triage_ci_run's queries plus 9 of shadow's own
+    # One variant: triage_ci_run's queries plus 11 of the compare's own (0017 added two: the
+    # legs' measured times, the attempt's outcome).
+    assert lots <= 26, lots
 
 
 def test_compare_query_count_does_not_grow_with_variants(db_session: Session) -> None:
@@ -657,9 +662,9 @@ FLAKY_ON_MAIN = "tests.test_queue::test_drain"
 def causes(db_session: Session, ci: str = SHADOW) -> dict[str, tuple[str | None, str | None]]:
     run_ids = [v.run_id for v in compare(db_session, ci).variants]
     stored = db_session.execute(
-        select(Test.test_id, ShadowFailure.cause, ShadowFailure.suggestion)
-        .join(Test, Test.id == ShadowFailure.test_key)
-        .where(ShadowFailure.run_id.in_(run_ids), ShadowFailure.cause.is_not(None))
+        select(Test.test_id, RunFailure.cause, RunFailure.suggestion)
+        .join(Test, Test.id == RunFailure.test_key)
+        .where(RunFailure.run_id.in_(run_ids), RunFailure.cause.is_not(None))
     )
     return {test_id: (cause, suggestion) for test_id, cause, suggestion in stored}
 
@@ -688,7 +693,7 @@ def test_each_cause_is_stored_with_the_miss(db_session: Session) -> None:
         OTHER: ("config_gap", '[[depends]]\ntests = "tests/test_db.py"\non = ["tests/data/**"]'),
         f"{GO}::TestC": ("no_link", None),  # no go_module recorded: can't be located
     }
-    failures = db_session.scalars(select(ShadowFailure)).all()
+    failures = db_session.scalars(select(RunFailure)).all()
     assert all((f.cause is None) == f.would_run or f.verdict == "flaky" for f in failures)
 
 
@@ -715,7 +720,7 @@ def test_recall_reports_causes_suggestions_and_selector_doubts(db_session: Sessi
     assert store(db_session, selection(PASSING), ci="old")
     shadow_run(db_session, {NEW: F}, ci="old", hour=9)
     run_ids = [v.run_id for v in compare(db_session, "old").variants]
-    db_session.execute(update(ShadowFailure).where(ShadowFailure.run_id.in_(run_ids))
+    db_session.execute(update(RunFailure).where(RunFailure.run_id.in_(run_ids))
                        .values(cause=None, cause_detail=None))  # fmt: skip
 
     report = recall(db_session, REPO, 30)
@@ -756,7 +761,7 @@ def test_recall_by_week(db_session: Session) -> None:
         assert store(db_session, sel, ci=ci)
         shadow_run(db_session, {TEST: F, OTHER: F, PASSING: P}, ci=ci, hour=6 + n)
         compare(db_session, ci)
-        db_session.execute(update(ShadowSelection).where(ShadowSelection.ci_run_id == ci)
+        db_session.execute(update(CiSelection).where(CiSelection.ci_run_id == ci)
                            .values(created_at=selected_at[ci]))  # fmt: skip
 
     report = recall(db_session, REPO, 30, now, by_week=True)
@@ -798,5 +803,5 @@ def test_a_long_lived_connection_keeps_storing_selections(
         assert store(db_session, selection(TEST), ci=f"shadow-{n}"), n
     assert store(db_session, selection(TEST), ci="shadow-0")  # a repeat: already stored
     assert store(db_session, selection(TEST), ci="shadow-0", variant="mac")
-    count = db_session.scalar(select(func.count()).select_from(ShadowSelection))
+    count = db_session.scalar(select(func.count()).select_from(CiSelection))
     assert count == 13

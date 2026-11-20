@@ -77,6 +77,15 @@ class KnownFlakyExpiredIn(BaseModel):
     until: date
 
 
+Client = Literal["github", "gitlab", "cli", "backfill"]
+CLIENTS: tuple[str, ...] = ("github", "gitlab", "cli", "backfill")
+
+
+def _known_client(value: object) -> object:
+    """``client`` comes from CI: one of CLIENTS, else unknown (None). The upload still counts."""
+    return value if isinstance(value, str) and value in CLIENTS else None
+
+
 class RunMetadata(BaseModel):
     """JSON metadata sent alongside the JUnit files in ``POST /runs``."""
 
@@ -132,6 +141,19 @@ class RunMetadata(BaseModel):
         le=10,
         description="0 = the run itself; n = the n-th re-run of failing tests within the same CI "
         "run attempt and variant (needs ci_run_id)",
+    )
+    client_version: Annotated[str, StringConstraints(pattern=r"^[0-9A-Za-z.+_-]{1,32}$")] | None = (
+        Field(
+            default=None,
+            description="The siftwise client that uploaded the run: the dashboard tells an "
+            "older client (selections not recorded) from one whose selection didn't arrive",
+        )
+    )
+    client: Annotated[Client | None, BeforeValidator(_known_client)] = Field(
+        default=None,
+        description="Which uploader: github (the Action) or gitlab (the template), whose jobs "
+        "have a select step that records selections; cli (siftwise record); backfill. Any "
+        "other value is stored as unknown (null), never as sent",
     )
 
     @model_validator(mode="after")
@@ -230,6 +252,43 @@ class ShadowIn(BaseModel):
     commit_sha: Sha40 = Field(description="The commit being tested (the run must match it)")
 
 
+# Text from CI (branch names: a pull request's author picks them) on one line, at most 255
+# characters: never a control character. Shown escaped by the dashboard.
+CiText = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True, min_length=1, max_length=255, pattern=r"^[^\x00-\x1f\x7f]+$"
+    ),
+]
+
+
+class CiIn(BaseModel):
+    """The CI run a /select call is for (the GitHub Action and the GitLab template send it):
+    the server records the selection under it. Laptop and MCP calls never send it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["github", "gitlab"]
+    ci_run_id: NonEmpty255
+    run_attempt: int = Field(default=1, ge=1, le=2**31 - 1)
+    variant: Variant = Field(
+        default=None,
+        description="Matrix leg the selection is for; null = every leg of the attempt",
+    )
+    commit_sha: Sha40 = Field(description="The commit being tested (the run must match it)")
+    branch: CiText
+    is_main: bool
+    pr_number: int | None = Field(
+        default=None, ge=1, le=2**31 - 1, description="The pull or merge request, if any"
+    )
+    event: Annotated[str, StringConstraints(pattern=r"^[a-z0-9_]{1,64}$")] | None = Field(
+        default=None, description="What started the run: push, pull_request, merge_group..."
+    )
+    client_version: Annotated[str, StringConstraints(pattern=r"^[0-9A-Za-z.+_-]{1,32}$")] | None = (
+        Field(default=None, description="The siftwise client's version")
+    )
+
+
 class JsImportIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -308,6 +367,11 @@ class SelectRequest(ChangeRequest):
     shadow: ShadowIn | None = Field(
         default=None,
         description="Store the selection for a shadow run (one running the full suite)",
+    )
+    ci: CiIn | None = Field(
+        default=None,
+        description="The CI run this selection is for: stored (with a write token) so the "
+        "dashboard can show what siftwise did. With ``shadow``, both must name the same run",
     )
     junit_dir: Annotated[str, StringConstraints(min_length=1, max_length=1024)] | None = Field(
         default=None,
@@ -445,6 +509,15 @@ class SelectResponse(BaseModel):
         description="Why a shadow selection wasn't stored: 'incomplete_selection' (a selected "
         "test unknown), 'commit_conflict' (the attempt holds another commit's selection) or "
         "'storage_error'; null when stored",
+    )
+    recorded: bool | None = Field(
+        default=None,
+        description="With ``ci``: the selection was recorded for that CI run (null without ci)",
+    )
+    record_reason: str | None = Field(
+        default=None,
+        description="Why it wasn't recorded: 'read_only_token', 'incomplete_selection', "
+        "'commit_conflict' or 'storage_error'; null when recorded",
     )
 
 
@@ -859,6 +932,60 @@ class ShadowCompareResponse(BaseModel):
     )
     missed_tests: list[ShadowMissOut] = Field(description="At most 100")
     time: ShadowTimeOut
+
+
+VerdictName = Literal["new_regression", "pre_existing", "flaky", "unknown"]
+
+
+class OutcomeRequest(BaseModel):
+    """Body of ``POST /repos/{repo}/outcome``: a recorded CI run attempt, after all legs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ci_run_id: NonEmpty255
+    run_attempt: int = Field(default=1, ge=1)
+    fail_on: list[VerdictName] | None = Field(
+        default=None,
+        max_length=4,
+        description="The verdicts the client's fail-on gates on (null: no gate), stored so "
+        "the dashboard can count the runs it failed",
+    )
+
+
+class LegOutcomeOut(BaseModel):
+    variant: str | None
+    run_id: int
+    selection: str | None = Field(
+        description="The recorded selection's mode for this leg ('full' or 'selective'), "
+        "'shadow' for a shadow run's, null when none was recorded for it"
+    )
+    failing: int = Field(description="Failing tests (final attempt failed or errored)")
+    new_regressions: int
+    pre_existing: int
+    flaky: int
+    unknown: int
+    failures_selected: int | None = Field(
+        description="Failing tests the recorded selection runs; null without one"
+    )
+    first_failure_rank: int | None = Field(
+        description="The best risk rank (1 = first) among the failing tests the selection "
+        "names; null when none is ranked"
+    )
+    measured_ms: float | None = Field(
+        description="The leg's measured test time: final attempts, Go subtests left out"
+    )
+
+
+class OutcomeResponse(BaseModel):
+    repo: str
+    ci_run_id: str
+    run_attempt: int
+    recorded: bool = Field(description="Uploads were found for the attempt and stored")
+    fail_on: list[str] | None
+    legs: list[LegOutcomeOut]
+    shadow: ShadowCompareResponse = Field(
+        description="What POST /repos/{repo}/shadow returns for the attempt"
+    )
 
 
 class RecallStatsOut(BaseModel):

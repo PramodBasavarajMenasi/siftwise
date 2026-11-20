@@ -11,7 +11,7 @@ from siftwise.config import Settings
 def test_healthz() -> None:
     response = TestClient(app).get("/healthz")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == {"status": "ok", "version": __version__}
 
 
 def test_settings_read_env(monkeypatch: pytest.MonkeyPatch) -> None:

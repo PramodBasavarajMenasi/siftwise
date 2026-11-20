@@ -1,6 +1,7 @@
 """The read-only dashboard (/ui): login, sessions, scope, escaping, headers and every page."""
 
 import hashlib
+import html
 import re
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
@@ -349,7 +350,9 @@ def test_the_repos_page_shows_totals_the_window_and_how_long_ago(
     page = client.get("/ui/").text
     row = re.search(rf"{REPO}</a>.*?</tr>", page, re.S)
     assert row is not None
-    assert re.findall(r'<td class="n">(.*?)</td>', row.group(0)) == ["2", "0", "0"]
+    cells = re.findall(r'<td class="n">(.*?)</td>', row.group(0))
+    # CI runs, in the window, shadow runs in the window, selections recorded (none in it)
+    assert cells == ["2", "0", "0", ""]
     assert re.search(r"> \d+ days ago<", row.group(0).replace("·", ""))  # the newest run, relative
     assert "1 repo · 2 CI runs recorded · 0 in the last 30 days · newest run" in _text(page)
     assert "1 of 1 repo has no CI runs in the last 30 days, only older ones" in page
@@ -385,7 +388,7 @@ def test_an_empty_window_with_older_shadow_runs_says_so(
     client: TestClient, db_session: Session
 ) -> None:
     _shadow_data(client, db_session)
-    db_session.execute(text("UPDATE shadow_selections SET created_at = now() - interval '40 days'"))
+    db_session.execute(text("UPDATE ci_selections SET created_at = now() - interval '40 days'"))
     signed_in(client)
     page = client.get(f"/ui/repos/{REPO}").text
     assert "Nothing in the last 30 days, but 1 older shadow runs exist (the newest 40 days" in page
@@ -438,7 +441,7 @@ def test_the_runs_page_counts_failing_tests_and_marks_shadow_runs(
     page = client.get(f"/ui/repos/{REPO}/-/runs").text
     row = re.search(rf"{SHADOW}</span> #1.*?</tr>", page, re.S)
     assert row is not None
-    assert "selective" in row.group(0)  # the shadow selection's mode
+    assert "shadow" in row.group(0) and "would run 1 of 2" in row.group(0)
     cells = re.findall(r'<td class="n">(.*?)</td>', row.group(0))
     assert cells == ["1", "2"]  # variants, failing tests
     assert ">view</a>" in row.group(0)  # verdicts aren't computed for the list
@@ -631,3 +634,185 @@ def test_the_flaky_page_lists_at_most_max_rows(
     assert re.search(rf"siftwise flaky --repo {REPO} --days [0-9]+</code>", page), page
     suggested = page.split("Suggested known_flaky")[-1].replace("&#34;", '"')
     assert suggested.count("{ test = ") == 1  # entries only for the listed tests
+
+
+# --- what siftwise did in a run (#85) -----------------------------------------------------
+
+EVIL_BRANCH = 'x"><script>alert(1)</script>'
+
+
+def _ci_run(client: TestClient, db_session: Session, *, ci: str = "ci-7",
+            branch: str = "feature/x") -> None:  # fmt: skip
+    """A CI run whose selection the select step recorded (ci), its upload, its outcome."""
+    from siftwise.core.history import recompute_repo_stats
+    from siftwise.core.models import Repo
+
+    record(db_session, commit=1, hour=1, tests={TEST: P, OTHER: P}, ci_run_id="100")
+    repo_id = db_session.scalars(select(Repo.id).where(Repo.name == REPO)).one()
+    recompute_repo_stats(db_session, repo_id, 90)
+    auth = {"Authorization": f"Bearer {ADMIN}"}
+    selected = client.post("/select", headers=auth, json={
+        "repo": REPO, "changed_files": ["src/cart.py"],
+        "ci": {"provider": "github", "ci_run_id": ci, "run_attempt": 1, "commit_sha": sha(50),
+               "branch": branch, "is_main": False, "pr_number": 9, "event": "pull_request",
+               "client_version": "0.4.0"},
+    })  # fmt: skip
+    assert selected.json()["recorded"] is True, selected.text
+    record(db_session, commit=50, hour=6, branch=branch, variant=None, ci_run_id=ci,
+           tests={TEST: F, OTHER: F})  # fmt: skip
+    outcome = client.post(f"/repos/{REPO}/outcome", json={"ci_run_id": ci}, headers=auth)
+    assert outcome.status_code == 200, outcome.text
+
+
+def test_the_run_page_shows_what_siftwise_selected(client: TestClient, db_session: Session) -> None:
+    _ci_run(client, db_session)
+    signed_in(client)
+    page = client.get(f"/ui/repos/{REPO}/-/runs/ci-7/1").text
+    text_ = _text(page)
+    assert "What siftwise did" in page
+    assert "selective: 1 of 2 tests in history" in text_
+    assert "estimated" in text_ and "for the full suite" in text_ and "measured" in text_
+    assert "Order" in page and ">risk<" in page.replace("<dd>", ">").replace("</dd>", "<")
+    assert "siftwise 0.4.0" in text_ and "#9" in text_
+    assert "Highest-risk tests" in page
+    # Each failure: in the selection with its rank, or run outside it.
+    verdicts = page.split("<h2>Verdicts</h2>")[1]
+    row = re.search(rf'title="{re.escape(TEST)}".*?</tr>', verdicts, re.S)
+    other = re.search(rf'title="{re.escape(OTHER)}".*?</tr>', verdicts, re.S)
+    assert row is not None and other is not None
+    assert ">selected<" in row.group(0) and 'data-label="Rank">1<' in row.group(0)
+    assert "not selected" in other.group(0)
+    # The runs list says it too, and how many listed runs have one.
+    runs = _text(client.get(f"/ui/repos/{REPO}/-/runs").text)
+    assert "selective · 1 of 2" in runs and "selections recorded for 1 of these 2" in runs
+
+
+def test_a_run_with_no_selection_says_why(client: TestClient, db_session: Session) -> None:
+    record(db_session, commit=1, hour=1, tests={TEST: P}, ci_run_id="first")
+    record(db_session, commit=2, hour=2, tests={TEST: F}, ci_run_id="old-client")
+    signed_in(client)
+    first = html.unescape(_text(client.get(f"/ui/repos/{REPO}/-/runs/first/1").text))
+    assert "this was the repo's first CI run" in first
+    # One reason where the upload says which client it was; the list only where it doesn't.
+    cases = [
+        ((None, None), "uploaded by a siftwise client older than 0.4"),
+        (("0.4.0", "github"), "the select step didn't reach the server"),
+        (("0.4.0", "gitlab"), "the select step didn't reach the server"),
+        (("0.4.0", "cli"), "uploaded with siftwise record or backfill"),
+        (("0.4.0", "backfill"), "uploaded with siftwise record or backfill"),
+        (("0.4.0", None), "the upload doesn't say why. It can be"),
+    ]
+    for (version, kind), expected in cases:
+        db_session.execute(
+            text("UPDATE runs SET client_version = :v, client = :c WHERE ci_run_id = 'old-client'"),
+            {"v": version, "c": kind},
+        )
+        page = html.unescape(_text(client.get(f"/ui/repos/{REPO}/-/runs/old-client/1").text))
+        assert expected in page, (version, kind)
+        assert not any(e in page for _, e in cases if e != expected), (version, kind)
+    # Every page says how much of the window has selections.
+    overview = _text(client.get(f"/ui/repos/{REPO}", params={"days": "all"}).text)
+    assert "Selections recorded for 0 of 2 CI runs in all recorded history" in overview
+
+
+def test_a_branch_from_ci_is_escaped(client: TestClient, db_session: Session) -> None:
+    _ci_run(client, db_session, branch=EVIL_BRANCH)
+    signed_in(client)
+    for path in (f"/ui/repos/{REPO}/-/runs", f"/ui/repos/{REPO}/-/runs/ci-7/1"):
+        page = client.get(path).text
+        assert "<script>" not in page and "&lt;script&gt;" in page, path
+
+
+def test_a_selection_without_estimates_and_a_full_shadow_one_read_plainly(
+    client: TestClient, db_session: Session
+) -> None:
+    # Found in the screenshots: "estimated 0.0 min of 0.0 min" for a history without
+    # durations, and "would run 9,167 of 9,167" for a shadow run's full-suite selection.
+    _ci_run(client, db_session)
+    db_session.execute(text(
+        "UPDATE ci_selections SET estimated_ms_total = 0, estimated_ms_would_run = 0, "
+        "shadow = true, mode = 'full'"
+    ))  # fmt: skip
+    signed_in(client)
+    page = _text(client.get(f"/ui/repos/{REPO}/-/runs/ci-7/1").text)
+    # A shadow row (its outcome is now a shadow comparison): the measured saving is below.
+    assert "not estimated at select time" in page and "0.0 min of" not in page
+    assert "test time saved" not in page
+    runs = _text(client.get(f"/ui/repos/{REPO}/-/runs").text)
+    assert "shadow · would run the full suite" in runs
+
+
+def test_the_run_page_labels_what_each_count_and_time_measures(
+    client: TestClient, db_session: Session
+) -> None:
+    # Found in a screenshot: "637 of 7,487" above and "169 of 2,144" in the shadow table for
+    # one variant, and "not estimated" next to a time saved, with nothing saying why.
+    _shadow_data(client, db_session)
+    db_session.execute(text("UPDATE ci_selections SET estimated_ms_total = 0, "
+                            "estimated_ms_would_run = 0"))  # fmt: skip
+    signed_in(client)
+    page = client.get(f"/ui/repos/{REPO}/-/runs/{SHADOW}/1").text
+    text_ = html.unescape(_text(page))
+    assert "would have run 1 of 2 tests in history" in text_
+    assert "Would have run, of the tests that ran here" in text_
+    assert "Time saved (measured)" in text_
+    assert "not estimated at select time" in text_ and "measures what it would have saved" in text_
+    assert ">Reason<" not in page  # a selective selection: the reason repeats it
+
+
+def test_a_full_selection_shows_its_reason(client: TestClient, db_session: Session) -> None:
+    _ci_run(client, db_session)
+    db_session.execute(text(
+        "UPDATE ci_selections SET mode = 'full', reason = 'build/config file changed: go.mod', "
+        "reason_code = 'build_file', reason_items = '{go.mod}'"
+    ))  # fmt: skip
+    signed_in(client)
+    page = client.get(f"/ui/repos/{REPO}/-/runs/ci-7/1").text
+    assert ">Reason<" in page and "build/config file changed: go.mod" in page
+    assert "Caused by:" in page
+
+
+def test_failures_are_listed_by_their_rank_and_stack_on_a_phone(
+    client: TestClient, db_session: Session
+) -> None:
+    _ci_run(client, db_session)
+    # Rank OTHER first, TEST second: the reverse of their names' order.
+    db_session.execute(text(
+        "UPDATE ci_selections SET selected_keys = ARRAY(SELECT id FROM tests "
+        "WHERE test_id IN (:a, :b) ORDER BY test_id DESC)"
+    ), {"a": TEST, "b": OTHER})  # fmt: skip
+    signed_in(client)
+    page = client.get(f"/ui/repos/{REPO}/-/runs/ci-7/1").text
+    verdicts = page.split("<h2>Verdicts</h2>")[1]
+    assert verdicts.index(f'title="{OTHER}"') < verdicts.index(f'title="{TEST}"')
+    # Below 640 px the rows stack: every fact keeps a label, the full name can wrap.
+    assert '<table class="stack">' in verdicts
+    for label in ("Verdict", "Confidence", "In the selection", "Rank", "Why"):
+        assert f'data-label="{label}"' in verdicts, label
+    assert "tests.<wbr>" not in verdicts and "tests.test_db::<wbr>test_query" in verdicts
+
+
+def test_the_full_test_name_is_escaped_before_it_can_wrap() -> None:
+    assert str(pages._breakable('a/<b>::c"')) == "a/<wbr>&lt;b&gt;::<wbr>c&#34;"
+
+
+def test_go_package_reasons_are_grouped_for_display_only() -> None:
+    from siftwise.api.dashboard.data import grouped_reasons
+
+    pkg = "in Go package github.com/a/dns, which has changed"
+    reasons = [f"{pkg} dns/parse.go", "imports changed package x", f"{pkg} dns/relay.go",
+               f"{pkg} dns/parse.go"]  # fmt: skip
+    assert grouped_reasons(reasons) == [
+        f"{pkg} dns/parse.go, dns/relay.go", "imports changed package x"]  # fmt: skip
+
+
+def test_links_say_where_they_go(client: TestClient, db_session: Session) -> None:
+    record(db_session, commit=1, hour=1, tests={TEST: P}, ci_run_id="first")
+    record(db_session, commit=2, hour=2, tests={TEST: F}, ci_run_id="old")
+    signed_in(client)
+    old = client.get(f"/ui/repos/{REPO}/-/runs/old/1").text
+    assert ">How to upgrade</a>" in old and "CHANGELOG.md#upgrading" in old
+    first = client.get(f"/ui/repos/{REPO}/-/runs/first/1").text
+    assert ">How selections are recorded</a>" in first
+    empty = client.get("/ui/repos/acme/none/-/runs").text
+    assert "GitHub Action</a>" not in empty

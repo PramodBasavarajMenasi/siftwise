@@ -159,6 +159,15 @@ class Run(Base):
     # attempt, variant and commit). Attempt-level readers (triage and shadow compare of an
     # attempt, lookups) skip re-runs; as history they are ordinary runs of the commit.
     rerun: Mapped[int] = mapped_column(SmallInteger, server_default="0")
+    # The measured test time of the upload (migration 0017, computed at ingest): each test's
+    # final attempt, Go subtests left out (``selector.measured_time``). NULL for runs ingested
+    # before 0017 that no compare has filled.
+    tests_run: Mapped[int | None] = mapped_column(Integer)
+    measured_ms: Mapped[float | None] = mapped_column(Float)
+    # The siftwise client that uploaded it, and which one: github, gitlab (the CI templates,
+    # with a select step), cli, backfill. Every 0.4 uploader sends both; NULL = older.
+    client_version: Mapped[str | None] = mapped_column(String(32))
+    client: Mapped[str | None] = mapped_column(String(16))
 
     # When the run happened. Use this (never created_at alone) wherever "latest" matters:
     # backfill ingests old runs late, so created_at is ingest time, not run time.
@@ -266,19 +275,20 @@ SHADOW_STATUSES = (
     SHADOW_COMMIT_MISMATCH,
     SHADOW_COMPARE_ERROR,
 )
-SHADOW_UNIQUE_INDEX = "uq_shadow_selections_repo_ci_run_attempt_variant"
+SHADOW_UNIQUE_INDEX = "uq_ci_selections_repo_ci_run_attempt_variant"
 # Why a failure was missed (core/shadow.py CAUSES, most specific first).
 MISS_CAUSES = (
     "budget", "new_test", "flaky_history", "fixture", "config_gap", "no_link", "unknown"
 )  # fmt: skip
 
 
-class ShadowSelection(Base):
-    """What siftwise would have selected for a shadow run (one that ran the full suite), as
-    ``selector.SelectionScope``: enough for ``WouldRun`` to tell whether a test would have run.
-    One per CI run attempt and variant; a NULL variant applies to every leg."""
+class CiSelection(Base):
+    """A selection /select returned in CI (migration 0017; shadow runs' since 0008), as
+    ``selector.SelectionScope``: enough for ``WouldRun`` to tell whether a test runs. One per
+    CI run attempt and variant; a NULL variant applies to every leg. ``shadow``: the run ran
+    the full suite, and this is what siftwise would have run."""
 
-    __tablename__ = "shadow_selections"
+    __tablename__ = "ci_selections"
     __table_args__ = (
         Index(
             SHADOW_UNIQUE_INDEX,
@@ -304,7 +314,10 @@ class ShadowSelection(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     mode: Mapped[str] = mapped_column(String(16))
     reason: Mapped[str] = mapped_column(Text)
+    shadow: Mapped[bool] = mapped_column(Boolean, server_default=false())
     # tests.id of the selected tests (all come from history), and the Go-runner subset of them.
+    # ``ranked``: selected_keys are in risk-rank order (a test's rank = its position, from 1);
+    # rows from before 0017 are sorted by key.
     selected_keys: Mapped[list[int]] = mapped_column(ARRAY(Integer))
     go_selected_keys: Mapped[list[int]] = mapped_column(ARRAY(Integer))
     go_packages: Mapped[list[str]] = mapped_column(ARRAY(Text))
@@ -324,40 +337,65 @@ class ShadowSelection(Base):
     estimated_ms_would_run: Mapped[float] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(32), server_default=SHADOW_PENDING)
     compared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    # A time budget that left selected tests out (NULL: none): the budget and the selection it
-    # cut, as core/shadow.py stores it, so the compare can tell budget misses apart.
+    # The time budget asked for (NULL: none), as core/shadow.py stores it: applied, limited,
+    # what it left out; for a limited shadow selection also the selection it cut ("before"),
+    # so the compare can tell budget misses apart.
     budget: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    ranked: Mapped[bool] = mapped_column(Boolean, server_default=false())
+    # A full-suite fallback's code (selector.FullReason) and the files or tests behind it.
+    reason_code: Mapped[str | None] = mapped_column(String(32))
+    reason_items: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), server_default=text("'{}'::text[]"), default=list
+    )
+    command_order: Mapped[str | None] = mapped_column(String(16))  # risk or default
+    changed_count: Mapped[int | None] = mapped_column(Integer)  # changed files sent
+    # The CI run, as the client sent it (``schemas.CiIn``; NULL for shadow rows of 0.3
+    # clients). Branch and event come partly from a pull request's author: shown escaped.
+    provider: Mapped[str | None] = mapped_column(String(16))
+    branch: Mapped[str | None] = mapped_column(String(255))
+    is_main: Mapped[bool | None] = mapped_column(Boolean)
+    pr_number: Mapped[int | None] = mapped_column(Integer)
+    event: Mapped[str | None] = mapped_column(String(64))
+    client_version: Mapped[str | None] = mapped_column(String(32))
+    # The highest-risk selected tests: [{key, reasons, why}], at most TOP_RISK.
+    top_risk: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB(none_as_null=True))
 
 
-class ShadowResult(Base):
-    """One recorded run (variant) of a shadow CI run attempt, compared with its selection.
-    Flaky failures are counted apart: neither caught nor missed."""
+class RunOutcome(Base):
+    """One recorded leg (variant) of a CI run attempt after ``POST /repos/{repo}/outcome``:
+    its failures by verdict and what its recorded selection did with them (0017; shadow runs'
+    comparisons since 0008). The measured test time is on ``runs``."""
 
-    __tablename__ = "shadow_results"
+    __tablename__ = "run_outcomes"
 
     run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
-    selection_id: Mapped[int] = mapped_column(
-        ForeignKey("shadow_selections.id", ondelete="CASCADE"), index=True
+    # The leg's selection (NULL: none recorded for it, or one of another commit).
+    selection_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ci_selections.id", ondelete="CASCADE"), index=True
     )
     compared_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
     failing: Mapped[int] = mapped_column(Integer)
-    caught: Mapped[int] = mapped_column(Integer)
-    missed: Mapped[int] = mapped_column(Integer)
+    new_regressions: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    pre_existing: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     flaky: Mapped[int] = mapped_column(Integer)
-    # Measured in this (full-suite) run: final attempts' durations, Go subtests left out.
-    tests_total: Mapped[int] = mapped_column(Integer)
-    tests_would_run: Mapped[int] = mapped_column(Integer)
-    ms_total: Mapped[float] = mapped_column(Float)
-    ms_would_run: Mapped[float] = mapped_column(Float)
+    unknown: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    failures_selected: Mapped[int | None] = mapped_column(Integer)  # NULL: no selection
+    first_failure_rank: Mapped[int | None] = mapped_column(Integer)
+    # Shadow runs only (NULL otherwise): caught and missed failures (flaky ones neither), and
+    # the tests and measured time the selection would have run.
+    caught: Mapped[int | None] = mapped_column(Integer)
+    missed: Mapped[int | None] = mapped_column(Integer)
+    tests_would_run: Mapped[int | None] = mapped_column(Integer)
+    ms_would_run: Mapped[float | None] = mapped_column(Float)
 
 
-class ShadowFailure(Base):
-    """Every failing test of a compared shadow run: whether the selection would have run it,
-    and triage's verdict (flaky ones are not misses)."""
+class RunFailure(Base):
+    """Every failing test of an outcome's leg: triage's verdict, whether the recorded
+    selection runs it (NULL without one) and its rank there; a shadow miss's cause."""
 
-    __tablename__ = "shadow_failures"
+    __tablename__ = "run_failures"
     __table_args__ = (
         CheckConstraint(
             "cause IN (" + ", ".join(f"'{c}'" for c in MISS_CAUSES) + ")", name="cause"
@@ -365,12 +403,13 @@ class ShadowFailure(Base):
     )
 
     run_id: Mapped[int] = mapped_column(
-        ForeignKey("shadow_results.run_id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("run_outcomes.run_id", ondelete="CASCADE"), primary_key=True
     )
     test_key: Mapped[int] = mapped_column(
         ForeignKey("tests.id", ondelete="CASCADE"), primary_key=True
     )
-    would_run: Mapped[bool] = mapped_column(Boolean)
+    would_run: Mapped[bool | None] = mapped_column(Boolean)
+    rank: Mapped[int | None] = mapped_column(Integer)
     verdict: Mapped[str] = mapped_column(String(32))
     confidence: Mapped[str] = mapped_column(String(16))
     # Misses only (NULL otherwise, and for misses compared before migration 0009): why it was
@@ -378,6 +417,23 @@ class ShadowFailure(Base):
     cause: Mapped[str | None] = mapped_column(String(32))
     cause_detail: Mapped[str | None] = mapped_column(Text)
     suggestion: Mapped[str | None] = mapped_column(Text)
+
+
+class AttemptOutcome(Base):
+    """A CI run attempt whose outcome was stored (``POST /repos/{repo}/outcome``), and the
+    verdicts the client's ``fail-on`` gates on (NULL: no gate, or a client older than 0.4)."""
+
+    __tablename__ = "attempt_outcomes"
+
+    repo_id: Mapped[int] = mapped_column(
+        ForeignKey("repos.id", ondelete="CASCADE"), primary_key=True
+    )
+    ci_run_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    run_attempt: Mapped[int] = mapped_column(Integer, primary_key=True)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    fail_on: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
 
 
 TOKEN_SCOPES = ("read", "write")

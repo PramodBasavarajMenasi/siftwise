@@ -26,6 +26,9 @@ from typing import Annotated, Any, Self
 import httpx
 import typer
 
+from siftwise import __version__
+from siftwise.cli.main import SiftwiseError, unknown_fields
+
 GITHUB_API = "https://api.github.com"
 PER_PAGE = 100
 # The compare API lists at most 300 files; a list that long is probably truncated.
@@ -399,12 +402,28 @@ class SiftwiseClient:
         return variants
 
     def upload(self, files: list[tuple[str, bytes]], metadata: Json) -> httpx.Response:
-        return self._http.post(
-            "/runs",
-            params={"defer_rollup": "true"} if self.defer_rollup else None,
-            files=[("files", (name, content, "application/xml")) for name, content in files],
-            data={"metadata": json.dumps(metadata)},
-        )
+        """``POST /runs``, saying which client uploaded it (the dashboard tells a backfilled
+        run from one whose select step didn't record). A server older than 0.4 rejects those
+        two fields: then once more without them."""
+
+        def post(meta: Json) -> httpx.Response:
+            return self._http.post(
+                "/runs",
+                params={"defer_rollup": "true"} if self.defer_rollup else None,
+                files=[("files", (name, content, "application/xml")) for name, content in files],
+                data={"metadata": json.dumps(meta)},
+            )
+
+        response = post({**metadata, **CLIENT})
+        if response.status_code == httpx.codes.UNPROCESSABLE_ENTITY:
+            try:
+                detail = response.json().get("detail")
+            except ValueError:
+                detail = None
+            unknown = unknown_fields(SiftwiseError("", 422, detail), where="metadata")
+            if unknown and unknown <= set(CLIENT):
+                response = post(metadata)
+        return response
 
     def rollup(self, repo: str) -> Json:
         """Recompute the repo's test_stats (after batch uploads). Can take minutes."""
@@ -412,6 +431,10 @@ class SiftwiseClient:
         response.raise_for_status()
         result: Json = response.json()
         return result
+
+
+# Sent with every upload (0.4): which client, for the dashboard.
+CLIENT: Json = {"client_version": __version__, "client": "backfill"}
 
 
 # --- backfill -----------------------------------------------------------------------------

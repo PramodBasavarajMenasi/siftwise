@@ -21,6 +21,7 @@ from siftwise.core.models import (
     truncate_utf8,
 )
 from siftwise.core.schemas import RunMetadata, StatusCounts
+from siftwise.core.selector import measured_time
 
 
 def find_run(
@@ -90,6 +91,8 @@ def create_run(
     race, this transaction is rolled back and the winner's run is returned with
     ``created=False``.
     """
+    results = list(results)
+    tests_run, measured_ms = measured_time(_final_attempts(results))
     try:
         repo_id = _get_or_create_repo(session, meta.repo)
         run = Run(
@@ -107,6 +110,10 @@ def create_run(
             known_flaky_changed=meta.known_flaky_changed,
             known_flaky_expired=[e.model_dump(mode="json") for e in meta.known_flaky_expired],
             rerun=meta.rerun,
+            tests_run=tests_run,
+            measured_ms=measured_ms,
+            client_version=meta.client_version,
+            client=meta.client,
         )
         session.add(run)
         session.flush()
@@ -115,7 +122,6 @@ def create_run(
             session.execute(
                 insert(ChangedFile), [{"run_id": run.id, "path": p} for p in meta.changed_files]
             )
-        results = list(results)
         keys = _test_keys(session, repo_id, run.id, results)
         if results:
             _insert_results(session, run.id, keys, results)
@@ -132,6 +138,15 @@ def create_run(
             raise
         return existing, False
     return run, True
+
+
+def _final_attempts(results: list[ParsedTestResult]) -> list[tuple[str, int | None]]:
+    """Each test's final attempt as (test ID, duration), as the shadow compare reads them."""
+    final: dict[str, ParsedTestResult] = {}
+    for r in results:
+        if r.test_id not in final or r.attempt > final[r.test_id].attempt:
+            final[r.test_id] = r
+    return [(r.test_id, r.duration_ms) for r in final.values()]
 
 
 # One statement for all of a run's results: arrays in, ``unnest`` out. Status codes and message

@@ -45,7 +45,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+        # The version (from 0.4): clients use it to pick /repos/{repo}/outcome over the
+        # older /repos/{repo}/shadow. An older server reports none.
+        return {"status": "ok", "version": __version__}
 
     return app
 

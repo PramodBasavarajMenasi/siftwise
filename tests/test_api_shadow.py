@@ -14,7 +14,7 @@ from siftwise.api.main import create_app
 from siftwise.api.routes import select as select_route
 from siftwise.config import Settings
 from siftwise.core.history import recompute_repo_stats
-from siftwise.core.models import Repo, ShadowSelection
+from siftwise.core.models import CiSelection, Repo
 from siftwise.db import get_session
 from tests.test_shadow import SHADOW, shadow_run
 from tests.test_triage_db import OTHER, REPO, TEST, F, P, record, sha
@@ -52,7 +52,7 @@ def test_select_stores_a_shadow_selection(client: TestClient, db_session: Sessio
 
     assert (body["mode"], body["selected_count"], body["shadow_stored"]) == ("selective", 1, True)
     assert body["shadow_reason"] is None
-    stored = db_session.scalars(select(ShadowSelection)).one()
+    stored = db_session.scalars(select(CiSelection)).one()
     assert (stored.ci_run_id, stored.variant, stored.commit_sha, stored.mode) == (
         SHADOW, None, sha(50), "selective")  # fmt: skip
     assert (stored.selected_count, stored.total_known) == (1, 2)
@@ -63,14 +63,14 @@ def test_select_without_shadow_stores_nothing(client: TestClient, db_session: Se
     body = post_select(client).json()
 
     assert (body["shadow_stored"], body["shadow_reason"]) == (None, None)
-    assert db_session.scalars(select(ShadowSelection)).all() == []
+    assert db_session.scalars(select(CiSelection)).all() == []
 
 
 @pytest.mark.usefixtures("seeded")
 def test_a_failed_store_never_fails_select(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def broken(*_: object) -> bool:
+    def broken(*_: object, **__: object) -> bool:
         raise OperationalError("INSERT", {}, Exception("disk full"))
 
     monkeypatch.setattr(select_route, "store_selection", broken)
@@ -189,7 +189,7 @@ def test_a_budget_limited_shadow_run_counts_budget_misses_apart(
                            budget_seconds=0.005).json()  # fmt: skip
     assert (selected["budget_limited"], selected["shadow_stored"]) == (True, True)
     assert [t["test_id"] for t in selected["tests"]] == [TEST]
-    stored = db_session.scalars(select(ShadowSelection)).one()
+    stored = db_session.scalars(select(CiSelection)).one()
     assert stored.budget is not None
     assert (stored.budget["full_suite"], stored.budget["left_out"]) == (True, 1)
     assert stored.budget["before"]["full"] is True
@@ -214,8 +214,12 @@ def test_a_budget_limited_shadow_run_counts_budget_misses_apart(
 
 
 @pytest.mark.usefixtures("seeded")
-def test_a_budget_that_left_nothing_out_stores_no_budget(
+def test_a_budget_that_left_nothing_out_is_stored_as_not_limiting(
     client: TestClient, db_session: Session
 ) -> None:
     post_select(client, shadow=SHADOW_IN, budget_seconds=60)
-    assert db_session.scalars(select(ShadowSelection)).one().budget is None
+    budget = db_session.scalars(select(CiSelection)).one().budget
+    # Every budget asked for is stored (0017), so the dashboard can show it; only a limiting
+    # one keeps the selection it cut, and only that one makes the run budget-limited.
+    assert budget is not None and (budget["applied"], budget["limited"]) == (True, False)
+    assert "before" not in budget

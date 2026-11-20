@@ -8,6 +8,34 @@ All notable changes to siftwise. The format follows
 
 ### Added
 
+- Every CI selection is recorded, and the dashboard shows what siftwise did in each run
+  ([#85](https://github.com/PramodBasavarajMenasi/siftwise/issues/85), part 1):
+  - The Action's and the GitLab template's select step send their CI run with `/select`
+    (`ci`: provider, run ID, attempt, variant, commit, branch, PR number, event, client
+    version). With a write token the server records the selection under that run: mode, the
+    full-suite reason as a code (`changed_files_unknown`, `no_net_changes`, `build_file`,
+    `no_history`, `java_build`, `fixture_unreferenced`, `unmapped_file`, `no_runner`) with
+    the files or tests behind it (the reason text is unchanged), the selected tests in risk
+    order, the estimates, the budget, the order, the changed-file count and the five
+    highest-risk tests. A read token still selects, with one warning that nothing was
+    recorded. Laptop and MCP calls are never recorded. About 4 bytes per selected test:
+    a selective row's median is 78 KB on rdflib (18,219 tests), 6.3 KB on substrate, 1.4 KB
+    on dropwizard; a full one under 1 KB.
+  - `POST /repos/{repo}/outcome` (write), called by the rollup step (or record in a single
+    job) after the attempt's last upload, triages the attempt once and stores each leg's
+    outcome: failures by verdict, which of them the recorded selection ran and at what rank,
+    and the `fail-on` verdicts. `POST /repos/{repo}/shadow` does the same for older clients.
+    A 0.4 client uses `/outcome` when `/healthz` reports the server's version (new), else
+    `/shadow`.
+  - Uploads carry `client_version`; every upload stores its measured test time
+    (`runs.tests_run`, `runs.measured_ms`).
+  - Dashboard: a run's page says what siftwise did (selected X of Y, or why the full suite
+    ran; estimated and measured test time, test time saved (estimated); budget; order; the
+    highest-risk tests) next to each failure's verdict, whether it was in the selection and its
+    rank, or why no selection was recorded (a client older than 0.4, a select step that didn't
+    reach the server, the repo's first run). The runs list shows each run's selection; every
+    page says how many CI runs in its window have one.
+
 - A read-only dashboard ([#75](https://github.com/PramodBasavarajMenasi/siftwise/issues/75)),
   off unless `SIFTWISE_DASHBOARD=1`: server-rendered pages at `/ui` (no JavaScript) for each
   repo a token can see: shadow-mode recall (all runs and selective runs, by week, misses by
@@ -85,6 +113,18 @@ All notable changes to siftwise. The format follows
 
 ### Upgrading
 
+- **Back up the database, then migrate (0017).** Migration 0017 renames the shadow-mode
+  tables to `ci_selections`, `run_outcomes` and `run_failures` (with their constraints,
+  indexes and sequence), adds columns with defaults, moves the measured test time of shadow
+  runs to `runs` and adds `attempt_outcomes`. It doesn't rewrite `test_results`. Recall and
+  `siftwise report` give the same numbers before and after (checked on a replay of 112
+  substrate shadow runs). Its downgrade keeps all shadow data but drops what 0016 can't hold:
+  selections of non-shadow runs and outcomes without a shadow selection.
+- **Update the server before the clients, or together.** A 0.4 client against an older server
+  works as before: `/select` is sent again without `ci` (the summary says the server doesn't
+  record selections), uploads drop `client_version`, and the outcome goes to `/shadow`.
+  Recording needs the select step's token to be a write token (it is for most setups: the
+  same secret as record).
 - **Migration 0016** adds `ui_sessions` (dashboard logins: the SHA-256 of each session ID, the
   token it was made with, and its expiry). A new table: nothing is rewritten, and it stays
   empty unless the dashboard is turned on. `siftwise server start` applies it (with 0013 to

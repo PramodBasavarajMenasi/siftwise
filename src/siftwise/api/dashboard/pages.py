@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, quote
 
 from fastapi import APIRouter, Depends, Request
 from jinja2 import Environment, PackageLoader, StrictUndefined
+from markupsafe import Markup, escape
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import HTMLResponse, RedirectResponse, Response
@@ -51,11 +52,26 @@ from siftwise.db import get_session
 router = APIRouter(include_in_schema=False)
 
 README = "https://github.com/PramodBasavarajMenasi/siftwise/blob/main/README.md"
+CHANGELOG = "https://github.com/PramodBasavarajMenasi/siftwise/blob/main/CHANGELOG.md"
 # Windows: the last N days, counted back from NOW on every page (None = all history). The
 # recall API and `siftwise report` count the same way; `siftwise flaky` ends at the newest run.
 DAYS: tuple[int | None, ...] = (7, 30, 90, None)
 DEFAULT_DAYS = 30
 MAX_RUN_TESTS = 500  # tests listed on a run page
+# How a failing test stood in its leg's recorded selection, most telling first (a test is
+# shown with its worst leg's).
+PLACE_ORDER = ("not selected", "run whole", "selected", "full suite", "")
+# selector.FullReason codes, as the dashboard names them.
+REASON_LABELS = {
+    "changed_files_unknown": "changed files unknown",
+    "no_net_changes": "no net changes",
+    "build_file": "build or config file changed",
+    "no_history": "no test history",
+    "java_build": "Java build not analysable",
+    "fixture_unreferenced": "fixture no test references",
+    "unmapped_file": "changed file with no known tests",
+    "no_runner": "selected test with no known runner",
+}
 MAX_FLAKY_ROWS = 100  # flaky tests listed (and entries suggested); `siftwise flaky` has all
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
 CSRF_LIFETIME = timedelta(hours=1)
@@ -162,6 +178,12 @@ def _short(text: str, limit: int = 72) -> str:
     return f"{text[:head]}…{text[-(limit - head - 1) :]}"
 
 
+def _breakable(value: str) -> Markup:
+    """A long test ID that can wrap after each "/" and "::" (escaped first, then <wbr>)."""
+    escaped = str(escape(value))
+    return Markup(escaped.replace("/", "/<wbr>").replace("::", "::<wbr>"))
+
+
 def _environment() -> Environment:
     env = Environment(
         loader=PackageLoader("siftwise.api.dashboard", "templates"),
@@ -171,11 +193,12 @@ def _environment() -> Environment:
         lstrip_blocks=True,
     )
     env.filters.update(minutes=_minutes, pct=_pct, recall=_recall, num=_num, when=_when,
-                       day=_day, ago=_ago, window=_window, short=_short)  # fmt: skip
+                       day=_day, ago=_ago, window=_window, short=_short,
+                       breakable=_breakable)  # fmt: skip
     env.globals.update(repo_url=_repo_url, with_days=_with_days, days_options=DAYS,
                        version=__version__, stylesheet=lambda: stylesheet_file().name,
-                       readme=README, prefix=PREFIX, cause_labels=CAUSE_LABELS,
-                       verdicts=VERDICT_ORDER)  # fmt: skip
+                       readme=README, changelog=CHANGELOG, prefix=PREFIX, cause_labels=CAUSE_LABELS,
+                       verdicts=VERDICT_ORDER, reason_labels=REASON_LABELS)  # fmt: skip
     return env
 
 
@@ -365,6 +388,7 @@ def run_page(request: Request, repo: str, ci_run_id: str, attempt: int, session:
     if meta is None:
         return not_found(request.state.ui_session)
     variants = triage_ci_run(session, repo, ci_run_id, attempt, settings.stats_window_days) or []
+    selected = data.run_selections(session, repo, ci_run_id, attempt)
     by_test: dict[str, list[tuple[str | None, Any]]] = {}
     for v in variants:
         for result in v.report.results if v.report else ():
@@ -376,14 +400,20 @@ def run_page(request: Request, repo: str, ci_run_id: str, attempt: int, session:
         results.sort(key=lambda r: (rank.get(r[1].verdict.value, 9),
                                     conf.get(r[1].confidence.value, 9), r[0] or ""))  # fmt: skip
         worst = results[0][1]
+        # Where the selection had it, on the worst leg (a leg that ran it outside the
+        # selection is the one to see).
+        places = [selected.place(test_id, v) for v, _ in results]
+        place = min(places, key=lambda p: PLACE_ORDER.index(p[0]))
         rows.append({
             "test_id": test_id, "verdict": worst.verdict.value,
             "confidence": worst.confidence.value,
             "variants": [v for v, r in results if r.verdict == worst.verdict],
             "reason": worst.reasons[0] if worst.reasons else "",
+            "place": place[0], "rank": place[1],
         })  # fmt: skip
-    rows.sort(key=lambda r: (rank.get(r["verdict"], 9), conf.get(r["confidence"], 9),
-                             r["test_id"]))  # fmt: skip
+    # The selection's failures first, by their rank in it; then the rest, worst verdict first.
+    rows.sort(key=lambda r: (r["rank"] is None, r["rank"] or 0, rank.get(r["verdict"], 9),
+                             conf.get(r["confidence"], 9), r["test_id"]))  # fmt: skip
     counts = Counter(r["verdict"] for r in rows)
     shadow = data.shadow_attempt(session, repo, ci_run_id, attempt)
     crumbs = [*_repo_crumbs(repo), ("Runs", _repo_url(repo, "runs")),
@@ -392,7 +422,7 @@ def run_page(request: Request, repo: str, ci_run_id: str, attempt: int, session:
                  tab="runs", meta=meta, rows=rows[:MAX_RUN_TESTS],
                  more=max(0, len(rows) - MAX_RUN_TESTS), counts=counts,
                  variant_names=[v.variant for v in variants], shadow=shadow,
-                 multi=len(variants) > 1)  # fmt: skip
+                 multi=len(variants) > 1, selected=selected)  # fmt: skip
 
 
 @router.get(f"{PREFIX}/repos/{{repo:path}}/-/runs")

@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 
 from scripts import backfill as bf
 from scripts.backfill import BackfillError, GitHubClient, SiftwiseClient, Summary
+from siftwise import __version__ as siftwise_version
 
 GH = "https://api.github.com"
 SIFTWISE = "http://siftwise.test"
@@ -210,6 +211,9 @@ def test_normal_run_is_uploaded(router: respx.MockRouter, clock: FakeClock) -> N
         "changed_files": ["src/a.py", "src/new.py", "src/old.py"],
         "changed_files_known": True,
         "variant": "results",
+        # Which client (0.4): the dashboard says a backfilled run had no select step.
+        "client_version": siftwise_version,
+        "client": "backfill",
     }
     lookup = router["lookup"].calls.last.request
     assert dict(lookup.url.params) == {
@@ -1095,3 +1099,36 @@ def test_cli_reports_fatal_github_errors(
 
     assert result.exit_code == 2
     assert "401" in result.stderr
+
+
+def test_an_older_server_gets_the_upload_again_without_the_client_fields(
+    router: respx.MockRouter, clock: FakeClock
+) -> None:
+    mock_runs(router, gh_run(101))
+    standard_run(router, gh_run(101))
+    mock_changed_files(router, [{"filename": "src/a.py"}])
+    old_422 = {"detail": [{"type": "extra_forbidden", "loc": ["metadata", "client_version"]},
+                          {"type": "extra_forbidden", "loc": ["metadata", "client"]}]}  # fmt: skip
+    route = router.post(f"{SIFTWISE}/runs").mock(side_effect=[
+        httpx.Response(422, json=old_422),
+        httpx.Response(201, json={"run_id": 1, "counts": {"total": 12}}),
+    ])  # fmt: skip
+
+    summary, _ = run_backfill(clock)
+
+    assert counts(summary) == {"new": 1}
+    first, second = (parse_upload(call.request)[0] for call in route.calls)
+    assert first["client"] == "backfill" and "client" not in second
+    assert "client_version" not in second
+
+
+def test_any_other_422_is_not_sent_again(router: respx.MockRouter, clock: FakeClock) -> None:
+    mock_runs(router, gh_run(101))
+    standard_run(router, gh_run(101))
+    mock_changed_files(router, [{"filename": "src/a.py"}])
+    bad = {"detail": [{"type": "string_too_long", "loc": ["metadata", "branch"]}]}
+    route = router.post(f"{SIFTWISE}/runs").mock(return_value=httpx.Response(422, json=bad))
+
+    summary, _ = run_backfill(clock)
+
+    assert route.call_count == 1 and counts(summary) == {"errors": 1}

@@ -1,5 +1,6 @@
-"""Shadow mode. POST /repos/{repo}/shadow: compare a recorded shadow run with its stored
-selection. GET /repos/{repo}/recall: live recall over the last days."""
+"""Run outcomes and shadow mode. POST /repos/{repo}/outcome: store a recorded CI run
+attempt's outcome (and compare a shadow run with its selection); POST /repos/{repo}/shadow:
+the same, answering as before 0.4. GET /repos/{repo}/recall: live recall over the last days."""
 
 from typing import Annotated, Literal
 
@@ -10,6 +11,9 @@ from siftwise.api.deps import Caller, authorize, get_app_settings
 from siftwise.config import Settings
 from siftwise.core.schemas import (
     EstimatedMs,
+    LegOutcomeOut,
+    OutcomeRequest,
+    OutcomeResponse,
     RecallMissOut,
     RecallPeriodOut,
     RecallResponse,
@@ -28,8 +32,10 @@ from siftwise.core.shadow import (
     MISSED,
     UNCLASSIFIED,
     VERDICT_ORDER,
+    AttemptComparison,
     Tally,
     Time,
+    budget_limited,
     compare_ci_run,
 )
 from siftwise.core.shadow import recall as shadow_recall
@@ -50,20 +56,56 @@ def post_shadow_compare(
     """Compare every recorded variant of a shadow CI run attempt with the selection stored
     for it: each failure caught, missed, or flaky (not counted). Idempotent: a re-call
     replaces the stored comparison. ``shadow: false`` when the attempt wasn't a shadow run.
-    For the GitHub Action, after all legs."""
+    Since 0.4 it also stores the attempt's outcome, as ``/outcome`` does (without fail-on):
+    clients older than 0.4 call this one."""
     authorize(caller, repo, write=True, what="a shadow compare")
     result = compare_ci_run(
         session, repo, body.ci_run_id, body.run_attempt, settings.stats_window_days
     )
     if result is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown repo {repo!r}")
+    return _shadow_response(repo, body.ci_run_id, body.run_attempt, result)
+
+
+@router.post("/repos/{repo:path}/outcome", responses={404: {"description": "Unknown repo"}})
+def post_outcome(
+    repo: str,
+    caller: Caller,
+    body: OutcomeRequest,
+    session: Annotated[Session, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> OutcomeResponse:
+    """After a CI run attempt's last upload (the GitHub Action's rollup, or record in a
+    single job): triage every recorded leg once and store its outcome: failures by verdict,
+    which of them the recorded selection runs and at what risk rank, and the ``fail_on``
+    verdicts the client gates on. A shadow run is compared with its selection too
+    (``shadow``). Idempotent: a re-call replaces the stored outcome."""
+    authorize(caller, repo, write=True, what="storing a run outcome")
+    result = compare_ci_run(session, repo, body.ci_run_id, body.run_attempt,
+                            settings.stats_window_days, fail_on=body.fail_on)  # fmt: skip
+    if result is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown repo {repo!r}")
+    return OutcomeResponse(
+        repo=repo,
+        ci_run_id=body.ci_run_id,
+        run_attempt=body.run_attempt,
+        recorded=bool(result.legs),
+        fail_on=None if body.fail_on is None else sorted(set(body.fail_on)),
+        legs=[LegOutcomeOut(**vars(leg)) for leg in result.legs],
+        shadow=_shadow_response(repo, body.ci_run_id, body.run_attempt, result),
+    )
+
+
+def _shadow_response(
+    repo: str, ci_run_id: str, run_attempt: int, result: AttemptComparison
+) -> ShadowCompareResponse:
     tally = result.tally
     missed = [u for u in result.units if u.outcome == MISSED]
     missed.sort(key=lambda u: (VERDICT_ORDER.index(u.verdict), u.test_id))
     return ShadowCompareResponse(
         repo=repo,
-        ci_run_id=body.ci_run_id,
-        run_attempt=body.run_attempt,
+        ci_run_id=ci_run_id,
+        run_attempt=run_attempt,
         shadow=result.shadow,
         counted=result.counted,
         mode=result.mode,
@@ -79,7 +121,7 @@ def post_shadow_compare(
                     total=s.estimated_ms_total, would_run=s.estimated_ms_would_run
                 ),
                 status=s.status,
-                budget_limited=s.budget is not None,
+                budget_limited=budget_limited(s),
             )
             for s in result.selections
         ],

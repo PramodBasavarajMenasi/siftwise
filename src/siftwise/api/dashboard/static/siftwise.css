@@ -78,6 +78,9 @@ h1 { font-size: 20px; line-height: 28px; margin: 28px 0 4px; font-weight: 600; }
 h1 .mono { font-size: 0.9em; }
 h2 { font-size: 15px; line-height: 20px; margin: 32px 0 8px; font-weight: 600; }
 h2 .muted { font-weight: 400; font-size: 14px; }
+h3 { font-size: 14px; line-height: 20px; margin: 20px 0 4px; font-weight: 600; }
+.coverage { color: var(--muted); margin: 0 0 4px; font-size: 13px; }
+.coverage strong { color: var(--fg); font-weight: 600; }
 p { margin: 8px 0; }
 .muted { color: var(--muted); }
 
@@ -303,3 +306,19 @@ svg.meter .bad { fill: var(--bad); }
   color: var(--fg);
 }
 .login button { justify-self: start; }
+
+/* a table whose rows stack below 640 px (the run page's failures): the full test name, wrapping
+   at / and ::, then its facts on one line with their labels, then why. No hidden columns. */
+.id-full, .stack-only { display: none; }
+@media (max-width: 640px) {
+  table.stack thead { display: none; }
+  table.stack, table.stack tbody, table.stack tr { display: block; width: auto; }
+  table.stack tr { padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
+  table.stack td { display: block; border: 0; padding: 2px 0; white-space: normal; text-align: left; width: auto; min-width: 0; }
+  table.stack td.fact { display: inline-block; margin-right: 12px; }
+  table.stack td[data-label]::before { content: attr(data-label) ": "; color: var(--muted); font-weight: 400; }
+  table.stack .id-short { display: none; }
+  table.stack .id-full { display: inline; overflow-wrap: anywhere; }
+  table.stack .stack-only { display: inline; }
+  .scroll:has(> table.stack) { overflow-x: visible; }
+}

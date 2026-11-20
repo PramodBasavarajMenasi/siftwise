@@ -1,9 +1,12 @@
-"""Shadow mode: live recall.
+"""CI selections, run outcomes and shadow mode's live recall.
 
-A shadow run runs the full suite while ``POST /select`` stores what siftwise would have
-selected (``store_selection``). Once the run is recorded, ``compare_ci_run`` checks every
-failure against that selection with the selector's own ``WouldRun`` and triage's verdict:
-caught, missed, or flaky (counted apart, never a miss). ``recall`` sums it up over days.
+``POST /select`` from CI stores the selection it returned (``store_selection``): every CI
+selection since 0.4, a shadow run's (one that runs the full suite) since 0.2. Once the run
+attempt is recorded, ``compare_ci_run`` (``POST /repos/{repo}/outcome``, or the older
+``/shadow``) triages it once and stores each leg's outcome: its failures by verdict, whether
+the recorded selection runs each (the selector's own ``WouldRun``) and its risk rank. For a
+shadow run, each failure is also caught, missed, or flaky (counted apart, never a miss), and
+``recall`` sums those up over days.
 
 Units: a test in one CI run attempt. It's flaky only if every variant it failed in says flaky;
 otherwise it's missed if any non-flaky failing variant's selection wouldn't have run it.
@@ -12,7 +15,7 @@ Every miss gets a cause (``miss_cause``), from evidence the server has: triage's
 links for the test, and the run's recorded change. When the evidence doesn't say, ``unknown``.
 
 A budget-limited selection (a time budget left selected tests out) is stored as what would
-have run, plus the selection the budget cut (``shadow_selections.budget``): a miss that
+have run, plus the selection the budget cut (``ci_selections.budget``): a miss that
 selection would have run is a ``budget`` miss, counted apart, so a budget never hides misses
 and never passes its own misses off as the selector's.
 """
@@ -35,14 +38,17 @@ from siftwise.core.models import (
     SHADOW_COMPARED,
     SHADOW_NO_UPLOAD,
     SHADOW_PENDING,
+    AttemptOutcome,
+    CiSelection,
     Repo,
-    ShadowFailure,
-    ShadowResult,
-    ShadowSelection,
+    RunFailure,
+    RunOutcome,
 )
 from siftwise.core.selector import (
     JS_EXTENSIONS,
+    Budget,
     Mode,
+    SelectedTest,
     Selection,
     SelectionScope,
     WouldRun,
@@ -51,6 +57,7 @@ from siftwise.core.selector import (
     is_go_subtest,
     is_ignorable,
     locate_test,
+    measured_time,
 )
 from siftwise.core.triage import SAME_COMMIT, TriageResult, Verdict, triage_ci_run
 
@@ -73,8 +80,11 @@ UNKNOWN_REPO = "unknown_repo"
 INCOMPLETE_SELECTION = "incomplete_selection"  # a selected test has no key: would under-count
 COMMIT_CONFLICT = "commit_conflict"  # the attempt and variant hold another commit's selection
 STORAGE_ERROR = "storage_error"  # the database failed (set by the /select route)
+READ_ONLY_TOKEN = "read_only_token"  # a CI selection with a read token: selected, not stored
+TOP_RISK = 5  # highest-risk tests stored with a selection, with their reasons
+REASON_CHARS = 200  # each stored reason cut to this
 
-# Why a failure was missed (``shadow_failures.cause``), most specific first: a unit missed in
+# Why a failure was missed (``run_failures.cause``), most specific first: a unit missed in
 # several variants takes the first of its variants' causes in this order.
 BUDGET = "budget"  # the selection had it, a time budget left it out
 NEW_TEST = "new_test"  # no result before the run
@@ -95,7 +105,7 @@ CHANGED_SHOWN = 5  # changed files listed as a no_link miss's context
 
 @dataclass(frozen=True)
 class ShadowTarget:
-    """The CI run attempt (and variant) a shadow selection is stored for."""
+    """The CI run attempt (and variant) a selection is stored for."""
 
     ci_run_id: str
     run_attempt: int
@@ -103,54 +113,75 @@ class ShadowTarget:
     commit_sha: str
 
 
+@dataclass(frozen=True)
+class CiRun:
+    """What a CI /select call says about its run besides the target (``schemas.CiIn``)."""
+
+    provider: str
+    branch: str
+    is_main: bool
+    pr_number: int | None = None
+    event: str | None = None
+    client_version: str | None = None
+    changed_count: int | None = None
+
+
+def _by_rank(test: SelectedTest) -> tuple[bool, int, str]:
+    return (test.rank is None, test.rank or 0, test.test_id)
+
+
 def store_selection(
-    session: Session, repo: str, target: ShadowTarget, selection: Selection
+    session: Session,
+    repo: str,
+    target: ShadowTarget,
+    selection: Selection,
+    *,
+    shadow: bool = True,
+    ci: CiRun | None = None,
 ) -> str | None:
-    """Store ``selection`` for a shadow run. None if it's stored (by this call, or already for
-    the same commit by another leg), else why not: ``UNKNOWN_REPO``, ``INCOMPLETE_SELECTION``
-    or ``COMMIT_CONFLICT``. Commits."""
+    """Store ``selection`` for a CI run attempt (``shadow``: a shadow run's, which runs the
+    full suite instead). None if it's stored (by this call, or already for the same commit
+    by another leg), else why not: ``UNKNOWN_REPO``, ``INCOMPLETE_SELECTION`` or
+    ``COMMIT_CONFLICT``. The selected tests are stored in risk-rank order. Commits."""
     repo_id = session.scalars(select(Repo.id).where(Repo.name == repo)).one_or_none()
     if repo_id is None:
         return UNKNOWN_REPO
     scope = SelectionScope.of(selection)
-    budget = selection.budget if selection.budget and selection.budget.limited else None
-    before = budget.before if budget else None
+    budget = selection.budget
+    # The selection a budget cut: only the shadow compare reads it (budget misses).
+    before = budget.before if shadow and budget is not None and budget.limited else None
     named = scope.test_ids | (before.test_ids if before else frozenset())
     keys = _test_keys(session, repo_id, sorted(named))
     # Selected tests come from history, so all have keys; a missing one can't be stored, and
     # the comparison would call it not selected: refuse rather than under-count.
     if len(keys) < len(named):
-        logger.warning("shadow selection not stored: %d selected tests unknown",
+        logger.warning("selection not stored: %d selected tests unknown",
                        len(named) - len(keys))  # fmt: skip
         return INCOMPLETE_SELECTION
-    stored_budget = None
-    if budget is not None and before is not None:
-        stored_budget = {
-            "seconds": budget.budget_ms / 1000,
-            "full_suite": budget.full_suite,
-            "left_out": budget.left_out,
-            "left_out_ms": budget.left_out_ms,
-            "left_out_risk_share": budget.left_out_risk_share,
-            "before": {
-                "full": before.full,
-                "keys": sorted(keys[test_id] for test_id in before.test_ids),
-                "go_keys": sorted(keys[test_id] for test_id in before.go_test_ids),
-                "go_packages": sorted(before.go_packages),
-                "python_files": sorted(before.python_files),
-                "java_classes": sorted(before.java_classes),
-            },
+    in_order = sorted(selection.tests, key=_by_rank)
+    top = [
+        {
+            "key": keys[t.test_id],
+            "reasons": [reason[:REASON_CHARS] for reason in t.reasons[:3]],
+            "why": t.rank_reason[:REASON_CHARS],
         }
+        for t in in_order[:TOP_RISK]
+    ]
     inserted = session.execute(
-        pg_insert(ShadowSelection)
+        pg_insert(CiSelection)
         .values(
             repo_id=repo_id,
             ci_run_id=target.ci_run_id,
             run_attempt=target.run_attempt,
             variant=target.variant,
             commit_sha=target.commit_sha,
+            shadow=shadow,
             mode=selection.mode.value,
             reason=selection.reason,
-            selected_keys=sorted(keys[test_id] for test_id in scope.test_ids),
+            reason_code=selection.reason_code.value if selection.reason_code else None,
+            reason_items=list(selection.reason_items),
+            selected_keys=[keys[t.test_id] for t in in_order],
+            ranked=True,
             go_selected_keys=sorted(keys[test_id] for test_id in scope.go_test_ids),
             go_packages=sorted(scope.go_packages),
             python_files=sorted(scope.python_files),
@@ -160,7 +191,16 @@ def store_selection(
             total_known=selection.total_known,
             estimated_ms_total=selection.estimated_ms_total,
             estimated_ms_would_run=selection.estimated_ms_would_run,
-            budget=stored_budget,
+            budget=None if budget is None else _budget_json(budget, before, keys),
+            command_order=selection.order.value,
+            top_risk=top or None,
+            provider=ci.provider if ci else None,
+            branch=ci.branch if ci else None,
+            is_main=ci.is_main if ci else None,
+            pr_number=ci.pr_number if ci else None,
+            event=ci.event if ci else None,
+            client_version=ci.client_version if ci else None,
+            changed_count=ci.changed_count if ci else None,
         )
         .on_conflict_do_nothing(
             # SHADOW_UNIQUE_INDEX: one selection per attempt and variant. The '' is written
@@ -168,13 +208,13 @@ def store_selection(
             # picks a generic plan, a bound '' no longer matches the index expression and
             # every store fails (from the 11th on one connection).
             index_elements=[
-                ShadowSelection.repo_id,
-                ShadowSelection.ci_run_id,
-                ShadowSelection.run_attempt,
+                CiSelection.repo_id,
+                CiSelection.ci_run_id,
+                CiSelection.run_attempt,
                 text("coalesce(variant, '')"),
             ]
         )
-        .returning(ShadowSelection.id)
+        .returning(CiSelection.id)
     ).scalar_one_or_none()
     session.commit()
     if inserted is not None:
@@ -182,14 +222,47 @@ def store_selection(
     # Another leg stored it first (selections of one commit are the same), or a different
     # commit claims this attempt: that one isn't ours to compare.
     stored = session.scalars(
-        select(ShadowSelection.commit_sha).where(
-            ShadowSelection.repo_id == repo_id,
-            ShadowSelection.ci_run_id == target.ci_run_id,
-            ShadowSelection.run_attempt == target.run_attempt,
-            func.coalesce(ShadowSelection.variant, "") == (target.variant or ""),
+        select(CiSelection.commit_sha).where(
+            CiSelection.repo_id == repo_id,
+            CiSelection.ci_run_id == target.ci_run_id,
+            CiSelection.run_attempt == target.run_attempt,
+            func.coalesce(CiSelection.variant, "") == (target.variant or ""),
         )
     ).one()
     return None if stored == target.commit_sha else COMMIT_CONFLICT
+
+
+def _budget_json(
+    budget: Budget, before: SelectionScope | None, keys: Mapping[str, int]
+) -> dict[str, Any]:
+    """A stored budget: what it did, and for a limited shadow selection the selection it cut."""
+    stored: dict[str, Any] = {
+        "seconds": budget.budget_ms / 1000,
+        "applied": budget.applied,
+        "limited": budget.limited,
+        "full_suite": budget.full_suite,
+        "note": budget.note,
+        "estimated_ms": budget.estimated_ms,
+        "left_out": budget.left_out,
+        "left_out_ms": budget.left_out_ms,
+        "left_out_risk_share": budget.left_out_risk_share,
+        "unknown_ms": budget.unknown_ms,
+    }
+    if before is not None:
+        stored["before"] = {
+            "full": before.full,
+            "keys": sorted(keys[test_id] for test_id in before.test_ids),
+            "go_keys": sorted(keys[test_id] for test_id in before.go_test_ids),
+            "go_packages": sorted(before.go_packages),
+            "python_files": sorted(before.python_files),
+            "java_classes": sorted(before.java_classes),
+        }
+    return stored
+
+
+def budget_limited(selection: CiSelection) -> bool:
+    """A time budget left selected tests out of this selection."""
+    return bool((selection.budget or {}).get("limited"))
 
 
 @dataclass(frozen=True)
@@ -414,13 +487,32 @@ class VariantComparison:
 
 
 @dataclass(frozen=True)
-class AttemptComparison:
-    """A CI run attempt compared with its shadow selection(s)."""
+class LegOutcome:
+    """One recorded leg's stored outcome (``run_outcomes``)."""
 
-    shadow: bool  # a selection was stored for the attempt
-    selections: tuple[ShadowSelection, ...] = ()
+    variant: str | None
+    run_id: int
+    selection: str | None  # the leg's selection: its mode, "shadow", or None (none recorded)
+    failing: int = 0
+    new_regressions: int = 0
+    pre_existing: int = 0
+    flaky: int = 0
+    unknown: int = 0
+    failures_selected: int | None = None  # None: no selection
+    first_failure_rank: int | None = None
+    measured_ms: float | None = None
+
+
+@dataclass(frozen=True)
+class AttemptComparison:
+    """A CI run attempt's outcome: every leg's (``legs``), and the comparison with its shadow
+    selection(s) (the rest: empty, ``shadow`` false, when it wasn't a shadow run)."""
+
+    shadow: bool  # a shadow selection was stored for the attempt
+    selections: tuple[CiSelection, ...] = ()  # the shadow ones
     variants: tuple[VariantComparison, ...] = ()
     units: tuple[Unit, ...] = ()
+    legs: tuple[LegOutcome, ...] = ()
 
     @property
     def counted(self) -> bool:
@@ -444,7 +536,7 @@ class AttemptComparison:
         """A compared variant's selection was cut by a time budget."""
         by_variant = {s.variant: s for s in self.selections}
         return any(
-            (by_variant.get(v.variant) or by_variant[None]).budget is not None
+            budget_limited(by_variant.get(v.variant) or by_variant[None])
             for v in self.variants
             if v.status == SHADOW_COMPARED
         )
@@ -463,41 +555,48 @@ class AttemptComparison:
 
 
 def compare_ci_run(
-    session: Session, repo: str, ci_run_id: str, run_attempt: int, window_days: int = 90
+    session: Session,
+    repo: str,
+    ci_run_id: str,
+    run_attempt: int,
+    window_days: int = 90,
+    *,
+    fail_on: Sequence[str] | None = None,
 ) -> AttemptComparison | None:
-    """Compare every recorded variant of a shadow CI run attempt with its stored selection,
-    store the result (replacing an earlier comparison) and commit. None for an unknown repo;
-    ``shadow=False`` when no selection was stored for the attempt. A server error marks the
-    attempt's selections ``compare_error`` and re-raises."""
+    """Triage every recorded leg of a CI run attempt once and store each leg's outcome (its
+    failures, what the recorded selection did with them), compare a shadow run with its
+    selection, store the attempt's ``fail_on`` verdicts, all replacing an earlier call's, and
+    commit. None for an unknown repo. A server error marks the attempt's selections
+    ``compare_error`` and re-raises."""
     repo_id = session.scalars(select(Repo.id).where(Repo.name == repo)).one_or_none()
     if repo_id is None:
         return None
     selections = tuple(
         session.scalars(
-            select(ShadowSelection)
+            select(CiSelection)
             .where(
-                ShadowSelection.repo_id == repo_id,
-                ShadowSelection.ci_run_id == ci_run_id,
-                ShadowSelection.run_attempt == run_attempt,
+                CiSelection.repo_id == repo_id,
+                CiSelection.ci_run_id == ci_run_id,
+                CiSelection.run_attempt == run_attempt,
             )
-            .order_by(func.coalesce(ShadowSelection.variant, ""))
+            .order_by(func.coalesce(CiSelection.variant, ""))
         )
     )
-    if not selections:
-        return AttemptComparison(shadow=False)
     ids = [s.id for s in selections]
     try:
         with session.begin_nested():
-            result = _compare(session, repo, ci_run_id, run_attempt, window_days, selections)
+            result = _compare(session, repo_id, repo, ci_run_id, run_attempt, window_days,
+                              selections, fail_on)  # fmt: skip
     except Exception:
-        logger.exception("shadow compare failed for %s run %s attempt %s",
+        logger.exception("run outcome failed for %s run %s attempt %s",
                          repo, ci_run_id, run_attempt)  # fmt: skip
-        session.execute(
-            update(ShadowSelection)
-            .where(ShadowSelection.id.in_(ids))
-            .values(status=SHADOW_COMPARE_ERROR, compared_at=func.now())
-        )
-        session.commit()
+        if ids:
+            session.execute(
+                update(CiSelection)
+                .where(CiSelection.id.in_(ids))
+                .values(status=SHADOW_COMPARE_ERROR, compared_at=func.now())
+            )
+            session.commit()
         raise
     session.commit()
     return result
@@ -505,103 +604,184 @@ def compare_ci_run(
 
 def _compare(
     session: Session,
+    repo_id: int,
     repo: str,
     ci_run_id: str,
     run_attempt: int,
     window_days: int,
-    selections: Sequence[ShadowSelection],
+    selections: Sequence[CiSelection],
+    fail_on: Sequence[str] | None,
 ) -> AttemptComparison:
     by_variant = {s.variant: s for s in selections}
-    scopes, befores = _scopes(session, selections)
+    shadow_ids = {s.id for s in selections if s.shadow}
+    scopes, befores, names = _scopes(session, selections)
     triaged = triage_ci_run(session, repo, ci_run_id, run_attempt, window_days) or []
     run_ids = [v.run_id for v in triaged]
-    # A re-call replaces the earlier comparison (shadow_failures go with it).
-    session.execute(delete(ShadowResult).where(ShadowResult.run_id.in_(run_ids)))
-    durations = _durations(session, run_ids)
+    # A re-call replaces the earlier outcome (run_failures go with it).
+    session.execute(delete(RunOutcome).where(RunOutcome.run_id.in_(run_ids)))
+    measured = _measured(session, run_ids)
+    # Each test's duration is needed for what a shadow selection would have run, and for legs
+    # ingested before 0017 (no measured time yet).
+    timed_ids = [
+        v.run_id
+        for v in triaged
+        if measured.get(v.run_id) is None
+        or ((sel := by_variant.get(v.variant) or by_variant.get(None)) and sel.id in shadow_ids)
+    ]
+    durations = _durations(session, timed_ids)
+    missing = {i: measured_time(durations[i]) for i in timed_ids if measured.get(i) is None}
+    if missing:
+        session.execute(
+            text(
+                "UPDATE runs r SET tests_run = m.tests, measured_ms = m.ms "
+                "FROM unnest(CAST(:ids AS bigint[]), CAST(:tests AS integer[]), "
+                "CAST(:ms AS double precision[])) AS m(id, tests, ms) "
+                "WHERE r.id = m.id AND r.measured_ms IS NULL"
+            ),
+            {"ids": list(missing), "tests": [t for t, _ in missing.values()],
+             "ms": [ms for _, ms in missing.values()]},
+        )  # fmt: skip
+        measured.update({i: ms for i, (_, ms) in missing.items()})
     failing_ids = sorted({
         r.test_id for v in triaged for r in (v.report.results if v.report else ())
     })  # fmt: skip
-    keys, paths = _failing_tests(session, selections[0].repo_id, failing_ids)
+    keys, paths = _failing_tests(session, repo_id, failing_ids)
     changes = _run_changes(session, run_ids)
+    ranks = {
+        s.id: {names[key]: n for n, key in enumerate(s.selected_keys, start=1)}
+        for s in selections
+        if s.ranked
+    }
+    shadow_run = bool(shadow_ids)
 
     variants: list[VariantComparison] = []
+    legs: list[LegOutcome] = []
     rows: list[FailureRow] = []
-    # Inserted together at the end (results first: failures refer to them), so the number of
+    # Inserted together at the end (outcomes first: failures refer to them), so the number of
     # statements doesn't grow with the number of variants.
-    stored_results: list[ShadowResult] = []
-    stored_failures: list[ShadowFailure] = []
+    stored_outcomes: list[RunOutcome] = []
+    stored_failures: list[RunFailure] = []
     used: dict[int, list[str]] = defaultdict(list)  # selection id -> its variants' statuses
     for v in triaged:
         selection = by_variant.get(v.variant) or by_variant.get(None)
-        if selection is None:
-            variants.append(VariantComparison(v.variant, v.run_id, NO_SELECTION))
-            continue
-        if selection.commit_sha != v.commit_sha:
+        if selection is not None and selection.commit_sha != v.commit_sha:
             used[selection.id].append(SHADOW_COMMIT_MISMATCH)
-            variants.append(VariantComparison(v.variant, v.run_id, SHADOW_COMMIT_MISMATCH))
-            continue
-        used[selection.id].append(SHADOW_COMPARED)
-        would_run = WouldRun(scopes[selection.id])
-        before = befores.get(selection.id)
-        selective = selection.mode == Mode.SELECTIVE.value
+            if selection.id in shadow_ids:
+                variants.append(VariantComparison(v.variant, v.run_id, SHADOW_COMMIT_MISMATCH))
+            selection = None  # another commit's: not this leg's selection
+        elif selection is None and shadow_run:
+            variants.append(VariantComparison(v.variant, v.run_id, NO_SELECTION))
+        shadow = selection is not None and selection.id in shadow_ids
+        if selection is not None:
+            used[selection.id].append(SHADOW_COMPARED)
+        would_run = WouldRun(scopes[selection.id]) if selection is not None else None
+        rank_of = ranks.get(selection.id, {}) if selection is not None else {}
+        before = befores.get(selection.id) if selection is not None else None
         results = v.report.results if v.report else []
         change = changes.get(v.run_id, RunChange())
         change = RunChange(change.changed_files, v.links_known, change.go_module,
                            change.generated)  # fmt: skip
         variant_rows = []
         for r in results:
-            runs_it = would_run(r.test_id)
-            missed = not runs_it and r.verdict is not Verdict.FLAKY
+            runs_it = would_run(r.test_id) if would_run is not None else None
             cause = None
-            if missed and before is not None and before(r.test_id):
-                cause = MissCause(BUDGET, _budget_detail(selection.budget or {}))
-            elif missed:
-                cause = miss_cause(r, change, paths.get(r.test_id), selection.fixture_files)
-            variant_rows.append(FailureRow(r.test_id, v.variant, runs_it, r.verdict.value,
-                                           selective, cause))  # fmt: skip
-        rows.extend(variant_rows)
-        timed = [(t, ms) for t, ms in durations[v.run_id] if not is_go_subtest(t)]
-        ran = [(t, ms) for t, ms in timed if would_run(t)]
-        outcomes = Counter(
-            FLAKY if row.verdict == FLAKY else CAUGHT if row.would_run else MISSED
-            for row in variant_rows
-        )
-        compared = VariantComparison(
+            if shadow and not runs_it and r.verdict is not Verdict.FLAKY:
+                assert selection is not None
+                if before is not None and before(r.test_id):
+                    cause = MissCause(BUDGET, _budget_detail(selection.budget or {}))
+                else:
+                    cause = miss_cause(r, change, paths.get(r.test_id), selection.fixture_files)
+            variant_rows.append((r, runs_it, rank_of.get(r.test_id), cause))
+        verdicts = Counter(r.verdict.value for r in results)
+        ranked = [rank for _, _, rank, _ in variant_rows if rank is not None]
+        leg = LegOutcome(
             variant=v.variant,
             run_id=v.run_id,
-            status=SHADOW_COMPARED,
-            failing=len(variant_rows),
-            caught=outcomes[CAUGHT],
-            missed=outcomes[MISSED],
-            flaky=outcomes[FLAKY],
-            tests_total=len(timed),
-            tests_would_run=len(ran),
-            ms_total=float(sum(ms for _, ms in timed)),
-            ms_would_run=float(sum(ms for _, ms in ran)),
-        )
-        variants.append(compared)
-        stored_results.append(ShadowResult(
-            run_id=v.run_id, selection_id=selection.id, failing=compared.failing,
-            caught=compared.caught, missed=compared.missed, flaky=compared.flaky,
-            tests_total=compared.tests_total, tests_would_run=compared.tests_would_run,
-            ms_total=compared.ms_total, ms_would_run=compared.ms_would_run,
-        ))  # fmt: skip
+            selection=None if selection is None else "shadow" if shadow else selection.mode,
+            failing=len(results),
+            new_regressions=verdicts[Verdict.NEW_REGRESSION.value],
+            pre_existing=verdicts[Verdict.PRE_EXISTING.value],
+            flaky=verdicts[Verdict.FLAKY.value],
+            unknown=verdicts[Verdict.UNKNOWN.value],
+            failures_selected=None if selection is None else sum(
+                1 for _, runs_it, _, _ in variant_rows if runs_it),
+            first_failure_rank=min(ranked, default=None),
+            measured_ms=measured.get(v.run_id),
+        )  # fmt: skip
+        legs.append(leg)
+        outcome = RunOutcome(
+            run_id=v.run_id, selection_id=selection.id if selection is not None else None,
+            failing=leg.failing, new_regressions=leg.new_regressions,
+            pre_existing=leg.pre_existing, flaky=leg.flaky, unknown=leg.unknown,
+            failures_selected=leg.failures_selected, first_failure_rank=leg.first_failure_rank,
+        )  # fmt: skip
+        if shadow:
+            assert selection is not None and would_run is not None
+            selective = selection.mode == Mode.SELECTIVE.value
+            shadow_rows = [
+                FailureRow(r.test_id, v.variant, bool(runs_it), r.verdict.value, selective, cause)
+                for r, runs_it, _, cause in variant_rows
+            ]
+            rows.extend(shadow_rows)
+            timed = [(t, ms) for t, ms in durations[v.run_id] if not is_go_subtest(t)]
+            ran = [(t, ms) for t, ms in timed if would_run(t)]
+            outcomes = Counter(
+                FLAKY if row.verdict == FLAKY else CAUGHT if row.would_run else MISSED
+                for row in shadow_rows
+            )
+            compared = VariantComparison(
+                variant=v.variant,
+                run_id=v.run_id,
+                status=SHADOW_COMPARED,
+                failing=len(shadow_rows),
+                caught=outcomes[CAUGHT],
+                missed=outcomes[MISSED],
+                flaky=outcomes[FLAKY],
+                tests_total=len(timed),
+                tests_would_run=len(ran),
+                ms_total=float(sum(ms for _, ms in timed)),
+                ms_would_run=float(sum(ms for _, ms in ran)),
+            )
+            variants.append(compared)
+            outcome.caught, outcome.missed = compared.caught, compared.missed
+            outcome.tests_would_run = compared.tests_would_run
+            outcome.ms_would_run = compared.ms_would_run
+        stored_outcomes.append(outcome)
         stored_failures.extend(
-            ShadowFailure(
+            RunFailure(
                 run_id=v.run_id,
                 test_key=keys[r.test_id],
-                would_run=row.would_run,
+                would_run=runs_it,
+                rank=rank,
                 verdict=r.verdict.value,
                 confidence=r.confidence.value,
-                cause=row.cause.cause if row.cause else None,
-                cause_detail=row.cause.detail if row.cause else None,
-                suggestion=row.cause.suggestion if row.cause else None,
+                cause=cause.cause if cause else None,
+                cause_detail=cause.detail if cause else None,
+                suggestion=cause.suggestion if cause else None,
             )
-            for r, row in zip(results, variant_rows, strict=True)
+            for r, runs_it, rank, cause in variant_rows
         )
-    session.add_all(stored_results)
+    session.add_all(stored_outcomes)
     session.flush()
     session.add_all(stored_failures)
+    if triaged:
+        session.execute(
+            pg_insert(AttemptOutcome)
+            .values(
+                repo_id=repo_id,
+                ci_run_id=ci_run_id,
+                run_attempt=run_attempt,
+                fail_on=None if fail_on is None else sorted(set(fail_on)),
+            )
+            .on_conflict_do_update(
+                index_elements=[
+                    AttemptOutcome.repo_id,
+                    AttemptOutcome.ci_run_id,
+                    AttemptOutcome.run_attempt,
+                ],
+                set_={"computed_at": func.now(), "fail_on": text("excluded.fail_on")},
+            )
+        )
 
     for selection in selections:
         statuses = used.get(selection.id, [])
@@ -612,13 +792,24 @@ def _compare(
         )  # fmt: skip
         selection.compared_at = datetime.now(UTC)
     session.flush()
-    return AttemptComparison(True, tuple(selections), tuple(variants), tuple(units(rows)))
+    shadows = tuple(s for s in selections if s.id in shadow_ids)
+    return AttemptComparison(shadow_run, shadows, tuple(variants), tuple(units(rows)),
+                             tuple(legs))  # fmt: skip
+
+
+def _measured(session: Session, run_ids: Sequence[int]) -> dict[int, float | None]:
+    """Each run's measured test time (``runs.measured_ms``; NULL before 0017's ingest)."""
+    rows = session.execute(
+        text("SELECT id, measured_ms FROM runs WHERE id = ANY(:ids)"), {"ids": list(run_ids)}
+    )
+    return {run_id: ms for run_id, ms in rows}
 
 
 def _scopes(
-    session: Session, selections: Sequence[ShadowSelection]
-) -> tuple[dict[int, SelectionScope], dict[int, WouldRun]]:
-    """Each selection's scope, and for a budget-limited one, the selection the budget cut."""
+    session: Session, selections: Sequence[CiSelection]
+) -> tuple[dict[int, SelectionScope], dict[int, WouldRun], dict[int, str]]:
+    """Each selection's scope, for a budget-limited shadow one the selection the budget cut,
+    and the test IDs of the keys they name."""
     keys = {key for s in selections for key in s.selected_keys}
     for s in selections:
         before = (s.budget or {}).get("before") or {}
@@ -642,9 +833,9 @@ def _scopes(
     }
     befores = {}
     for s in selections:
-        if not s.budget:
+        if not (s.budget or {}).get("before"):
             continue
-        before = s.budget.get("before") or {}
+        before = (s.budget or {})["before"]
         befores[s.id] = WouldRun(SelectionScope(
             full=bool(before.get("full")),
             test_ids=frozenset(names[key] for key in before.get("keys") or ()),
@@ -653,7 +844,15 @@ def _scopes(
             python_files=frozenset(before.get("python_files") or ()),
             java_classes=frozenset(before.get("java_classes") or ()),
         ))  # fmt: skip
-    return scopes, befores
+    return scopes, befores, names
+
+
+def selection_scopes(
+    session: Session, selections: Sequence[CiSelection]
+) -> tuple[dict[int, SelectionScope], dict[int, str]]:
+    """Stored selections' scopes (``WouldRun`` reads them), and the test IDs of their keys."""
+    scopes, _, names = _scopes(session, selections)
+    return scopes, names
 
 
 def _budget_detail(budget: Mapping[str, Any]) -> str:
@@ -813,8 +1012,9 @@ def recall(
     for status, created_at in session.execute(
         text(
             """
-            SELECT status, created_at FROM shadow_selections
-            WHERE repo_id = :repo_id AND created_at >= :since AND status <> 'compared'
+            SELECT status, created_at FROM ci_selections
+            WHERE repo_id = :repo_id AND shadow AND created_at >= :since
+              AND status <> 'compared'
             """
         ),
         params,
@@ -843,13 +1043,14 @@ def recall(
     ) in session.execute(
         text(
             """
-            SELECT s.ci_run_id, s.run_attempt, s.mode, sr.ms_total, sr.ms_would_run,
-                   COALESCE(r.started_at, r.created_at), r.commit_sha, s.created_at,
-                   s.budget IS NOT NULL
-            FROM shadow_selections s
-            JOIN shadow_results sr ON sr.selection_id = s.id
+            SELECT s.ci_run_id, s.run_attempt, s.mode, COALESCE(r.measured_ms, 0),
+                   COALESCE(sr.ms_would_run, 0), COALESCE(r.started_at, r.created_at),
+                   r.commit_sha, s.created_at,
+                   COALESCE(CAST(s.budget ->> 'limited' AS boolean), false)
+            FROM ci_selections s
+            JOIN run_outcomes sr ON sr.selection_id = s.id
             JOIN runs r ON r.id = sr.run_id
-            WHERE s.repo_id = :repo_id AND s.created_at >= :since
+            WHERE s.repo_id = :repo_id AND s.shadow AND s.created_at >= :since
             """
         ),
         params,
@@ -874,12 +1075,12 @@ def recall(
             """
             SELECT s.ci_run_id, s.run_attempt, s.mode, r.variant, t.test_id, f.would_run,
                    f.verdict, f.cause, f.cause_detail, f.suggestion
-            FROM shadow_selections s
-            JOIN shadow_results sr ON sr.selection_id = s.id
+            FROM ci_selections s
+            JOIN run_outcomes sr ON sr.selection_id = s.id
             JOIN runs r ON r.id = sr.run_id
-            JOIN shadow_failures f ON f.run_id = sr.run_id
+            JOIN run_failures f ON f.run_id = sr.run_id
             JOIN tests t ON t.id = f.test_key
-            WHERE s.repo_id = :repo_id AND s.created_at >= :since
+            WHERE s.repo_id = :repo_id AND s.shadow AND s.created_at >= :since
             """
         ),
         params,
