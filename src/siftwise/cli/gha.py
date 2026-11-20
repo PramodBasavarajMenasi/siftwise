@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 import httpx
 import typer
 
+from siftwise import __version__
 from siftwise.cli import reruns
 from siftwise.cli.repoconfig import RepoConfig, RepoConfigError
 from siftwise.core.junit import JUnitParseError, Status, parse_junit
@@ -319,8 +320,16 @@ def run_select(
                     "variant": variant or None,
                     "commit_sha": ctx.head_sha,
                 }
+            ci_context = ci_selection_context(ctx, variant, ci.provider)
+            if ci_context is not None:
+                body["ci"] = ci_context
             result = cli.post_select(server, token, body, timeout=SELECT_TIMEOUT)
             problem = ""
+            note = record_note(body, result)
+            if note and result.get("recorded") is False:
+                _annotate("warning", note)  # one warning: e.g. a read-only token
+            elif note:
+                ci.echo(note)
         except cli.SiftwiseError as exc:
             if exc.status == httpx.codes.NOT_FOUND:
                 # A repo siftwise has never seen: the normal first run, not an outage.
@@ -462,7 +471,7 @@ def run_record(
         response = None
         if not problem:
             response, problem = fetch_triage(server, token, repo, ctx)
-        shadow = fetch_shadow(server, token, repo, ctx)
+        shadow = fetch_shadow(server, token, repo, ctx, gate)
         _shadow_outputs(env, shadow)
         code = report_failures(ctx, response, problem, comment=comment,
                                github_token=scm_token, fail_on=gate, shadow=shadow)  # fmt: skip
@@ -518,6 +527,10 @@ def _record(
         # sends the run without it).
         **({"known_flaky_expired": [e.to_json() for e in flaky.expired]} if flaky.expired
            else {}),
+        # Which client (a select step records selections): dropped by upload_run for a
+        # server older than 0.4.
+        "client_version": __version__,
+        "client": ci.provider,
     }  # fmt: skip
     try:
         result = cli.upload_run(server, token, files, metadata, defer_rollup=defer,
@@ -576,7 +589,7 @@ def run_rollup(
     repo = repo or ctx.repo
     code = 0
     # A shadow run's comparison, after every leg recorded (a no-op answer otherwise).
-    shadow = fetch_shadow(server, token, repo, ctx)
+    shadow = fetch_shadow(server, token, repo, ctx, gate if triage else frozenset())
     _shadow_outputs(env, shadow)
     if triage:
         response, problem = fetch_triage(server, token, repo, ctx)
@@ -603,6 +616,44 @@ def run_rollup(
 
 
 # --- pieces ---------------------------------------------------------------------------------
+
+
+def ci_selection_context(ctx: Context, variant: str, provider: str) -> dict[str, Any] | None:
+    """``/select``'s ``ci``: the CI run the server records the selection under (None without
+    a run ID or head commit). Branch and event come from the CI system, partly from a pull
+    request's author: one line, at most 255 characters, else left out."""
+    if not ctx.run_id or not ctx.head_sha:
+        return None
+    branch = re.sub(r"[\x00-\x1f\x7f]", "", ctx.branch).strip()[:255]
+    event = ctx.event_name if re.fullmatch(r"[a-z0-9_]{1,64}", ctx.event_name or "") else None
+    return {
+        "provider": provider,
+        "ci_run_id": ctx.run_id,
+        "run_attempt": ctx.run_attempt,
+        "variant": variant or None,
+        "commit_sha": ctx.head_sha,
+        "branch": branch or "unknown",
+        "is_main": ctx.is_main,
+        "pr_number": ctx.pr_number,
+        "event": event,
+        "client_version": __version__,
+    }
+
+
+def record_note(body: Mapping[str, Any], result: Mapping[str, Any]) -> str:
+    """One line when a selection sent with ``ci`` wasn't recorded (empty when it was)."""
+    if "ci" not in body:
+        return ""
+    if "recorded" not in result:
+        return ("siftwise: the server is older than 0.4 and doesn't record selections: "
+                "upgrade it to see them on the dashboard")  # fmt: skip
+    if result["recorded"]:
+        return ""
+    why = result.get("record_reason")
+    if why == "read_only_token":
+        return ("siftwise: selection not recorded: the token is read-only (a write token "
+                "records selections for the dashboard)")  # fmt: skip
+    return f"siftwise: selection not recorded ({why}): the dashboard won't show it"
 
 
 def fail_open_result(problem: str) -> dict[str, Any]:
@@ -1284,21 +1335,33 @@ def sampled(repo: str, run_id: str, rate: float) -> bool:
     return int.from_bytes(digest[:8], "big") / 2**64 < rate
 
 
-def fetch_shadow(server: str, token: str, repo: str, ctx: Context) -> dict[str, Any] | None:
-    """``POST /repos/{repo}/shadow`` for this run attempt: the comparison if this was a
-    shadow run, else None. A failure only warns: the run just isn't counted."""
+def fetch_shadow(
+    server: str, token: str, repo: str, ctx: Context, gate: frozenset[str] = frozenset()
+) -> dict[str, Any] | None:
+    """After the attempt's last upload: ``POST /repos/{repo}/outcome``, which stores the
+    attempt's verdicts and what its recorded selection did (and the ``fail-on`` verdicts, so
+    the dashboard can count gated runs), or, for a server older than 0.4 (``/healthz``
+    reports no version), ``POST /repos/{repo}/shadow``. Returns the shadow comparison if this
+    was a shadow run, else None. A failure only warns: the run just isn't counted."""
     from siftwise.cli import main as cli
 
     if not token or not ctx.run_id:
         return None
-    body = {"ci_run_id": ctx.run_id, "run_attempt": ctx.run_attempt}
+    body: dict[str, Any] = {"ci_run_id": ctx.run_id, "run_attempt": ctx.run_attempt}
     try:
-        result = cli.post_json(server, token, f"/repos/{repo}/shadow", body,
-                               timeout=TRIAGE_TIMEOUT)  # fmt: skip
+        if cli.server_version(server, timeout=TRIAGE_TIMEOUT) is not None:
+            outcome = cli.post_json(server, token, f"/repos/{repo}/outcome",
+                                    {**body, "fail_on": sorted(gate) or None},
+                                    timeout=TRIAGE_TIMEOUT)  # fmt: skip
+            result: dict[str, Any] = outcome["shadow"]
+        else:
+            result = cli.post_json(server, token, f"/repos/{repo}/shadow", body,
+                                   timeout=TRIAGE_TIMEOUT)  # fmt: skip
     except cli.SiftwiseError as exc:
         if exc.status != httpx.codes.NOT_FOUND:  # 404: a repo siftwise doesn't know, no shadow
-            _annotate("warning", f"siftwise: shadow comparison failed: {exc}; this run won't "
-                      "be counted in recall")  # fmt: skip
+            _annotate("warning", f"siftwise: run outcome not stored: {exc}; the dashboard "
+                      "won't show this run's verdicts, and a shadow run won't be counted in "
+                      "recall")  # fmt: skip
         return None
     return result if result.get("shadow") else None
 
@@ -1668,6 +1731,7 @@ class Provider:
     GitLab CI's (``cli/gitlab.py``) overrides what differs; the flows themselves are shared.
     The active one is ``_PROVIDER``'s (``use_provider``)."""
 
+    provider = "github"  # /select's ci.provider
     no_token = NO_TOKEN
     no_token_hint = "fork pull request?"
     gate_skip_warning = "fail-on skipped: no siftwise token (fork PR?); this run is not gated"

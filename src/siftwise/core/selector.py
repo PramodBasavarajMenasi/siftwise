@@ -112,6 +112,23 @@ NO_TESTS_AFFECTED = "no tests affected"
 # Reason for the full suite when the changed files are known but there are none.
 NO_NET_CHANGES = "this PR has no net changes"
 
+
+class FullReason(StrEnum):
+    """Why a selection is the full suite, as a code (``Selection.reason_code``): the dashboard
+    groups fallbacks by it. The reason text stays the sentence it always was."""
+
+    CHANGED_FILES_UNKNOWN = "changed_files_unknown"
+    NO_NET_CHANGES = "no_net_changes"
+    BUILD_FILE = "build_file"
+    NO_HISTORY = "no_history"
+    JAVA_BUILD = "java_build"
+    FIXTURE_UNREFERENCED = "fixture_unreferenced"
+    UNMAPPED_FILE = "unmapped_file"
+    NO_RUNNER = "no_runner"
+
+
+REASON_ITEMS_MAX = 20  # files or tests stored with a full-suite reason code
+
 JS_EXTENSIONS = frozenset({".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"})
 
 # Changing any of these can affect every test: dependencies, build, CI, test configuration.
@@ -366,6 +383,10 @@ class Selection:
     order: Order = Order.DEFAULT
     # A time budget's effect; None when no budget was asked for.
     budget: Budget | None = None
+    # A full-suite fallback's code and the files or tests that caused it (at most
+    # REASON_ITEMS_MAX); None for a selective run. Kept when a budget packs the full suite.
+    reason_code: FullReason | None = None
+    reason_items: tuple[str, ...] = ()
 
     @property
     def command(self) -> str:
@@ -588,11 +609,13 @@ def _select(
     }
     deleted = frozenset(p for p in (normalize_path(f) for f in deleted_files) if p)
 
-    def full(reason: str) -> Selection:
+    def full(reason: str, code: FullReason, items: Sequence[str] = ()) -> Selection:
         runners = {t.runner for t in tests.values() if t.runner is not None}
         selection = Selection(
             mode=Mode.FULL,
             reason=reason,
+            reason_code=code,
+            reason_items=tuple(items[:REASON_ITEMS_MAX]),
             tests=(),
             selected_count=len(tests),
             total_known=len(tests),
@@ -610,12 +633,12 @@ def _select(
                                    order, budget_ms, java)  # fmt: skip
 
     if not changed_files_known:
-        return full("changed files are unknown for this change")
+        return full("changed files are unknown for this change", FullReason.CHANGED_FILES_UNKNOWN)
     paths = sorted({p for p in (normalize_path(f) for f in changed_files) if p})
     if not paths:
         # A known but empty diff: e.g. a PR whose commits cancel out. Still "unsure": nothing
         # to select on, so the full suite.
-        return full(NO_NET_CHANGES)
+        return full(NO_NET_CHANGES, FullReason.NO_NET_CHANGES)
     # Changed test data (.siftwise.toml `fixtures`, sent by the CLI with the test files that
     # reference it): never a build file, never the full suite by itself.
     refs = {
@@ -634,9 +657,9 @@ def _select(
     build = [p for p in paths if is_build_file(p) and p not in scoped_build
              and p not in java_scoped and p not in fixtures]  # fmt: skip
     if build:
-        return full(f"build/config file changed: {_list(build)}")
+        return full(f"build/config file changed: {_list(build)}", FullReason.BUILD_FILE, build)
     if history is None or not tests:
-        return full("no test history for this repo")
+        return full("no test history for this repo", FullReason.NO_HISTORY)
 
     selected: dict[str, list[str]] = {}
     links: dict[str, Link] = {}  # each test's strongest link, for the risk score
@@ -674,7 +697,7 @@ def _select(
     if java is not None:
         problem = _java_problem([p for p in relevant if p not in fixtures], java)
         if problem:
-            return full(problem)
+            return full(problem[1], FullReason.JAVA_BUILD, (problem[0],))
 
     def run_module(module: str, reason: str) -> None:
         """Every test class of a module. A class whose name another module also has is run
@@ -850,7 +873,9 @@ def _select(
     if unreferenced:
         return full(
             "fixture file changed and no test references its fixture (no [[depends]] rule "
-            f"on it either): {_list(unreferenced)}"
+            f"on it either): {_list(unreferenced)}",
+            FullReason.FIXTURE_UNREFERENCED,
+            unreferenced,
         )
 
     # A changed file is covered if its own tests, its package's dependents' tests, test files
@@ -870,7 +895,8 @@ def _select(
         )
     ]
     if unmapped:
-        return full(f"changed file maps to no known tests: {_list(unmapped)}")
+        return full(f"changed file maps to no known tests: {_list(unmapped)}",
+                    FullReason.UNMAPPED_FILE, unmapped)  # fmt: skip
 
     # Co-change: earlier failures in runs that touched the same files. One reason per test,
     # from the most recent such run.
@@ -924,7 +950,8 @@ def _select(
     ]
     unrunnable = [t.test_id for t in chosen if t.runner is None]
     if unrunnable:
-        return full(f"no known test runner for selected test(s): {_list(unrunnable)}")
+        return full(f"no known test runner for selected test(s): {_list(unrunnable)}",
+                    FullReason.NO_RUNNER, unrunnable)  # fmt: skip
 
     files_run_whole = (
         py_whole_files
@@ -1640,6 +1667,18 @@ def is_go_subtest(test_id: str) -> bool:
     return "/" in name and _looks_like_go(classname, name)
 
 
+def measured_time(final: Iterable[tuple[str, int | None]]) -> tuple[int, float]:
+    """A run's measured test time from each test's final attempt ``(test_id, duration_ms)``:
+    (tests, ms), Go subtests left out (their time is inside their parent's). One definition
+    for ingest (``runs.measured_ms``) and the shadow compare."""
+    tests, ms = 0, 0.0
+    for test_id, duration in final:
+        if not is_go_subtest(test_id):
+            tests += 1
+            ms += duration or 0
+    return tests, ms
+
+
 def is_build_file(path: str) -> bool:
     base = posixpath.basename(path)
     return (
@@ -2243,28 +2282,31 @@ _OTHER_JVM_SOURCES = (".kt", ".groovy", ".scala")
 JAVA_TEST_NAMES = ("{}Test", "{}Tests", "Test{}", "{}TestCase", "{}IT", "{}ITCase")
 
 
-def _java_problem(paths: Iterable[str], java: JavaBuildInfo) -> str | None:
-    """Why a change needs the full suite as far as Java goes, or None."""
+def _java_problem(paths: Iterable[str], java: JavaBuildInfo) -> tuple[str, str] | None:
+    """Why a change needs the full suite as far as Java goes, as (the file, the reason), or
+    None."""
     for path in paths:
         ext = posixpath.splitext(path)[1]
         if ext in _OTHER_JVM_SOURCES:
-            return f"Kotlin, Groovy or Scala source changed (not analysed): {path}"
+            return path, f"Kotlin, Groovy or Scala source changed (not analysed): {path}"
         module = java.module_of(path)
         if module is not None and path.startswith(module.prefix("src/main/resources")):
-            return (f"main resources changed: {path} (code anywhere may load them at runtime, "
-                    "which no graph sees)")  # fmt: skip
+            return path, (
+                f"main resources changed: {path} (code anywhere may load them at runtime, "
+                "which no graph sees)"
+            )
         if ext != ".java":
             continue
         if java.unsupported:
-            return f"the Java build couldn't be read ({java.unsupported}): {path}"
+            return path, f"the Java build couldn't be read ({java.unsupported}): {path}"
         located = java_class_of(path)
         if module is None or located is None or located[0] != module.path:
-            return (
+            return path, (
                 f"Java file outside the build's source roots (src/main/java, src/test/java): {path}"
             )
         if module.unanalysed:
             where = module.name if module.path else "the root project"
-            return f"{where} isn't analysed ({module.unanalysed[0]}): {path}"
+            return path, f"{where} isn't analysed ({module.unanalysed[0]}): {path}"
     return None
 
 

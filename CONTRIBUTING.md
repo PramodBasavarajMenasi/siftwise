@@ -158,6 +158,13 @@ uv run alembic revision --rev-id 0011 -m "what it changes"
   `budget` (no rewrite).
 - **0012** adds `shadow_selections.java_classes` (the Java test classes a selection runs
   whole), with a default (no rewrite).
+- **0017** renames the shadow tables (`shadow_selections` -> `ci_selections`,
+  `shadow_results` -> `run_outcomes`, `shadow_failures` -> `run_failures`, with their
+  constraints, indexes and sequence), adds columns with defaults, moves the measured test time
+  to `runs` (an UPDATE of the runs that have shadow results: fast) and adds
+  `attempt_outcomes`. No rewrite of `test_results`. Back up first: its downgrade keeps the
+  shadow data but drops what 0016 can't hold (selections of non-shadow runs, outcomes without
+  a shadow selection). `tests/test_migrations.py` checks the round trip.
 
 ## Evals
 

@@ -1,10 +1,11 @@
 {% extends "base.html" %}
-{% from "_macros.html" import recall_cell, bar, older, test_id %}
+{% from "_macros.html" import recall_cell, bar, older, test_id, coverage %}
 {% block content %}
 <h1>Recall</h1>
 <p class="lede">Failures the selection would have caught, on shadow runs of {{ days|window }}.</p>
+{{ coverage(recorded, days) }}
 {% if report is none %}
-<p class="empty">No runs recorded for <span class="mono">{{ repo }}</span> yet. Record CI results with the record action or <code>siftwise record</code>. <a href="{{ readme }}#github-action">GitHub Action</a></p>
+<p class="empty">No runs recorded for <span class="mono">{{ repo }}</span> yet. Record CI results with the record action or <code>siftwise record</code>. <a href="{{ readme }}#github-action">Set up the record action</a></p>
 {% elif not report.all.runs %}
 {% if recorded.shadow_total %}
 {{ older(repo_url(repo), days, "shadow runs", recorded.shadow_total, recorded.newest_shadow_at) }}

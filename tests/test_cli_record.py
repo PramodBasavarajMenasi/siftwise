@@ -10,6 +10,7 @@ import pytest
 import respx
 from typer.testing import CliRunner
 
+from siftwise import __version__
 from siftwise.cli.main import EXIT_API_ERROR, EXIT_USAGE, app
 
 SERVER = "http://siftwise.test"
@@ -66,6 +67,8 @@ def test_record_uploads_junit_with_metadata(checkout: str, api: respx.MockRouter
         # b.py is imported by no test file: an empty but complete graph
         "affected": {"affected_packages": {}, "affected_files": {}, "depends": [],
                      "go_module": None, "generated": []},
+        # Which client (0.4): a CLI-recorded run's page says it had no select step.
+        "client_version": __version__, "client": "cli",
     }  # fmt: skip
 
 

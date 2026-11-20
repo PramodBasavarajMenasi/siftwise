@@ -34,3 +34,17 @@
 {%- if is_main and name == "main" -%}<span class="tag">main</span>
 {%- else -%}<span class="mono trunc" title="{{ name }}">{{ name }}</span>{% if is_main %} <span class="tag">main</span>{% endif %}{%- endif -%}
 {%- endmacro %}
+{# A CI run's recorded selection in a list: "selective · 120 of 4,000", "full · why", "shadow". #}
+{% macro selection_cell(sel) -%}
+{%- if sel is none -%}<span class="muted" title="no selection recorded for this run">–</span>
+{%- elif sel.shadow -%}shadow <span class="muted" title="a shadow run: the full suite ran; siftwise would have run {{ sel.selected|num }} of {{ sel.known|num }} ({{ sel.mode }})">· would run {% if sel.mode == "full" %}the full suite{% else %}{{ sel.selected|num }} of {{ sel.known|num }}{% endif %}</span>
+{%- elif sel.mode == "selective" -%}selective <span class="muted">· {{ sel.selected|num }} of {{ sel.known|num }}</span>{% if sel.budget_limited %} <span class="tag" title="a time budget left selected tests out">budget</span>{% endif %}
+{%- else -%}full{% if sel.reason_code %} <span class="muted">· {{ reason_labels.get(sel.reason_code, sel.reason_code) }}</span>{% endif %}{%- endif -%}
+{%- endmacro %}
+{# How much of the window's CI runs have a recorded selection: shown on every page, so
+   partial data never looks complete. #}
+{% macro coverage(recorded, days) -%}
+{%- set runs = recorded.runs_window if days is not none else recorded.runs_total -%}
+{%- set sel = recorded.selected_window if days is not none else recorded.selected_total -%}
+{%- if runs -%}<p class="coverage" title="CI runs whose select step recorded its selection (the Action or GitLab template 0.4, with a write token), of the CI runs uploaded in the window">Selections recorded for <strong>{{ sel|num }}</strong> of <strong>{{ runs|num }}</strong> CI runs in {{ days|window }}{% if sel < runs %}: <a href="{{ readme }}#dashboard">upgrade the Action or template to 0.4</a> to record the rest{% endif %}.</p>{%- endif -%}
+{%- endmacro %}

@@ -72,9 +72,10 @@ class KnownFlakySource(StrEnum):
 class SiftwiseError(Exception):
     """The server couldn't be reached, timed out, or answered with an error."""
 
-    def __init__(self, message: str, status: int | None = None) -> None:
+    def __init__(self, message: str, status: int | None = None, detail: Any = None) -> None:
         super().__init__(message)
         self.status = status  # the HTTP status, if the server answered
+        self.detail = detail  # the answer's JSON "detail", if it had one
 
 
 def _print_version(value: bool) -> None:
@@ -249,6 +250,9 @@ def record_command(
         "variant": variant,
         "started_at": started_at,
         **recorded_change(base, head, go_list=go_list, py_imports=py_imports),
+        # Which client: dropped by upload_run for a server older than 0.4.
+        "client_version": __version__,
+        "client": "cli",
     }
     try:
         result = upload_run(server, token, junit, metadata, defer_rollup=defer_rollup,
@@ -1106,8 +1110,11 @@ def post_select(
     try:
         return post_json(server, token, "/select", body, timeout=timeout)
     except SiftwiseError as exc:
-        rejected = [k for k in OPTIONAL_SELECT_FIELDS if k in body and k in str(exc)]
-        if exc.status != 422 or not rejected:
+        unknown = unknown_fields(exc)
+        rejected = sorted(unknown or ())
+        # Only a server that doesn't know these fields: every error is one of them, unknown.
+        # Any other 422 (a bad value, even inside one of them) is shown as it is.
+        if not rejected or not set(rejected) <= {k for k in OPTIONAL_SELECT_FIELDS if k in body}:
             raise
     _err(f"siftwise: the server doesn't take {', '.join(rejected)} (it's older than this "
          "client): selecting without them")  # fmt: skip
@@ -1115,8 +1122,29 @@ def post_select(
     return post_json(server, token, "/select", rest, timeout=timeout)
 
 
+def unknown_fields(exc: SiftwiseError, where: str = "body") -> set[str] | None:
+    """The top-level fields a 422 rejects as unknown (``extra_forbidden`` at ``[where,
+    field]``: what an older server answers for a field it doesn't have; ``where`` is "body",
+    or "metadata" for an upload), or None if the 422 is about anything else, alone or among
+    them."""
+    if exc.status != httpx.codes.UNPROCESSABLE_ENTITY or not isinstance(exc.detail, list):
+        return None
+    fields = set()
+    for error in exc.detail:
+        if not isinstance(error, dict):
+            return None
+        loc = error.get("loc")
+        if error.get("type") != "extra_forbidden" or not (
+            isinstance(loc, list) and len(loc) == 2 and loc[0] == where
+        ):
+            return None
+        fields.add(str(loc[1]))
+    return fields or None
+
+
 # /select fields a server older than this client may not know; dropped on its 422.
-OPTIONAL_SELECT_FIELDS = ("js_graph", "java", "go_modules", "import_depths", "fixture_refs")
+OPTIONAL_SELECT_FIELDS = ("js_graph", "java", "go_modules", "import_depths", "fixture_refs",
+                          "ci")  # fmt: skip
 
 
 def post_json(
@@ -1194,17 +1222,33 @@ def upload_run(
             raise SiftwiseError(f"could not reach siftwise at {server}: {exc}") from exc
 
     response = post(metadata)
-    if (
-        response.status_code == httpx.codes.UNPROCESSABLE_ENTITY
-        and "known_flaky_expired" in metadata
-        and "known_flaky_expired" in _detail(response)
-    ):
-        # A server older than 0.4: the run counts the same, only the expiry note is lost.
-        if warn is not None:
+    unknown = unknown_fields(
+        SiftwiseError("", response.status_code, _json_detail(response)), where="metadata"
+    )
+    rejected = sorted(unknown or ())
+    if rejected and set(rejected) <= {key for key in OPTIONAL_RUN_FIELDS if key in metadata}:
+        # A server older than 0.4: the run counts the same, only these notes are lost.
+        if warn is not None and "known_flaky_expired" in rejected:
             warn("siftwise: the server doesn't take known_flaky_expired (older than 0.4): "
                  "recorded without the expired-entry note")  # fmt: skip
-        response = post({k: v for k, v in metadata.items() if k != "known_flaky_expired"})
+        response = post({k: v for k, v in metadata.items() if k not in rejected})
     return _ok(response)
+
+
+# Run metadata a server older than this client may not know; dropped on its 422.
+OPTIONAL_RUN_FIELDS = ("known_flaky_expired", "client_version", "client")
+
+
+def server_version(server: str, timeout: float = 30) -> str | None:
+    """The server's version from ``GET /healthz`` (no token needed), or None for a server
+    older than 0.4, which doesn't report one. Raises SiftwiseError if it can't be reached."""
+    try:
+        response = httpx.get(f"{server.rstrip('/')}/healthz", timeout=timeout)
+    except httpx.HTTPError as exc:
+        raise SiftwiseError(f"could not reach siftwise at {server}: {exc}") from exc
+    body = _ok(response)
+    version = body.get("version")
+    return version if isinstance(version, str) and version else None
 
 
 def rollup_repo(server: str, token: str, repo: str, timeout: float = 1800) -> dict[str, Any]:
@@ -1215,7 +1259,9 @@ def rollup_repo(server: str, token: str, repo: str, timeout: float = 1800) -> di
 def _ok(response: httpx.Response) -> dict[str, Any]:
     if not response.is_success:
         raise SiftwiseError(
-            f"siftwise returned {response.status_code}: {_detail(response)}", response.status_code
+            f"siftwise returned {response.status_code}: {_detail(response)}",
+            response.status_code,
+            _json_detail(response),
         )
     result: dict[str, Any] = response.json()
     return result
@@ -1409,6 +1455,13 @@ def parse_deleted(output: bytes) -> list[str]:
     """Paths that no longer exist at head: deleted files and the old side of renames."""
     deleted = [entry[0] for status, entry in _name_status_entries(output) if status in "DR"]
     return list(dict.fromkeys(deleted))
+
+
+def _json_detail(response: httpx.Response) -> Any:
+    try:
+        return response.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
 
 
 def _detail(response: httpx.Response) -> str:

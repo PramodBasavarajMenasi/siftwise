@@ -1,4 +1,5 @@
-"""POST /select: which tests to run for a change (and, for a shadow run, store the selection)."""
+"""POST /select: which tests to run for a change; from CI (``ci``) or for a shadow run, it
+also stores the selection for that CI run."""
 
 import logging
 from typing import Annotated
@@ -26,7 +27,14 @@ from siftwise.core.selector import (
     load_history,
     select_tests,
 )
-from siftwise.core.shadow import STORAGE_ERROR, ShadowTarget, store_selection
+from siftwise.core.shadow import (
+    READ_ONLY_TOKEN,
+    STORAGE_ERROR,
+    CiRun,
+    ShadowTarget,
+    store_selection,
+)
+from siftwise.core.tokens import Principal
 from siftwise.db import get_session
 
 logger = logging.getLogger(__name__)
@@ -37,10 +45,12 @@ router = APIRouter()
 def post_select(
     body: SelectRequest, session: Annotated[Session, Depends(get_session)], caller: Caller
 ) -> SelectResponse:
-    """Select tests for a change. Falls back to the full suite whenever unsure. With
-    ``shadow``, also stores the selection for that (full-suite) run's recall: that needs a
-    write token."""
+    """Select tests for a change. Falls back to the full suite whenever unsure. With ``ci``
+    (the GitHub Action, the GitLab template), also records the selection for that CI run, if
+    the token can write (a read token still gets its selection, ``recorded: false``). With
+    ``shadow``, stores it for that (full-suite) run's recall: that needs a write token."""
     authorize(caller, body.repo, write=body.shadow is not None, what="storing a shadow selection")
+    _same_run(body)
     config = SelectorConfig(
         always_run=tuple(body.always_run),
         depends=tuple(DependsRule(rule.tests, tuple(rule.on)) for rule in body.depends),
@@ -76,7 +86,7 @@ def post_select(
         import_depths=body.import_depths,
         fixture_refs=body.fixture_refs,
     )
-    shadow_reason = _store_shadow(session, body, selection) if body.shadow else None
+    reason = _store(session, body, selection, caller)
     return SelectResponse(
         repo=body.repo,
         mode=selection.mode.value,
@@ -106,8 +116,10 @@ def post_select(
         order=selection.order.value,
         budget_limited=bool(selection.budget and selection.budget.limited),
         budget=_budget(selection),
-        shadow_stored=None if body.shadow is None else shadow_reason is None,
-        shadow_reason=shadow_reason,
+        shadow_stored=None if body.shadow is None else reason is None,
+        shadow_reason=None if body.shadow is None else reason,
+        recorded=None if body.ci is None else reason is None,
+        record_reason=None if body.ci is None else reason,
     )
 
 
@@ -133,16 +145,48 @@ def _budget(selection: Selection) -> BudgetOut | None:
     )
 
 
-def _store_shadow(session: Session, body: SelectRequest, selection: Selection) -> str | None:
-    """Store a shadow run's selection; None, or why it wasn't stored. Never fails the request:
-    the caller runs the full suite whatever happens, and an unstored selection only means the
-    run isn't counted."""
-    assert body.shadow is not None
-    shadow = body.shadow
-    target = ShadowTarget(shadow.ci_run_id, shadow.run_attempt, shadow.variant, shadow.commit_sha)
+def _same_run(body: SelectRequest) -> None:
+    """``ci`` and ``shadow`` together (a 0.4 client's shadow run) must name one CI run."""
+    if body.ci is None or body.shadow is None:
+        return
+    ci, shadow = body.ci, body.shadow
+    if (ci.ci_run_id, ci.run_attempt, ci.variant, ci.commit_sha) != (
+        shadow.ci_run_id, shadow.run_attempt, shadow.variant, shadow.commit_sha
+    ):  # fmt: skip
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "ci and shadow name different CI runs (run ID, attempt, variant and commit must match)",
+        )
+
+
+def _store(
+    session: Session, body: SelectRequest, selection: Selection, caller: Principal
+) -> str | None:
+    """Store the selection for its CI run: None, or why it wasn't stored. Never fails the
+    request: the caller runs its tests whatever happens, and an unstored selection only means
+    the dashboard (or recall) doesn't count the run."""
+    if body.ci is None and body.shadow is None:
+        return None
+    if not caller.can_write():  # only with ci alone: shadow needed a write token above
+        return READ_ONLY_TOKEN
+    run = body.shadow or body.ci
+    assert run is not None
+    target = ShadowTarget(run.ci_run_id, run.run_attempt, run.variant, run.commit_sha)
+    ci = None
+    if body.ci is not None:
+        ci = CiRun(
+            provider=body.ci.provider,
+            branch=body.ci.branch,
+            is_main=body.ci.is_main,
+            pr_number=body.ci.pr_number,
+            event=body.ci.event,
+            client_version=body.ci.client_version,
+            changed_count=len({path for path in body.changed_files if path.strip()}),
+        )
     try:
-        return store_selection(session, body.repo, target, selection)
+        return store_selection(session, body.repo, target, selection,
+                               shadow=body.shadow is not None, ci=ci)  # fmt: skip
     except SQLAlchemyError:
-        logger.exception("shadow selection not stored for %s run %s", body.repo, shadow.ci_run_id)
+        logger.exception("selection not stored for %s run %s", body.repo, run.ci_run_id)
         session.rollback()
         return STORAGE_ERROR

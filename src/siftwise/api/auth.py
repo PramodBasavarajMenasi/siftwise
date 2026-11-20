@@ -30,7 +30,9 @@ READ, WRITE = TokenScope.READ, TokenScope.WRITE
 # Every route's scope, by method and path template. A route missing here needs WRITE (fail
 # closed); tests/test_tokens.py checks every route of the app is listed.
 ROUTE_SCOPES: dict[tuple[str, str], TokenScope] = {
-    ("POST", "/select"): READ,  # storing a shadow selection needs WRITE (checked in the route)
+    # Storing a shadow selection needs WRITE (checked in the route); recording a CI selection
+    # (``ci``) too, but a read token still gets its selection, not recorded.
+    ("POST", "/select"): READ,
     ("POST", "/triage"): READ,
     ("POST", "/repos/{repo:path}/triage"): READ,
     ("POST", "/explain"): READ,
@@ -42,6 +44,7 @@ ROUTE_SCOPES: dict[tuple[str, str], TokenScope] = {
     ("POST", "/runs"): WRITE,
     ("POST", "/repos/{repo:path}/rollup"): WRITE,
     ("POST", "/repos/{repo:path}/shadow"): WRITE,
+    ("POST", "/repos/{repo:path}/outcome"): WRITE,
     # The dashboard (SIFTWISE_DASHBOARD=1): read-only pages behind its own session cookie,
     # checked by api/dashboard/auth.py, never by a Bearer token. Login, logout and the
     # stylesheet are listed too: every /ui route is a read.

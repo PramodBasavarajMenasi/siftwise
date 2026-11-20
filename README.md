@@ -293,11 +293,13 @@ siftwise token revoke 2                                             # 401 from t
 | Scope | Can |
 |---|---|
 | `read` | `select`, `triage` (also of a recorded CI run), `explain`, `report` (recall), test history and run lookups |
-| `write` | all of that, plus uploading runs (`record`, backfill), rollups, shadow compares, and storing a shadow run's selection |
+| `write` | all of that, plus uploading runs (`record`, backfill), rollups, storing a run's outcome (verdicts, shadow compares), and recording a CI run's selection |
 
 - **Which to use:** CI (the Action, the GitLab template, `siftwise record`, backfill) needs a
-  `write` token for its repo: it uploads runs and `rerun-unknown`'s re-runs, rolls up, and in
-  shadow mode stores the selection and compares the run. Coding agents (`siftwise mcp`) and
+  `write` token for its repo: it uploads runs and `rerun-unknown`'s re-runs, rolls up, records
+  each run's selection and outcome for the dashboard, and in shadow mode compares the run. With
+  a `read` token the select step still selects, but warns once that the selection wasn't
+  recorded. Coding agents (`siftwise mcp`) and
   `siftwise select`/`triage` on a laptop need only `read`: they never upload or store
   anything.
 - **What goes wrong:** an unknown or revoked token gets 401; a read token on a write call, or
@@ -314,9 +316,10 @@ siftwise token revoke 2                                             # 401 from t
 
 ### Dashboard
 
-A read-only view of what the server knows, for people rather than CI: per repo, shadow-mode
-recall (all runs and selective runs, week by week, misses by cause), recent CI runs with their
-failing tests and each run's verdicts, and flaky tests with `known_flaky` entries to paste.
+A read-only view of what the server knows, for people rather than CI: per repo, what
+siftwise selected in each CI run and what happened to its failures, shadow-mode recall (all
+runs and selective runs, week by week, misses by cause), recent CI runs with their failing
+tests and verdicts, and flaky tests with `known_flaky` entries to paste.
 Server-rendered pages, no JavaScript. Off unless you turn it on:
 
 ```sh
@@ -329,9 +332,12 @@ SIFTWISE_DASHBOARD=1 siftwise server start            # then open http://localho
 - **The pages:** *Repos* lists the CI runs recorded per repo (a CI run is one run attempt
   with its matrix legs; re-run uploads don't count). *Overview* is recall on shadow runs, which
   run the full suite and store what siftwise would have selected, so a failure outside the
-  selection is a miss. *Runs* lists the newest 20 CI runs on any branch; each run's page gives
-  every failing test's verdict as the PR comment does, from what its uploads stored and with
-  no peeking at later runs, plus its shadow comparison. *Flaky tests* are tests that failed and
+  selection is a miss. *Runs* lists the newest 20 CI runs on any branch with what siftwise selected for
+  each. A run's page says what siftwise did in it (selected X of Y known tests, or why the full
+  suite ran, the estimated and measured test time, the budget, the order, the highest-risk
+  tests and why) and gives every failing test's verdict as the PR comment does, from what its
+  uploads stored and with no peeking at later runs, with where it stood in the selection and
+  its risk rank; plus a shadow run's comparison. *Flaky tests* are tests that failed and
   passed on one commit and variant (retries, re-runs). Long test IDs and branches are cut with
   an ellipsis; hover for the full value.
 - **Windows:** every page counts back from now (7, 30 or 90 days, or all history), as
@@ -354,10 +360,42 @@ SIFTWISE_DASHBOARD=1 siftwise server start            # then open http://localho
 
   (or `SIFTWISE_FORWARDED_ALLOW_IPS`; `*` trusts any peer, only safe when nothing but the proxy
   can reach the server). Headers from any other peer are ignored.
-- **What it shows, and what it can't:** recall and time saved come from shadow runs only: the
-  server stores what siftwise selected only for those ([Shadow mode](#shadow-mode)). Without
-  shadow runs the overview says so. Verdicts are computed when a run's page opens, as the PR
-  comment computes them (a few seconds for a big matrix with thousands of failures).
+- **Recorded selections (0.4):** the Action's and the GitLab template's select step sends
+  its CI run with `/select` (`ci`), and the server records the selection it returned under that
+  run, attempt and variant: one row per attempt, or one per leg when the select step's
+  `variant` is set. Laptop (`siftwise select`) and MCP calls never send it and are never
+  recorded. After the attempt's last upload, the rollup step (or record in a single job) stores
+  its outcome once (`POST /repos/{repo}/outcome`): each leg's failures by verdict, which of
+  them the selection ran, and its `fail-on` verdicts. A run from a client older than 0.4, or
+  whose select step didn't reach the server, has no selection, and its page says which. Every
+  page says how many CI runs in the window have a recorded selection ("selections recorded for
+  80 of 112 CI runs"), so partial data never looks complete.
+- **Storage:** a selection keeps its selected tests as 4-byte test keys in risk order (a test's
+  rank is its position), plus its five highest-risk tests with their reasons. Measured on
+  replayed PR runs (2026-11-20), a selective row's median is 78 KB on rdflib (18,219 tests
+  selected), 6.3 KB on substrate (630) and 1.4 KB on dropwizard (26); a full-suite row is
+  under 1 KB (median 0.4 to 0.5 KB). With `variant` set on a
+  big matrix, every leg stores its own row: 22 legs of rdflib would be 22 times that.
+- **How these numbers work:** each is defined once; hover a heading or number for it.
+  - *CI run*: one run attempt with its matrix legs; re-run uploads and uploads without a CI
+    run ID count as described above. Times are UTC; windows count back from now.
+  - *Selected X of Y*: the tests the selection names, of the tests history knows (the
+    `known` tests: seen in the last 50 CI runs).
+  - *Test time*: sums of test durations, never wall-clock CI time. *Estimated* = each test's
+    mean duration in history (the selection, and the full suite); *measured* = the uploaded
+    tests' durations (each test's final attempt; Go subtests left out, their time is in their
+    parent's). *Test time saved (estimated)* = the full-suite estimate minus the measured test
+    time of the selected run, per uploaded leg; a full or shadow run saves nothing.
+  - *Rank*: a test's place in the selection's risk order (1 = run first). Commands run whole
+    files and packages by their best-ranked test, so a test can run a little before or after
+    its rank.
+  - *In the selection*: selected (named, with its rank); run whole (its file, package or class
+    ran whole: e.g. a new test); not selected (it ran outside the selection, or a shadow run's
+    selection would have missed it).
+- **What else it shows, and what it can't:** recall comes from shadow runs only
+  ([Shadow mode](#shadow-mode)); without shadow runs the overview says so. Verdicts are
+  computed when a run's page opens, as the PR comment computes them (a few seconds for a big
+  matrix with thousands of failures).
 - **Safety:** test names, branches and repo names are escaped everywhere; pages are sent with a
   Content-Security-Policy that allows no scripts, `frame-ancestors 'none'` and
   `Cache-Control: no-store`; sign-in and sign-out are protected against cross-site requests.

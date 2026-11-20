@@ -265,3 +265,121 @@ def test_0015_adds_known_flaky_expired_and_drops_it_again(
     with engine.connect() as connection:
         assert connection.execute(column).first() is None
     command.upgrade(config, "head")
+
+
+# 0016 shadow data: a selective selection with a budget, one without, their results and
+# failures (one caught, one missed with a cause, one flaky).
+SHADOW_0016 = f"""
+INSERT INTO repos (id, name) VALUES (1, 'acme/shop');
+INSERT INTO runs (id, repo_id, commit_sha, branch, is_main, ci_run_id, variant, started_at)
+VALUES (10, 1, '{sha(1)}', 'pr', false, '7', 'linux', '2026-11-01'),
+       (11, 1, '{sha(1)}', 'pr', false, '7', 'mac', '2026-11-01'),
+       (12, 1, '{sha(2)}', 'pr', false, '8', NULL, '2026-11-02');
+INSERT INTO tests (id, repo_id, test_id) VALUES (1, 1, 't::a'), (2, 1, 't::b'), (3, 1, 't::c');
+INSERT INTO shadow_selections (id, repo_id, ci_run_id, run_attempt, variant, commit_sha,
+    created_at, mode, reason, selected_keys, go_selected_keys, go_packages, python_files,
+    selected_count, total_known, estimated_ms_total, estimated_ms_would_run, status, budget)
+VALUES (1, 1, '7', 1, NULL, '{sha(1)}', '2026-11-01', 'selective', 'why', '{{1,3}}', '{{}}',
+        '{{}}', '{{}}', 2, 3, 300, 200, 'compared',
+        '{{"seconds": 60, "full_suite": false, "left_out": 1, "left_out_ms": 5,
+          "left_out_risk_share": 0.1, "before": {{"full": false, "keys": [1, 2, 3],
+          "go_keys": [], "go_packages": [], "python_files": [], "java_classes": []}}}}'),
+       (2, 1, '8', 1, NULL, '{sha(2)}', '2026-11-02', 'full', 'build', '{{}}', '{{}}', '{{}}',
+        '{{}}', 3, 3, 300, 300, 'compared', NULL);
+INSERT INTO shadow_results (run_id, selection_id, failing, caught, missed, flaky, tests_total,
+    tests_would_run, ms_total, ms_would_run)
+VALUES (10, 1, 3, 1, 1, 1, 3, 2, 300, 200), (11, 1, 0, 0, 0, 0, 3, 2, 310, 210),
+       (12, 2, 1, 1, 0, 0, 3, 3, 290, 290);
+INSERT INTO shadow_failures (run_id, test_key, would_run, verdict, confidence, cause,
+    cause_detail, suggestion)
+VALUES (10, 1, true, 'new_regression', 'high', NULL, NULL, NULL),
+       (10, 2, false, 'unknown', 'low', 'budget', 'left out', NULL),
+       (10, 3, true, 'flaky', 'high', NULL, NULL, NULL),
+       (12, 1, true, 'pre_existing', 'medium', NULL, NULL, NULL);
+SELECT setval('shadow_selections_id_seq', 2);
+"""
+SHADOW_ROWS_0016 = {
+    "shadow_selections": "SELECT id, ci_run_id, mode, selected_keys, budget, status "
+    "FROM shadow_selections ORDER BY id",
+    "shadow_results": "SELECT run_id, selection_id, failing, caught, missed, flaky, "
+    "tests_total, tests_would_run, ms_total, ms_would_run FROM shadow_results ORDER BY run_id",
+    "shadow_failures": "SELECT run_id, test_key, would_run, verdict, confidence, cause "
+    "FROM shadow_failures ORDER BY run_id, test_key",
+}
+
+
+def test_0017_generalises_the_shadow_tables_and_back(scratch_engine: tuple[Engine, str]) -> None:
+    engine, url = scratch_engine
+    config = alembic_config(url)
+    command.upgrade(config, "0016")
+    with engine.begin() as connection:
+        connection.execute(text(SHADOW_0016))
+    with engine.connect() as connection:
+        before = {t: connection.execute(text(q)).all() for t, q in SHADOW_ROWS_0016.items()}
+
+    command.upgrade(config, "0017")
+
+    with engine.begin() as connection:
+        for old in SHADOW_ROWS_0016:
+            assert connection.execute(text(f"SELECT to_regclass('{old}')")).scalar() is None
+        rows = connection.execute(text(
+            "SELECT id, shadow, ranked, budget->>'limited', budget->>'applied', reason_code, "
+            "reason_items FROM ci_selections ORDER BY id"
+        )).all()  # fmt: skip
+        assert [tuple(r) for r in rows] == [
+            (1, True, False, "true", "true", None, []),
+            (2, True, False, None, None, None, []),
+        ]
+        # Which client uploaded a run: new, empty for every existing run.
+        assert connection.execute(text(
+            "SELECT count(*), count(client), count(client_version) FROM runs"
+        )).one() == (3, 0, 0)  # fmt: skip
+        connection.execute(text("UPDATE runs SET client = 'github', client_version = '0.4.0' "
+                                "WHERE id = 10"))  # fmt: skip
+        # The measured time moved to runs; the verdict counts were filled from the failures.
+        assert connection.execute(text(
+            "SELECT id, tests_run, measured_ms FROM runs ORDER BY id"
+        )).all() == [(10, 3, 300.0), (11, 3, 310.0), (12, 3, 290.0)]  # fmt: skip
+        assert connection.execute(text(
+            "SELECT run_id, new_regressions, pre_existing, unknown, flaky, failures_selected, "
+            "caught, missed FROM run_outcomes ORDER BY run_id"
+        )).all() == [(10, 1, 0, 1, 1, 2, 1, 1), (11, 0, 0, 0, 0, 0, 0, 0),
+                     (12, 0, 1, 0, 0, 1, 1, 0)]  # fmt: skip
+        # 0017 rows 0016 can't hold: a non-shadow selection with an outcome, an outcome
+        # without a selection, an attempt outcome. Downgrade drops them, keeps the rest.
+        connection.execute(text(f"""
+            INSERT INTO runs (id, repo_id, commit_sha, branch, is_main, ci_run_id, started_at,
+                              tests_run, measured_ms)
+            VALUES (13, 1, '{sha(3)}', 'pr', false, '9', '2026-11-03', 3, 100),
+                   (14, 1, '{sha(4)}', 'pr', false, '10', '2026-11-04', 3, 100);
+            INSERT INTO ci_selections (repo_id, ci_run_id, run_attempt, commit_sha, mode,
+                reason, selected_keys, go_selected_keys, go_packages, python_files,
+                selected_count, total_known, estimated_ms_total, estimated_ms_would_run,
+                shadow, ranked, budget)
+            VALUES (1, '9', 1, '{sha(3)}', 'selective', 'x', '{{2,1}}', '{{}}', '{{}}', '{{}}',
+                    2, 3, 300, 200, false, true, '{{"seconds": 60, "applied": true,
+                    "limited": false}}');
+            INSERT INTO run_outcomes (run_id, selection_id, failing, flaky)
+            VALUES (13, currval('ci_selections_id_seq'), 1, 0), (14, NULL, 1, 0);
+            INSERT INTO run_failures (run_id, test_key, would_run, rank, verdict, confidence)
+            VALUES (13, 1, true, 2, 'unknown', 'low'), (14, 1, NULL, NULL, 'unknown', 'low');
+            INSERT INTO attempt_outcomes (repo_id, ci_run_id, run_attempt, fail_on)
+            VALUES (1, '9', 1, '{{new_regression}}');
+        """))  # fmt: skip
+
+    command.downgrade(config, "0016")
+
+    with engine.connect() as connection:
+        after = {t: connection.execute(text(q)).all() for t, q in SHADOW_ROWS_0016.items()}
+        assert after == before
+        assert connection.execute(text("SELECT to_regclass('attempt_outcomes')")).scalar() is None
+        assert connection.execute(text(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'runs' "
+            "AND column_name IN ('measured_ms', 'tests_run', 'client', 'client_version')"
+        )).all() == []  # fmt: skip
+    command.upgrade(config, "head")
+    with engine.connect() as connection:  # and back up: the columns again, empty (the
+        # downgrade kept the runs, only their client columns went)
+        assert connection.execute(text(
+            "SELECT count(*), count(client), count(client_version) FROM runs"
+        )).one() == (5, 0, 0)  # fmt: skip

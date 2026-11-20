@@ -3,18 +3,20 @@
 <h1>Repos</h1>
 <p class="lede">CI runs recorded for each repo this token can see.</p>
 {% if not repos %}
-<p class="empty">No repos yet: a repo appears with its first upload (<code>siftwise record</code> or the record action). <a href="{{ readme }}#github-action">GitHub Action</a></p>
+<p class="empty">No repos yet: a repo appears with its first upload (<code>siftwise record</code> or the record action). <a href="{{ readme }}#github-action">Set up the record action</a></p>
 {% else %}
 {% set times = repos|selectattr("newest_run_at")|map(attribute="newest_run_at")|list %}
 {% set newest = times|max if times else none %}
 <p class="stats"><strong>{{ repos|length|num }}</strong> repo{{ "s" if repos|length != 1 else "" }} · <strong>{{ repos|sum(attribute="runs_total")|num }}</strong> CI runs recorded{% if days is not none %} · <strong>{{ repos|sum(attribute="runs_window")|num }}</strong> in {{ days|window }}{% endif %} · {% if newest %}newest run <strong>{{ newest|ago }}</strong>{% else %}no runs yet{% endif %}</p>
 <div class="scroll"><table>
-<thead><tr><th scope="col">Repo</th><th scope="col" class="fit">Newest run (UTC)</th><th scope="col" class="n">CI runs</th>{% if days is not none %}<th scope="col" class="n">CI runs, last {{ days }} days</th><th scope="col" class="n">Shadow runs, last {{ days }} days</th>{% else %}<th scope="col" class="n">Shadow runs</th>{% endif %}</tr></thead>
+<thead><tr><th scope="col">Repo</th><th scope="col" class="fit">Newest run (UTC)</th><th scope="col" class="n">CI runs</th>{% if days is not none %}<th scope="col" class="n">CI runs, last {{ days }} days</th><th scope="col" class="n">Shadow runs, last {{ days }} days</th>{% else %}<th scope="col" class="n">Shadow runs</th>{% endif %}<th scope="col" class="n" title="CI runs whose select step recorded its selection, of the CI runs in the window">Selections recorded</th></tr></thead>
 <tbody>
 {% for r in repos %}
 <tr><td><a href="{{ repo_url(r.name) }}">{{ r.name }}</a></td>
 <td class="fit">{% if r.newest_run_at %}<span class="mono">{{ r.newest_run_at|when }}</span> <span class="muted">· {{ r.newest_run_at|ago }}</span>{% else %}<span class="muted">no runs yet</span>{% endif %}</td>
-<td class="n">{{ r.runs_total|num }}</td>{% if days is not none %}<td class="n">{{ r.runs_window|num }}</td><td class="n">{{ r.shadow_window|num }}</td>{% else %}<td class="n">{{ r.shadow_total|num }}</td>{% endif %}</tr>
+<td class="n">{{ r.runs_total|num }}</td>{% if days is not none %}<td class="n">{{ r.runs_window|num }}</td><td class="n">{{ r.shadow_window|num }}</td>{% else %}<td class="n">{{ r.shadow_total|num }}</td>{% endif %}
+{% set runs = r.runs_window if days is not none else r.runs_total %}{% set sel = r.selected_window if days is not none else r.selected_total %}
+<td class="n">{% if runs %}{{ sel|num }} <span class="muted">of {{ runs|num }}</span>{% endif %}</td></tr>
 {% endfor %}
 </tbody></table></div>
 {% set quiet = repos|selectattr("runs_total")|rejectattr("runs_window")|list %}

@@ -89,6 +89,7 @@ CALLS = {
     "upload": Call("POST", "/runs", True, upload=True),
     "rollup": Call("POST", "/repos/{repo}/rollup", True),
     "shadow compare": Call("POST", "/repos/{repo}/shadow", True, json={"ci_run_id": "1"}),
+    "outcome": Call("POST", "/repos/{repo}/outcome", True, json={"ci_run_id": "1"}),
 }
 
 

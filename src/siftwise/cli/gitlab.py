@@ -161,6 +161,7 @@ class GitLabProvider(gha.Provider):
     """GitLab CI's reporting for one ``siftwise gitlab`` job (``step``: select, record or
     rollup)."""
 
+    provider = "gitlab"  # /select's ci.provider
     no_token = (
         "no siftwise server or token in this pipeline (merge requests from forks get none of "
         "this project's variables, and protected ones only reach protected branches)"

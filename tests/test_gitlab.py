@@ -65,6 +65,9 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
 def api() -> Iterator[respx.MockRouter]:
     with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
         router.post(f"{SERVER}/repos/{REPO}/shadow").respond(json={"shadow": False})
+        # A server older than 0.4 by default (/healthz without a version): /shadow, not
+        # /outcome. Tests about recording outcomes replace this route.
+        router.get(f"{SERVER}/healthz").respond(json={"status": "ok"})
         yield router
 
 
