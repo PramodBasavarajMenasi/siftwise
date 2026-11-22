@@ -650,7 +650,9 @@ it once, quoted. `record` uploads `**/junit*.xml` plus everything in the select 
 ### Matrix
 
 Each leg records its own `variant` and skips the per-upload stats rollup; one `rollup` job runs
-after every leg:
+after every leg. Give `select` the same `variant`: outside a shadow run it changes nothing (one
+selection serves every leg of the run), but a shadow run stores each leg's selection for that
+leg's variant, so the measured recall is compared like with like:
 
 ```yaml
 jobs:
@@ -670,6 +672,7 @@ jobs:
         with:
           server-url: ${{ secrets.SIFTWISE_URL }}
           token: ${{ secrets.SIFTWISE_TOKEN }}
+          variant: ${{ matrix.os }}-py${{ matrix.python }}
           comment: ${{ strategy.job-index == 0 }}   # one leg comments, or they race
       # ... the Tests step, as above ...
       - if: always()
@@ -691,6 +694,13 @@ jobs:
 ```
 
 The rollup job needs no checkout: the server already has what each leg recorded.
+
+Every leg is recorded as its own row, so a 22-leg matrix stores 22 rows instead of one. Each
+row costs the same: a selection keeps its selected tests as 4-byte test keys and stays under
+1 KB (median 0.4 to 0.5 KB, see the dashboard's storage note), so 22 legs of rdflib are 22
+times that. The estimated time saved is compared against the same variant's full-suite runs,
+never across legs: a macOS leg is measured against macOS full-suite runs, since the legs run
+different tests.
 
 ### Failure verdicts
 
