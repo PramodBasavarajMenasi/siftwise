@@ -220,6 +220,13 @@ class CiStats:
         """Time saved rests on fewer than ``LOW_CONFIDENCE_RUNS`` counted runs."""
         return 0 < len(self.savings) < LOW_CONFIDENCE_RUNS
 
+    @property
+    def range_text(self) -> str:
+        """The window's exact date range in UTC: 'YYYY-MM-DD to YYYY-MM-DD (UTC)'."""
+        start = (self.since or self.until).astimezone(UTC).strftime("%Y-%m-%d")
+        end = self.until.astimezone(UTC).strftime("%Y-%m-%d")
+        return f"{start} to {end} (UTC)"
+
 
 @dataclass
 class _Attempt:
@@ -286,7 +293,8 @@ def ci_stats_by_branch(
     now = now or datetime.now(UTC)
     since = None if days is None else now - timedelta(days=days)
     attempts = _attempts(session, repo_id, since)
-    stats = {b: CiStats(days, b, since, now) for b in branches}
+    first = since if since is not None else min((a.at for a in attempts), default=now)
+    stats = {b: CiStats(days, b, first, now) for b in branches}
     _compute(session, repo_id, attempts,
              lambda a: [s for b, s in stats.items() if _on_branch(a, b)])  # fmt: skip
     return stats
@@ -349,7 +357,7 @@ def ci_stats_periods(
         start += step
     if by == "day" and len(starts) > MAX_DAY_PERIODS:
         raise TooManyPeriods(f"{len(starts)} days: at most {MAX_DAY_PERIODS} by day; use by week")
-    total = CiStats(days, branch, since, now)
+    total = CiStats(days, branch, first, now)
     periods = {s: CiStats(1 if by == "day" else 7, branch, s, min(s + step, now)) for s in starts}
     _compute(session, repo_id, attempts,
              lambda a: [total, periods[period_start(a.at, by)]])  # fmt: skip

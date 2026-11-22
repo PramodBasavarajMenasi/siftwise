@@ -183,6 +183,19 @@ button.primary:hover { filter: brightness(0.95); border-color: var(--accent); }
 .tabs > a:first-child { padding-left: 0; }
 .tabs > a[aria-current="page"] { color: var(--fg); border-bottom-color: var(--accent); }
 /* the window: a small segmented control */
+.window-nav {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  margin: 6px 0 6px auto;
+}
+.window-nav .days { margin: 0; }
+.window-range {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 3px;
+  line-height: 14px;
+}
 .days {
   display: inline-flex;
   align-items: center;

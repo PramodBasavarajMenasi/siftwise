@@ -83,7 +83,10 @@ def test_an_unknown_repo_and_an_empty_window(db_session: Session) -> None:
     assert (s.runs, s.recorded, s.counted) == (0, 0, 0)
     assert (s.median_share, s.saved_ms, s.median_saved_ms) == (None, None, None)
     assert s.failures.runs == 0 and s.full_reasons == {}
-    assert stats(db_session).runs == 1  # all history
+    assert s.range_text == "2026-10-12 to 2026-11-11 (UTC)"
+    all_s = stats(db_session)
+    assert all_s.runs == 1  # all history
+    assert all_s.range_text == "2026-10-01 to 2026-11-11 (UTC)"
 
 
 def test_runs_without_a_selection_count_in_coverage_only(db_session: Session) -> None:
