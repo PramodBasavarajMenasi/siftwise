@@ -554,6 +554,18 @@ class AttemptComparison:
         return Time(sum(v.ms_total for v in compared), sum(v.ms_would_run for v in compared))
 
 
+OUTCOME_LIVE = "ci"  # attempt_outcomes.source: stored by the CI run's own outcome call
+OUTCOME_BACKFILL = "backfill"  # computed later by the outcomes backfill
+OUTCOME_SOURCES = (OUTCOME_LIVE, OUTCOME_BACKFILL)
+# pg_advisory_xact_lock(namespace, key): 1 = the rollup's, 2 = migrations', 3 = one attempt's
+# outcome (a live /outcome and the backfill never write the same attempt at once).
+_ATTEMPT_LOCK = 3
+
+
+class OutcomeExists(Exception):
+    """The backfill found the attempt already has an outcome (a live one won the race)."""
+
+
 def compare_ci_run(
     session: Session,
     repo: str,
@@ -562,15 +574,43 @@ def compare_ci_run(
     window_days: int = 90,
     *,
     fail_on: Sequence[str] | None = None,
+    source: str = OUTCOME_LIVE,
+    known_at: datetime | None = None,
+    if_missing: bool = False,
 ) -> AttemptComparison | None:
     """Triage every recorded leg of a CI run attempt once and store each leg's outcome (its
     failures, what the recorded selection did with them), compare a shadow run with its
     selection, store the attempt's ``fail_on`` verdicts, all replacing an earlier call's, and
     commit. None for an unknown repo. A server error marks the attempt's selections
-    ``compare_error`` and re-raises."""
+    ``compare_error`` and re-raises.
+
+    One attempt is compared by one caller at a time (an advisory lock until the commit).
+    ``source``: who stored it (``attempt_outcomes.source``). The outcomes backfill passes
+    ``if_missing`` (raise ``OutcomeExists``, writing nothing, when the attempt has an outcome
+    once the lock is held: a live call that got there first wins) and ``known_at`` (history is
+    only what was uploaded by then: ``triage.Target.known_at``)."""
+    if source not in OUTCOME_SOURCES:
+        raise ValueError(f"unknown outcome source {source!r}")
     repo_id = session.scalars(select(Repo.id).where(Repo.name == repo)).one_or_none()
     if repo_id is None:
         return None
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:ns, hashtext(:key))"),
+        {"ns": _ATTEMPT_LOCK, "key": f"{repo_id}:{ci_run_id}:{run_attempt}"},
+    )
+    if (
+        if_missing
+        and session.scalar(
+            select(AttemptOutcome.repo_id).where(
+                AttemptOutcome.repo_id == repo_id,
+                AttemptOutcome.ci_run_id == ci_run_id,
+                AttemptOutcome.run_attempt == run_attempt,
+            )
+        )
+        is not None
+    ):
+        session.rollback()  # releases the lock
+        raise OutcomeExists(f"{ci_run_id} attempt {run_attempt}")
     selections = tuple(
         session.scalars(
             select(CiSelection)
@@ -586,7 +626,7 @@ def compare_ci_run(
     try:
         with session.begin_nested():
             result = _compare(session, repo_id, repo, ci_run_id, run_attempt, window_days,
-                              selections, fail_on)  # fmt: skip
+                              selections, fail_on, source, known_at)  # fmt: skip
     except Exception:
         logger.exception("run outcome failed for %s run %s attempt %s",
                          repo, ci_run_id, run_attempt)  # fmt: skip
@@ -611,11 +651,14 @@ def _compare(
     window_days: int,
     selections: Sequence[CiSelection],
     fail_on: Sequence[str] | None,
+    source: str = OUTCOME_LIVE,
+    known_at: datetime | None = None,
 ) -> AttemptComparison:
     by_variant = {s.variant: s for s in selections}
     shadow_ids = {s.id for s in selections if s.shadow}
     scopes, befores, names = _scopes(session, selections)
-    triaged = triage_ci_run(session, repo, ci_run_id, run_attempt, window_days) or []
+    triaged = triage_ci_run(session, repo, ci_run_id, run_attempt, window_days,
+                            known_at=known_at) or []  # fmt: skip
     run_ids = [v.run_id for v in triaged]
     # A re-call replaces the earlier outcome (run_failures go with it).
     session.execute(delete(RunOutcome).where(RunOutcome.run_id.in_(run_ids)))
@@ -645,7 +688,7 @@ def _compare(
     failing_ids = sorted({
         r.test_id for v in triaged for r in (v.report.results if v.report else ())
     })  # fmt: skip
-    keys, paths = _failing_tests(session, repo_id, failing_ids)
+    keys, paths = _failing_tests(session, repo_id, failing_ids, known_at)
     changes = _run_changes(session, run_ids)
     ranks = {
         s.id: {names[key]: n for n, key in enumerate(s.selected_keys, start=1)}
@@ -772,6 +815,7 @@ def _compare(
                 ci_run_id=ci_run_id,
                 run_attempt=run_attempt,
                 fail_on=None if fail_on is None else sorted(set(fail_on)),
+                source=source,
             )
             .on_conflict_do_update(
                 index_elements=[
@@ -779,7 +823,11 @@ def _compare(
                     AttemptOutcome.ci_run_id,
                     AttemptOutcome.run_attempt,
                 ],
-                set_={"computed_at": func.now(), "fail_on": text("excluded.fail_on")},
+                set_={
+                    "computed_at": func.now(),
+                    "fail_on": text("excluded.fail_on"),
+                    "source": text("excluded.source"),
+                },
             )
         )
 
@@ -881,17 +929,19 @@ def _durations(session: Session, run_ids: Sequence[int]) -> dict[int, list[tuple
 
 
 def _failing_tests(
-    session: Session, repo_id: int, test_ids: Sequence[str]
+    session: Session, repo_id: int, test_ids: Sequence[str], known_at: datetime | None = None
 ) -> tuple[dict[str, int], dict[str, str]]:
-    """The failing tests' keys, and their reported file paths (Jest needs one to be located)."""
+    """The failing tests' keys, and their reported file paths (Jest needs one to be located);
+    with ``known_at``, only a path reported by then (a later one would be peeking)."""
     keys: dict[str, int] = {}
     paths: dict[str, str] = {}
     for test_id, key, path in session.execute(
         text(
-            "SELECT test_id, id, file_path FROM tests "
+            "SELECT test_id, id, CASE WHEN CAST(:known_at AS timestamptz) IS NULL "
+            "OR file_path_at <= CAST(:known_at AS timestamptz) THEN file_path END FROM tests "
             "WHERE repo_id = :repo_id AND test_id = ANY(:ids)"
         ),
-        {"repo_id": repo_id, "ids": list(test_ids)},
+        {"repo_id": repo_id, "ids": list(test_ids), "known_at": known_at},
     ):
         keys[test_id] = key
         if path:

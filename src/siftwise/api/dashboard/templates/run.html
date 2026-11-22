@@ -10,6 +10,9 @@
 <dt>Variants</dt><dd>{% if variant_names|select|list %}<span class="mono">{{ variant_names|map("default", "(unnamed)", true)|join(", ") }}</span>{% else %}<span class="muted">one, unnamed</span>{% endif %}</dd>
 </dl>
 <h2>What siftwise did</h2>
+{% if meta.outcome_source == "backfill" %}
+<p class="notice" title="Stored by siftwise outcomes backfill, from what was uploaded by this run's last upload (no peeking); the CI numbers count it">Outcome: <strong>{{ outcome_label(selected.selections|length > 0) }}</strong>.</p>
+{% endif %}
 {% if not selected.selections %}
 <p class="notice">{{ selected.missing }} {% if selected.upgrade %}<a href="{{ changelog }}#upgrading">How to upgrade</a>{% else %}<a href="{{ readme }}#dashboard">How selections are recorded</a>{% endif %}</p>
 {% else %}

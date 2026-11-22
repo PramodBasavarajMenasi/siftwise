@@ -36,13 +36,30 @@ from siftwise.api.dashboard.auth import (
 )
 from siftwise.api.deps import get_app_settings
 from siftwise.api.forwarded import public_origin
-from siftwise.cli.main import CAUSE_LABELS, ci_minutes, ci_pct, ci_rank, ci_share, ci_too_few
+from siftwise.cli.main import (
+    CAUSE_LABELS,
+    ci_minutes,
+    ci_pct,
+    ci_rank,
+    ci_share,
+    ci_too_few,
+    outcome_label,
+)
 from siftwise.cli.repoconfig import SUGGESTED_FLAKY_DAYS, known_flaky_entry
 from siftwise.config import Settings
 from siftwise.core import ui_sessions
-from siftwise.core.ci_stats import ci_stats_by_branch
+from siftwise.core.ci_stats import (
+    BRANCHES,
+    PERIODS,
+    Branch,
+    Period,
+    TooManyPeriods,
+    ci_stats_by_branch,
+    ci_stats_periods,
+    slowest_tests,
+)
 from siftwise.core.flaky import FlakyTest, flaky_tests
-from siftwise.core.selector import matching_glob
+from siftwise.core.selector import format_duration, matching_glob
 from siftwise.core.shadow import VERDICT_ORDER
 from siftwise.core.shadow import recall as shadow_recall
 from siftwise.core.tokens import ALL_REPOS, Principal
@@ -87,6 +104,15 @@ AppSettings = Annotated[Settings, Depends(get_app_settings)]
 def _minutes(ms: float) -> str:
     minutes = ms / 60_000
     return f"{minutes:.1f} min" if minutes < 120 else f"{minutes / 60:.1f} h"
+
+
+def _test_time(ms: float) -> str:
+    """One test's duration: "850 ms", "12.3 s", "4m 50s"."""
+    if ms < 1000:
+        return f"{ms:.0f} ms"
+    if ms < 60_000:
+        return f"{ms / 1000:.1f} s"
+    return format_duration(ms)
 
 
 def _pct(value: float | None, digits: int = 1) -> str:
@@ -195,13 +221,14 @@ def _environment() -> Environment:
     )
     env.filters.update(minutes=_minutes, pct=_pct, recall=_recall, num=_num, when=_when,
                        day=_day, ago=_ago, window=_window, short=_short,
-                       breakable=_breakable)  # fmt: skip
+                       breakable=_breakable, test_time=_test_time)  # fmt: skip
     env.globals.update(repo_url=_repo_url, with_days=_with_days, days_options=DAYS,
                        version=__version__, stylesheet=lambda: stylesheet_file().name,
                        readme=README, changelog=CHANGELOG, prefix=PREFIX, cause_labels=CAUSE_LABELS,
                        verdicts=VERDICT_ORDER, reason_labels=REASON_LABELS,
                        ci_pct=ci_pct, ci_minutes=ci_minutes, ci_share=ci_share,
-                       ci_rank=ci_rank, ci_too_few=ci_too_few)  # fmt: skip
+                       ci_rank=ci_rank, ci_too_few=ci_too_few,
+                       outcome_label=outcome_label)  # fmt: skip
     return env
 
 
@@ -465,6 +492,34 @@ def flaky_page(request: Request, repo: str, session: Db) -> HTMLResponse:
                  crumbs=[*_repo_crumbs(repo), ("Flaky tests", "")], repo=repo, tab="flaky",
                  days=days, span=span, report=report, rows=rows, more=more,
                  suggested=suggested, until=until, recorded=recorded)  # fmt: skip
+
+
+BRANCH_NAMES: dict[Branch, str] = {"all": "All", "main": "Main",
+                                    "prs": "Pull requests and other branches"}  # fmt: skip
+MAX_SLOW_TESTS = 20
+
+
+@router.get(f"{PREFIX}/repos/{{repo:path}}/-/ci")
+def ci_page(request: Request, repo: str, session: Db) -> HTMLResponse:
+    """CI health: the CI numbers per UTC day or week (core/ci_stats), and the slowest tests."""
+    days = _days(request)
+    raw_by = request.query_params.get("by", "")
+    by: Period = raw_by if raw_by in PERIODS else ("day" if days in (7, 30) else "week")
+    raw_branch = request.query_params.get("branch", "")
+    branch: Branch = raw_branch if raw_branch in BRANCHES else "all"
+    now = datetime.now(UTC)
+    recorded = data.repo_activity(session, repo, _since(days, now))
+    by_note = ""
+    try:
+        found = ci_stats_periods(session, repo, days, by, branch, now)
+    except TooManyPeriods:
+        by, by_note = "week", "Too many days to list one by one: by week."
+        found = ci_stats_periods(session, repo, days, by, branch, now)
+    slow = slowest_tests(session, repo, days, MAX_SLOW_TESTS, now) or []
+    crumbs = [*_repo_crumbs(repo), ("CI", "")]
+    return _page(request, "ci.html", title=f"{repo} CI", crumbs=crumbs, repo=repo, tab="ci",
+                 days=days, by=by, by_note=by_note, branch=branch, branch_names=BRANCH_NAMES,
+                 found=found, slow=slow, recorded=recorded)  # fmt: skip
 
 
 @router.get(f"{PREFIX}/repos/{{repo:path}}")

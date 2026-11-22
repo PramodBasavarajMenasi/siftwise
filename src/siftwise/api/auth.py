@@ -46,6 +46,7 @@ ROUTE_SCOPES: dict[tuple[str, str], TokenScope] = {
     ("POST", "/repos/{repo:path}/rollup"): WRITE,
     ("POST", "/repos/{repo:path}/shadow"): WRITE,
     ("POST", "/repos/{repo:path}/outcome"): WRITE,
+    ("POST", "/repos/{repo:path}/outcomes/backfill"): WRITE,
     # The dashboard (SIFTWISE_DASHBOARD=1): read-only pages behind its own session cookie,
     # checked by api/dashboard/auth.py, never by a Bearer token. Login, logout and the
     # stylesheet are listed too: every /ui route is a read.
@@ -58,6 +59,7 @@ ROUTE_SCOPES: dict[tuple[str, str], TokenScope] = {
     ("GET", "/ui/repos/{repo:path}"): READ,
     ("GET", "/ui/repos/{repo:path}/-/runs"): READ,
     ("GET", "/ui/repos/{repo:path}/-/flaky"): READ,
+    ("GET", "/ui/repos/{repo:path}/-/ci"): READ,
     ("GET", "/ui/repos/{repo:path}/-/runs/{ci_run_id}/{attempt:int}"): READ,
 }
 DASHBOARD_PREFIX = "/ui"

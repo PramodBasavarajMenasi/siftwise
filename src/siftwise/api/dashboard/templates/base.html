@@ -31,6 +31,7 @@
   {% if repo and tab is defined %}
   <nav class="tabs" aria-label="Repo pages">
     <a href="{{ repo_url(repo) }}"{% if tab == "overview" %} aria-current="page"{% endif %}>Overview</a>
+    <a href="{{ repo_url(repo, "ci") }}"{% if tab == "ci" %} aria-current="page"{% endif %}>CI</a>
     <a href="{{ repo_url(repo, "runs") }}"{% if tab == "runs" %} aria-current="page"{% endif %}>Runs</a>
     <a href="{{ repo_url(repo, "flaky") }}"{% if tab == "flaky" %} aria-current="page"{% endif %}>Flaky tests</a>
   </nav>

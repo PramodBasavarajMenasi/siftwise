@@ -9,12 +9,16 @@ from siftwise.api.forwarded import ForwardedMiddleware
 from siftwise.api.limits import BodySizeLimitMiddleware
 from siftwise.api.routes import ci, explain, flaky, history, repos, runs, select, shadow, triage
 from siftwise.config import Settings, get_settings
+from siftwise.db import sessionmaker_for
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(title="siftwise", version=__version__)
     app.state.settings = settings  # read by routes through siftwise.api.deps.get_app_settings
+    # Every request's session (db.get_session) and the middleware's token lookups use this
+    # app's database, the one in its settings: never the process-wide SIFTWISE_DATABASE_URL.
+    app.state.sessionmaker = sessionmaker_for(settings.database_url)
     # Starlette runs the last-added middleware first: forwarded headers, then auth (which
     # rejects before any body is read), then the dashboard's session check, then the limit.
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_upload_bytes)

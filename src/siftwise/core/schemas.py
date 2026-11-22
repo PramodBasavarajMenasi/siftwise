@@ -952,6 +952,59 @@ class OutcomeRequest(BaseModel):
     )
 
 
+class BackfillCursorIn(BaseModel):
+    """Where the previous batch stopped (its response's ``next``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_at: datetime
+    ci_run_id: NonEmpty255
+    run_attempt: int = Field(ge=1)
+
+
+class OutcomesBackfillRequest(BaseModel):
+    """Body of ``POST /repos/{repo}/outcomes/backfill``: one batch of the outcomes backfill."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dry_run: bool = Field(default=False, description="Only count the pending attempts")
+    limit: int = Field(default=20, ge=1, le=100, description="Attempts in this batch, at most")
+    max_seconds: float = Field(
+        default=30, gt=0, le=60, description="No new attempt is started after this long"
+    )
+    after: BackfillCursorIn | None = Field(
+        default=None, description="Continue after this attempt (the previous batch's next)"
+    )
+
+
+class BackfillFailureOut(BaseModel):
+    ci_run_id: str
+    run_attempt: int
+    error: str = Field(description="The error's type (the server log has the details)")
+
+
+class OutcomesBackfillResponse(BaseModel):
+    repo: str
+    dry_run: bool
+    pending: int = Field(
+        description="CI run attempts with an upload and no outcome, before this batch"
+    )
+    with_selection: int = Field(description="Of those, with a recorded selection")
+    computed_with_selection: int = Field(
+        description="Computed in this batch, labelled 'verdicts computed later'"
+    )
+    computed_without_selection: int = Field(
+        description="Computed in this batch, labelled 'verdicts computed later; no selection "
+        "recorded'"
+    )
+    skipped_live: int = Field(description="Skipped: a live outcome call got there first")
+    failed: list[BackfillFailureOut]
+    next: BackfillCursorIn | None = Field(
+        description="Send as 'after' for the next batch; null when nothing is left after it"
+    )
+    remaining: int = Field(description="Pending attempts after 'next'")
+
+
 class LegOutcomeOut(BaseModel):
     variant: str | None
     run_id: int
@@ -1146,15 +1199,11 @@ class CiFailuresOut(BaseModel):
     )
 
 
-class CiStatsResponse(BaseModel):
-    """``GET /repos/{repo}/ci``: what siftwise did in CI (core/ci_stats.py defines each)."""
+class CiNumbersOut(BaseModel):
+    """What siftwise did in CI from ``since`` to ``until`` (core/ci_stats.py defines each)."""
 
-    repo: str
-    days: int
-    branch: Literal["all", "main", "prs"]
     since: datetime
     until: datetime
-    counting: str = Field(description="How CI runs and attempts are counted")
     runs: int = Field(description="CI runs uploaded in the window")
     recorded: int = Field(description="Of those, with a recorded selection (coverage)")
     shadow_runs: int
@@ -1165,7 +1214,30 @@ class CiStatsResponse(BaseModel):
     time_saved: CiTimeSavedOut
     shadow: CiShadowOut
     failures: CiFailuresOut
+    backfilled: int = Field(
+        description="CI runs whose outcome was computed later (siftwise outcomes backfill)"
+    )
+    backfilled_without_selection: int = Field(
+        description="Of those, with no recorded selection (they count in coverage only)"
+    )
+
+
+class CiPeriodOut(CiNumbersOut):
+    """One UTC day or week (Monday 00:00 UTC) of the window: its CI runs by their time."""
+
+
+class CiStatsResponse(CiNumbersOut):
+    """``GET /repos/{repo}/ci``: what siftwise did in CI (core/ci_stats.py defines each)."""
+
+    repo: str
+    days: int
+    branch: Literal["all", "main", "prs"]
+    counting: str = Field(description="How CI runs and attempts are counted")
     recall_note: str = Field(
         description="Recall comes only from shadow runs (GET /repos/{repo}/recall): in a "
         "selective run, an unselected test didn't run, so a failure it would show is unseen"
     )
+    by: Literal["day", "week"] | None = Field(
+        default=None, description="With by: the window per UTC day or week, oldest first"
+    )
+    periods: list[CiPeriodOut] | None = None

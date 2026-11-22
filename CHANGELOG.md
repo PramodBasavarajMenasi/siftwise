@@ -8,6 +8,22 @@ All notable changes to siftwise. The format follows
 
 ### Added
 
+- CI health and older outcomes ([#85](https://github.com/PramodBasavarajMenasi/siftwise/issues/85),
+  part 3):
+  - The dashboard's *CI* page: the overview's CI numbers per UTC day or week (Monday 00:00
+    UTC), empty periods listed, for all runs, main or pull requests; the slowest tests by mean
+    duration ("mean over the last N runs", only tests that ran in the window, no
+    percentiles). `GET /repos/{repo}/ci` takes `by=day|week` for the same periods. Every
+    number comes from `core/ci_stats.py`, with PR 2's rules (counts next to shares, rounded
+    down, the too-few-runs flag, no recall from selective runs).
+  - `siftwise outcomes backfill --repo X [--dry-run]` (`POST /repos/{repo}/outcomes/backfill`,
+    a write token): stores outcomes for CI runs uploaded without one (older clients, a failed
+    outcome step), labelled "verdicts computed later" (plus "no selection recorded" when the
+    run has none) on the run page, the runs list and the CI page. No peeking: each uses only
+    what a live outcome call could have read (for runs CI uploaded itself, only runs uploaded
+    by the attempt's last upload). Resumable and idempotent; batches capped at 100 attempts
+    and 60 s; a live outcome always wins (an advisory lock per attempt).
+  - `docker-compose.dev.yml` passes `SIFTWISE_DASHBOARD` through (default off).
 - The CI numbers ([#85](https://github.com/PramodBasavarajMenasi/siftwise/issues/85), part 2):
   `GET /repos/{repo}/ci?days=30&branch=all|main|prs` (read scope), the overview's CI section
   (main and pull requests apart) and new lines in `siftwise report` show, for a window:
@@ -129,7 +145,14 @@ All notable changes to siftwise. The format follows
 
 ### Upgrading
 
-- **Back up the database, then migrate (0017).** Migration 0017 renames the shadow-mode
+- **Migrations in this release: 0013 to 0018. Back up the database first.**
+  `siftwise server start` (or `siftwise server migrate`) applies them: 0013 `api_tokens`,
+  0014 fixture files and the fixture miss cause, 0015 `runs.known_flaky_expired`, 0016
+  `ui_sessions`, 0017 the CI selection tables (below), 0018 `attempt_outcomes.source` (below).
+- **Migration 0018** adds `attempt_outcomes.source` (`ci` for every existing row, `backfill`
+  for the outcomes backfill's). A catalog change plus a check of that small table: 0.1 s on a copy of substrate's history (6.4M results, 798 outcomes, median of 3); `test_results` is not touched and no index is built, so uploads are never blocked; outcome writes wait for those 0.1 s (the table is locked while the column is added). Then, to count older runs' failures in the CI
+  numbers, run `siftwise outcomes backfill --repo X` once per repo (`--dry-run` first).
+- **0017.** Migration 0017 renames the shadow-mode
   tables to `ci_selections`, `run_outcomes` and `run_failures` (with their constraints,
   indexes and sequence), adds columns with defaults, moves the measured test time of shadow
   runs to `runs` and adds `attempt_outcomes`. It doesn't rewrite `test_results`. Recall and
@@ -151,6 +174,13 @@ All notable changes to siftwise. The format follows
 
 ### Fixed
 
+- `create_app(settings)` now serves every request from `settings.database_url`: the routes'
+  sessions and the auth middleware's token lookups used the process-wide
+  `SIFTWISE_DATABASE_URL` instead (`siftwise server start` builds both from the same
+  environment, so servers weren't affected; an app built with another URL was).
+- `siftwise token revoke` deletes the token's dashboard sessions at once. They were already
+  refused on their next request (every `/ui` request checks the token), but their rows stayed
+  until then or until they expired.
 - Go: preserve workspace vendoring when listing packages by checking for
   `vendor/modules.txt` next to the active `go.work`
   ([#78](https://github.com/PramodBasavarajMenasi/siftwise/issues/78)).

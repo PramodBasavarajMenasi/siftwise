@@ -86,6 +86,16 @@ measured test time: a fixed number of queries per window, no triage on read. Tes
 compares each selective leg with its own variant's full-suite legs (the median measured time
 over the 30 days before it), not with `/select`'s summed per-test estimate, which the time
 budget still uses.
+The CI page reads the same module per UTC day or week (`ci_stats_periods`: one read, each
+attempt counted in the period of its newest upload) and the slowest tests from `test_stats`.
+
+The outcomes backfill (`core/outcomes_backfill.py`, `POST /repos/{repo}/outcomes/backfill`)
+stores outcomes for attempts uploaded without one, through the same `compare_ci_run` with
+`source = 'backfill'`. No peeking: `triage.Target.known_at` limits history to runs uploaded by
+the attempt's last upload (for attempts CI uploaded itself), on top of triage's own cut-off
+by run time. `compare_ci_run` holds an advisory lock per attempt (namespace 3) until it
+commits, and the backfill skips an attempt that has an outcome once it holds it, so a live
+outcome always wins.
 
 The MCP server and `siftwise triage` use the stateless variants: `POST /triage` with failures
 from local JUnit files, and `POST /explain` for one test.

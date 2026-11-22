@@ -42,13 +42,15 @@ these numbers work" says the same in words:
 
 import statistics
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+
+from siftwise.core.codes import SKIPPED_CODE
 
 Branch = Literal["all", "main", "prs"]
 BRANCHES: tuple[Branch, ...] = ("all", "main", "prs")
@@ -193,6 +195,8 @@ class CiStats:
     shadow_would_save_ms: float = 0.0
     shadow_compared: int = 0  # shadow runs with a compared leg
     failures: Failures = field(default_factory=Failures)
+    backfilled: int = 0  # runs whose outcome the outcomes backfill computed later
+    backfilled_without_selection: int = 0  # of those, with no recorded selection
 
     @property
     def counted(self) -> int:
@@ -224,6 +228,12 @@ class _Attempt:
     legs: list[tuple[int, str | None, float | None]]  # (run id, variant, measured ms)
     started: list[datetime] = field(default_factory=list)  # each leg's Run.occurred_at
     selections: list[Any] = field(default_factory=list)
+    backfilled: bool = False  # its outcome was computed later (attempt_outcomes.source)
+
+    @property
+    def at(self) -> datetime:
+        """The attempt's time: its newest upload's run time (what puts it in a window)."""
+        return max(self.started)
 
 
 _ATTEMPTS_SQL = """
@@ -276,15 +286,90 @@ def ci_stats_by_branch(
     now = now or datetime.now(UTC)
     since = None if days is None else now - timedelta(days=days)
     attempts = _attempts(session, repo_id, since)
-    _attach_selections(session, repo_id, attempts)
     stats = {b: CiStats(days, b, since, now) for b in branches}
+    _compute(session, repo_id, attempts,
+             lambda a: [s for b, s in stats.items() if _on_branch(a, b)])  # fmt: skip
+    return stats
+
+
+def _on_branch(attempt: _Attempt, branch: Branch) -> bool:
+    return branch == "all" or (branch == "main") == attempt.main
+
+
+Period = Literal["day", "week"]
+PERIODS: tuple[Period, ...] = ("day", "week")
+MAX_DAY_PERIODS = 370  # by day, at most this many periods (else by week)
+
+
+class TooManyPeriods(ValueError):
+    """By day over a span longer than ``MAX_DAY_PERIODS`` days."""
+
+
+@dataclass
+class CiPeriods:
+    """``ci_stats`` for a window and, inside it, per UTC day or week (Monday 00:00 UTC), empty
+    ones included. Each CI run counts in the period of its time (``_Attempt.at``), so the
+    periods' counts add up to the window's."""
+
+    by: Period
+    total: CiStats
+    periods: list[CiStats]  # oldest first; each one's since/until are the period's bounds
+
+
+def period_start(at: datetime, by: Period) -> datetime:
+    """The UTC day, or the week (Monday 00:00 UTC), that ``at`` falls in."""
+    day = at.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    return day if by == "day" else day - timedelta(days=day.weekday())
+
+
+def ci_stats_periods(
+    session: Session,
+    repo: str,
+    days: int | None,
+    by: Period,
+    branch: Branch = "all",
+    now: datetime | None = None,
+) -> CiPeriods | None:
+    """The window's numbers and each period's, from one read (``ci_stats``' queries); None
+    for an unknown repo. Raises ``TooManyPeriods`` for days over ``MAX_DAY_PERIODS``."""
+    repo_id = session.execute(
+        text("SELECT id FROM repos WHERE name = :name"), {"name": repo}
+    ).scalar_one_or_none()
+    if repo_id is None:
+        return None
+    now = now or datetime.now(UTC)
+    since = None if days is None else now - timedelta(days=days)
+    attempts = [a for a in _attempts(session, repo_id, since) if _on_branch(a, branch)]
+    first = since if since is not None else min((a.at for a in attempts), default=now)
+    step = timedelta(days=1 if by == "day" else 7)
+    starts: list[datetime] = []
+    start = period_start(first, by)
+    while start <= now:
+        starts.append(start)
+        start += step
+    if by == "day" and len(starts) > MAX_DAY_PERIODS:
+        raise TooManyPeriods(f"{len(starts)} days: at most {MAX_DAY_PERIODS} by day; use by week")
+    total = CiStats(days, branch, since, now)
+    periods = {s: CiStats(1 if by == "day" else 7, branch, s, min(s + step, now)) for s in starts}
+    _compute(session, repo_id, attempts,
+             lambda a: [total, periods[period_start(a.at, by)]])  # fmt: skip
+    return CiPeriods(by, total, list(periods.values()))
+
+
+def _compute(session: Session, repo_id: int, attempts: list[_Attempt],
+             targets_of: Callable[[_Attempt], list[CiStats]]) -> None:  # fmt: skip
+    """Count each attempt into the ``CiStats`` it belongs to (a fixed number of queries)."""
+    _attach_selections(session, repo_id, attempts)
     selective: list[tuple[_Attempt, list[CiStats]]] = []
     shadow: list[tuple[_Attempt, list[CiStats]]] = []
     for attempt in attempts:
-        targets = [s for b, s in stats.items() if b == "all" or (b == "main") == attempt.main]
+        targets = targets_of(attempt)
         kind = _kind(attempt)
         for s in targets:
             s.runs += 1
+            if attempt.backfilled:
+                s.backfilled += 1
+                s.backfilled_without_selection += kind is None
             if kind is None:
                 continue
             s.recorded += 1
@@ -308,7 +393,6 @@ def ci_stats_by_branch(
     _add_savings(session, repo_id, selective)
     _add_shadow_savings(session, shadow)
     _add_failures(session, selective)
-    return stats
 
 
 def _attempts(session: Session, repo_id: int, since: datetime | None) -> list[_Attempt]:
@@ -336,6 +420,16 @@ def _attach_selections(session: Session, repo_id: int, attempts: list[_Attempt])
         {"repo_id": repo_id, "ci": [k[0] for k in by_key], "attempt": [k[1] for k in by_key]},
     ):
         by_key[(row.ci_run_id, row.run_attempt)].selections.append(row)
+    for ci_run_id, attempt in session.execute(
+        text(
+            "SELECT o.ci_run_id, o.run_attempt FROM attempt_outcomes o "
+            "JOIN unnest(CAST(:ci AS text[]), CAST(:attempt AS integer[])) AS a(ci, attempt) "
+            "ON o.ci_run_id = a.ci AND o.run_attempt = a.attempt "
+            "WHERE o.repo_id = :repo_id AND o.source = 'backfill'"
+        ),
+        {"repo_id": repo_id, "ci": [k[0] for k in by_key], "attempt": [k[1] for k in by_key]},
+    ):
+        by_key[(ci_run_id, attempt)].backfilled = True
 
 
 def _kind(attempt: _Attempt) -> str | None:
@@ -434,3 +528,58 @@ def _add_failures(session: Session, selective: list[tuple[_Attempt, list[CiStats
             f.ranks.extend(ranks)
             if ranks:
                 f.first_ranks.append(ranks[0])
+
+
+@dataclass(frozen=True)
+class SlowTest:
+    test_id: str
+    mean_ms: float  # test_stats.avg_duration_ms: its non-skipped attempts in the stats window
+    runs: int  # the runs (legs) it ran in, in the stats window: "mean over the last N runs"
+    file_path: str | None
+
+
+SLOW_CANDIDATES = 200  # slowest test_stats rows checked for a run in the window
+
+
+def slowest_tests(
+    session: Session, repo: str, days: int | None, limit: int = 20, now: datetime | None = None
+) -> list[SlowTest] | None:
+    """The slowest tests by mean duration (``test_stats``: over the stats window, skips left
+    out), only tests that ran (not skipped) in the last ``days`` days; None for an unknown
+    repo. No percentiles: the mean is what history keeps."""
+    repo_id = session.execute(
+        text("SELECT id FROM repos WHERE name = :name"), {"name": repo}
+    ).scalar_one_or_none()
+    if repo_id is None:
+        return None
+    since = None if days is None else (now or datetime.now(UTC)) - timedelta(days=days)
+    rows = session.execute(
+        text(
+            # The top N first, then their keys: joining every row to tests before the sort
+            # was two thirds of the time (rdflib, 39K rows: 48 ms).
+            "SELECT t.id, s.test_id, s.avg_duration_ms, s.runs, s.file_path FROM ("
+            "SELECT test_id, avg_duration_ms, runs, file_path FROM test_stats "
+            "WHERE repo_id = :repo_id AND avg_duration_ms IS NOT NULL AND runs > 0 "
+            "AND (CAST(:since AS timestamptz) IS NULL OR last_seen_at >= :since) "
+            "ORDER BY avg_duration_ms DESC, test_id LIMIT :n) s "
+            "JOIN tests t ON t.repo_id = :repo_id AND t.test_id = s.test_id "
+            "ORDER BY s.avg_duration_ms DESC, s.test_id"
+        ),
+        {"repo_id": repo_id, "since": since, "n": SLOW_CANDIDATES},
+    ).all()
+    ran: set[int] | None = None
+    if since is not None and rows:
+        # last_seen_at counts skipped appearances too: keep tests with a non-skipped result
+        # in the window (probes by the primary key's (run_id, test_key) prefix).
+        ran = set(session.scalars(
+            text(
+                "SELECT DISTINCT tr.test_key FROM runs r JOIN test_results tr "
+                "ON tr.run_id = r.id AND tr.test_key = ANY(:keys) "
+                "WHERE r.repo_id = :repo_id AND COALESCE(r.started_at, r.created_at) >= :since "
+                "AND tr.status <> :skipped"
+            ),
+            {"repo_id": repo_id, "keys": [r.id for r in rows], "since": since,
+             "skipped": SKIPPED_CODE},
+        ))  # fmt: skip
+    return [SlowTest(r.test_id, r.avg_duration_ms, r.runs, r.file_path)
+            for r in rows if ran is None or r.id in ran][:limit]  # fmt: skip

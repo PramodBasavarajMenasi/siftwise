@@ -326,13 +326,23 @@ Server-rendered pages, no JavaScript. Off unless you turn it on:
 SIFTWISE_DASHBOARD=1 siftwise server start            # then open http://localhost:8000/ui/
 ```
 
+From the development compose stack (the API built from your checkout; the dashboard stays off
+unless `SIFTWISE_DASHBOARD` is set, in the shell or in `.env`):
+
+```sh
+SIFTWISE_DASHBOARD=1 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+```
+
 - **Signing in:** paste an API token ([Tokens](#tokens)); a `read` token is enough, and the
   dashboard never writes. A token for one repo sees only that repo (another repo's pages say
   "not found", whether it exists or not); the admin token and `*` tokens see every repo.
 - **The pages:** *Repos* lists the CI runs recorded per repo (a CI run is one run attempt
   with its matrix legs; re-run uploads don't count). *Overview* is recall on shadow runs, which
   run the full suite and store what siftwise would have selected, so a failure outside the
-  selection is a miss. *Runs* lists the newest 20 CI runs on any branch with what siftwise selected for
+  selection is a miss. *CI* gives the same CI numbers as the overview per UTC day or week
+  (Monday 00:00 UTC), for all runs, main or pull requests, with the slowest tests (their mean
+  duration, "mean over the last N runs"; only tests that ran in the window). *Runs* lists the
+  newest 20 CI runs on any branch with what siftwise selected for
   each. A run's page says what siftwise did in it (selected X of Y known tests, or why the full
   suite ran, the estimated and measured test time, the budget, the order, the highest-risk
   tests and why) and gives every failing test's verdict as the PR comment does, from what its
@@ -345,8 +355,10 @@ SIFTWISE_DASHBOARD=1 siftwise server start            # then open http://localho
   A window with nothing in it while older data exists says so and links to wider ones.
 - **The session:** the browser gets a random session ID in a cookie (HttpOnly, SameSite=Strict,
   `Path=/ui`, Secure, 4 hours); the server stores only its SHA-256 and which token signed in,
-  never the token. Every page checks that token again, so `siftwise token revoke` (or a new
-  `SIFTWISE_API_TOKEN`) ends the session at the next click. Sign out deletes it. The API
+  never the token. Every page checks that token again, so a revoked or deleted token's
+  session (or an admin session after a new `SIFTWISE_API_TOKEN`) is refused at the next
+  click; `siftwise token revoke` also deletes the token's sessions at once. Sign out deletes
+  it. The API
   doesn't accept the cookie: scripts and CI still need a Bearer token.
 - **HTTPS:** the cookie is Secure, so the dashboard needs HTTPS, except on `localhost`
   (plain HTTP works there, for a quick look). Behind a TLS reverse proxy, start the server
@@ -398,6 +410,15 @@ with one module (`core/ci_stats.py`), so the three show the same values for the 
   ID is a run of its own (it can't have a selection).
 - **Window:** a run is in it when any of its uploads started within the last N days, counted
   back from now (UTC). The API takes `days` from 1 to 365 (default 30).
+- **Per day or week** (the CI page; the API's `by=day|week`): each run counts in the UTC day,
+  or week from Monday 00:00 UTC, of its newest upload, so the periods add up to the window.
+  Empty periods are listed. By day covers at most 370 days.
+- **Verdicts computed later:** runs whose outcome the outcomes backfill stored
+  ([Outcomes for older runs](#outcomes-for-older-runs)); counted apart, and never as a
+  selection.
+- **Slowest tests:** each test's mean duration from test history (its non-skipped attempts in
+  the server's stats window), "mean over the last N runs" (the runs it ran in there); only
+  tests with a non-skipped result in the page's window. No percentiles: history keeps the mean.
 - **Main and pull requests:** *main* = a run with an upload on the repo's default branch, as
   the uploader reported it (`is_main`: the Action reads the default branch from the GitHub
   event, the GitLab template from `CI_DEFAULT_BRANCH`, `siftwise record` takes `--main`), so a
@@ -452,6 +473,41 @@ with one module (`core/ci_stats.py`), so the three show the same values for the 
   full suite and compare it with the selection (`siftwise report`'s first line, the overview's
   Recall section).
 - **An empty window** says "no recorded selections in this window", never 0% or 0 min.
+
+### Outcomes for older runs
+
+A CI run's outcome (its failures by verdict, which of them the selection ran) is stored by its
+own rollup step from 0.4 on. Runs uploaded by older clients, or whose outcome step failed,
+have none, so the CI numbers can't count their failures. Store them once, after upgrading:
+
+```sh
+SIFTWISE_API_TOKEN=<a write token> siftwise outcomes backfill --repo acme/shop --dry-run
+SIFTWISE_API_TOKEN=<a write token> siftwise outcomes backfill --repo acme/shop
+```
+
+- **What it does:** every CI run attempt with an upload and no outcome, oldest first, gets the
+  outcome the server's own outcome call computes, in batches of at most 100 attempts and
+  60 seconds a request (`POST /repos/{repo}/outcomes/backfill`; a `write` token). It prints
+  how many it computed, skipped and failed. Stop it any time and run it again: attempts done
+  are skipped, so a second run changes nothing. `--dry-run` only counts.
+- **Labels:** everywhere they appear (a run's page, the runs list, the CI page) these say
+  "verdicts computed later", plus "no selection recorded" when the run has no recorded
+  selection (an older client). A run whose select step recorded a selection but whose outcome
+  step failed is only "verdicts computed later". A backfilled outcome never adds a selection:
+  such runs still count in coverage only.
+- **No peeking:** each verdict uses only what a live outcome call could have read. Triage
+  reads only runs that ran before the attempt, the change links and `known_flaky` list the
+  attempt's own uploads stored, and file paths reported by then. For a run uploaded by CI
+  itself (its last upload within a day of the run), history is also cut at its last upload: a
+  run that ran earlier but was uploaded later doesn't count.
+- **What it can't recover:** a run imported later (`scripts/backfill.py`, uploads days after
+  the run) had no live moment, so its history is every run that ran before it, whenever it
+  was uploaded. The server's stats window (`SIFTWISE_STATS_WINDOW_DAYS`) is today's, not the
+  one set then. Anything else `.siftwise.toml` held then that the uploads didn't store can't
+  be read back.
+- **With live CI:** a live outcome call and the backfill never write one run at once, and the
+  live one wins: the backfill skips a run that has an outcome, and a later live call replaces a
+  backfilled one.
 
 ### Seed history from past CI runs
 

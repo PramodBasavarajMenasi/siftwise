@@ -545,6 +545,9 @@ class Target:
     ci_run_id: str | None = None
     run_attempt: int = 1
     as_of: datetime | None = None
+    # Only runs uploaded by then (``runs.created_at``) are history: what a compare made right
+    # after the run's last upload could have read (the outcomes backfill). None: no limit.
+    known_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -683,17 +686,18 @@ class _Load:
 
 
 # The targets of a batch as a table, ``t(idx, cut_at, cut_id, ci, attempt, variant,
-# window_start, commit)``, and the cut-off condition (``_BEFORE``) per target.
+# window_start, commit, known_at)``, and the cut-off condition (``_BEFORE``) per target.
 _TARGETS = """
     unnest(CAST(:t_idx AS integer[]), CAST(:t_cut_at AS timestamptz[]),
            CAST(:t_cut_id AS bigint[]), CAST(:t_ci AS text[]), CAST(:t_attempt AS integer[]),
            CAST(:t_variant AS text[]), CAST(:t_window_start AS timestamptz[]),
-           CAST(:t_commit AS text[]))
-        AS t(idx, cut_at, cut_id, ci, attempt, variant, window_start, commit)
+           CAST(:t_commit AS text[]), CAST(:t_known_at AS timestamptz[]))
+        AS t(idx, cut_at, cut_id, ci, attempt, variant, window_start, commit, known_at)
 """
 _BEFORE_T = """
     (COALESCE(r.started_at, r.created_at), r.id) < (t.cut_at, t.cut_id)
     AND (t.ci IS NULL OR r.ci_run_id IS DISTINCT FROM t.ci OR r.run_attempt <> t.attempt)
+    AND (t.known_at IS NULL OR r.created_at <= t.known_at)
 """
 
 
@@ -726,6 +730,7 @@ class _Batch:
             "t_variant": [load.target.variant for load in loads],
             "t_window_start": [load.window_start or load.cut_at for load in loads],
             "t_commit": [load.target.commit_sha for load in loads],
+            "t_known_at": [load.target.known_at for load in loads],
         }
 
     def cut_offs(self) -> None:
@@ -813,9 +818,13 @@ class _Batch:
                 key, file_path, file_path_at = found[test_id]
                 load.keys[key] = test_id
                 # A path reported by the triaged run or a later one would be peeking.
+                known = load.target.known_at
                 load.paths[test_id] = (
-                    file_path if file_path_at is not None and file_path_at < load.cut_at else None
-                )
+                    file_path
+                    if file_path_at is not None and file_path_at < load.cut_at
+                    and (known is None or file_path_at <= known)
+                    else None
+                )  # fmt: skip
                 pairs.append((load.idx, key))
         if not pairs:
             return
@@ -1380,6 +1389,7 @@ def triage_ci_run(
     run_attempt: int = 1,
     window_days: int = 90,
     variants: Collection[str | None] | None = None,
+    known_at: datetime | None = None,
 ) -> list[VariantTriage] | None:
     """Triage every recorded variant of a CI run attempt (or only ``variants``), from what
     was stored: the failing tests (final attempt failed or errored), the changed files, the
@@ -1390,8 +1400,10 @@ def triage_ci_run(
     Each variant is triaged as ``/triage`` would with the same change: the cut-off is that
     variant's run, and no upload of this CI run attempt is history, except the variant's own
     re-runs for rule 1. Re-run uploads (``runs.rerun`` > 0) are never variants themselves.
+    ``known_at``: history is only what was uploaded by then (``Target.known_at``).
     """
-    found = triage_ci_runs(session, repo, [(ci_run_id, run_attempt)], window_days, variants)
+    found = triage_ci_runs(session, repo, [(ci_run_id, run_attempt)], window_days, variants,
+                           known_at)  # fmt: skip
     return None if found is None else found[(ci_run_id, run_attempt)]
 
 
@@ -1401,6 +1413,7 @@ def triage_ci_runs(
     attempts: Sequence[tuple[str, int]],
     window_days: int = 90,
     variants: Collection[str | None] | None = None,
+    known_at: datetime | None = None,
 ) -> dict[tuple[str, int], list[VariantTriage]] | None:
     """``triage_ci_run`` for several CI run attempts at once (the dashboard's recent runs):
     every failing variant of every attempt in ONE batched history load, so the query count
@@ -1448,7 +1461,8 @@ def triage_ci_runs(
     loaded = load_histories_many(
         session,
         [
-            (Target(repo, run.commit_sha, run.variant, run.ci_run_id, run.run_attempt),
+            (Target(repo, run.commit_sha, run.variant, run.ci_run_id, run.run_attempt,
+                    known_at=known_at),
              [f.test_id for f in failures[run.id]])
             for run in failing
         ],

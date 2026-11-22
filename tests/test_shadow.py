@@ -509,9 +509,9 @@ def test_compare_query_count_does_not_grow_with_failures(db_session: Session) ->
     few, lots = count_compare_queries(db_session, "few"), count_compare_queries(db_session, "lots")
 
     assert few == lots
-    # One variant: triage_ci_run's queries plus 11 of the compare's own (0017 added two: the
-    # legs' measured times, the attempt's outcome).
-    assert lots <= 26, lots
+    # One variant: triage_ci_run's queries plus 12 of the compare's own (0017 added two: the
+    # legs' measured times, the attempt's outcome; 0018 one: the attempt's advisory lock).
+    assert lots <= 27, lots
 
 
 def test_compare_query_count_does_not_grow_with_variants(db_session: Session) -> None:
@@ -525,7 +525,7 @@ def test_compare_query_count_does_not_grow_with_variants(db_session: Session) ->
         counts[legs] = counted(db_session, lambda: compare(db_session, ci))  # noqa: B023
 
     assert counts[1] == counts[5] == counts[20], counts
-    assert counts[20] <= 30, counts
+    assert counts[20] <= 31, counts  # 0018: +1, the attempt's advisory lock
 
 
 # --- miss causes (pure) ---------------------------------------------------------------------

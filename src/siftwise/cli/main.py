@@ -44,6 +44,8 @@ app.add_typer(gha.app, name="gha")
 app.add_typer(gitlab.app, name="gitlab")
 app.add_typer(server.app, name="server")
 app.add_typer(token.app, name="token")
+outcomes_app = typer.Typer(help="Run outcomes stored by the server.", no_args_is_help=True)
+app.add_typer(outcomes_app, name="outcomes")
 
 # `siftwise select` exit codes, besides 0 (success, including "no tests affected").
 EXIT_API_ERROR = 1
@@ -563,6 +565,78 @@ def report_command(
         lines = [*recall_lines(result), "", *(ci_lines(ci) if ci else [CI_UNSUPPORTED])]
     for line in lines:
         typer.echo(line)
+
+
+# How a backfilled outcome is labelled everywhere (the dashboard uses these too).
+OUTCOME_LATER = "verdicts computed later"
+OUTCOME_NO_SELECTION = "no selection recorded"
+
+
+def outcome_label(selection: bool) -> str:
+    """The label of an outcome the backfill computed: "no selection recorded" only when the
+    attempt has none (a 0.4 run whose outcome step failed did record one)."""
+    return OUTCOME_LATER if selection else f"{OUTCOME_LATER}; {OUTCOME_NO_SELECTION}"
+
+
+@outcomes_app.command("backfill")
+def outcomes_backfill_command(
+    repo: Annotated[str, typer.Option(help="Repository name in siftwise, e.g. acme/shop.")],
+    server: ServerOption = DEFAULT_SERVER,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Only count the attempts it would compute.")
+    ] = False,
+    batch: Annotated[
+        int, typer.Option(min=1, max=100, help="Attempts per request (the server caps it).")
+    ] = 20,
+) -> None:
+    """Store outcomes for older CI run attempts that have uploads but none (clients older
+    than 0.4, or a failed outcome step), labelled "verdicts computed later". Each uses only
+    what a live outcome call could have read then; a live outcome always wins. Safe to stop and
+    re-run: done attempts are skipped. Needs a write token in SIFTWISE_API_TOKEN. Exit codes: 0
+    ok, 1 API error or an attempt failed, 2 usage error."""
+    token = _token()
+    path = f"/repos/{repo}/outcomes/backfill"
+    after: dict[str, Any] | None = None
+    later = no_selection = skipped = 0
+    failed: list[dict[str, Any]] = []
+    first = True
+    while True:
+        body: dict[str, Any] = {"dry_run": dry_run, "limit": batch, "max_seconds": 30}
+        if after is not None:
+            body["after"] = after
+        try:
+            r = post_json(server, token, path, body, timeout=180)
+        except SiftwiseError as exc:
+            _err(f"error: {exc}")
+            raise typer.Exit(EXIT_API_ERROR) from exc
+        if first:
+            typer.echo(f"{_plural(r['pending'], 'CI run attempt')} without an outcome "
+                       f"({r['with_selection']:,} with a recorded selection).")  # fmt: skip
+            first = False
+        if dry_run:
+            without = r["pending"] - r["with_selection"]
+            typer.echo(f"Dry run, nothing written: {r['with_selection']:,} would be labelled "
+                       f'"{outcome_label(True)}", {without:,} '
+                       f'"{outcome_label(False)}".')  # fmt: skip
+            return
+        later += r["computed_with_selection"]
+        no_selection += r["computed_without_selection"]
+        skipped += r["skipped_live"]
+        failed += r["failed"]
+        done = r["computed_with_selection"] + r["computed_without_selection"]
+        typer.echo(f"  computed {done:,}, skipped {r['skipped_live']:,}, failed "
+                   f"{len(r['failed']):,}; {r['remaining']:,} left")  # fmt: skip
+        after = r["next"]
+        if after is None:
+            break
+    typer.echo(f'Computed {later + no_selection:,}: {later:,} "{outcome_label(True)}", '
+               f'{no_selection:,} "{outcome_label(False)}"; skipped {skipped:,} (a live '
+               f"outcome got there first); failed {len(failed):,}.")  # fmt: skip
+    for f in failed:
+        typer.echo(f"  failed: {f['ci_run_id']} attempt {f['run_attempt']} ({f['error']}); "
+                   "run it again to retry")  # fmt: skip
+    if failed:
+        raise typer.Exit(EXIT_API_ERROR)
 
 
 CI_BRANCHES = ("main", "prs")

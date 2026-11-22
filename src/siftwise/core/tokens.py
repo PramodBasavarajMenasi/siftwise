@@ -15,10 +15,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
-from siftwise.core.models import ApiToken
+from siftwise.core.models import ApiToken, UiSession
 
 PREFIX = "sw_"
 ALL_REPOS = "*"
@@ -85,14 +85,16 @@ def list_tokens(session: Session) -> list[ApiToken]:
 
 
 def revoke_token(session: Session, token_id: int) -> ApiToken | None:
-    """Revoke a token (idempotent: an already revoked one keeps its first revocation time).
-    None if there is no such token."""
+    """Revoke a token (idempotent: an already revoked one keeps its first revocation time)
+    and end its dashboard sessions now (every /ui request also checks the token, so they were
+    already refused; this leaves none behind). None if there is no such token."""
     row = session.get(ApiToken, token_id)
     if row is None:
         return None
     if row.revoked_at is None:
         row.revoked_at = session.scalar(select(func.now()))
-        session.commit()
+    session.execute(delete(UiSession).where(UiSession.api_token_id == token_id))
+    session.commit()
     return row
 
 

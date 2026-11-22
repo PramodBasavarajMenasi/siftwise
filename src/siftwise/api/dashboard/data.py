@@ -117,6 +117,8 @@ class RunRow:
     variants: int
     failing: int = 0
     selection: "SelectionSummary | None" = None  # what siftwise selected, if recorded
+    # attempt_outcomes.source: "ci", "backfill" (verdicts computed later) or None (no outcome)
+    outcome_source: str | None = None
 
 
 def recent_runs(session: Session, repo: str, limit: int = RECENT_RUNS) -> list[RunRow] | None:
@@ -153,11 +155,31 @@ def recent_runs(session: Session, repo: str, limit: int = RECENT_RUNS) -> list[R
     failures = recorded_failures(session, [i for r in rows for i in r.run_ids])
     for run, row in zip(runs, rows, strict=True):
         run.failing = len({f.test_id for i in row.run_ids for f in failures.get(i, ())})
-    summaries = selection_summaries(session, repo_id,
-                                    [(r.ci_run_id, r.run_attempt) for r in runs])  # fmt: skip
+    keys = [(r.ci_run_id, r.run_attempt) for r in runs]
+    summaries = selection_summaries(session, repo_id, keys)
+    sources = outcome_sources(session, repo_id, keys)
     for run in runs:
         run.selection = summaries.get((run.ci_run_id, run.run_attempt))
+        run.outcome_source = sources.get((run.ci_run_id, run.run_attempt))
     return runs
+
+
+def outcome_sources(session: Session, repo_id: int, keys: Sequence[tuple[str, int]]
+                    ) -> dict[tuple[str, int], str]:  # fmt: skip
+    """Each attempt's stored outcome's source (``attempt_outcomes.source``), if it has one."""
+    if not keys:
+        return {}
+    return {
+        (ci, attempt): source
+        for ci, attempt, source in session.execute(
+            text(
+                "SELECT o.ci_run_id, o.run_attempt, o.source FROM attempt_outcomes o "
+                "JOIN unnest(CAST(:ci AS text[]), CAST(:attempt AS integer[])) AS a(ci, attempt)"
+                " ON o.ci_run_id = a.ci AND o.run_attempt = a.attempt WHERE o.repo_id = :repo_id"
+            ),
+            {"repo_id": repo_id, "ci": [k[0] for k in keys], "attempt": [k[1] for k in keys]},
+        )
+    }
 
 
 @dataclass(frozen=True)
@@ -525,8 +547,11 @@ def attempt_meta(session: Session, repo: str, ci_run_id: str, attempt: int) -> R
             """
             SELECT r.ci_run_id, r.run_attempt, max(COALESCE(r.started_at, r.created_at)) AS at,
                    min(r.branch) AS branch, bool_or(r.is_main) AS is_main,
-                   min(r.commit_sha) AS commit_sha, count(*) AS variants
+                   min(r.commit_sha) AS commit_sha, count(*) AS variants,
+                   min(o.source) AS outcome_source
             FROM runs r JOIN repos p ON p.id = r.repo_id
+            LEFT JOIN attempt_outcomes o ON o.repo_id = r.repo_id
+                AND o.ci_run_id = r.ci_run_id AND o.run_attempt = r.run_attempt
             WHERE p.name = :repo AND r.ci_run_id = :ci AND r.run_attempt = :attempt
               AND r.rerun = 0
             GROUP BY r.ci_run_id, r.run_attempt
@@ -537,4 +562,4 @@ def attempt_meta(session: Session, repo: str, ci_run_id: str, attempt: int) -> R
     if row is None:
         return None
     return RunRow(row.ci_run_id, row.run_attempt, row.at, row.branch, row.is_main,
-                  row.commit_sha, row.variants)  # fmt: skip
+                  row.commit_sha, row.variants, outcome_source=row.outcome_source)  # fmt: skip
