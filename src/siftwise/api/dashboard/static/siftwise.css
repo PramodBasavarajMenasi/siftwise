@@ -271,6 +271,7 @@ dl.facts dd { margin: 0; min-width: 0; }
 .notice, .error, .warn { padding: 8px 12px; border-left: 3px solid var(--line-strong); max-width: 880px; }
 .error { border-left-color: var(--bad); color: var(--bad); }
 .warn { border-left-color: var(--warn); }
+.low-confidence { color: var(--warn); font-weight: 600; }
 .tag {
   font-size: 12px;
   color: var(--muted);
@@ -320,5 +321,13 @@ svg.meter .bad { fill: var(--bad); }
   table.stack .id-short { display: none; }
   table.stack .id-full { display: inline; overflow-wrap: anywhere; }
   table.stack .stack-only { display: inline; }
+  table.stack tbody th { display: block; padding: 4px 0 2px; font-weight: 600; white-space: normal; }
   .scroll:has(> table.stack) { overflow-x: visible; }
+}
+
+/* the CI numbers: three value columns that wrap, so the table fits the page column */
+table.ci th, table.ci td { white-space: normal; }
+@media (min-width: 641px) {  /* the stacked layout (<= 640px) keeps full-width rows */
+  table.ci tbody th { width: 22%; }
+  table.ci td { width: 26%; }
 }

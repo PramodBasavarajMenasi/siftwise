@@ -1,6 +1,7 @@
 """`siftwise` command-line interface."""
 
 import json
+import math
 import os
 import posixpath
 import re
@@ -543,12 +544,134 @@ def report_command(
     except SiftwiseError as exc:
         _err(f"error: {exc}")
         raise typer.Exit(EXIT_API_ERROR) from exc
+    ci: dict[str, Any] = {}
+    try:
+        # The CI numbers (GET /repos/{repo}/ci came with 0.4) go with the overall report, not
+        # the weekly recall.
+        if by is None and server_version(server) is not None:
+            ci = {b: get_json(server, token, f"/repos/{repo}/ci", {"days": days, "branch": b})
+                  for b in CI_BRANCHES}  # fmt: skip
+    except SiftwiseError as exc:
+        _err(f"error: {exc}")
+        raise typer.Exit(EXIT_API_ERROR) from exc
     if json_output:
-        typer.echo(json.dumps(result, indent=2))
+        typer.echo(json.dumps({**result, **({"ci": ci} if ci else {})}, indent=2))
         return
-    lines = weekly_lines(result) if by == "week" else recall_lines(result)
+    if by == "week":
+        lines = weekly_lines(result)
+    else:
+        lines = [*recall_lines(result), "", *(ci_lines(ci) if ci else [CI_UNSUPPORTED])]
     for line in lines:
         typer.echo(line)
+
+
+CI_BRANCHES = ("main", "prs")
+CI_BRANCH_NAMES = {"main": "main", "prs": "pull requests and other branches", "all": "all"}
+CI_UNSUPPORTED = "CI numbers: the server is older than 0.4 (no GET /repos/{repo}/ci)."
+CI_NO_SELECTIONS = "no recorded selections in this window"
+CI_RECALL_NOTE = (
+    "No recall from these runs: in a selective run, a test that wasn't selected didn't run, so "
+    "a failure it would have shown can't be seen. Recall comes only from shadow runs (above)."
+)
+CI_TIME_NOTE = "sums of test durations, not wall-clock CI time"
+# core.ci_stats' BASELINE_DAYS and BASELINE_MIN_RUNS (the light CLI can't import it; a test
+# keeps them in step).
+CI_BASELINE_NOTE = (
+    "a leg's baseline is the median measured time of its variant's full-suite runs in the 30 "
+    "days before it, at least 3"
+)
+CI_LEGS_LEFT_OUT = "no baseline yet or nothing measured"
+
+
+def ci_too_few(runs: int) -> str:
+    """Time saved from fewer than 5 counted runs (core.ci_stats.LOW_CONFIDENCE_RUNS)."""
+    return f"too few runs for a reliable figure ({_plural(runs, 'run')})"
+
+
+def ci_pct(n: int | float, of: int | float, digits: int = 0) -> str:
+    """A share with its counts, "39% (9 of 23)"; rounded down, so a part never reads as all."""
+    if not of:
+        return "n/a"
+    share = math.floor(n / of * 100 * 10**digits) / 10**digits
+    return f"{share:.{digits}f}% ({n:,} of {of:,})"
+
+
+def ci_share(share: float) -> str:
+    """A median share of tests, rounded down to 0.1%."""
+    return f"{math.floor(share * 1000) / 10:.1f}%"
+
+
+def ci_rank(rank: float) -> str:
+    """A (median) rank: 3, or 2.5 between two."""
+    return f"{rank:g}"
+
+
+def ci_minutes(ms: float) -> str:
+    """Test time: minutes, hours past two (sign kept: a saving can be negative)."""
+    return _minutes(ms) if ms >= 0 else "-" + _minutes(-ms)
+
+
+def ci_lines(ci: dict[str, Any]) -> list[str]:
+    """``siftwise report``'s CI numbers, one block per branch filter (``GET /repos/{repo}/ci``
+    results by branch). The dashboard's overview shows the same values."""
+    first = next(iter(ci.values()))
+    lines = [f"CI runs, the last {first['days']} days ({first['counting']}):"]
+    for branch, r in ci.items():
+        lines.append(f"  {CI_BRANCH_NAMES[branch]}: selections recorded for {r['recorded']:,} of "
+                     f"{_plural(r['runs'], 'CI run')}")  # fmt: skip
+        if not r["recorded"]:
+            lines.append(f"    {CI_NO_SELECTIONS}")
+            continue
+        lines += [f"    {line}" for line in ci_detail_lines(r)]
+    lines += ["", CI_RECALL_NOTE]
+    return lines
+
+
+def ci_detail_lines(r: dict[str, Any]) -> list[str]:
+    counted = r["selective_runs"] + r["full_runs"]
+    reasons = ", ".join(f"{code} {n:,}" for code, n in r["full_reasons"].items())
+    lines = [
+        f"selective {ci_pct(r['selective_runs'], counted)} runs; full suite "
+        f"{r['full_runs']:,}{f' ({reasons})' if reasons else ''}; shadow runs "
+        f"{r['shadow_runs']:,} (ran the full suite, counted apart)"
+    ]
+    share = r["share_selected"]
+    if share["median"] is not None:
+        lines.append(f"median share of tests selected: {ci_share(share['median'])} "
+                     f"({_plural(share['runs'], 'selective run')})")  # fmt: skip
+    saved = r["time_saved"]
+    legs_left_out = saved.get("legs_left_out", 0)
+    if saved["sum_ms"] is None:
+        lines.append(f"test time saved (estimated): no leg of the "
+                     f"{_plural(r['selective_runs'], 'selective run')} has a baseline and a "
+                     f"measured time ({CI_BASELINE_NOTE})")  # fmt: skip
+    else:
+        lines.append(f"test time saved (estimated, {CI_TIME_NOTE}): "
+                     f"{ci_minutes(saved['sum_ms'])} based on {saved['runs']:,} of "
+                     f"{_plural(r['selective_runs'], 'selective run')}"
+                     + (f" ({_plural(legs_left_out, 'leg')} left out: {CI_LEGS_LEFT_OUT})"
+                        if legs_left_out else "")
+                     + f", median {ci_minutes(saved['median_ms'])} a run"
+                     + (f"; {ci_too_few(saved['runs'])}" if saved.get("low_confidence")
+                        else ""))  # fmt: skip
+    shadow = r["shadow"]
+    if shadow["compared"]:
+        lines.append(f"shadow runs would have saved {ci_minutes(shadow['would_save_ms'])} of "
+                     f"{ci_minutes(shadow['measured_ms'])} measured "
+                     f"({_plural(shadow['compared'], 'run')}; not in the time saved)")  # fmt: skip
+    f = r["failures"]
+    if not f["runs"]:
+        lines.append("failures in selective runs: no selective run with a stored outcome")
+    else:
+        line = (f"failures in selective runs ({_plural(f['runs'], 'run')} with an outcome): "
+                f"{f['failing']:,} failing tests, {f['in_selection']:,} in the selection, "
+                f"{f['outside']:,} ran outside it")  # fmt: skip
+        if f["median_rank"] is not None:
+            line += (f"; median rank {ci_rank(f['median_rank'])} ({f['ranked']:,} ranked), first "
+                     f"failure median rank {ci_rank(f['median_first_rank'])} "
+                     f"({_plural(f['first_rank_runs'], 'run')})")  # fmt: skip
+        lines.append(line)
+    return lines
 
 
 def recall_lines(result: dict[str, Any]) -> list[str]:

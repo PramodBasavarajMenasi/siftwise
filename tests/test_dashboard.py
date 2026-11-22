@@ -394,7 +394,7 @@ def test_an_empty_window_with_older_shadow_runs_says_so(
     assert "Nothing in the last 30 days, but 1 older shadow runs exist (the newest 40 days" in page
     assert f'href="/ui/repos/{REPO}?days=90"' in page and "?days=all" in page
     every = client.get(f"/ui/repos/{REPO}", params={"days": "all"}).text
-    assert "(1 of 2)" in every and "on shadow runs of all recorded history" in every
+    assert "(1 of 2)" in every and "recall from shadow runs, in all recorded history" in every
 
 
 def _shadow_data(client: TestClient, db_session: Session) -> None:
@@ -671,7 +671,9 @@ def test_the_run_page_shows_what_siftwise_selected(client: TestClient, db_sessio
     text_ = _text(page)
     assert "What siftwise did" in page
     assert "selective: 1 of 2 tests in history" in text_
-    assert "estimated" in text_ and "for the full suite" in text_ and "measured" in text_
+    # No summed per-test estimate: the leg's own full-suite baseline (none yet here).
+    assert "measured" in text_ and "for the full suite" not in text_
+    assert "no baseline yet (3 full-suite runs of this variant in the 30 days before)" in text_
     assert "Order" in page and ">risk<" in page.replace("<dd>", ">").replace("</dd>", "<")
     assert "siftwise 0.4.0" in text_ and "#9" in text_
     assert "Highest-risk tests" in page
@@ -736,7 +738,7 @@ def test_a_selection_without_estimates_and_a_full_shadow_one_read_plainly(
     signed_in(client)
     page = _text(client.get(f"/ui/repos/{REPO}/-/runs/ci-7/1").text)
     # A shadow row (its outcome is now a shadow comparison): the measured saving is below.
-    assert "not estimated at select time" in page and "0.0 min of" not in page
+    assert "measures what it would have saved" in page and "0.0 min of" not in page
     assert "test time saved" not in page
     runs = _text(client.get(f"/ui/repos/{REPO}/-/runs").text)
     assert "shadow · would run the full suite" in runs
@@ -756,7 +758,10 @@ def test_the_run_page_labels_what_each_count_and_time_measures(
     assert "would have run 1 of 2 tests in history" in text_
     assert "Would have run, of the tests that ran here" in text_
     assert "Time saved (measured)" in text_
-    assert "not estimated at select time" in text_ and "measures what it would have saved" in text_
+    assert (
+        "measures what it would have saved" in text_
+        and "estimated" not in text_.split("Time budget")[0].split("Test time")[1]
+    )
     assert ">Reason<" not in page  # a selective selection: the reason repeats it
 
 
@@ -816,3 +821,25 @@ def test_links_say_where_they_go(client: TestClient, db_session: Session) -> Non
     assert ">How selections are recorded</a>" in first
     empty = client.get("/ui/repos/acme/none/-/runs").text
     assert "GitHub Action</a>" not in empty
+
+
+def test_the_ci_section_never_shows_0_for_a_window_without_selections(
+    client: TestClient, db_session: Session
+) -> None:
+    record(db_session, commit=1, hour=_hours_ago(5), tests={TEST: P}, ci_run_id="1")
+    signed_in(client)
+    text_ = html.unescape(_text(client.get(f"/ui/repos/{REPO}").text))
+    assert "No recorded selections in this window" in text_
+    assert "Selective runs" not in text_ and "0 min" not in text_
+    # Main has a selection, pull requests don't: that column says so instead of 0%.
+    _ci_run(client, db_session)  # a pull request run with a selection
+    db_session.execute(text("UPDATE runs SET is_main = true WHERE ci_run_id = 'ci-7'"))
+    record(db_session, commit=3, hour=_hours_ago(4), branch="pr", tests={TEST: P},
+           ci_run_id="pr-1")  # fmt: skip
+    page = client.get(f"/ui/repos/{REPO}", params={"days": "all"}).text
+    row = re.search(r">Selective runs</th>.*?</tr>", page, re.S)
+    assert row is not None
+    cells = re.findall(r'data-label="([^"]+)">(.*?)</td>', row.group(0), re.S)
+    assert [label for label, _ in cells] == ["Main", "Pull requests and other branches", "All"]
+    assert "100% (1 of 1)" in cells[0][1]
+    assert "no recorded selections in this window" in cells[1][1] and "%" not in cells[1][1]

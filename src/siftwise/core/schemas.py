@@ -1091,3 +1091,81 @@ class FlakyResponse(BaseModel):
         description="The known_flaky globs the newest main run applied (as record stored them)"
     )
     main_known_flaky_at: datetime | None = Field(description="That run's time")
+
+
+class CiShareOut(BaseModel):
+    median: float | None = Field(
+        description="Median share of known tests selected (0-1); null without selective runs"
+    )
+    runs: int = Field(description="The selective runs it's the median of")
+
+
+class CiTimeSavedOut(BaseModel):
+    sum_ms: float | None = Field(
+        description="Test time saved (estimated), summed: per uploaded leg of a selective run, "
+        "the leg's baseline (the median measured test time of its variant's full-suite legs in "
+        "the 30 days before it, at least 3) minus its measured test time. Sums of test "
+        "durations, not wall-clock CI time; negative values kept; null when no leg has both"
+    )
+    median_ms: float | None = Field(description="The median per run")
+    runs: int = Field(description="Selective runs with a counted leg")
+    left_out: int = Field(
+        description="Selective runs left out: no leg with a baseline and a measured time"
+    )
+    legs: int = Field(description="Legs counted (a baseline and a measured time)")
+    legs_left_out: int = Field(
+        description="Legs of selective runs left out: no baseline yet, or nothing measured"
+    )
+    baseline_ms: float = Field(description="The counted legs' baselines, summed")
+    low_confidence: bool = Field(
+        description="Fewer than 5 runs counted: too few runs for a reliable figure"
+    )
+
+
+class CiShadowOut(BaseModel):
+    runs: int = Field(description="Shadow runs (they ran the full suite)")
+    compared: int = Field(description="Of those, with a compared leg")
+    measured_ms: float = Field(description="Their measured test time")
+    would_save_ms: float = Field(
+        description="What their selection would have saved, measured on those runs: never "
+        "added to the time saved (they ran everything)"
+    )
+
+
+class CiFailuresOut(BaseModel):
+    runs: int = Field(description="Selective runs with a stored outcome")
+    runs_failing: int = Field(description="Of those, with a failing test")
+    failing: int = Field(description="Distinct failing tests per run, summed")
+    in_selection: int = Field(description="Of those, the selection ran (named or run whole)")
+    outside: int = Field(description="Of those, ran outside the selection")
+    ranked: int = Field(description="Failing tests the selection named, with a rank")
+    median_rank: float | None
+    first_rank_runs: int = Field(description="Runs whose failures include a ranked one")
+    median_first_rank: float | None = Field(
+        description="Median over runs of the best rank among the run's failing tests"
+    )
+
+
+class CiStatsResponse(BaseModel):
+    """``GET /repos/{repo}/ci``: what siftwise did in CI (core/ci_stats.py defines each)."""
+
+    repo: str
+    days: int
+    branch: Literal["all", "main", "prs"]
+    since: datetime
+    until: datetime
+    counting: str = Field(description="How CI runs and attempts are counted")
+    runs: int = Field(description="CI runs uploaded in the window")
+    recorded: int = Field(description="Of those, with a recorded selection (coverage)")
+    shadow_runs: int
+    selective_runs: int = Field(description="Recorded, not shadow, every selection selective")
+    full_runs: int
+    full_reasons: dict[str, int] = Field(description="Full runs per reason code")
+    share_selected: CiShareOut
+    time_saved: CiTimeSavedOut
+    shadow: CiShadowOut
+    failures: CiFailuresOut
+    recall_note: str = Field(
+        description="Recall comes only from shadow runs (GET /repos/{repo}/recall): in a "
+        "selective run, an unselected test didn't run, so a failure it would show is unseen"
+    )

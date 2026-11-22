@@ -8,6 +8,22 @@ All notable changes to siftwise. The format follows
 
 ### Added
 
+- The CI numbers ([#85](https://github.com/PramodBasavarajMenasi/siftwise/issues/85), part 2):
+  `GET /repos/{repo}/ci?days=30&branch=all|main|prs` (read scope), the overview's CI section
+  (main and pull requests apart) and new lines in `siftwise report` show, for a window:
+  selections recorded for X of Y CI runs; selective vs full-suite runs, full-suite runs by
+  reason code; the median share of tests selected; test time saved (estimated: per leg, the
+  median measured time of the same variant's full-suite runs in the 30 days before it, at
+  least 3, minus the leg's measured test time; not /select's summed per-test estimate, which
+  charges every matrix leg every known test and overstated the saving: rdflib 413 s
+  estimated for a 231 s leg; sums of test durations, not wall-clock CI time; negative when a
+  leg took longer, never clipped; "based on N of M selective runs (K legs left out)" for legs
+  with no baseline yet or no measured upload; the run page shows the same baseline); main = the uploader's `is_main` (the repo's default
+  branch, whatever its name);
+  shadow runs apart (what they would have saved, measured, never added to the time saved);
+  and failures in selective runs (in the selection or not, and their rank). One module
+  (`core/ci_stats.py`) computes them for all three. No recall is claimed from selective runs:
+  it comes only from shadow runs. README: [How these numbers work](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/README.md#how-these-numbers-work).
 - Every CI selection is recorded, and the dashboard shows what siftwise did in each run
   ([#85](https://github.com/PramodBasavarajMenasi/siftwise/issues/85), part 1):
   - The Action's and the GitLab template's select step send their CI run with `/select`

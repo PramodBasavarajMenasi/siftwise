@@ -36,10 +36,11 @@ from siftwise.api.dashboard.auth import (
 )
 from siftwise.api.deps import get_app_settings
 from siftwise.api.forwarded import public_origin
-from siftwise.cli.main import CAUSE_LABELS
+from siftwise.cli.main import CAUSE_LABELS, ci_minutes, ci_pct, ci_rank, ci_share, ci_too_few
 from siftwise.cli.repoconfig import SUGGESTED_FLAKY_DAYS, known_flaky_entry
 from siftwise.config import Settings
 from siftwise.core import ui_sessions
+from siftwise.core.ci_stats import ci_stats_by_branch
 from siftwise.core.flaky import FlakyTest, flaky_tests
 from siftwise.core.selector import matching_glob
 from siftwise.core.shadow import VERDICT_ORDER
@@ -198,7 +199,9 @@ def _environment() -> Environment:
     env.globals.update(repo_url=_repo_url, with_days=_with_days, days_options=DAYS,
                        version=__version__, stylesheet=lambda: stylesheet_file().name,
                        readme=README, changelog=CHANGELOG, prefix=PREFIX, cause_labels=CAUSE_LABELS,
-                       verdicts=VERDICT_ORDER, reason_labels=REASON_LABELS)  # fmt: skip
+                       verdicts=VERDICT_ORDER, reason_labels=REASON_LABELS,
+                       ci_pct=ci_pct, ci_minutes=ci_minutes, ci_share=ci_share,
+                       ci_rank=ci_rank, ci_too_few=ci_too_few)  # fmt: skip
     return env
 
 
@@ -471,6 +474,7 @@ def overview(request: Request, repo: str, session: Db) -> HTMLResponse:
     recorded = data.repo_activity(session, repo, _since(days, now))
     span = days if days is not None else _days_back_to(recorded.oldest_shadow_at, now)
     report = shadow_recall(session, repo, span, now, by_week=True)
+    ci = ci_stats_by_branch(session, repo, days, ("main", "prs", "all"), now)
     crumbs = [*_repo_crumbs(repo)[:1], (repo, "")]
     return _page(request, "overview.html", title=repo, crumbs=crumbs, repo=repo, tab="overview",
-                 days=days, report=report, recorded=recorded)  # fmt: skip
+                 days=days, report=report, recorded=recorded, ci=ci)  # fmt: skip

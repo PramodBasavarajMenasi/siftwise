@@ -62,8 +62,10 @@ def record(
     rerun: int = 0,
     known_flaky: Sequence[str] = (),
     known_flaky_changed: bool = False,
+    is_main: bool | None = None,
 ) -> Run:
-    """One run. ``changed`` None = unknown diff; ``graph`` None = no stored change links."""
+    """One run. ``changed`` None = unknown diff; ``graph`` None = no stored change links;
+    ``is_main`` None = on the branch "main"."""
     results = []
     for test_id, statuses in tests.items():
         attempts = [statuses] if isinstance(statuses, Status) else statuses
@@ -77,7 +79,7 @@ def record(
         repo=REPO,
         commit_sha=sha(commit),
         branch=branch,
-        is_main=branch == "main",
+        is_main=branch == "main" if is_main is None else is_main,
         ci_run_id=ci_run_id or f"ci-{commit}-{hour}",
         run_attempt=run_attempt,
         variant=variant,
