@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% from "_macros.html" import coverage, test_id %}
+{# CI health: core/ci_stats per UTC day or week (no numbers computed here) and the slowest
+   tests. `found`: ci_stats.CiPeriods or None (unknown repo); `slow`: ci_stats.SlowTest list. #}
+{% set days_param = "all" if days is none else days %}
+{% macro cells(p) -%}
+{%- set dash = '<span class="muted">–</span>'|safe -%}
+<td class="n" data-label="CI runs">{% if p.runs %}{{ p.runs|num }}{% else %}<span class="muted">no CI runs</span>{% endif %}</td>
+<td class="n" data-label="Selections recorded">{% if p.runs %}{{ ci_pct(p.recorded, p.runs) }}{% else %}{{ dash }}{% endif %}</td>
+<td class="n" data-label="Selective">{% if p.counted %}{{ ci_pct(p.selective_runs, p.counted) }}{% elif p.recorded %}<span class="muted">only shadow runs</span>{% elif p.runs %}<span class="muted">no recorded selections</span>{% else %}{{ dash }}{% endif %}</td>
+<td class="n" data-label="Full suite, by reason">{% if p.recorded %}{{ p.full_runs|num }}{% for code, n in p.full_reasons.most_common() %}<br><span class="muted">{{ reason_labels.get(code, code) }}: {{ n|num }}</span>{% endfor %}{% else %}{{ dash }}{% endif %}</td>
+<td class="n" data-label="Shadow runs">{% if p.recorded %}{{ p.shadow_runs|num }}{% else %}{{ dash }}{% endif %}</td>
+<td class="n" data-label="Failures in selective runs">{% if p.failures.runs %}{{ p.failures.failing|num }} failing <span class="muted">· {{ p.failures.in_selection|num }} in the selection · {{ p.failures.outside|num }} outside ({{ p.failures.runs|num }} run{{ "s" if p.failures.runs != 1 else "" }} with an outcome)</span>{% elif p.selective_runs %}<span class="muted">no outcome stored</span>{% else %}{{ dash }}{% endif %}</td>
+<td class="n" data-label="First failure's rank">{% if p.failures.median_first_rank is not none %}median {{ ci_rank(p.failures.median_first_rank) }} <span class="muted">({{ p.failures.first_ranks|length|num }} run{{ "s" if p.failures.first_ranks|length != 1 else "" }})</span>{% else %}{{ dash }}{% endif %}</td>
+<td class="n" data-label="Test time saved (estimated)">{% if p.saved_ms is not none %}{{ ci_minutes(p.saved_ms) }} <span class="muted">({{ p.savings|length|num }} of {{ p.selective_runs|num }} selective)</span>{% if p.low_confidence %}<br><span class="low-confidence">{{ ci_too_few(p.savings|length) }}</span>{% endif %}{% elif p.selective_runs %}<span class="muted">no baseline yet</span>{% else %}{{ dash }}{% endif %}</td>
+<td class="n" data-label="Verdicts computed later">{% if p.backfilled %}{{ p.backfilled|num }}{% if p.backfilled_without_selection %} <span class="muted">({{ p.backfilled_without_selection|num }} no selection recorded)</span>{% endif %}{% else %}{{ dash }}{% endif %}</td>
+{%- endmacro %}
+{% block content %}
+<h1>CI</h1>
+<p class="lede">What siftwise did in CI per UTC {{ by }}{% if by == "week" %} (Monday 00:00 UTC){% endif %}, in {{ days|window }}{% if branch != "all" %}, {{ branch_names[branch]|lower }}{% endif %}. Each CI run attempt counts once, in the {{ by }} of its newest upload, so the {{ by }}s add up to the window.</p>
+{{ coverage(recorded, days) }}
+<div class="switches">
+<nav class="days" aria-label="Periods"><span class="days-label">By</span>{% for name in ("day", "week") %}<a href="{{ repo_url(repo, "ci", days=days_param, by=name, branch=branch) }}"{% if name == by %} aria-current="true"{% endif %}>UTC {{ name }}</a>{% endfor %}</nav>
+<nav class="days" aria-label="Branch"><span class="days-label">Runs</span>{% for key in ("all", "main", "prs") %}<a href="{{ repo_url(repo, "ci", days=days_param, by=by, branch=key) }}"{% if key == branch %} aria-current="true"{% endif %}>{{ {"all": "All", "main": "Main", "prs": "PRs and other"}[key] }}</a>{% endfor %}</nav>
+</div>
+{% if by_note %}<p class="notice">{{ by_note }}</p>{% endif %}
+{% if found is none %}
+<p class="empty">No runs recorded for <span class="mono">{{ repo }}</span> yet. <a href="{{ readme }}#github-action">Set up the record action</a></p>
+{% elif not found.total.runs %}
+<p class="empty">No CI runs in {{ days|window }}{% if branch != "all" %} ({{ branch_names[branch]|lower }}){% endif %}: no recorded selections in this window.</p>
+{% else %}
+{% set t = found.total %}
+<p class="stats"><strong>{{ t.runs|num }}</strong> CI runs · selections recorded <strong>{{ ci_pct(t.recorded, t.runs) }}</strong>{% if t.counted %} · selective <strong>{{ ci_pct(t.selective_runs, t.counted) }}</strong>{% endif %}{% if t.backfilled %} · <span title="Outcomes stored later by siftwise outcomes backfill, from what was uploaded by each run's last upload">{{ outcome_label(true) }} for <strong>{{ t.backfilled|num }}</strong>{% if t.backfilled_without_selection %} ({{ t.backfilled_without_selection|num }}: {{ outcome_label(false) }}){% endif %}</span>{% endif %}</p>
+<div class="scroll"><table class="stack periods">
+<thead><tr><th scope="col">UTC {{ by }}</th><th scope="col" class="n" title="CI run attempts whose newest upload ran in this {{ by }}">CI runs</th><th scope="col" class="n" title="CI runs whose select step recorded its selection, of the CI runs in this {{ by }}">Selections recorded</th><th scope="col" class="n" title="Of the recorded runs that weren't shadow runs, those where every selection was selective">Selective</th><th scope="col" class="n" title="Runs whose selection was the full suite, by reason; a run with several reasons counts under each">Full suite, by reason</th><th scope="col" class="n" title="Shadow runs ran the full suite: counted apart">Shadow runs</th><th scope="col" class="n" title="Selective runs with a stored outcome: their distinct failing tests, how many the selection ran, how many ran outside it. No recall: a test that wasn't selected didn't run.">Failures in selective runs</th><th scope="col" class="n" title="The risk rank (1 = run first) of each run's best-ranked failure, the median over runs">First failure's rank</th><th scope="col" class="n" title="Per leg: its variant's full-suite baseline minus its measured test time. Sums of test durations, not wall-clock CI time.">Test time saved (estimated)</th><th scope="col" class="n" title="Runs whose outcome was computed later by siftwise outcomes backfill, from what was uploaded by their last upload">{{ outcome_label(true)|capitalize }}</th></tr></thead>
+<tbody>
+{% for p in found.periods|reverse %}
+<tr{% if not p.runs %} class="quiet-row"{% endif %}><th scope="row" class="mono period">{% if by == "week" %}week of {% endif %}{{ p.since|day }}{% if loop.first %} <span class="muted">(so far)</span>{% endif %}</th>{{ cells(p) }}</tr>
+{% endfor %}
+</tbody>
+<tfoot><tr><th scope="row" class="period">{{ days|window|capitalize }}</th>{{ cells(t) }}</tr></tfoot>
+</table></div>
+<p class="muted">Test times are sums of test durations, not wall-clock CI time. No recall from these runs: in a selective run, a test that wasn't selected didn't run, so a failure it would have shown can't be seen. Recall comes only from shadow runs (<a href="{{ repo_url(repo) }}">Overview</a>). <a href="{{ readme }}#how-these-numbers-work">How these numbers work</a></p>
+{% endif %}
+<h2>Slowest tests <span class="muted">(mean duration; tests that ran in {{ days|window }})</span></h2>
+{% if slow %}
+<div class="scroll"><table class="stack">
+<thead><tr><th scope="col" class="n">#</th><th scope="col">Test</th><th scope="col" class="n" title="The mean of the test's non-skipped attempts in test history (the server's stats window). No percentiles: history keeps the mean.">Mean duration</th></tr></thead>
+<tbody>
+{% for s in slow %}
+<tr><td class="n fact" data-label="#">{{ loop.index }}</td><td class="grow name"><span class="id-short">{{ test_id(s.test_id) }}</span><span class="id-full mono">{{ s.test_id|breakable }}</span></td><td class="n" data-label="Mean duration">{{ s.mean_ms|test_time }} <span class="muted">mean over the last {{ s.runs|num }} run{{ "s" if s.runs != 1 else "" }}</span></td></tr>
+{% endfor %}
+</tbody></table></div>
+{% else %}
+<p class="empty">No test ran in {{ days|window }} with a recorded duration.</p>
+{% endif %}
+{% endblock %}

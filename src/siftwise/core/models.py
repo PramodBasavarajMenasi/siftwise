@@ -424,6 +424,7 @@ class AttemptOutcome(Base):
     verdicts the client's ``fail-on`` gates on (NULL: no gate, or a client older than 0.4)."""
 
     __tablename__ = "attempt_outcomes"
+    __table_args__ = (CheckConstraint("source IN ('ci', 'backfill')", name="source"),)
 
     repo_id: Mapped[int] = mapped_column(
         ForeignKey("repos.id", ondelete="CASCADE"), primary_key=True
@@ -434,6 +435,9 @@ class AttemptOutcome(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     fail_on: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    # ci: the CI run's own outcome call; backfill: computed later (``siftwise outcomes
+    # backfill``, 0018), from what was uploaded by the attempt's last upload.
+    source: Mapped[str] = mapped_column(String(16), server_default=text("'ci'"))
 
 
 TOKEN_SCOPES = ("read", "write")

@@ -6,9 +6,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from siftwise.api.deps import Caller, authorize
-from siftwise.core.ci_stats import COUNTING, Branch, CiStats, ci_stats
+from siftwise.core.ci_stats import (
+    COUNTING,
+    Branch,
+    CiStats,
+    Period,
+    TooManyPeriods,
+    ci_stats,
+    ci_stats_periods,
+)
 from siftwise.core.schemas import (
     CiFailuresOut,
+    CiNumbersOut,
+    CiPeriodOut,
     CiShadowOut,
     CiShareOut,
     CiStatsResponse,
@@ -33,27 +43,51 @@ def get_ci(
     branch: Annotated[
         Branch, Query(description="'main' (the default branch), 'prs' (every other run) or 'all'")
     ] = "all",
+    by: Annotated[
+        Period | None,
+        Query(description="'day' or 'week': also the window per UTC day or week (Monday)"),
+    ] = None,
 ) -> CiStatsResponse:
     """Coverage, selective and full-suite runs with their reasons, the share of tests
     selected, the test time saved (estimated), shadow runs apart, and failures in selective
-    runs. No recall figure: see /recall."""
+    runs; with ``by``, the same per UTC day or week (empty ones included; they add up to the
+    window). No recall figure: see /recall."""
     authorize(caller, repo)
-    stats = ci_stats(session, repo, days, branch)
-    if stats is None:
+    if by is None:
+        stats = ci_stats(session, repo, days, branch)
+        if stats is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown repo {repo!r}")
+        return ci_response(repo, stats)
+    try:
+        found = ci_stats_periods(session, repo, days, by, branch)
+    except TooManyPeriods as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    if found is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown repo {repo!r}")
-    return ci_response(repo, stats)
+    response = ci_response(repo, found.total)
+    response.by = by
+    response.periods = [CiPeriodOut(**numbers(p).model_dump()) for p in found.periods]
+    return response
 
 
 def ci_response(repo: str, stats: CiStats) -> CiStatsResponse:
-    assert stats.since is not None and stats.days is not None
-    f = stats.failures
+    assert stats.days is not None
     return CiStatsResponse(
         repo=repo,
         days=stats.days,
         branch=stats.branch,
+        counting=COUNTING,
+        recall_note=RECALL_NOTE,
+        **numbers(stats).model_dump(),
+    )
+
+
+def numbers(stats: CiStats) -> CiNumbersOut:
+    assert stats.since is not None
+    f = stats.failures
+    return CiNumbersOut(
         since=stats.since,
         until=stats.until,
-        counting=COUNTING,
         runs=stats.runs,
         recorded=stats.recorded,
         shadow_runs=stats.shadow_runs,
@@ -88,5 +122,6 @@ def ci_response(repo: str, stats: CiStats) -> CiStatsResponse:
             first_rank_runs=len(f.first_ranks),
             median_first_rank=f.median_first_rank,
         ),
-        recall_note=RECALL_NOTE,
+        backfilled=stats.backfilled,
+        backfilled_without_selection=stats.backfilled_without_selection,
     )

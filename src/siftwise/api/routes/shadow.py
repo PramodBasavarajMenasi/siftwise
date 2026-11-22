@@ -1,6 +1,7 @@
 """Run outcomes and shadow mode. POST /repos/{repo}/outcome: store a recorded CI run
 attempt's outcome (and compare a shadow run with its selection); POST /repos/{repo}/shadow:
-the same, answering as before 0.4. GET /repos/{repo}/recall: live recall over the last days."""
+the same, answering as before 0.4. POST /repos/{repo}/outcomes/backfill: verdicts computed later
+for attempts without an outcome. GET /repos/{repo}/recall: live recall over the last days."""
 
 from typing import Annotated, Literal
 
@@ -9,11 +10,16 @@ from sqlalchemy.orm import Session
 
 from siftwise.api.deps import Caller, authorize, get_app_settings
 from siftwise.config import Settings
+from siftwise.core.outcomes_backfill import Cursor, backfill_outcomes
 from siftwise.core.schemas import (
+    BackfillCursorIn,
+    BackfillFailureOut,
     EstimatedMs,
     LegOutcomeOut,
     OutcomeRequest,
     OutcomeResponse,
+    OutcomesBackfillRequest,
+    OutcomesBackfillResponse,
     RecallMissOut,
     RecallPeriodOut,
     RecallResponse,
@@ -93,6 +99,44 @@ def post_outcome(
         fail_on=None if body.fail_on is None else sorted(set(body.fail_on)),
         legs=[LegOutcomeOut(**vars(leg)) for leg in result.legs],
         shadow=_shadow_response(repo, body.ci_run_id, body.run_attempt, result),
+    )
+
+
+@router.post(
+    "/repos/{repo:path}/outcomes/backfill", responses={404: {"description": "Unknown repo"}}
+)
+def post_outcomes_backfill(
+    repo: str,
+    caller: Caller,
+    body: OutcomesBackfillRequest,
+    session: Annotated[Session, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> OutcomesBackfillResponse:
+    """One batch of the outcomes backfill (``siftwise outcomes backfill`` loops over them):
+    store the outcome of CI run attempts that have uploads and none (older clients, or a failed
+    outcome step), oldest first, labelled as computed later. No peeking: each uses only what a
+    live outcome call could have read then. A live outcome always wins; attempts with one are
+    never touched, so running it twice changes nothing. ``dry_run`` only counts."""
+    authorize(caller, repo, write=True, what="backfilling outcomes")
+    after = None if body.after is None else Cursor(**body.after.model_dump())
+    result = backfill_outcomes(session, repo, window_days=settings.stats_window_days,
+                               limit=body.limit, max_seconds=body.max_seconds, after=after,
+                               dry_run=body.dry_run)  # fmt: skip
+    if result is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown repo {repo!r}")
+    return OutcomesBackfillResponse(
+        repo=repo,
+        dry_run=result.dry_run,
+        pending=result.pending,
+        with_selection=result.with_selection,
+        computed_with_selection=result.computed_with_selection,
+        computed_without_selection=result.computed_without_selection,
+        skipped_live=result.skipped_live,
+        failed=[
+            BackfillFailureOut(ci_run_id=c, run_attempt=a, error=e) for c, a, e in result.failed
+        ],
+        next=None if result.next is None else BackfillCursorIn(**vars(result.next)),
+        remaining=result.remaining,
     )
 
 

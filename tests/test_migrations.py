@@ -8,6 +8,7 @@ import pytest
 from alembic import command
 from alembic.script import ScriptDirectory
 from sqlalchemy import Engine, create_engine, make_url, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from siftwise import migrate
@@ -383,3 +384,43 @@ def test_0017_generalises_the_shadow_tables_and_back(scratch_engine: tuple[Engin
         assert connection.execute(text(
             "SELECT count(*), count(client), count(client_version) FROM runs"
         )).one() == (5, 0, 0)  # fmt: skip
+
+
+def test_0018_adds_the_outcome_source_and_drops_it_again(
+    scratch_engine: tuple[Engine, str],
+) -> None:
+    engine, url = scratch_engine
+    config = alembic_config(url)
+    command.upgrade(config, "0017")
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO repos (id, name) VALUES (1, 'acme/shop');"
+            "INSERT INTO attempt_outcomes (repo_id, ci_run_id, run_attempt) VALUES (1, '9', 1)"
+        ))  # fmt: skip
+
+    command.upgrade(config, "0018")
+
+    source = text("SELECT ci_run_id, source FROM attempt_outcomes ORDER BY 1")
+    with engine.begin() as connection:
+        assert connection.execute(source).all() == [("9", "ci")]  # existing rows were live
+        connection.execute(text(
+            "INSERT INTO attempt_outcomes (repo_id, ci_run_id, run_attempt, source) "
+            "VALUES (1, '10', 1, 'backfill')"))  # fmt: skip
+    with pytest.raises(IntegrityError), engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO attempt_outcomes (repo_id, ci_run_id, run_attempt, source) "
+            "VALUES (1, '11', 1, 'guess')"))  # fmt: skip
+
+    command.downgrade(config, "0017")
+
+    with engine.connect() as connection:
+        column = text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'attempt_outcomes' AND column_name = 'source'"
+        )
+        assert connection.execute(column).all() == []
+        kept = text("SELECT ci_run_id FROM attempt_outcomes ORDER BY 1")
+        assert connection.execute(kept).scalars().all() == ["10", "9"]
+    command.upgrade(config, "head")
+    with engine.connect() as connection:  # back up: every row reads as a live one again
+        assert connection.execute(source).all() == [("10", "ci"), ("9", "ci")]

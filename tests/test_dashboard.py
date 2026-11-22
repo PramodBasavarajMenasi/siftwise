@@ -223,6 +223,47 @@ def test_a_revoked_token_stops_working_on_the_next_request(
     assert login(client, token).status_code == 401
 
 
+UI_PAGES = ("/ui/", f"/ui/repos/{REPO}", f"/ui/repos/{REPO}/-/ci", f"/ui/repos/{REPO}/-/runs",
+            f"/ui/repos/{REPO}/-/flaky", f"/ui/repos/{REPO}/-/runs/1/1")  # fmt: skip
+
+
+def test_revoking_a_token_ends_its_sessions_at_once_on_every_page(
+    make_client: Callable[..., TestClient], db_session: Session
+) -> None:
+    token_id, token = tokens.create_token(db_session, "*", Scope.READ, "local-look")
+    browsers = [signed_in(make_client(), token) for _ in range(len(UI_PAGES))]
+    assert db_session.scalar(select(func.count()).select_from(UiSession)) == len(UI_PAGES)
+    tokens.revoke_token(db_session, token_id)
+    # Gone at once, not at the 4-hour expiry or the next click...
+    assert db_session.scalar(select(func.count()).select_from(UiSession)) == 0
+    # ...and each browser's next request, on any page, goes to sign-in.
+    for browser, path in zip(browsers, UI_PAGES, strict=True):
+        response = browser.get(path)
+        assert response.status_code == 303, path
+        assert response.headers["location"] == "/ui/login", path
+
+
+def test_a_session_whose_token_was_revoked_or_deleted_behind_its_back_is_refused(
+    client: TestClient, db_session: Session
+) -> None:
+    # Revoked without going through revoke_token (another server, or SQL): the per-request
+    # check still refuses the session and drops it.
+    token_id, token = tokens.create_token(db_session, REPO, Scope.READ, "laptop")
+    signed_in(client, token)
+    db_session.execute(text("UPDATE api_tokens SET revoked_at = now() WHERE id = :id"),
+                       {"id": token_id})  # fmt: skip
+    response = client.get(f"/ui/repos/{REPO}/-/ci")
+    assert response.status_code == 303 and response.headers["location"] == "/ui/login"
+    assert db_session.scalar(select(func.count()).select_from(UiSession)) == 0
+    # Deleted: its sessions go with it (ON DELETE CASCADE), and the cookie gets nothing.
+    token_id, token = tokens.create_token(db_session, REPO, Scope.READ, "laptop 2")
+    signed_in(client, token)
+    db_session.execute(text("DELETE FROM api_tokens WHERE id = :id"), {"id": token_id})
+    assert db_session.scalar(select(func.count()).select_from(UiSession)) == 0
+    response = client.get("/ui/")
+    assert response.status_code == 303 and response.headers["location"] == "/ui/login"
+
+
 def test_a_changed_admin_token_ends_admin_sessions(
     make_client: Callable[..., TestClient],
 ) -> None:

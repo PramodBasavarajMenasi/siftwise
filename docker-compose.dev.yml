@@ -6,6 +6,10 @@
 services:
   api:
     image: siftwise:dev
+    environment:
+      # The read-only dashboard at /ui (off unless set: SIFTWISE_DASHBOARD=1 in .env or the
+      # shell). Interpolated, never env_file: .env also holds GITHUB_TOKEN.
+      SIFTWISE_DASHBOARD: ${SIFTWISE_DASHBOARD:-0}
   postgres:
     ports:
       - "5432:5432"

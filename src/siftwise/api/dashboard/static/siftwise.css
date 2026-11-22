@@ -331,3 +331,15 @@ table.ci th, table.ci td { white-space: normal; }
   table.ci tbody th { width: 22%; }
   table.ci td { width: 26%; }
 }
+/* The CI page: its two switches side by side; empty periods quieter. */
+.switches { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 8px 0 12px; }
+tr.quiet-row td, tr.quiet-row th { color: var(--muted); }
+table.periods th, table.periods td { white-space: normal; }
+table.periods th.period { white-space: nowrap; width: 1%; }
+table.periods td { min-width: 6.5em; }
+@media (max-width: 640px) {
+  table.periods td { min-width: 0; }
+  table.periods th.period { white-space: normal; width: auto; }
+  /* An empty period stacks to its label and "no CI runs", not nine dashes. */
+  table.periods tr.quiet-row td:not(:first-of-type) { display: none; }
+}

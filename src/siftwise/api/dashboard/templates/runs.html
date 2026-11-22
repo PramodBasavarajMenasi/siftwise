@@ -20,7 +20,7 @@
 <td>{{ branch(r.branch, r.is_main) }}</td>
 <td class="fit"><span class="mono">{{ r.commit_sha[:7] }}</span></td><td class="n">{{ r.variants|num }}</td><td class="n">{% if r.failing %}{{ r.failing|num }}{% endif %}</td>
 <td class="fit">{% if r.failing %}<a href="{{ page }}" title="verdicts of the {{ r.failing|num }} failing tests">view</a>{% endif %}</td>
-<td>{{ selection_cell(r.selection) }}</td></tr>
+<td>{{ selection_cell(r.selection) }}{% if r.outcome_source == "backfill" %}<br><span class="tag" title="Stored by siftwise outcomes backfill, from what was uploaded by the run's last upload">{{ outcome_label(r.selection is not none) }}</span>{% endif %}</td></tr>
 {% endfor %}
 </tbody></table></div>
 <p class="muted">Verdicts are on each run's page, as the PR comment gives them. <a href="{{ readme }}#failure-verdicts">Failure verdicts</a></p>

@@ -11,7 +11,7 @@ from siftwise.api.auth import repo_forbidden, write_forbidden
 from siftwise.config import Settings
 from siftwise.core import tokens
 from siftwise.core.tokens import Principal, Revoked
-from siftwise.db import get_session
+from siftwise.db import app_sessionmaker, get_session
 
 
 def get_app_settings(request: Request) -> Settings:
@@ -57,13 +57,17 @@ class SessionTokenStore:
 
 
 def app_sessions(app: FastAPI) -> Callable[[], AbstractContextManager[Session]]:
-    """Sessions from the app's ``get_session``, honouring ``dependency_overrides``, so the
-    middleware reads tokens from the same database as the routes (tests override it)."""
+    """Sessions on the app's database (``create_app``'s settings), or ``get_session``'s
+    override (tests), so the middleware reads tokens from the same database as the routes."""
 
     @contextmanager
     def session_scope() -> Iterator[Session]:
-        factory = app.dependency_overrides.get(get_session, get_session)
-        made = factory()
+        override = app.dependency_overrides.get(get_session)
+        if override is None:
+            with app_sessionmaker(app.state)() as session:
+                yield session
+            return
+        made = override()
         if isinstance(made, Session):
             yield made
             return
