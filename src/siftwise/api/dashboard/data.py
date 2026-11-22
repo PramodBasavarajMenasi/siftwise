@@ -12,6 +12,7 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from siftwise.core.ci_stats import Baseline, Saving, leg_baselines, saving
 from siftwise.core.models import CiSelection, Repo
 from siftwise.core.selector import WouldRun
 from siftwise.core.shadow import budget_limited, selection_scopes
@@ -246,6 +247,7 @@ class LegTime:
     variant: str | None
     measured_ms: float | None
     tests_run: int | None
+    baseline: Baseline | None = None  # the variant's full-suite baseline (core.ci_stats)
 
 
 @dataclass
@@ -266,15 +268,18 @@ class RunSelection:
         return sum(times) if times else None
 
     @property
+    def saving(self) -> Saving | None:
+        """Test time saved (estimated): per uploaded leg of a selective run, its baseline minus
+        its measured time (ci_stats' one definition); None for a full or shadow run, or when no
+        leg has a baseline and a measured time."""
+        if self.row.shadow or self.row.mode != "selective":
+            return None
+        return saving([(leg.baseline, leg.measured_ms) for leg in self.legs])
+
+    @property
     def saved_ms(self) -> float | None:
-        """Test time saved (estimated): the full-suite estimate minus the measured time, per
-        uploaded leg of a selective run; None for a full or shadow run, or nothing measured."""
-        measured = [leg.measured_ms for leg in self.legs if leg.measured_ms is not None]
-        if self.row.shadow or self.row.mode != "selective" or not measured:
-            return None
-        if not self.row.estimated_ms_total:  # no durations in history: nothing to compare
-            return None
-        return sum(self.row.estimated_ms_total - ms for ms in measured)
+        found = self.saving
+        return None if found is None else found.saved_ms
 
 
 @dataclass
@@ -372,6 +377,7 @@ def run_selections(session: Session, repo: str, ci_run_id: str, attempt: int) ->
         text(
             """
             SELECT r.variant, r.measured_ms, r.tests_run, r.client_version, r.client,
+                   COALESCE(r.started_at, r.created_at) AS started,
                    NOT EXISTS (SELECT 1 FROM runs o WHERE o.repo_id = r.repo_id
                                AND COALESCE(o.started_at, o.created_at)
                                    < COALESCE(r.started_at, r.created_at)) AS first
@@ -389,11 +395,16 @@ def run_selections(session: Session, repo: str, ci_run_id: str, attempt: int) ->
         )
         return RunSelections([], missing, upgrade=missing == NO_SELECTION_OLD_CLIENT)
     by_variant = {row.variant for row in rows}
+    baselines = dict(zip(
+        [leg.variant for leg in legs],
+        leg_baselines(session, repo_id, [(leg.variant, leg.started) for leg in legs]),
+        strict=True,
+    ))  # fmt: skip
     selections = [
         RunSelection(
             row,
             [
-                LegTime(leg.variant, leg.measured_ms, leg.tests_run)
+                LegTime(leg.variant, leg.measured_ms, leg.tests_run, baselines[leg.variant])
                 for leg in legs
                 if leg.variant == row.variant
                 or (row.variant is None and leg.variant not in by_variant)

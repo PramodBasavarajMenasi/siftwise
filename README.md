@@ -376,22 +376,7 @@ SIFTWISE_DASHBOARD=1 siftwise server start            # then open http://localho
   selected), 6.3 KB on substrate (630) and 1.4 KB on dropwizard (26); a full-suite row is
   under 1 KB (median 0.4 to 0.5 KB). With `variant` set on a
   big matrix, every leg stores its own row: 22 legs of rdflib would be 22 times that.
-- **How these numbers work:** each is defined once; hover a heading or number for it.
-  - *CI run*: one run attempt with its matrix legs; re-run uploads and uploads without a CI
-    run ID count as described above. Times are UTC; windows count back from now.
-  - *Selected X of Y*: the tests the selection names, of the tests history knows (the
-    `known` tests: seen in the last 50 CI runs).
-  - *Test time*: sums of test durations, never wall-clock CI time. *Estimated* = each test's
-    mean duration in history (the selection, and the full suite); *measured* = the uploaded
-    tests' durations (each test's final attempt; Go subtests left out, their time is in their
-    parent's). *Test time saved (estimated)* = the full-suite estimate minus the measured test
-    time of the selected run, per uploaded leg; a full or shadow run saves nothing.
-  - *Rank*: a test's place in the selection's risk order (1 = run first). Commands run whole
-    files and packages by their best-ranked test, so a test can run a little before or after
-    its rank.
-  - *In the selection*: selected (named, with its rank); run whole (its file, package or class
-    ran whole: e.g. a new test); not selected (it ran outside the selection, or a shadow run's
-    selection would have missed it).
+- **The numbers:** each is defined once, below; hover a heading or number for it.
 - **What else it shows, and what it can't:** recall comes from shadow runs only
   ([Shadow mode](#shadow-mode)); without shadow runs the overview says so. Verdicts are
   computed when a run's page opens, as the PR comment computes them (a few seconds for a big
@@ -401,6 +386,72 @@ SIFTWISE_DASHBOARD=1 siftwise server start            # then open http://localho
   `Cache-Control: no-store`; sign-in and sign-out are protected against cross-site requests.
   There is no rate limit on sign-in: stored tokens are 256-bit random, but the admin token is
   as strong as you made it.
+
+### How these numbers work
+
+The dashboard's overview, `GET /repos/{repo}/ci` and `siftwise report` compute every CI number
+with one module (`core/ci_stats.py`), so the three show the same values for the same window.
+
+- **CI run:** one CI run attempt (run ID and attempt number) with at least one upload. Each
+  attempt counts once: re-running the whole workflow is a new attempt, so a new CI run.
+  Re-run uploads of failing tests (`rerun-unknown`) are not runs. An upload without a CI run
+  ID is a run of its own (it can't have a selection).
+- **Window:** a run is in it when any of its uploads started within the last N days, counted
+  back from now (UTC). The API takes `days` from 1 to 365 (default 30).
+- **Main and pull requests:** *main* = a run with an upload on the repo's default branch, as
+  the uploader reported it (`is_main`: the Action reads the default branch from the GitHub
+  event, the GitLab template from `CI_DEFAULT_BRANCH`, `siftwise record` takes `--main`), so a
+  `master` or `develop` default works; the branch's name is never compared with "main". *Pull
+  requests and other branches* = every other run (the API's `branch=prs`; `all` = both).
+- **Selections recorded (coverage):** runs with a recorded selection, of all runs in the
+  window. Always shown. Runs without one (an older client, a select step that didn't reach the
+  server) count here and nowhere else.
+- **Shadow runs:** recorded runs whose selection was a shadow run's. They ran the full suite,
+  so they're counted apart and never feed the numbers below except their own line.
+- **Selective and full-suite runs:** of the other recorded runs, *selective* = every selection
+  of the run (one, or one per matrix leg) was selective; else *full suite*, listed by reason
+  code (`build_file`, `unmapped_file`, `no_history`, ...; a run with several reasons counts
+  under each). Shown as "39% (9 of 23)": a share always comes with its counts, and is rounded
+  down, so a part never reads as all.
+- **Median share of tests selected:** in each selective run, selected tests / known tests
+  (the tests history knows: seen in the last 50 CI runs); the median over selective runs, with
+  how many runs.
+- **Test time saved (estimated):** in a selective run, for each uploaded leg, the leg's
+  *baseline* minus its measured test time (each test's final attempt, Go subtests left out).
+  The baseline is the median measured test time of the same variant's full-suite legs (their
+  selection was the full suite, or a shadow run's) that started in the 30 days before this
+  leg, never after it, and needs at least 3 of them. Why not the full-suite estimate `/select`
+  returns (each known test's mean duration, summed): matrix legs run different tests
+  (platform-only tests, skips), so charging every leg every known test overstated the saving.
+  On rdflib that estimate was 413 s for a leg that measured 231 s, so a selective run of 99%
+  of the tests looked like it saved 45%. Summed over runs, and the median per run, with how
+  many runs. These are sums of test durations, not wall-clock CI time (tests run in parallel,
+  and setup isn't counted). Legs without a baseline yet or without a measured upload are left
+  out (a measured 0 means the upload reported no durations: no measured time), and the page,
+  the report and the API say how many ("based on 12 of 17 selective runs (9 legs left out)",
+  `time_saved.left_out` and `legs_left_out`). Under 5 counted runs the figure still shows,
+  marked "too few runs for a reliable figure (N runs)" (`time_saved.low_confidence`).
+  Checked on rdflib's replayed full-suite legs, where nothing was skipped so the saving should
+  be 0: baseline minus measured had a median of +0.6% of the baseline and a middle half of
+  -22% to +11% (213 of 301 legs had a baseline; 22 legs measuring 0 left out). So no bias,
+  but per-leg noise of about +-20%: read small sums and few runs with care. A leg that took longer than
+  its baseline saves a negative amount, kept as it is (never clipped to 0), so the sum isn't
+  biased up. The run page shows each selective run's baseline the same way.
+- **Shadow runs, would have saved (measured):** on each compared shadow run, its measured test
+  time minus the measured time of the tests its selection would have run. Never added to the
+  test time saved: those runs ran everything.
+- **Failures in selective runs:** for selective runs whose outcome is stored (the rollup step,
+  or record in a single job), each run's distinct failing tests (final attempt failed or
+  errored, any leg), how many the selection ran (named, or its file, package or class ran
+  whole) and how many ran outside it. **Rank:** for the failing tests the selection named, the
+  median of their risk rank (1 = run first), and the median over runs of each run's
+  best-ranked failure.
+- **No recall from selective runs.** In a selective run a test that wasn't selected didn't
+  run, so a failure it would have shown can't be seen: these numbers never say how many
+  failures siftwise missed. Recall comes only from [shadow runs](#shadow-mode), which run the
+  full suite and compare it with the selection (`siftwise report`'s first line, the overview's
+  Recall section).
+- **An empty window** says "no recorded selections in this window", never 0% or 0 min.
 
 ### Seed history from past CI runs
 

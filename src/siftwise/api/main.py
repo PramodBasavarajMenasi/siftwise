@@ -7,7 +7,7 @@ from siftwise.api.auth import BearerAuthMiddleware
 from siftwise.api.deps import SessionTokenStore, app_sessions
 from siftwise.api.forwarded import ForwardedMiddleware
 from siftwise.api.limits import BodySizeLimitMiddleware
-from siftwise.api.routes import explain, flaky, history, repos, runs, select, shadow, triage
+from siftwise.api.routes import ci, explain, flaky, history, repos, runs, select, shadow, triage
 from siftwise.config import Settings, get_settings
 
 
@@ -38,6 +38,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(repos.router)
     app.include_router(shadow.router)
     app.include_router(flaky.router)
+    app.include_router(ci.router)
     if settings.dashboard:
         from siftwise.api.dashboard import pages
 

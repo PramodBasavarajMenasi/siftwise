@@ -80,6 +80,13 @@ sequenceDiagram
    aggregate those. `POST /repos/{repo}/shadow` does the same for clients older than 0.4 (they
    send no `fail-on`); a 0.4 client picks `/outcome` when `/healthz` reports a version.
 
+The CI numbers (`GET /repos/{repo}/ci`, the dashboard's overview, `siftwise report`) are
+computed by one module, `core/ci_stats.py`, from the stored selections, outcomes and the runs'
+measured test time: a fixed number of queries per window, no triage on read. Test time saved
+compares each selective leg with its own variant's full-suite legs (the median measured time
+over the 30 days before it), not with `/select`'s summed per-test estimate, which the time
+budget still uses.
+
 The MCP server and `siftwise triage` use the stateless variants: `POST /triage` with failures
 from local JUnit files, and `POST /explain` for one test.
 

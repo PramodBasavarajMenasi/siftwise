@@ -97,7 +97,9 @@ def recall(**overrides: Any) -> dict[str, Any]:
 @pytest.fixture
 def api(monkeypatch: pytest.MonkeyPatch) -> Iterator[respx.MockRouter]:
     monkeypatch.setenv("SIFTWISE_API_TOKEN", "cli-token")
-    with respx.mock(assert_all_mocked=True) as router:
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
+        # A server older than 0.4 by default (/healthz without a version): no CI numbers.
+        router.get(url__regex=r"/healthz$").respond(json={"status": "ok"})
         yield router
 
 
@@ -281,3 +283,78 @@ def test_budget_misses_are_counted_apart_never_hidden() -> None:
 
 def test_no_budget_line_without_budget_runs() -> None:
     assert not any(line.startswith("Budget-limited") for line in recall_lines(recall()))
+
+
+def ci_result(branch: str, **overrides: Any) -> dict[str, Any]:
+    """A GET /repos/{repo}/ci response."""
+    return {
+        "repo": "acme/shop", "days": 30, "branch": branch, "since": "2026-10-22T00:00:00Z",
+        "until": "2026-11-21T00:00:00Z", "counting": "each CI run attempt counts once",
+        "runs": 23, "recorded": 20, "shadow_runs": 2, "selective_runs": 9, "full_runs": 9,
+        "full_reasons": {"build_file": 6, "unmapped_file": 3},
+        "share_selected": {"median": 0.125, "runs": 9},
+        "time_saved": {"sum_ms": 7_200_000.0, "median_ms": 600_000.0, "runs": 8,
+                       "left_out": 1, "legs": 10, "legs_left_out": 2,
+                       "baseline_ms": 9_000_000.0},
+        "shadow": {"runs": 2, "compared": 2, "measured_ms": 1_200_000.0,
+                   "would_save_ms": 900_000.0},
+        "failures": {"runs": 7, "runs_failing": 3, "failing": 5, "in_selection": 4,
+                     "outside": 1, "ranked": 4, "median_rank": 2.5, "first_rank_runs": 3,
+                     "median_first_rank": 1},
+        "recall_note": "...",
+        **overrides,
+    }  # fmt: skip
+
+
+def test_report_adds_the_ci_numbers_from_a_04_server(api: respx.MockRouter) -> None:
+    api.get(url__regex=r"/healthz$").respond(json={"status": "ok", "version": "0.4.0"})
+    api.get(URL).respond(json=recall())
+    ci = api.get(f"{SERVER}/repos/acme/shop/ci")
+    ci.side_effect = [httpx.Response(200, json=ci_result("main")),
+                      httpx.Response(200, json=ci_result("prs", runs=4, recorded=0))]  # fmt: skip
+
+    result = CliRunner().invoke(app, [*ARGS, "--days", "30"])
+
+    assert result.exit_code == 0, result.output
+    assert [dict(c.request.url.params) for c in ci.calls] == [
+        {"days": "30", "branch": "main"}, {"days": "30", "branch": "prs"}]  # fmt: skip
+    out = result.stdout
+    assert "  main: selections recorded for 20 of 23 CI runs" in out
+    assert ("selective 50% (9 of 18) runs; full suite 9 (build_file 6, unmapped_file 3); "
+            "shadow runs 2 (ran the full suite, counted apart)") in out  # fmt: skip
+    assert "median share of tests selected: 12.5% (9 selective runs)" in out
+    assert ("test time saved (estimated, sums of test durations, not wall-clock CI time): "
+            "2.0 h based on 8 of 9 selective runs (2 legs left out: no baseline yet or nothing "
+            "measured), median 10.0 min a run") in out  # fmt: skip
+    assert "shadow runs would have saved 15.0 min of 20.0 min measured (2 runs; not in" in out
+    assert ("5 failing tests, 4 in the selection, 1 ran outside it; median rank 2.5 (4 "
+            "ranked), first failure median rank 1 (3 runs)") in out  # fmt: skip
+    # An empty window says so: never 0% or 0 min.
+    lines = out.splitlines()
+    empty = lines.index(
+        "  pull requests and other branches: selections recorded for 0 of 4 CI runs"
+    )
+    assert lines[empty + 1] == "    no recorded selections in this window"
+    assert "Recall comes only from shadow runs" in out
+
+
+def test_report_against_an_older_server_says_there_are_no_ci_numbers(
+    api: respx.MockRouter,
+) -> None:
+    api.get(URL).respond(json=recall())
+    result = CliRunner().invoke(app, ARGS)
+    assert result.exit_code == 0
+    assert "CI numbers: the server is older than 0.4" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("n", "of", "expected"),
+    [(9, 23, "39% (9 of 23)"), (2043, 2044, "99% (2,043 of 2,044)"), (0, 5, "0% (0 of 5)"),
+     (1, 0, "n/a")],
+)  # fmt: skip
+def test_a_share_shows_its_counts_and_never_rounds_up_to_all(
+    n: int, of: int, expected: str
+) -> None:
+    from siftwise.cli.main import ci_pct
+
+    assert ci_pct(n, of) == expected
