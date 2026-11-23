@@ -13,8 +13,11 @@
 <svg class="mark" width="22" height="24" viewBox="0 0 96 106" aria-hidden="true" focusable="false"><g class="mark-in"><circle cx="26" cy="9" r="9"></circle><circle cx="48" cy="9" r="9"></circle><circle cx="70" cy="9" r="9"></circle></g><path class="mark-funnel" d="M8 32 H88 L57 64 V80 H39 V64 Z"></path><circle class="mark-out" cx="48" cy="96" r="9"></circle></svg>
 {%- endmacro %}
 {# The window switcher: a segmented control on the right of the tab row. #}
-{% macro days_nav(base, current) -%}
+{% macro days_nav(base, current, range_text=none) -%}
+<div class="window-nav">
 <nav class="days" aria-label="Window" title="Windows count back from now"><span class="days-label">Window</span>{% for d in days_options %}<a href="{{ with_days(base, d) }}"{% if d == current %} aria-current="true"{% endif %}>{{ "all" if d is none else d ~ "d" }}</a>{% endfor %}</nav>
+{% if range_text %}<div class="window-range mono">{{ range_text }}</div>{% endif %}
+</div>
 {%- endmacro %}
 {# A window with nothing in it while older data exists: say so, and link to wider windows. #}
 {% macro older(base, current, what, total, newest) -%}

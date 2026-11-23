@@ -37,7 +37,7 @@
   </nav>
   {% endif %}
   {% if days is defined %}
-  {{ days_nav(repo_url(repo, "" if tab == "overview" else tab) if repo else prefix ~ "/", days) }}
+  {{ days_nav(repo_url(repo, "" if tab == "overview" else tab) if repo else prefix ~ "/", days, range_text if range_text is defined else none) }}
   {% endif %}
 </div>
 {% block content %}{% endblock %}

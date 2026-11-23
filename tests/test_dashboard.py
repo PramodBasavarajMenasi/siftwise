@@ -884,3 +884,23 @@ def test_the_ci_section_never_shows_0_for_a_window_without_selections(
     assert [label for label, _ in cells] == ["Main", "Pull requests and other branches", "All"]
     assert "100% (1 of 1)" in cells[0][1]
     assert "no recorded selections in this window" in cells[1][1] and "%" not in cells[1][1]
+
+
+def test_the_overview_and_ci_pages_show_the_window_date_range(
+    client: TestClient, db_session: Session
+) -> None:
+    record(db_session, commit=1, hour=1, tests={TEST: P}, ci_run_id="1")
+    signed_in(client)
+    now = datetime.now(UTC)
+    d30 = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+    today = now.strftime("%Y-%m-%d")
+
+    overview_30 = client.get(f"/ui/repos/{REPO}").text
+    assert f'<div class="window-range mono">{d30} to {today} (UTC)</div>' in overview_30
+    overview_all = client.get(f"/ui/repos/{REPO}", params={"days": "all"}).text
+    assert f'<div class="window-range mono">2026-10-01 to {today} (UTC)</div>' in overview_all
+
+    ci_30 = client.get(f"/ui/repos/{REPO}/-/ci").text
+    assert f'<div class="window-range mono">{d30} to {today} (UTC)</div>' in ci_30
+    ci_all = client.get(f"/ui/repos/{REPO}/-/ci", params={"days": "all"}).text
+    assert f'<div class="window-range mono">2026-10-01 to {today} (UTC)</div>' in ci_all

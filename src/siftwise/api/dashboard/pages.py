@@ -517,9 +517,10 @@ def ci_page(request: Request, repo: str, session: Db) -> HTMLResponse:
         found = ci_stats_periods(session, repo, days, by, branch, now)
     slow = slowest_tests(session, repo, days, MAX_SLOW_TESTS, now) or []
     crumbs = [*_repo_crumbs(repo), ("CI", "")]
+    range_text = found.total.range_text if found else None
     return _page(request, "ci.html", title=f"{repo} CI", crumbs=crumbs, repo=repo, tab="ci",
                  days=days, by=by, by_note=by_note, branch=branch, branch_names=BRANCH_NAMES,
-                 found=found, slow=slow, recorded=recorded)  # fmt: skip
+                 found=found, slow=slow, recorded=recorded, range_text=range_text)  # fmt: skip
 
 
 @router.get(f"{PREFIX}/repos/{{repo:path}}")
@@ -531,5 +532,7 @@ def overview(request: Request, repo: str, session: Db) -> HTMLResponse:
     report = shadow_recall(session, repo, span, now, by_week=True)
     ci = ci_stats_by_branch(session, repo, days, ("main", "prs", "all"), now)
     crumbs = [*_repo_crumbs(repo)[:1], (repo, "")]
-    return _page(request, "overview.html", title=repo, crumbs=crumbs, repo=repo, tab="overview",
-                 days=days, report=report, recorded=recorded, ci=ci)  # fmt: skip
+    range_text = ci["all"].range_text if ci else None
+    return _page(request, "overview.html", title=repo, crumbs=crumbs, repo=repo,
+                 tab="overview", days=days, report=report, recorded=recorded, ci=ci,
+                 range_text=range_text)  # fmt: skip
