@@ -256,6 +256,11 @@ in place of the image name.
   non-root user: it applies the database migrations, then serves on port 8000. Migrations take
   a Postgres lock, so several replicas can start at once. A Docker health check calls
   `/healthz`.
+- **Platforms:** from the next release (0.4), one image for `linux/amd64` and `linux/arm64`
+  (Docker picks the right one); 0.3.0 and earlier are `linux/amd64` only. The arm64 image is
+  built on amd64 runners and has been tested under QEMU emulation (it starts, migrates an
+  empty database and answers `/healthz`), not yet on arm64 hardware. Under that emulation it
+  answered after about 22 seconds, against 4 seconds for amd64 (Docker Desktop, Windows).
 - **Without Docker:** `pip install 'siftwise[server]'`, then `siftwise server start --host
   0.0.0.0` (`siftwise server migrate` applies the migrations alone).
 - **Reaching it from CI:** the quickstart's `docker-compose.yml` publishes the API on
@@ -1472,7 +1477,7 @@ public issue.
   inside the CI job ([dogfood.yml](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/.github/workflows/dogfood.yml)).
 - **Next (v0.4):** scoping test-fixture build files (today a fixture's `build.gradle.kts` or
   `tsconfig.json` runs the full suite), and more recall numbers; a demo and the launch
-  write-up; an arm64 server image.
+  write-up.
 
 ## Contributing
 

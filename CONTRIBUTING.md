@@ -186,7 +186,9 @@ Each repo's exact commands are in its "Reproducing" section of
 For maintainers. [release.yml](.github/workflows/release.yml) runs on a `v*` tag: it checks the
 tag is `v` + `__version__`, builds and checks the distributions, publishes them with trusted
 publishing (dev and pre-releases to TestPyPI, other versions to PyPI), then pushes the server
-image to GHCR.
+image to GHCR: one multi-arch image, `linux/amd64` and `linux/arm64` (built under QEMU on an
+amd64 runner). Pull requests that touch the image build both platforms without pushing (the
+`image` job in quickstart.yml).
 
 1. Set `__version__` in `src/siftwise/__init__.py`, the image tag in `docker-compose.yml` and
    the README (`tests/test_packaging.py` checks they agree), and add the version to
