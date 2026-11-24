@@ -35,8 +35,10 @@ ENV PATH=/app/.venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 USER 10001:10001
 EXPOSE 8000
-# No curl in slim images. The start period covers the migrations.
+# No curl in slim images: GET /healthz over a plain socket, healthy on HTTP 200. Not urllib:
+# importing it took 3.3 s of the 3 s timeout in the arm64 image under QEMU emulation (this
+# takes about 1.1 s there). The start period covers the migrations.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=3 \
-    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+    CMD ["python", "-c", "import socket; s = socket.create_connection(('127.0.0.1', 8000), 2); s.settimeout(2); s.sendall(b'GET /healthz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'); assert s.recv(16).split()[1] == b'200'"]
 ENTRYPOINT ["siftwise", "server"]
 CMD ["start", "--host", "0.0.0.0"]

@@ -8,6 +8,15 @@ All notable changes to siftwise. The format follows
 
 ### Added
 
+- The server image is published for `linux/arm64` as well as `linux/amd64`
+  ([#76](https://github.com/PramodBasavarajMenasi/siftwise/issues/76)): one multi-arch image
+  per tag on GHCR, same tags as before, built with buildx (arm64 under QEMU on the amd64
+  runner). Tested under QEMU emulation, not on arm64 hardware: the arm64 image starts,
+  migrates an empty database to the newest migration and answers `/healthz` (about 22 s
+  under emulation; amd64 4 s). Pull requests that touch the image now build both platforms
+  without pushing (`image` job in quickstart.yml). The image's health check now sends its
+  `GET /healthz` over a plain socket instead of importing `urllib` (same endpoint, interval,
+  timeout and retries): under emulation the import alone outran the 3 s timeout.
 - CI health and older outcomes ([#85](https://github.com/PramodBasavarajMenasi/siftwise/issues/85),
   part 3):
   - The dashboard's *CI* page: the overview's CI numbers per UTC day or week (Monday 00:00
