@@ -1,5 +1,7 @@
 """`siftwise` command-line interface."""
 
+import csv
+import io
 import json
 import math
 import os
@@ -528,6 +530,7 @@ def report_command(
     json_output: Annotated[
         bool, typer.Option("--json", help="Print the full API response as JSON.")
     ] = False,
+    csv_output: Annotated[bool, typer.Option("--csv", help="Print the report as CSV.")] = False,
     by: Annotated[
         str | None, typer.Option(help="'week': recall, caught, missed and time saved per week.")
     ] = None,
@@ -536,6 +539,10 @@ def report_command(
     missed (and why), over every shadow run and over selective ones only, the time it would
     have saved, and .siftwise.toml rules to consider. Needs SIFTWISE_API_TOKEN. Exit codes:
     0 ok, 1 API error, 2 usage error."""
+    if json_output and csv_output:
+        _err("error: --csv and --json cannot be used together")
+        raise typer.Exit(EXIT_USAGE)
+
     if by not in (None, "week"):
         _err(f"error: --by must be 'week', not {by!r}")
         raise typer.Exit(EXIT_USAGE)
@@ -550,7 +557,7 @@ def report_command(
     try:
         # The CI numbers (GET /repos/{repo}/ci came with 0.4) go with the overall report, not
         # the weekly recall.
-        if by is None and server_version(server) is not None:
+        if by is None and not csv_output and server_version(server) is not None:
             ci = {b: get_json(server, token, f"/repos/{repo}/ci", {"days": days, "branch": b})
                   for b in CI_BRANCHES}  # fmt: skip
     except SiftwiseError as exc:
@@ -558,6 +565,9 @@ def report_command(
         raise typer.Exit(EXIT_API_ERROR) from exc
     if json_output:
         typer.echo(json.dumps({**result, **({"ci": ci} if ci else {})}, indent=2))
+        return
+    if csv_output:
+        typer.echo(csv_report(result, by == "week"), nl=False)
         return
     if by == "week":
         lines = weekly_lines(result)
@@ -827,6 +837,45 @@ def weekly_lines(result: dict[str, Any]) -> list[str]:
             f"{every['missed']:>6}  {('-' if saved is None else f'{saved:.0%}'):>10}"
         )
     return lines
+
+
+def _saved_minutes(time: dict[str, Any]) -> float | None:
+    """Return measured time saved in minutes, or None when durations are unavailable."""
+    if time["saved"] is None:
+        return None
+
+    return float((time["total_ms"] - time["would_run_ms"]) / 60_000)
+
+
+def csv_report(result: dict[str, Any], by_week: bool = False) -> str:
+    """Return the report as CSV, with one summary row or one row per week."""
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["runs", "selective runs", "caught", "missed", "time saved"])
+
+    if by_week:
+        for period in result.get("periods") or []:
+            writer.writerow(
+                [
+                    period["shadow_runs"],
+                    period["selective_runs"],
+                    period["all"]["caught"],
+                    period["all"]["missed"],
+                    _saved_minutes(period["time"]),
+                ]
+            )
+    else:
+        writer.writerow(
+            [
+                result["shadow_runs"],
+                result["selective_runs"],
+                result["all"]["caught"],
+                result["all"]["missed"],
+                _saved_minutes(result["time"]),
+            ]
+        )
+
+    return output.getvalue()
 
 
 CAUSE_LABELS = {

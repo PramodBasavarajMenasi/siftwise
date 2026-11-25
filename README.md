@@ -879,6 +879,46 @@ Week of     Runs  Recall (all)        Selective  Recall (selective)  Caught  Mis
 2026-09-28    11  100.0% (41 of 41)           7  100.0% (13 of 13)       41       0         38%
 2026-10-05    12  98.0% (49 of 50)            8  95.0% (19 of 20)        49       1         41%
 ```
+#### CSV output
+
+Use `--csv` to export the report as CSV instead of human-readable output:
+
+```sh
+siftwise report --repo acme/shop --days 30 --csv
+```
+
+The CSV contains exactly five columns:
+
+| Column | Description |
+|---|---|
+| `runs` | Total number of shadow runs |
+| `selective runs` | Number of selective shadow runs |
+| `caught` | Failures caught across all shadow runs |
+| `missed` | Failures missed across all shadow runs |
+| `time saved` | Measured test time saved, in minutes |
+
+Example summary CSV:
+
+```csv
+runs,selective runs,caught,missed,time saved
+40,25,148,2,40.0
+```
+
+To export one row per week, combine `--csv` with `--by week`:
+
+```sh
+siftwise report --repo acme/shop --days 30 --csv --by week
+```
+
+Example weekly CSV:
+
+```csv
+runs,selective runs,caught,missed,time saved
+3,2,49,1,40.0
+0,0,0,0,
+```
+
+The CSV contains plain numeric values rather than human-readable formatting. Time saved is expressed in minutes. If measured time is unavailable for a period, its `time saved` field is empty.
 
 Each miss gets a cause, from evidence the server already has:
 
