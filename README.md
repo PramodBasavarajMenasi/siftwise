@@ -915,6 +915,47 @@ Each miss gets a cause, from evidence the server already has:
 on every push and PR of this repo: verdicts, `fail-on`, a shadow run with a miss,
 `known_flaky` and `rerun-unknown`.
 
+#### CSV output
+
+Use `--csv` to export the report as CSV instead of human-readable output:
+
+```sh
+siftwise report --repo acme/shop --days 30 --csv
+```
+
+The summary CSV contains five columns:
+
+| Column | Description |
+|---|---|
+| `runs` | Total number of shadow runs |
+| `selective_runs` | Number of selective shadow runs |
+| `caught` | Failures caught across all shadow runs |
+| `missed` | Failures missed across all shadow runs |
+| `time_saved_min` | Measured test time saved, in minutes |
+
+Example summary CSV:
+
+```csv
+runs,selective_runs,caught,missed,time_saved_min
+40,25,148,2,40.0
+```
+
+To export one row per week, combine `--csv` with `--by week`:
+
+```sh
+siftwise report --repo acme/shop --days 30 --csv --by week
+```
+
+Weekly CSV includes an additional `week` column containing the week's starting date in UTC:
+
+```csv
+week,runs,selective_runs,caught,missed,time_saved_min
+2026-10-05,3,2,49,1,40.0
+2026-10-12,0,0,0,0,
+```
+
+Time saved is expressed in minutes and rounded to one decimal place. If measured time is unavailable for a period, its `time_saved_min` field is empty.
+
 ## GitLab CI
 
 A CI template, [`gitlab/siftwise.gitlab-ci.yml`](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/gitlab/siftwise.gitlab-ci.yml),
