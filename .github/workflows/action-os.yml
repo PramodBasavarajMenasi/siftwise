@@ -103,19 +103,34 @@ jobs:
           echo $! > "$RUNNER_TEMP/server.pid"
           echo "$(date -u +%FT%TZ) server launched (pid $!)"
 
-      # A background process from a bash step may not outlive the step on Windows.
+      # A background process from a bash step may not outlive the step on Windows. The venv's
+      # python.exe (like siftwise.exe) is a launcher that starts the base interpreter as its
+      # child: the child is the server (migrations, then uvicorn in the same process), so its
+      # PID is the one to watch. siftwise has no __main__ module: run its CLI entry point.
       - name: Start the server (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           Set-Content -Path "$env:RUNNER_TEMP\server.launched" `
             -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
-          $server = Start-Process -FilePath .siftwise-src\.venv\Scripts\siftwise.exe `
-            -ArgumentList 'server', 'start', '--port', '8000' -PassThru `
+          $launcher = Start-Process -FilePath .siftwise-src\.venv\Scripts\python.exe `
+            -ArgumentList '-c', '"from siftwise.cli.main import app; app()"', 'server', 'start', '--port', '8000' `
+            -PassThru `
             -RedirectStandardOutput "$env:RUNNER_TEMP\server.log" `
             -RedirectStandardError "$env:RUNNER_TEMP\server.err.log"
-          Set-Content -Path "$env:RUNNER_TEMP\server.pid" -Value $server.Id
-          "{0} server launched (pid {1})" -f [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'), $server.Id
+          Set-Content -Path "$env:RUNNER_TEMP\server.launcher.pid" -Value $launcher.Id
+          $server = $null
+          foreach ($try in 1..40) {
+            $server = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($launcher.Id) AND Name='python.exe'" |
+              Select-Object -First 1
+            if ($server) { break }
+            Start-Sleep -Milliseconds 250
+          }
+          $serverPid = if ($server) { $server.ProcessId } else { $launcher.Id }  # no child: not a launcher
+          Set-Content -Path "$env:RUNNER_TEMP\server.pid" -Value $serverPid
+          "{0} server launched (launcher pid {1}, server pid {2}: {3})" -f `
+            [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'), $launcher.Id, $serverPid, `
+            $(if ($server) { $server.ExecutablePath } else { 'no child process found' })
 
       # By deadline: the server migrates an empty database first (Windows took over 90 s).
       - name: Wait for the server
@@ -129,22 +144,38 @@ jobs:
               kill -0 "$pid" 2> /dev/null
             fi
           }
+          elapsed() { echo $(( $(date +%s) - launched )); }
           echo "$(date -u +%FT%TZ) waiting for /healthz (pid $pid, up to 300 s)"
           deadline=$(( $(date +%s) + 300 ))
+          next_report=$(( $(date +%s) + 15 ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
-            if curl -sf --max-time 5 "$SERVER/healthz"; then
-              echo
-              echo "$(date -u +%FT%TZ) /healthz answered $(( $(date +%s) - launched )) s after launch"
+            # -sS: curl's own error (refused, timeout) on stderr; -w: the HTTP code.
+            code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$SERVER/healthz" \
+              2> "$RUNNER_TEMP/curl.err")
+            answer="HTTP $code"
+            [ -s "$RUNNER_TEMP/curl.err" ] && answer="$answer, $(tr -d '\r\n' < "$RUNNER_TEMP/curl.err")"
+            if [ "$code" = 200 ]; then
+              echo "$(date -u +%FT%TZ) /healthz answered $(elapsed) s after launch"
+              grep -h "Uvicorn running" "$RUNNER_TEMP/server.log" "$RUNNER_TEMP/server.err.log" || true
+              if [ "$RUNNER_OS" = Windows ]; then
+                owner=$(powershell.exe -NoProfile -Command \
+                  "(Get-NetTCPConnection -LocalPort 8000 -State Listen).OwningProcess | Sort-Object -Unique" | tr -d '\r')
+                echo "listening on 8000: pid $owner (watched: $pid)"
+                [ "$owner" = "$pid" ] || echo "::warning::the watched pid $pid isn't the one listening on 8000 ($owner)"
+              fi
               exit 0
             fi
             if ! alive; then
-              echo "::error::the server process ($pid) exited $(( $(date +%s) - launched )) s after launch, before /healthz answered (see the Server log step)"
+              echo "::error::the server process ($pid) exited $(elapsed) s after launch, before /healthz answered (last answer: $answer; see the Server log step)"
               exit 1
+            fi
+            if [ "$(date +%s)" -ge "$next_report" ]; then
+              echo "$(date -u +%FT%TZ) $(elapsed) s after launch, pid $pid running: $answer"
+              next_report=$(( $(date +%s) + 15 ))
             fi
             sleep 2
           done
-          echo "::error::no answer from /healthz within 300 s (server process $pid still running); last attempt:"
-          curl -sSf --max-time 5 "$SERVER/healthz" || true
+          echo "::error::no answer from /healthz within 300 s (server process $pid still running); last answer: $answer"
           exit 1
 
       - name: Sample repo and test runner
@@ -392,7 +423,9 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $pidFile = Join-Path $env:RUNNER_TEMP 'server.pid'
-          if (Test-Path $pidFile) {
-            Stop-Process -Id ([int](Get-Content $pidFile)) -Force -ErrorAction SilentlyContinue
+          foreach ($name in 'server.pid', 'server.launcher.pid') {
+            $pidFile = Join-Path $env:RUNNER_TEMP $name
+            if (Test-Path $pidFile) {
+              Stop-Process -Id ([int](Get-Content $pidFile)) -Force -ErrorAction SilentlyContinue
+            }
           }
