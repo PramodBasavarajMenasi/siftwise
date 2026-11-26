@@ -103,10 +103,11 @@ jobs:
           echo $! > "$RUNNER_TEMP/server.pid"
           echo "$(date -u +%FT%TZ) server launched (pid $!)"
 
-      # A background process from a bash step may not outlive the step on Windows. The venv's
-      # python.exe (like siftwise.exe) is a launcher that starts the base interpreter as its
-      # child: the child is the server (migrations, then uvicorn in the same process), so its
-      # PID is the one to watch. siftwise has no __main__ module: run its CLI entry point.
+      # A background process from a bash step may not outlive the step on Windows. siftwise
+      # has no __main__ module: run its CLI entry point. No PID is tracked on Windows: the
+      # venv's python.exe is a launcher whose PID isn't the server's (and on GitHub's runner
+      # it exited while the server ran), so the wait goes by /healthz and a deadline only, and
+      # the stop step finds the server by its port. The process info below is for debugging.
       - name: Start the server (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -119,36 +120,66 @@ jobs:
             -RedirectStandardOutput "$env:RUNNER_TEMP\server.log" `
             -RedirectStandardError "$env:RUNNER_TEMP\server.err.log"
           Set-Content -Path "$env:RUNNER_TEMP\server.launcher.pid" -Value $launcher.Id
-          $server = $null
-          foreach ($try in 1..40) {
-            $server = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($launcher.Id) AND Name='python.exe'" |
-              Select-Object -First 1
-            if ($server) { break }
-            Start-Sleep -Milliseconds 250
+          "{0} server launched (launcher pid {1})" -f [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'), $launcher.Id
+          try {
+            Start-Sleep -Seconds 1
+            Get-CimInstance Win32_Process -Filter "ProcessId=$($launcher.Id) OR ParentProcessId=$($launcher.Id)" |
+              ForEach-Object { "  process {0} (parent {1}): {2}" -f $_.ProcessId, $_.ParentProcessId, $_.ExecutablePath }
+          } catch {
+            "  process info unavailable: $_"
           }
-          $serverPid = if ($server) { $server.ProcessId } else { $launcher.Id }  # no child: not a launcher
-          Set-Content -Path "$env:RUNNER_TEMP\server.pid" -Value $serverPid
-          "{0} server launched (launcher pid {1}, server pid {2}: {3})" -f `
-            [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'), $launcher.Id, $serverPid, `
-            $(if ($server) { $server.ExecutablePath } else { 'no child process found' })
 
-      # By deadline: the server migrates an empty database first (Windows took over 90 s).
+      # By deadline: the server migrates an empty database first. GitHub runs this with
+      # `bash -e -o pipefail`: commands that fail while the server starts (curl) are guarded.
+      - name: Wait for the server (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          launched=$(tr -d '\r\n ' < "$RUNNER_TEMP/server.launched")
+          elapsed() { echo $(( $(date +%s) - launched )); }
+          echo "$(date -u +%FT%TZ) waiting for /healthz (up to 300 s)"
+          deadline=$(( $(date +%s) + 300 ))
+          next_report=$(( $(date +%s) + 15 ))
+          answer="no try yet"
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$SERVER/healthz" \
+              2> "$RUNNER_TEMP/curl.err") || true
+            code=${code:-000}
+            answer="HTTP $code"
+            if [ -s "$RUNNER_TEMP/curl.err" ]; then
+              answer="$answer, $(tr -d '\r\n' < "$RUNNER_TEMP/curl.err")"
+            fi
+            if [ "$code" = 200 ]; then
+              echo "$(date -u +%FT%TZ) /healthz answered $(elapsed) s after launch"
+              grep -h "Uvicorn running" "$RUNNER_TEMP/server.log" "$RUNNER_TEMP/server.err.log" || true
+              # Info only. netstat, not Get-NetTCPConnection: locally its CIM query sometimes
+              # found no listener on a port that had just answered.
+              owner=$(netstat -ano -p TCP | tr -d '\r' \
+                | awk '$2 ~ /:8000$/ && $4 == "LISTENING" { print $5 }' | sort -u | tr '\n' ' ') || true
+              echo "listening on 8000: pid ${owner:-unknown}"
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$next_report" ]; then
+              echo "$(date -u +%FT%TZ) $(elapsed) s after launch: $answer"
+              next_report=$(( $(date +%s) + 15 ))
+            fi
+            sleep 2
+          done
+          echo "::error::no answer from /healthz within 300 s of waiting ($(elapsed) s after launch); last answer: $answer"
+          for log in server.log server.err.log; do
+            echo "--- tail of $log"
+            tail -n 40 "$RUNNER_TEMP/$log" || true
+          done
+          exit 1
+
+      # By deadline: the server migrates an empty database first.
       # GitHub runs this with `bash -e -o pipefail`: every command that may fail while the
-      # server is still starting (curl, tasklist, powershell) is guarded, or it ends the step.
-      - name: Wait for the server
+      # server is still starting (curl) is guarded, or it ends the step.
+      - name: Wait for the server (Linux, macOS)
+        if: runner.os != 'Windows'
         run: |
           pid=$(tr -d '\r\n ' < "$RUNNER_TEMP/server.pid")
           launched=$(tr -d '\r\n ' < "$RUNNER_TEMP/server.launched")
-          alive() {
-            if [ "$RUNNER_OS" = Windows ]; then  # a Windows PID (Start-Process): not bash's
-              # No `| grep -q`: under pipefail, grep closing the pipe early can fail tasklist.
-              local tasks
-              tasks=$(tasklist //FI "PID eq $pid" //FO CSV //NH 2> /dev/null) || return 1
-              [[ "$tasks" == *"\"$pid\""* ]]
-            else
-              kill -0 "$pid" 2> /dev/null
-            fi
-          }
+          alive() { kill -0 "$pid" 2> /dev/null; }
           elapsed() { echo $(( $(date +%s) - launched )); }
           echo "$(date -u +%FT%TZ) waiting for /healthz (pid $pid, up to 300 s)"
           deadline=$(( $(date +%s) + 300 ))
@@ -167,16 +198,6 @@ jobs:
             if [ "$code" = 200 ]; then
               echo "$(date -u +%FT%TZ) /healthz answered $(elapsed) s after launch"
               grep -h "Uvicorn running" "$RUNNER_TEMP/server.log" "$RUNNER_TEMP/server.err.log" || true
-              if [ "$RUNNER_OS" = Windows ]; then
-                # netstat, not Get-NetTCPConnection: locally its CIM query sometimes found no
-                # listener on a port that had just answered.
-                owner=$(netstat -ano -p TCP | tr -d '\r' \
-                  | awk '$2 ~ /:8000$/ && $4 == "LISTENING" { print $5 }' | sort -u | tr '\n' ' ') || true
-                owner=${owner% }
-                owner=${owner:-unknown}
-                echo "listening on 8000: pid $owner (watched: $pid)"
-                [ "$owner" = "$pid" ] || echo "::warning::the watched pid $pid isn't the one listening on 8000 ($owner)"
-              fi
               exit 0
             fi
             if ! alive; then
@@ -437,9 +458,20 @@ jobs:
         if: always()
         shell: pwsh
         run: |
+          # Linux, macOS: the nohup PID. Windows: whatever listens on 8000 (netstat), then the
+          # launcher if it's still running. Never fails: they may be gone already.
+          $ids = @()
           foreach ($name in 'server.pid', 'server.launcher.pid') {
             $pidFile = Join-Path $env:RUNNER_TEMP $name
-            if (Test-Path $pidFile) {
-              Stop-Process -Id ([int](Get-Content $pidFile)) -Force -ErrorAction SilentlyContinue
-            }
+            if (Test-Path $pidFile) { $ids += [int](Get-Content $pidFile) }
           }
+          if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+            $listening = netstat -ano -p TCP | Select-String '^\s*TCP\s+\S+:8000\s+\S+\s+LISTENING\s+(\d+)' |
+              ForEach-Object { [int]$_.Matches[0].Groups[1].Value }
+            $ids = @($listening) + $ids
+          }
+          foreach ($id in ($ids | Select-Object -Unique)) {
+            "stopping pid $id"
+            Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+          }
+          exit 0
