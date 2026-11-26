@@ -88,12 +88,21 @@ Its commands must not import any of them, pydantic included. `[server]` and `[mc
 uv build && uv run --no-project python scripts/check_dist.py dist
 ```
 
-Three more workflows run on PRs:
+Four more workflows run on PRs:
 
 - [quickstart.yml](.github/workflows/quickstart.yml) runs the README Quickstart as written
   (below).
 - [action-e2e.yml](.github/workflows/action-e2e.yml) runs the three GitHub Actions against a
   real server: verdicts, `fail-on`, shadow mode, `known_flaky` and re-runs.
+- [action-os.yml](.github/workflows/action-os.yml) runs the three actions on
+  `ubuntu-latest`, `macos-latest` and `windows-latest` (Postgres from
+  `ikalnytskyi/action-setup-postgres`, a server in the job) on a sample repo it makes in the
+  job: a full run, then a selective one after a change, with outputs and exit codes checked.
+  Only when `actions/`, the CLI code they run, `pyproject.toml`, `uv.lock` or the workflow
+  change, plus weekly and on demand (runner images change). It points the actions at the
+  sample repo's commits with `SIFTWISE_HEAD_SHA`. The OS jobs only run on GitHub; to try the
+  flow locally, run `siftwise gha select|record|rollup` with the `GITHUB_*` variables and
+  files set by hand.
 - [dogfood.yml](.github/workflows/dogfood.yml) runs siftwise on itself as a shadow run (a
   server inside the job, history in the Actions cache). It never fails for siftwise reasons and
   never comments; `python -m scripts.dogfood_report report` adds up its summaries

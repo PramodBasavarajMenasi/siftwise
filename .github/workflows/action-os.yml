@@ -1,0 +1,491 @@
+name: Action OS
+
+# Runs actions/select, record and rollup from this checkout on Linux, macOS and Windows runners,
+# against a real siftwise server and Postgres started in the job. The workspace root is a tiny
+# sample repo made in the job (the Quickstart's shop example); siftwise itself is checked out
+# into .siftwise-src (a dot-dir: the import graph, pytest and record's JUnit search skip it).
+#
+# Phase 1: an empty history, so select says full; the full suite runs and passes; record, then
+# rollup. Phase 2: a change to shop/cart.py that breaks one cart test; select is selective
+# (tests/test_cart.py only, from the import graph), its command runs and fails as intended;
+# record and rollup triage the failure. Each phase has its own variant (one CI run attempt).
+#
+# The commits tested are the sample repo's, not the event's: SIFTWISE_HEAD_SHA (set through
+# GITHUB_ENV) tells the actions which commit that is.
+
+on:
+  pull_request:
+    paths:
+      - actions/**
+      - src/siftwise/cli/gha.py
+      - src/siftwise/cli/main.py
+      - src/siftwise/cli/pygraph.py
+      - src/siftwise/cli/repoconfig.py
+      - src/siftwise/cli/reruns.py
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/action-os.yml
+  push:
+    branches: [main]
+    paths:
+      - actions/**
+      - src/siftwise/cli/gha.py
+      - src/siftwise/cli/main.py
+      - src/siftwise/cli/pygraph.py
+      - src/siftwise/cli/repoconfig.py
+      - src/siftwise/cli/reruns.py
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/action-os.yml
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1"  # Mondays 05:17 UTC: runner images change under us
+
+permissions:
+  contents: read
+
+concurrency:
+  group: action-os-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SERVER: http://127.0.0.1:8000
+  # The job's own throwaway server: not a secret.
+  TOKEN: action-os-token
+  REPO_NAME: sample/shop
+
+jobs:
+  action:
+    name: action (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash  # Git Bash on Windows: the actions' own steps are bash too
+    env:
+      SIFTWISE_API_TOKEN: action-os-token  # the server's token
+      SIFTWISE_DATABASE_URL: postgresql+psycopg://siftwise:siftwise@127.0.0.1:5432/siftwise
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: .siftwise-src
+
+      # One step on all three OSes (apt / Chocolatey / Homebrew, then initdb + pg_ctl): service
+      # containers run on Linux only. Pinned by commit: v9.
+      - name: Start PostgreSQL
+        uses: ikalnytskyi/action-setup-postgres@325155bfd7807b2a21ac9c2c7bb9b9a6eacc44df # v9
+        with:
+          username: siftwise
+          password: siftwise
+          database: siftwise
+          postgres-version: "16"
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false  # no uv.lock at the workspace root (the sample repo's)
+
+      - name: Install the server
+        working-directory: .siftwise-src
+        run: uv sync --locked --no-dev --extra server --python 3.12
+
+      # `siftwise server start` migrates, then serves. The venv's siftwise, not `uv run`.
+      - name: Start the server (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: |
+          date +%s > "$RUNNER_TEMP/server.launched"
+          nohup .siftwise-src/.venv/bin/siftwise server start --port 8000 \
+            > "$RUNNER_TEMP/server.log" 2> "$RUNNER_TEMP/server.err.log" &
+          echo $! > "$RUNNER_TEMP/server.pid"
+          echo "$(date -u +%FT%TZ) server launched (pid $!)"
+
+      # GitHub's Windows runner kills the processes a step started when the step ends (the
+      # server's log ended after a complete start, then every /healthz was refused). So the
+      # server is created through WMI (Win32_Process.Create): its parent is WMI's provider
+      # host, outside this step's process tree. Such a process doesn't inherit the step's
+      # environment, so a .cmd file sets the SIFTWISE_* variables (values never printed) and
+      # runs the server with its output redirected. siftwise has no __main__ module: run its
+      # CLI entry point. No PID is tracked: the wait goes by /healthz, the stop by the port.
+      - name: Start the server (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $python = (Resolve-Path .siftwise-src\.venv\Scripts\python.exe).Path
+          $script = Join-Path $env:RUNNER_TEMP 'server.cmd'
+          $lines = @('@echo off', 'set PYTHONUNBUFFERED=1')
+          foreach ($var in Get-ChildItem env: | Where-Object Name -like 'SIFTWISE_*') {
+            if ($var.Value -match '[%"]') {  # cmd would expand or end the value there
+              "::error::$($var.Name) contains % or a double quote; server.cmd can't set it"
+              exit 1
+            }
+            $lines += 'set "{0}={1}"' -f $var.Name, $var.Value
+          }
+          $lines += ('"{0}" -c "from siftwise.cli.main import app; app()" server start --port 8000' -f $python) +
+            (' > "{0}" 2> "{1}"' -f (Join-Path $env:RUNNER_TEMP 'server.log'), (Join-Path $env:RUNNER_TEMP 'server.err.log'))
+          Set-Content -Path $script -Value $lines -Encoding ascii
+          Set-Content -Path "$env:RUNNER_TEMP\server.launched" `
+            -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+          $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+            CommandLine = 'cmd.exe /d /c "{0}"' -f $script
+            CurrentDirectory = (Get-Location).Path
+          }
+          if ($created.ReturnValue -ne 0) {
+            "::error::Win32_Process.Create failed with return value $($created.ReturnValue)"
+            exit 1
+          }
+          Set-Content -Path "$env:RUNNER_TEMP\server.launcher.pid" -Value $created.ProcessId
+          "{0} server launched through WMI (cmd.exe pid {1}; variables set: {2})" -f `
+            [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'), $created.ProcessId, `
+            ((Get-ChildItem env: | Where-Object Name -like 'SIFTWISE_*').Name -join ', ')
+
+      # By deadline: the server migrates an empty database first. GitHub runs this with
+      # `bash -e -o pipefail`: commands that fail while the server starts (curl) are guarded.
+      - name: Wait for the server (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          launched=$(tr -d '\r\n ' < "$RUNNER_TEMP/server.launched")
+          elapsed() { echo $(( $(date +%s) - launched )); }
+          echo "$(date -u +%FT%TZ) waiting for /healthz (up to 300 s)"
+          deadline=$(( $(date +%s) + 300 ))
+          next_report=$(( $(date +%s) + 15 ))
+          answer="no try yet"
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$SERVER/healthz" \
+              2> "$RUNNER_TEMP/curl.err") || true
+            code=${code:-000}
+            answer="HTTP $code"
+            if [ -s "$RUNNER_TEMP/curl.err" ]; then
+              answer="$answer, $(tr -d '\r\n' < "$RUNNER_TEMP/curl.err")"
+            fi
+            if [ "$code" = 200 ]; then
+              echo "$(date -u +%FT%TZ) /healthz answered $(elapsed) s after launch"
+              grep -h "Uvicorn running" "$RUNNER_TEMP/server.log" "$RUNNER_TEMP/server.err.log" || true
+              # Info only. netstat, not Get-NetTCPConnection: locally its CIM query sometimes
+              # found no listener on a port that had just answered.
+              owner=$(netstat -ano -p TCP | tr -d '\r' \
+                | awk '$2 ~ /:8000$/ && $4 == "LISTENING" { print $5 }' | sort -u | tr '\n' ' ') || true
+              echo "listening on 8000: pid ${owner:-unknown}"
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$next_report" ]; then
+              echo "$(date -u +%FT%TZ) $(elapsed) s after launch: $answer"
+              next_report=$(( $(date +%s) + 15 ))
+            fi
+            sleep 2
+          done
+          echo "::error::no answer from /healthz within 300 s of waiting ($(elapsed) s after launch); last answer: $answer"
+          for log in server.log server.err.log; do
+            echo "--- tail of $log"
+            tail -n 40 "$RUNNER_TEMP/$log" || true
+          done
+          exit 1
+
+      # By deadline: the server migrates an empty database first.
+      # GitHub runs this with `bash -e -o pipefail`: every command that may fail while the
+      # server is still starting (curl) is guarded, or it ends the step.
+      - name: Wait for the server (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: |
+          pid=$(tr -d '\r\n ' < "$RUNNER_TEMP/server.pid")
+          launched=$(tr -d '\r\n ' < "$RUNNER_TEMP/server.launched")
+          alive() { kill -0 "$pid" 2> /dev/null; }
+          elapsed() { echo $(( $(date +%s) - launched )); }
+          echo "$(date -u +%FT%TZ) waiting for /healthz (pid $pid, up to 300 s)"
+          deadline=$(( $(date +%s) + 300 ))
+          next_report=$(( $(date +%s) + 15 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            # -sS: curl's own error (refused, timeout) on stderr; -w: the HTTP code.
+            # A failed try is expected while the server starts: `|| true`, and -w still prints
+            # 000 when there was no HTTP answer.
+            code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$SERVER/healthz" \
+              2> "$RUNNER_TEMP/curl.err") || true
+            code=${code:-000}
+            answer="HTTP $code"
+            if [ -s "$RUNNER_TEMP/curl.err" ]; then
+              answer="$answer, $(tr -d '\r\n' < "$RUNNER_TEMP/curl.err")"
+            fi
+            if [ "$code" = 200 ]; then
+              echo "$(date -u +%FT%TZ) /healthz answered $(elapsed) s after launch"
+              grep -h "Uvicorn running" "$RUNNER_TEMP/server.log" "$RUNNER_TEMP/server.err.log" || true
+              exit 0
+            fi
+            if ! alive; then
+              echo "::error::the server process ($pid) exited $(elapsed) s after launch, before /healthz answered (last answer: $answer; see the Server log step)"
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$next_report" ]; then
+              echo "$(date -u +%FT%TZ) $(elapsed) s after launch, pid $pid running: $answer"
+              next_report=$(( $(date +%s) + 15 ))
+            fi
+            sleep 2
+          done
+          echo "::error::no answer from /healthz within 300 s (server process $pid still running); last answer: $answer"
+          exit 1
+
+      - name: Sample repo and test runner
+        id: sample
+        run: |
+          src=.siftwise-src/examples/quickstart
+          cp -R "$src/shop" "$src/tests" "$src/pyproject.toml" .
+          git init -q -b main
+          git config user.name "siftwise action-os"
+          git config user.email "action-os@example.invalid"
+          git config commit.gpgsign false
+          printf '.siftwise-src/\n' >> .git/info/exclude
+          printf '# sample\n' > README.md
+          git add README.md
+          git commit -q -m base
+          echo "c0=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git add -A
+          git commit -q -m "the shop"
+          echo "c1=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          test -z "$(git status --porcelain)"
+          git ls-files
+          # pytest in its own venv, on PATH for the Tests steps.
+          uv venv -q --python 3.12 "$RUNNER_TEMP/sample-venv"
+          uv pip install -q --python "$RUNNER_TEMP/sample-venv" pytest
+          if [ "$RUNNER_OS" = Windows ]; then bin=Scripts; else bin=bin; fi
+          echo "$RUNNER_TEMP/sample-venv/$bin" >> "$GITHUB_PATH"
+
+      # Before SIFTWISE_HEAD_SHA is in GITHUB_ENV: a SHA that isn't in the repo must fail select.
+      - name: Select with an unknown SIFTWISE_HEAD_SHA (must fail)
+        id: bad_head
+        continue-on-error: true
+        uses: ./.siftwise-src/actions/select
+        env:
+          SIFTWISE_HEAD_SHA: "0123456789012345678901234567890123456789"
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          comment: false
+
+      - name: Check it failed
+        env:
+          OUTCOME: ${{ steps.bad_head.outcome }}
+        run: test "$OUTCOME" = failure
+
+      # --- phase 1: no history -> full suite ---------------------------------------------
+
+      - name: Test commit 1
+        env:
+          C1: ${{ steps.sample.outputs.c1 }}
+        run: echo "SIFTWISE_HEAD_SHA=$C1" >> "$GITHUB_ENV"
+
+      - name: Select (empty history)
+        id: select1
+        uses: ./.siftwise-src/actions/select
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          base-ref: ${{ steps.sample.outputs.c0 }}
+          junit-dir: ${{ runner.temp }}/junit phase 1  # a space: quoting
+          variant: p1
+          comment: false
+
+      - name: Check the first selection
+        env:
+          MODE: ${{ steps.select1.outputs.mode }}
+          COMMAND: ${{ steps.select1.outputs.command }}
+          REASON: ${{ steps.select1.outputs.reason }}
+          JUNIT_DIR: ${{ steps.select1.outputs.junit-dir }}
+        run: |
+          printf 'mode=%s reason=%s junit-dir=%s\n' "$MODE" "$REASON" "$JUNIT_DIR"
+          test "$MODE" = full
+          test -z "$COMMAND"
+          test "$REASON" = "no test history for this repo yet"
+          test -d "$JUNIT_DIR"
+
+      - name: Tests (full suite)
+        env:
+          COMMAND: ${{ steps.select1.outputs.command }}
+          JUNIT_DIR: ${{ steps.select1.outputs.junit-dir }}
+        run: |
+          if [ -n "$COMMAND" ]; then eval "$COMMAND"; else pytest tests --junitxml="$JUNIT_DIR/full.xml"; fi
+          ls -l "$JUNIT_DIR"
+
+      - name: Record (phase 1)
+        id: record1
+        uses: ./.siftwise-src/actions/record
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          base-ref: ${{ steps.sample.outputs.c0 }}
+          variant: p1
+          comment: false
+
+      - name: Rollup (phase 1)
+        id: rollup1
+        uses: ./.siftwise-src/actions/rollup
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          comment: false
+
+      - name: Check phase 1 was recorded
+        env:
+          C1: ${{ steps.sample.outputs.c1 }}
+          AVAILABLE: ${{ steps.rollup1.outputs.verdicts-available }}
+          COUNTS: ${{ steps.rollup1.outputs.counts }}
+        run: |
+          printf 'verdicts-available=%s counts=%s\n' "$AVAILABLE" "$COUNTS"
+          test "$AVAILABLE" = true
+          echo "$COUNTS" | jq -e '([.[]] | add // 0) == 0'
+          run=$(curl -sf -H "Authorization: Bearer $TOKEN" --get "$SERVER/runs/lookup" \
+            --data-urlencode "repo=$REPO_NAME" --data-urlencode "ci_run_id=$GITHUB_RUN_ID" \
+            --data-urlencode "run_attempt=$GITHUB_RUN_ATTEMPT" --data-urlencode "variant=p1")
+          echo "$run"
+          echo "$run" | jq -e --arg c1 "$C1" '.commit_sha == $c1'
+
+      # --- phase 2: a change to shop/cart.py -> selective -----------------------------------
+
+      - name: Commit 2 (breaks the bulk discount)
+        id: change
+        run: |
+          cat > shop/cart.py <<'EOF'
+          """A shopping cart: totals with a bulk discount."""
+
+          from shop.prices import price
+
+
+          def total(items: list[str]) -> int:
+              cents = sum(price(item) for item in items)
+              if len(items) >= 10:
+                  cents = cents * 8 // 10  # a bug: 20% off
+              return cents
+          EOF
+          git commit -q -am "a bigger discount"
+          git show --stat HEAD
+          echo "SIFTWISE_HEAD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "c2=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Select (after the change)
+        id: select2
+        uses: ./.siftwise-src/actions/select
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          base-ref: ${{ steps.sample.outputs.c1 }}
+          junit-dir: ${{ runner.temp }}/junit phase 2
+          variant: p2
+          comment: false
+
+      - name: Check the selective selection
+        env:
+          MODE: ${{ steps.select2.outputs.mode }}
+          COMMAND: ${{ steps.select2.outputs.command }}
+          SELECTED: ${{ steps.select2.outputs.selected }}
+          TOTAL: ${{ steps.select2.outputs.total }}
+          REASON: ${{ steps.select2.outputs.reason }}
+        run: |
+          printf 'mode=%s selected=%s total=%s reason=%s\n' "$MODE" "$SELECTED" "$TOTAL" "$REASON"
+          printf 'command=%s\n' "$COMMAND"
+          test "$MODE" = selective
+          test "$SELECTED" = 2
+          test "$TOTAL" = 4
+          case "$COMMAND" in *tests/test_cart.py*) ;; *) echo "test_cart.py not selected"; exit 1;; esac
+          case "$COMMAND" in *test_prices*) echo "test_prices.py selected"; exit 1;; esac
+          case "$COMMAND" in *$'\r'*) echo "a carriage return in the command"; exit 1;; esac
+
+      - name: Tests (the selected command; one test fails on purpose)
+        env:
+          COMMAND: ${{ steps.select2.outputs.command }}
+          JUNIT_DIR: ${{ steps.select2.outputs.junit-dir }}
+        run: |
+          if eval "$COMMAND"; then echo "the broken bulk discount passed"; exit 1; fi
+          ls -l "$JUNIT_DIR"
+          test -n "$(ls "$JUNIT_DIR"/*.xml)"
+
+      - name: Record (phase 2)
+        id: record2
+        uses: ./.siftwise-src/actions/record
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          base-ref: ${{ steps.sample.outputs.c1 }}
+          variant: p2
+          comment: false
+
+      - name: Rollup (phase 2)
+        id: rollup2
+        uses: ./.siftwise-src/actions/rollup
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          comment: false
+
+      # The failing test has no history before this CI run attempt (triage never reads the
+      # attempt's own uploads) and its own file didn't change: unknown (rule 4).
+      - name: Check the failure verdict
+        env:
+          C2: ${{ steps.change.outputs.c2 }}
+          AVAILABLE: ${{ steps.rollup2.outputs.verdicts-available }}
+          COUNTS: ${{ steps.rollup2.outputs.counts }}
+          REPORT: ${{ steps.rollup2.outputs.report }}
+        run: |
+          printf 'verdicts-available=%s counts=%s report=%s\n' "$AVAILABLE" "$COUNTS" "$REPORT"
+          test "$AVAILABLE" = true
+          echo "$COUNTS" | jq -e '.unknown == 1 and ([.[]] | add) == 1'
+          test -f "$REPORT"
+          grep -F "test_bulk_discount" "$REPORT"
+          run=$(curl -sf -H "Authorization: Bearer $TOKEN" --get "$SERVER/runs/lookup" \
+            --data-urlencode "repo=$REPO_NAME" --data-urlencode "ci_run_id=$GITHUB_RUN_ID" \
+            --data-urlencode "run_attempt=$GITHUB_RUN_ATTEMPT" --data-urlencode "variant=p2")
+          echo "$run" | jq -e --arg c2 "$C2" '.commit_sha == $c2'
+
+      # fail-on is the one way siftwise fails a job on purpose: the exit code must get through.
+      - name: Rollup with fail-on unknown (must fail)
+        id: gate
+        continue-on-error: true
+        uses: ./.siftwise-src/actions/rollup
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          comment: false
+          fail-on: unknown
+
+      - name: Check the gate failed
+        env:
+          OUTCOME: ${{ steps.gate.outcome }}
+        run: test "$OUTCOME" = failure
+
+      - name: Server log
+        if: failure()
+        run: |
+          for log in "$RUNNER_TEMP/server.log" "$RUNNER_TEMP/server.err.log"; do
+            echo "::group::$log"; cat "$log" || true; echo "::endgroup::"
+          done
+
+      - name: Stop the server
+        if: always()
+        shell: pwsh
+        run: |
+          # Linux, macOS: the nohup PID. Windows: whatever listens on 8000 (netstat), then the
+          # launcher if it's still running. Never fails: they may be gone already.
+          $ids = @()
+          foreach ($name in 'server.pid', 'server.launcher.pid') {
+            $pidFile = Join-Path $env:RUNNER_TEMP $name
+            if (Test-Path $pidFile) { $ids += [int](Get-Content $pidFile) }
+          }
+          if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+            $listening = netstat -ano -p TCP | Select-String '^\s*TCP\s+\S+:8000\s+\S+\s+LISTENING\s+(\d+)' |
+              ForEach-Object { [int]$_.Matches[0].Groups[1].Value }
+            $ids = @($listening) + $ids
+          }
+          foreach ($id in ($ids | Select-Object -Unique)) {
+            "stopping pid $id"
+            Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+          }
+          Remove-Item (Join-Path $env:RUNNER_TEMP 'server.cmd') -ErrorAction SilentlyContinue
+          exit 0

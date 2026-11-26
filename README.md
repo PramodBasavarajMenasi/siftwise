@@ -591,6 +591,21 @@ checkout and never block CI: if the server is unreachable, times out or returns 
 - **Version:** the examples use `@main`; pin a release tag (`@v0.3.0`) or a commit SHA for
   reproducible CI. The actions install the CLI from their own checkout, so the CLI's version
   always matches the tag.
+- **Runners:** tested on GitHub-hosted `ubuntu-latest`, `macos-latest` and `windows-latest`
+  ([action-os.yml](https://github.com/PramodBasavarajMenasi/siftwise/blob/main/.github/workflows/action-os.yml)),
+  not on self-hosted runners. The actions' steps are bash: on Windows that's Git Bash, which
+  GitHub's Windows runners have; a self-hosted Windows runner needs Git Bash's `bash` on
+  `PATH`. They install uv (`astral-sh/setup-uv`) and Python 3.12, so the runner needs network
+  access.
+
+**Advanced: `SIFTWISE_HEAD_SHA`.** For a workflow that tests another commit than the event's
+(it built and checked out a different commit, or made one in the job), set
+`SIFTWISE_HEAD_SHA` to that commit's full 40-character SHA, e.g. through `$GITHUB_ENV`: all
+three actions then diff, record and triage that commit instead of the PR head or
+`GITHUB_SHA`, and each logs a notice saying so. It must be a full hex SHA of a commit in the
+checkout (`rollup` without a checkout checks only the format); anything else fails the step,
+with no fallback to the event's commit. Set `base-ref` too unless the event's base is in the
+same history.
 
 **Never use these actions with `pull_request_target`.** That event runs with secrets on code
 from the PR, so a fork could read your siftwise token. Use `pull_request`: on fork PRs, secrets
@@ -1457,7 +1472,8 @@ public issue.
 - **Stats cover the window only.** Per-test stats use the last `SIFTWISE_STATS_WINDOW_DAYS`
   (90) days before the repo's newest run; older raw results stay, but no longer feed stats.
 - **Limits to know:** merge-queue (`merge_group`), scheduled and manual runs always run the
-  full suite (no diff base); the Action is tested on Linux runners only, and the GitLab
+  full suite (no diff base); the Action is tested on GitHub-hosted Linux, macOS and Windows
+  runners (not self-hosted ones), and the GitLab
   template with mocks and one example project on gitlab.com (Free).
 
 ## Roadmap

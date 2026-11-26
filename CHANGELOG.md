@@ -8,6 +8,19 @@ All notable changes to siftwise. The format follows
 
 ### Added
 
+- The GitHub Action is tested on macOS and Windows runners as well as Linux
+  ([#79](https://github.com/PramodBasavarajMenasi/siftwise/issues/79)): `action-os.yml` runs
+  `actions/select`, `record` and `rollup` from the checkout on `ubuntu-latest`,
+  `macos-latest` and `windows-latest` against a server and Postgres in the job, on a sample
+  repo made in the job (a full run, then a selective run after a change; outputs, the
+  selected command, verdicts and `fail-on`'s exit code checked). It runs when the actions,
+  the CLI code they run, `pyproject.toml` or `uv.lock` change, weekly, and on demand. The README
+  lists the tested runners and the Windows requirement (Git Bash, which GitHub's Windows
+  runners have).
+- `SIFTWISE_HEAD_SHA` (advanced): the commit `actions/select`, `record` and `rollup` test,
+  for workflows that test another commit than the event's. A full 40-character SHA of a
+  commit in the checkout, else the step fails (no fallback); a notice names both commits.
+
 - The server image is published for `linux/arm64` as well as `linux/amd64`
   ([#76](https://github.com/PramodBasavarajMenasi/siftwise/issues/76)): one multi-arch image
   per tag on GHCR, same tags as before, built with buildx (arm64 under QEMU on the amd64
@@ -183,6 +196,9 @@ All notable changes to siftwise. The format follows
 
 ### Fixed
 
+- The Action writes `$GITHUB_OUTPUT`, `$GITHUB_ENV`, the job summary and the failures report
+  with LF line endings on every OS. On Windows, Python's text mode wrote CRLF, which could
+  leave a `\r` on an output value such as `command`.
 - `create_app(settings)` now serves every request from `settings.database_url`: the routes'
   sessions and the auth middleware's token lookups used the process-wide
   `SIFTWISE_DATABASE_URL` instead (`siftwise server start` builds both from the same
