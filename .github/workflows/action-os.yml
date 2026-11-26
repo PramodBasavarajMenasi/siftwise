@@ -97,25 +97,54 @@ jobs:
       - name: Start the server (Linux, macOS)
         if: runner.os != 'Windows'
         run: |
+          date +%s > "$RUNNER_TEMP/server.launched"
           nohup .siftwise-src/.venv/bin/siftwise server start --port 8000 \
             > "$RUNNER_TEMP/server.log" 2> "$RUNNER_TEMP/server.err.log" &
           echo $! > "$RUNNER_TEMP/server.pid"
+          echo "$(date -u +%FT%TZ) server launched (pid $!)"
 
       # A background process from a bash step may not outlive the step on Windows.
       - name: Start the server (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          Set-Content -Path "$env:RUNNER_TEMP\server.launched" `
+            -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
           $server = Start-Process -FilePath .siftwise-src\.venv\Scripts\siftwise.exe `
             -ArgumentList 'server', 'start', '--port', '8000' -PassThru `
             -RedirectStandardOutput "$env:RUNNER_TEMP\server.log" `
             -RedirectStandardError "$env:RUNNER_TEMP\server.err.log"
           Set-Content -Path "$env:RUNNER_TEMP\server.pid" -Value $server.Id
+          "{0} server launched (pid {1})" -f [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'), $server.Id
 
+      # By deadline: the server migrates an empty database first (Windows took over 90 s).
       - name: Wait for the server
         run: |
-          for _ in $(seq 90); do curl -sf "$SERVER/healthz" && exit 0; sleep 1; done
-          echo "the server didn't answer /healthz in 90 s"
+          pid=$(tr -d '\r\n ' < "$RUNNER_TEMP/server.pid")
+          launched=$(tr -d '\r\n ' < "$RUNNER_TEMP/server.launched")
+          alive() {
+            if [ "$RUNNER_OS" = Windows ]; then  # a Windows PID (Start-Process): not bash's
+              tasklist //FI "PID eq $pid" //FO CSV //NH | grep -q "\"$pid\""
+            else
+              kill -0 "$pid" 2> /dev/null
+            fi
+          }
+          echo "$(date -u +%FT%TZ) waiting for /healthz (pid $pid, up to 300 s)"
+          deadline=$(( $(date +%s) + 300 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            if curl -sf --max-time 5 "$SERVER/healthz"; then
+              echo
+              echo "$(date -u +%FT%TZ) /healthz answered $(( $(date +%s) - launched )) s after launch"
+              exit 0
+            fi
+            if ! alive; then
+              echo "::error::the server process ($pid) exited $(( $(date +%s) - launched )) s after launch, before /healthz answered (see the Server log step)"
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::no answer from /healthz within 300 s (server process $pid still running); last attempt:"
+          curl -sSf --max-time 5 "$SERVER/healthz" || true
           exit 1
 
       - name: Sample repo and test runner
