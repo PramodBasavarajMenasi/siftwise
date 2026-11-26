@@ -133,13 +133,18 @@ jobs:
             $(if ($server) { $server.ExecutablePath } else { 'no child process found' })
 
       # By deadline: the server migrates an empty database first (Windows took over 90 s).
+      # GitHub runs this with `bash -e -o pipefail`: every command that may fail while the
+      # server is still starting (curl, tasklist, powershell) is guarded, or it ends the step.
       - name: Wait for the server
         run: |
           pid=$(tr -d '\r\n ' < "$RUNNER_TEMP/server.pid")
           launched=$(tr -d '\r\n ' < "$RUNNER_TEMP/server.launched")
           alive() {
             if [ "$RUNNER_OS" = Windows ]; then  # a Windows PID (Start-Process): not bash's
-              tasklist //FI "PID eq $pid" //FO CSV //NH | grep -q "\"$pid\""
+              # No `| grep -q`: under pipefail, grep closing the pipe early can fail tasklist.
+              local tasks
+              tasks=$(tasklist //FI "PID eq $pid" //FO CSV //NH 2> /dev/null) || return 1
+              [[ "$tasks" == *"\"$pid\""* ]]
             else
               kill -0 "$pid" 2> /dev/null
             fi
@@ -150,16 +155,25 @@ jobs:
           next_report=$(( $(date +%s) + 15 ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
             # -sS: curl's own error (refused, timeout) on stderr; -w: the HTTP code.
+            # A failed try is expected while the server starts: `|| true`, and -w still prints
+            # 000 when there was no HTTP answer.
             code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$SERVER/healthz" \
-              2> "$RUNNER_TEMP/curl.err")
+              2> "$RUNNER_TEMP/curl.err") || true
+            code=${code:-000}
             answer="HTTP $code"
-            [ -s "$RUNNER_TEMP/curl.err" ] && answer="$answer, $(tr -d '\r\n' < "$RUNNER_TEMP/curl.err")"
+            if [ -s "$RUNNER_TEMP/curl.err" ]; then
+              answer="$answer, $(tr -d '\r\n' < "$RUNNER_TEMP/curl.err")"
+            fi
             if [ "$code" = 200 ]; then
               echo "$(date -u +%FT%TZ) /healthz answered $(elapsed) s after launch"
               grep -h "Uvicorn running" "$RUNNER_TEMP/server.log" "$RUNNER_TEMP/server.err.log" || true
               if [ "$RUNNER_OS" = Windows ]; then
-                owner=$(powershell.exe -NoProfile -Command \
-                  "(Get-NetTCPConnection -LocalPort 8000 -State Listen).OwningProcess | Sort-Object -Unique" | tr -d '\r')
+                # netstat, not Get-NetTCPConnection: locally its CIM query sometimes found no
+                # listener on a port that had just answered.
+                owner=$(netstat -ano -p TCP | tr -d '\r' \
+                  | awk '$2 ~ /:8000$/ && $4 == "LISTENING" { print $5 }' | sort -u | tr '\n' ' ') || true
+                owner=${owner% }
+                owner=${owner:-unknown}
                 echo "listening on 8000: pid $owner (watched: $pid)"
                 [ "$owner" = "$pid" ] || echo "::warning::the watched pid $pid isn't the one listening on 8000 ($owner)"
               fi
