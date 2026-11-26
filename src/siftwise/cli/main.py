@@ -844,19 +844,25 @@ def _saved_minutes(time: dict[str, Any]) -> float | None:
     if time["saved"] is None:
         return None
 
-    return float((time["total_ms"] - time["would_run_ms"]) / 60_000)
+    total_ms = float(time["total_ms"])
+    would_run_ms = float(time["would_run_ms"])
+
+    return round((total_ms - would_run_ms) / 60_000, 1)
 
 
 def csv_report(result: dict[str, Any], by_week: bool = False) -> str:
     """Return the report as CSV, with one summary row or one row per week."""
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["runs", "selective runs", "caught", "missed", "time saved"])
+
+    headers = ["runs", "selective_runs", "caught", "missed", "time_saved_min"]
 
     if by_week:
+        writer.writerow(["week", *headers])
         for period in result.get("periods") or []:
             writer.writerow(
                 [
+                    period["start"][:10],
                     period["shadow_runs"],
                     period["selective_runs"],
                     period["all"]["caught"],
@@ -865,6 +871,7 @@ def csv_report(result: dict[str, Any], by_week: bool = False) -> str:
                 ]
             )
     else:
+        writer.writerow(headers)
         writer.writerow(
             [
                 result["shadow_runs"],

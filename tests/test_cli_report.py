@@ -264,7 +264,7 @@ def test_report_csv(api: respx.MockRouter) -> None:
 
     assert result.exit_code == 0, result.output
     assert list(csv.reader(result.stdout.splitlines())) == [
-        ["runs", "selective runs", "caught", "missed", "time saved"],
+        ["runs", "selective_runs", "caught", "missed", "time_saved_min"],
         ["40", "25", "148", "2", "40.0"],
     ]
 
@@ -284,10 +284,29 @@ def test_report_csv_by_week(api: respx.MockRouter) -> None:
 
     assert result.exit_code == 0, result.output
     assert list(csv.reader(result.stdout.splitlines())) == [
-        ["runs", "selective runs", "caught", "missed", "time saved"],
-        ["3", "2", "49", "1", "40.0"],
-        ["0", "0", "0", "0", ""],
+        ["week", "runs", "selective_runs", "caught", "missed", "time_saved_min"],
+        ["2026-10-05", "3", "2", "49", "1", "40.0"],
+        ["2026-10-12", "0", "0", "0", "0", ""],
     ]
+
+
+def test_report_csv_rounds_time_saved_to_one_decimal(
+    api: respx.MockRouter,
+) -> None:
+    data = recall(
+        time={
+            "total_ms": 7_000.0,
+            "would_run_ms": 0.0,
+            "saved": 1.0,
+        }
+    )
+    api.get(URL).respond(json=data)
+
+    result = CliRunner().invoke(app, [*ARGS, "--csv"])
+
+    assert result.exit_code == 0, result.output
+    rows = list(csv.reader(result.stdout.splitlines()))
+    assert rows[1][-1] == "0.1"
 
 
 def test_report_csv_and_json_are_mutually_exclusive() -> None:
