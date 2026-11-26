@@ -103,31 +103,44 @@ jobs:
           echo $! > "$RUNNER_TEMP/server.pid"
           echo "$(date -u +%FT%TZ) server launched (pid $!)"
 
-      # A background process from a bash step may not outlive the step on Windows. siftwise
-      # has no __main__ module: run its CLI entry point. No PID is tracked on Windows: the
-      # venv's python.exe is a launcher whose PID isn't the server's (and on GitHub's runner
-      # it exited while the server ran), so the wait goes by /healthz and a deadline only, and
-      # the stop step finds the server by its port. The process info below is for debugging.
+      # GitHub's Windows runner kills the processes a step started when the step ends (the
+      # server's log ended after a complete start, then every /healthz was refused). So the
+      # server is created through WMI (Win32_Process.Create): its parent is WMI's provider
+      # host, outside this step's process tree. Such a process doesn't inherit the step's
+      # environment, so a .cmd file sets the SIFTWISE_* variables (values never printed) and
+      # runs the server with its output redirected. siftwise has no __main__ module: run its
+      # CLI entry point. No PID is tracked: the wait goes by /healthz, the stop by the port.
       - name: Start the server (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $python = (Resolve-Path .siftwise-src\.venv\Scripts\python.exe).Path
+          $script = Join-Path $env:RUNNER_TEMP 'server.cmd'
+          $lines = @('@echo off', 'set PYTHONUNBUFFERED=1')
+          foreach ($var in Get-ChildItem env: | Where-Object Name -like 'SIFTWISE_*') {
+            if ($var.Value -match '[%"]') {  # cmd would expand or end the value there
+              "::error::$($var.Name) contains % or a double quote; server.cmd can't set it"
+              exit 1
+            }
+            $lines += 'set "{0}={1}"' -f $var.Name, $var.Value
+          }
+          $lines += ('"{0}" -c "from siftwise.cli.main import app; app()" server start --port 8000' -f $python) +
+            (' > "{0}" 2> "{1}"' -f (Join-Path $env:RUNNER_TEMP 'server.log'), (Join-Path $env:RUNNER_TEMP 'server.err.log'))
+          Set-Content -Path $script -Value $lines -Encoding ascii
           Set-Content -Path "$env:RUNNER_TEMP\server.launched" `
             -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
-          $launcher = Start-Process -FilePath .siftwise-src\.venv\Scripts\python.exe `
-            -ArgumentList '-c', '"from siftwise.cli.main import app; app()"', 'server', 'start', '--port', '8000' `
-            -PassThru `
-            -RedirectStandardOutput "$env:RUNNER_TEMP\server.log" `
-            -RedirectStandardError "$env:RUNNER_TEMP\server.err.log"
-          Set-Content -Path "$env:RUNNER_TEMP\server.launcher.pid" -Value $launcher.Id
-          "{0} server launched (launcher pid {1})" -f [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'), $launcher.Id
-          try {
-            Start-Sleep -Seconds 1
-            Get-CimInstance Win32_Process -Filter "ProcessId=$($launcher.Id) OR ParentProcessId=$($launcher.Id)" |
-              ForEach-Object { "  process {0} (parent {1}): {2}" -f $_.ProcessId, $_.ParentProcessId, $_.ExecutablePath }
-          } catch {
-            "  process info unavailable: $_"
+          $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+            CommandLine = 'cmd.exe /d /c "{0}"' -f $script
+            CurrentDirectory = (Get-Location).Path
           }
+          if ($created.ReturnValue -ne 0) {
+            "::error::Win32_Process.Create failed with return value $($created.ReturnValue)"
+            exit 1
+          }
+          Set-Content -Path "$env:RUNNER_TEMP\server.launcher.pid" -Value $created.ProcessId
+          "{0} server launched through WMI (cmd.exe pid {1}; variables set: {2})" -f `
+            [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'), $created.ProcessId, `
+            ((Get-ChildItem env: | Where-Object Name -like 'SIFTWISE_*').Name -join ', ')
 
       # By deadline: the server migrates an empty database first. GitHub runs this with
       # `bash -e -o pipefail`: commands that fail while the server starts (curl) are guarded.
@@ -474,4 +487,5 @@ jobs:
             "stopping pid $id"
             Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
           }
+          Remove-Item (Join-Path $env:RUNNER_TEMP 'server.cmd') -ErrorAction SilentlyContinue
           exit 0
