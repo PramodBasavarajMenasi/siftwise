@@ -295,6 +295,15 @@ siftwise token list                                                 # never prin
 siftwise token revoke 2                                             # 401 from the next request
 ```
 
+`token list --active` leaves out revoked tokens; `--json` prints a JSON array (`id`, `name`,
+`repo`, `scope`, `created`, `last_used`, `revoked`: ISO 8601 UTC times, `null` when empty)
+instead of the table. They combine.
+
+```sh
+siftwise token list --active                                        # only usable tokens
+siftwise token list --json | jq -r '.[] | select(.last_used == null) | .id'  # never used
+```
+
 | Scope | Can |
 |---|---|
 | `read` | `select`, `triage` (also of a recorded CI run), `explain`, `report` (recall), test history and run lookups |

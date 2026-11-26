@@ -6,6 +6,7 @@ server's operator has. An API endpoint would let anyone holding the admin token 
 jobs use) mint tokens, so a leaked CI secret could create new, longer-lived ones.
 """
 
+import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated
 
@@ -70,7 +71,17 @@ def create_command(
 
 
 @app.command("list")
-def list_command() -> None:
+def list_command(
+    active: Annotated[bool, typer.Option("--active", help="Only tokens not revoked.")] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="A JSON array instead of the table: id, name, repo, scope, created, "
+            "last_used, revoked (ISO 8601 UTC, null when empty).",
+        ),
+    ] = False,
+) -> None:
     """List tokens: id, name, repo, scope, created, last used (to 10 minutes), revoked. Never
     the tokens themselves."""
     require_server("siftwise token")
@@ -78,6 +89,18 @@ def list_command() -> None:
 
     with _session() as session:
         rows = list_tokens(session)
+    if active:
+        rows = [r for r in rows if r.revoked_at is None]
+    if as_json:
+        # An explicit list of fields, never the model: token_hash must not leave the database.
+        objects = [
+            {"id": r.id, "name": r.name or None, "repo": r.repo, "scope": r.scope,
+             "created": _iso(r.created_at), "last_used": _iso(r.last_used_at),
+             "revoked": _iso(r.revoked_at)}
+            for r in rows
+        ]  # fmt: skip
+        typer.echo(json.dumps(objects, indent=2))
+        return
     if not rows:
         typer.echo("no tokens (SIFTWISE_API_TOKEN, the admin token, isn't stored here)", err=True)
         return
@@ -118,3 +141,10 @@ def _session() -> "Session":
 
 def _when(value: datetime | None) -> str:
     return "-" if value is None else value.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _iso(value: datetime | None) -> str | None:
+    """ISO 8601 in UTC, to the second (e.g. 2026-11-27T09:30:00Z); None stays None."""
+    if value is None:
+        return None
+    return value.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
