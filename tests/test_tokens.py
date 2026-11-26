@@ -6,7 +6,7 @@ import contextlib
 import json
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -545,6 +545,136 @@ def test_token_list_with_no_tokens(cli_db: Session) -> None:
 
     assert result.exit_code == 0
     assert "no tokens" in result.stderr
+
+
+CREATED = datetime(2026, 11, 20, 9, 30, 5, tzinfo=UTC)
+USED = datetime(2026, 11, 21, 14, 0, 0, tzinfo=UTC)
+REVOKED_AT = datetime(2026, 11, 22, 8, 15, 59, tzinfo=UTC)
+
+
+@pytest.fixture
+def three_tokens(cli_db: Session) -> list[str]:
+    """An active named one (used), an active one for every repo, a revoked one. Fixed times."""
+    made = [
+        tokens.create_token(cli_db, REPO, TokenScope.READ, "agent"),
+        tokens.create_token(cli_db, ALL_REPOS, TokenScope.WRITE),
+        tokens.create_token(cli_db, "acme/old", TokenScope.WRITE, "old ci"),
+    ]
+    rows = {r.id: r for r in cli_db.scalars(select(ApiToken))}
+    for (token_id, _), used, revoked in zip(
+        made, (USED, None, None), (None, None, REVOKED_AT), strict=True
+    ):
+        rows[token_id].created_at = CREATED
+        rows[token_id].last_used_at = used
+        rows[token_id].revoked_at = revoked
+    cli_db.commit()
+    return [token for _, token in made]
+
+
+def test_token_list_table_is_unchanged_without_flags(
+    cli_db: Session, three_tokens: list[str]
+) -> None:
+    ids = [r.id for r in cli_db.scalars(select(ApiToken).order_by(ApiToken.id))]
+    result = CliRunner().invoke(cli_app, ["token", "list"])
+
+    assert result.exit_code == 0, result.output
+    width = max(len("ID"), *(len(str(i)) for i in ids))
+    expected = [
+        f"{'ID':<{width}}  NAME    REPO       SCOPE  CREATED               LAST USED"
+        "             REVOKED",
+        f"{ids[0]:<{width}}  agent   acme/shop  read   2026-11-20 09:30 UTC  "
+        "2026-11-21 14:00 UTC  -",
+        f"{ids[1]:<{width}}  -       *          write  2026-11-20 09:30 UTC  -"
+        "                     -",
+        f"{ids[2]:<{width}}  old ci  acme/old   write  2026-11-20 09:30 UTC  -"
+        "                     2026-11-22 08:15 UTC",
+    ]
+    assert result.stdout.splitlines() == expected
+
+
+def test_token_list_active_leaves_out_revoked_tokens(
+    cli_db: Session, three_tokens: list[str]
+) -> None:
+    result = CliRunner().invoke(cli_app, ["token", "list", "--active"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert len(lines) == 3  # the header and the two active tokens
+    assert "agent" in lines[1] and "*" in lines[2]
+    assert "acme/old" not in result.stdout and "2026-11-22" not in result.stdout
+
+
+def test_token_list_json(cli_db: Session, three_tokens: list[str]) -> None:
+    ids = [r.id for r in cli_db.scalars(select(ApiToken).order_by(ApiToken.id))]
+    result = CliRunner().invoke(cli_app, ["token", "list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == [
+        {"id": ids[0], "name": "agent", "repo": REPO, "scope": "read",
+         "created": "2026-11-20T09:30:05Z", "last_used": "2026-11-21T14:00:00Z",
+         "revoked": None},
+        {"id": ids[1], "name": None, "repo": "*", "scope": "write",
+         "created": "2026-11-20T09:30:05Z", "last_used": None, "revoked": None},
+        {"id": ids[2], "name": "old ci", "repo": "acme/old", "scope": "write",
+         "created": "2026-11-20T09:30:05Z", "last_used": None,
+         "revoked": "2026-11-22T08:15:59Z"},
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize("args", [["--active", "--json"], ["--json", "--active"]])
+def test_token_list_active_and_json_together(
+    cli_db: Session, three_tokens: list[str], args: list[str]
+) -> None:
+    result = CliRunner().invoke(cli_app, ["token", "list", *args])
+
+    assert result.exit_code == 0, result.output
+    listed = json.loads(result.stdout)
+    assert [t["name"] for t in listed] == ["agent", None]
+    assert all(t["revoked"] is None for t in listed)
+
+
+@pytest.mark.parametrize(
+    ("args", "stdout", "stderr"),
+    [
+        (["--json"], "[]\n", ""),
+        (["--json", "--active"], "[]\n", ""),
+        ([], "", "no tokens"),
+        (["--active"], "", "no tokens"),
+    ],
+)
+def test_token_list_empty(cli_db: Session, args: list[str], stdout: str, stderr: str) -> None:
+    result = CliRunner().invoke(cli_app, ["token", "list", *args])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == stdout
+    assert stderr in result.stderr
+
+
+def test_token_list_active_with_only_revoked_tokens_is_empty(cli_db: Session) -> None:
+    token_id, _ = tokens.create_token(cli_db, REPO, TokenScope.READ)
+    tokens.revoke_token(cli_db, token_id)
+
+    as_json = CliRunner().invoke(cli_app, ["token", "list", "--active", "--json"])
+    table = CliRunner().invoke(cli_app, ["token", "list", "--active"])
+
+    assert as_json.stdout == "[]\n"
+    assert table.stdout == "" and "no tokens" in table.stderr
+
+
+@pytest.mark.parametrize("args", [[], ["--active"], ["--json"], ["--active", "--json"]])
+def test_token_list_never_shows_a_token_or_its_hash(
+    cli_db: Session, three_tokens: list[str], args: list[str]
+) -> None:
+    hashes = list(cli_db.scalars(select(ApiToken.token_hash)))
+    result = CliRunner().invoke(cli_app, ["token", "list", *args])
+
+    assert result.exit_code == 0, result.output
+    assert len(hashes) == 3
+    for text in (result.stdout, result.stderr):
+        assert "sw_" not in text
+        assert not any(token in text for token in three_tokens)
+        assert not any(value in text for value in hashes)
+        assert "token_hash" not in text and "hash" not in text.lower()
 
 
 def test_token_revoke(cli_db: Session) -> None:

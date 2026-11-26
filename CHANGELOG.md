@@ -8,6 +8,12 @@ All notable changes to siftwise. The format follows
 
 ### Added
 
+- `siftwise token list --active` (only tokens not revoked) and `--json` (a JSON array with
+  the table's fields: `id`, `name`, `repo` (`*` for every repo), `scope`, `created`,
+  `last_used`, `revoked`, times in ISO 8601 UTC, `null` when empty; never the token or its
+  hash) ([#90](https://github.com/PramodBasavarajMenasi/siftwise/issues/90)). The flags
+  combine; without them the table is unchanged.
+
 - The GitHub Action is tested on macOS and Windows runners as well as Linux
   ([#79](https://github.com/PramodBasavarajMenasi/siftwise/issues/79)): `action-os.yml` runs
   `actions/select`, `record` and `rollup` from the checkout on `ubuntu-latest`,
