@@ -81,6 +81,9 @@ COMMENT_FOOTER = "<sub>Updated on each push.</sub>"
 PULL_REQUEST_EVENTS = frozenset({"pull_request", "pull_request_target"})
 MERGE_REQUEST_EVENT = "merge_request_event"  # GitLab's CI_PIPELINE_SOURCE for MR pipelines
 ZERO_SHA = "0" * 40
+# Advanced: the commit the run tested, when it isn't the event's (a workflow that builds and
+# tests another commit, e.g. this repo's action-os.yml on a sample repo it makes in the job).
+HEAD_SHA_ENV = "SIFTWISE_HEAD_SHA"
 # Directories a recursive JUnit glob never needs to look into.
 SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "venv", ".tox", "__pycache__"})
 SELECT_TIMEOUT = 30.0
@@ -161,10 +164,43 @@ class Context:
         return self.event_name in PULL_REQUEST_EVENTS or self.event_name == MERGE_REQUEST_EVENT
 
 
+class HeadShaError(ValueError):
+    """SIFTWISE_HEAD_SHA is set but unusable: the step fails (no fallback to the event)."""
+
+
+def head_override(
+    env: Env, event_sha: str, exists: Callable[[str], bool | None]
+) -> tuple[str, str] | None:
+    """``(sha, notice)`` when ``SIFTWISE_HEAD_SHA`` is set, else None. It must be a full
+    40-character hex SHA that ``exists`` (``git cat-file -e``) in the checkout; ``exists``
+    returning None means no checkout to look in (rollup), and the notice says so."""
+    value = env.get(HEAD_SHA_ENV, "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+        raise HeadShaError(f"{HEAD_SHA_ENV} must be a full 40-character hex commit SHA, "
+                           f"got {value[:80]!r}")  # fmt: skip
+    sha = value.lower()
+    found = exists(sha)
+    if found is False:
+        raise HeadShaError(f"{HEAD_SHA_ENV} {sha} is not a commit in this repository "
+                           "(fetch it, or check out with fetch-depth: 0)")  # fmt: skip
+    notice = (f"siftwise: using {HEAD_SHA_ENV} {sha} instead of the event's commit "
+              f"{event_sha or '(none)'}")  # fmt: skip
+    if found is None:
+        notice += " (not checked: no git checkout here)"
+    return sha, notice
+
+
 def load_context(
-    env: Env, base_ref: str | None = None, has_commit: Callable[[str], bool] | None = None
+    env: Env,
+    base_ref: str | None = None,
+    has_commit: Callable[[str], bool] | None = None,
+    head_exists: Callable[[str], bool | None] | None = None,
 ) -> Context:
-    """Build the context. ``base_ref`` overrides the event's diff base.
+    """Build the context. ``base_ref`` overrides the event's diff base, ``SIFTWISE_HEAD_SHA``
+    the commit the run tested (checked with ``head_exists``, default ``has_commit``; raises
+    ``HeadShaError`` if unusable, and annotates a notice when used).
 
     The diff base matches what backfill records for the same CI run: a PR's base SHA (the
     whole PR), a push's ``before`` (every pushed commit), falling back to the first parent
@@ -191,6 +227,11 @@ def load_context(
         head_sha = env.get("GITHUB_SHA", "")
         branch = env.get("GITHUB_REF_NAME") or "unknown"
         fork = False
+
+    override = head_override(env, head_sha, head_exists or has_commit)
+    if override is not None:
+        head_sha, notice = override
+        _annotate("notice", notice)
 
     base = base_ref or None
     if base is None and event_name == "pull_request":
@@ -245,7 +286,7 @@ def select_step(
         _annotate("error", "siftwise needs the full git history to diff against the base: "
                   f"{_ci().shallow_fix}")  # fmt: skip
         raise typer.Exit(1)
-    ctx = load_context(os.environ, base_ref)
+    ctx = _context(load_context, os.environ, base_ref)
     if ctx.event_name == "pull_request_target":
         _annotate("warning", "siftwise doesn't support pull_request_target: full suite.")
     run_select(ctx, server=server, token=token, repo=repo, junit_dir=junit_dir,
@@ -420,7 +461,7 @@ def record_step(
     source = parse_known_flaky_source(known_flaky_source)
     rerun = parse_rerun(rerun_unknown, rerun_verdicts, rerun_max_tests, rerun_timeout_minutes,
                         rerun_prefix)  # fmt: skip
-    ctx = load_context(os.environ, base_ref)
+    ctx = _context(load_context, os.environ, base_ref)
     run_record(ctx, server=server, token=token, repo=repo, junit=junit, junit_dir=junit_dir,
                variant=variant, defer_rollup=defer_rollup, scm_token=github_token,
                triage=triage, comment=comment, gate=gate, source=source, rerun=rerun)  # fmt: skip
@@ -565,7 +606,8 @@ def rollup_step(
     ``fail_on`` is set."""
     gate = parse_fail_on(fail_on)
     # No checkout needed: the event payload says which run and PR, the server the rest.
-    ctx = load_context(os.environ, has_commit=lambda _ref: False)
+    ctx = _context(load_context, os.environ, has_commit=lambda _ref: False,
+                   head_exists=checkout_has_commit)  # fmt: skip
     run_rollup(ctx, server=server, token=token, repo=repo, scm_token=github_token,
                triage=triage, comment=comment, gate=gate)  # fmt: skip
 
@@ -972,7 +1014,7 @@ def report_failures(
     _append_summary(env, markdown)
     # The summary file is per step; this copy is for later steps (and the e2e check).
     report = ci.report_file(env)
-    report.write_text(ci.redact(markdown), encoding="utf-8")
+    report.write_text(ci.redact(markdown), encoding="utf-8", newline="\n")
     ci.outputs(env, {
         "verdicts-available": "true" if response is not None else "false",
         "counts": json.dumps(response["counts"] if response is not None else {}),
@@ -1669,6 +1711,24 @@ def git_is_shallow() -> bool:
     return proc.returncode == 0 and proc.stdout.decode().strip() == "true"
 
 
+def _context(load: Callable[..., Context], *args: Any, **kwargs: Any) -> Context:
+    """``load(*args, **kwargs)``; an unusable SIFTWISE_HEAD_SHA fails the step (exit 2)."""
+    try:
+        return load(*args, **kwargs)
+    except HeadShaError as exc:
+        _annotate("error", f"siftwise: {exc}")
+        raise typer.Exit(2) from exc
+
+
+def checkout_has_commit(ref: str) -> bool | None:
+    """Like ``git_has_commit``, but None outside a git work tree (rollup needs no checkout)."""
+    proc = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], capture_output=True,
+                          timeout=30, check=False)  # fmt: skip
+    if proc.returncode != 0:
+        return None
+    return git_has_commit(ref)
+
+
 def git_has_commit(ref: str) -> bool:
     proc = subprocess.run(["git", "cat-file", "-e", f"{ref}^{{commit}}"], capture_output=True,
                           timeout=30, check=False)  # fmt: skip
@@ -1681,7 +1741,8 @@ def _append(env: Env, file_var: str, values: Mapping[str, str]) -> None:
     path = env.get(file_var)
     if not path:
         return
-    with open(path, "a", encoding="utf-8") as out:
+    # newline="\n": text mode writes CRLF on Windows, which could leave a "\r" on a value.
+    with open(path, "a", encoding="utf-8", newline="\n") as out:
         for name, value in values.items():
             delimiter = f"siftwise_{uuid.uuid4().hex}"
             out.write(f"{name}<<{delimiter}\n{value}\n{delimiter}\n")
@@ -1759,7 +1820,7 @@ class Provider:
     def summary(self, env: Env, markdown: str) -> None:
         path = env.get("GITHUB_STEP_SUMMARY")
         if path:
-            with open(path, "a", encoding="utf-8") as out:
+            with open(path, "a", encoding="utf-8", newline="\n") as out:
                 out.write(markdown)
 
     def report_file(self, env: Env) -> Path:

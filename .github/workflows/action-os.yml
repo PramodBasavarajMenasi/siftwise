@@ -1,0 +1,369 @@
+name: Action OS
+
+# Runs actions/select, record and rollup from this checkout on Linux, macOS and Windows runners,
+# against a real siftwise server and Postgres started in the job. The workspace root is a tiny
+# sample repo made in the job (the Quickstart's shop example); siftwise itself is checked out
+# into .siftwise-src (a dot-dir: the import graph, pytest and record's JUnit search skip it).
+#
+# Phase 1: an empty history, so select says full; the full suite runs and passes; record, then
+# rollup. Phase 2: a change to shop/cart.py that breaks one cart test; select is selective
+# (tests/test_cart.py only, from the import graph), its command runs and fails as intended;
+# record and rollup triage the failure. Each phase has its own variant (one CI run attempt).
+#
+# The commits tested are the sample repo's, not the event's: SIFTWISE_HEAD_SHA (set through
+# GITHUB_ENV) tells the actions which commit that is.
+
+on:
+  pull_request:
+    paths:
+      - actions/**
+      - src/siftwise/cli/gha.py
+      - src/siftwise/cli/main.py
+      - src/siftwise/cli/pygraph.py
+      - src/siftwise/cli/repoconfig.py
+      - src/siftwise/cli/reruns.py
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/action-os.yml
+  push:
+    branches: [main]
+    paths:
+      - actions/**
+      - src/siftwise/cli/gha.py
+      - src/siftwise/cli/main.py
+      - src/siftwise/cli/pygraph.py
+      - src/siftwise/cli/repoconfig.py
+      - src/siftwise/cli/reruns.py
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/action-os.yml
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1"  # Mondays 05:17 UTC: runner images change under us
+
+permissions:
+  contents: read
+
+concurrency:
+  group: action-os-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SERVER: http://127.0.0.1:8000
+  # The job's own throwaway server: not a secret.
+  TOKEN: action-os-token
+  REPO_NAME: sample/shop
+
+jobs:
+  action:
+    name: action (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash  # Git Bash on Windows: the actions' own steps are bash too
+    env:
+      SIFTWISE_API_TOKEN: action-os-token  # the server's token
+      SIFTWISE_DATABASE_URL: postgresql+psycopg://siftwise:siftwise@127.0.0.1:5432/siftwise
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: .siftwise-src
+
+      # One step on all three OSes (apt / Chocolatey / Homebrew, then initdb + pg_ctl): service
+      # containers run on Linux only. Pinned by commit: v9.
+      - name: Start PostgreSQL
+        uses: ikalnytskyi/action-setup-postgres@325155bfd7807b2a21ac9c2c7bb9b9a6eacc44df # v9
+        with:
+          username: siftwise
+          password: siftwise
+          database: siftwise
+          postgres-version: "16"
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false  # no uv.lock at the workspace root (the sample repo's)
+
+      - name: Install the server
+        working-directory: .siftwise-src
+        run: uv sync --locked --no-dev --extra server --python 3.12
+
+      # `siftwise server start` migrates, then serves. The venv's siftwise, not `uv run`.
+      - name: Start the server (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: |
+          nohup .siftwise-src/.venv/bin/siftwise server start --port 8000 \
+            > "$RUNNER_TEMP/server.log" 2> "$RUNNER_TEMP/server.err.log" &
+          echo $! > "$RUNNER_TEMP/server.pid"
+
+      # A background process from a bash step may not outlive the step on Windows.
+      - name: Start the server (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $server = Start-Process -FilePath .siftwise-src\.venv\Scripts\siftwise.exe `
+            -ArgumentList 'server', 'start', '--port', '8000' -PassThru `
+            -RedirectStandardOutput "$env:RUNNER_TEMP\server.log" `
+            -RedirectStandardError "$env:RUNNER_TEMP\server.err.log"
+          Set-Content -Path "$env:RUNNER_TEMP\server.pid" -Value $server.Id
+
+      - name: Wait for the server
+        run: |
+          for _ in $(seq 90); do curl -sf "$SERVER/healthz" && exit 0; sleep 1; done
+          echo "the server didn't answer /healthz in 90 s"
+          exit 1
+
+      - name: Sample repo and test runner
+        id: sample
+        run: |
+          src=.siftwise-src/examples/quickstart
+          cp -R "$src/shop" "$src/tests" "$src/pyproject.toml" .
+          git init -q -b main
+          git config user.name "siftwise action-os"
+          git config user.email "action-os@example.invalid"
+          git config commit.gpgsign false
+          printf '.siftwise-src/\n' >> .git/info/exclude
+          printf '# sample\n' > README.md
+          git add README.md
+          git commit -q -m base
+          echo "c0=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git add -A
+          git commit -q -m "the shop"
+          echo "c1=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          test -z "$(git status --porcelain)"
+          git ls-files
+          # pytest in its own venv, on PATH for the Tests steps.
+          uv venv -q --python 3.12 "$RUNNER_TEMP/sample-venv"
+          uv pip install -q --python "$RUNNER_TEMP/sample-venv" pytest
+          if [ "$RUNNER_OS" = Windows ]; then bin=Scripts; else bin=bin; fi
+          echo "$RUNNER_TEMP/sample-venv/$bin" >> "$GITHUB_PATH"
+
+      # Before SIFTWISE_HEAD_SHA is in GITHUB_ENV: a SHA that isn't in the repo must fail select.
+      - name: Select with an unknown SIFTWISE_HEAD_SHA (must fail)
+        id: bad_head
+        continue-on-error: true
+        uses: ./.siftwise-src/actions/select
+        env:
+          SIFTWISE_HEAD_SHA: "0123456789012345678901234567890123456789"
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          comment: false
+
+      - name: Check it failed
+        env:
+          OUTCOME: ${{ steps.bad_head.outcome }}
+        run: test "$OUTCOME" = failure
+
+      # --- phase 1: no history -> full suite ---------------------------------------------
+
+      - name: Test commit 1
+        env:
+          C1: ${{ steps.sample.outputs.c1 }}
+        run: echo "SIFTWISE_HEAD_SHA=$C1" >> "$GITHUB_ENV"
+
+      - name: Select (empty history)
+        id: select1
+        uses: ./.siftwise-src/actions/select
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          base-ref: ${{ steps.sample.outputs.c0 }}
+          junit-dir: ${{ runner.temp }}/junit phase 1  # a space: quoting
+          variant: p1
+          comment: false
+
+      - name: Check the first selection
+        env:
+          MODE: ${{ steps.select1.outputs.mode }}
+          COMMAND: ${{ steps.select1.outputs.command }}
+          REASON: ${{ steps.select1.outputs.reason }}
+          JUNIT_DIR: ${{ steps.select1.outputs.junit-dir }}
+        run: |
+          printf 'mode=%s reason=%s junit-dir=%s\n' "$MODE" "$REASON" "$JUNIT_DIR"
+          test "$MODE" = full
+          test -z "$COMMAND"
+          test "$REASON" = "no test history for this repo yet"
+          test -d "$JUNIT_DIR"
+
+      - name: Tests (full suite)
+        env:
+          COMMAND: ${{ steps.select1.outputs.command }}
+          JUNIT_DIR: ${{ steps.select1.outputs.junit-dir }}
+        run: |
+          if [ -n "$COMMAND" ]; then eval "$COMMAND"; else pytest tests --junitxml="$JUNIT_DIR/full.xml"; fi
+          ls -l "$JUNIT_DIR"
+
+      - name: Record (phase 1)
+        id: record1
+        uses: ./.siftwise-src/actions/record
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          base-ref: ${{ steps.sample.outputs.c0 }}
+          variant: p1
+          comment: false
+
+      - name: Rollup (phase 1)
+        id: rollup1
+        uses: ./.siftwise-src/actions/rollup
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          comment: false
+
+      - name: Check phase 1 was recorded
+        env:
+          C1: ${{ steps.sample.outputs.c1 }}
+          AVAILABLE: ${{ steps.rollup1.outputs.verdicts-available }}
+          COUNTS: ${{ steps.rollup1.outputs.counts }}
+        run: |
+          printf 'verdicts-available=%s counts=%s\n' "$AVAILABLE" "$COUNTS"
+          test "$AVAILABLE" = true
+          echo "$COUNTS" | jq -e '([.[]] | add // 0) == 0'
+          run=$(curl -sf -H "Authorization: Bearer $TOKEN" --get "$SERVER/runs/lookup" \
+            --data-urlencode "repo=$REPO_NAME" --data-urlencode "ci_run_id=$GITHUB_RUN_ID" \
+            --data-urlencode "run_attempt=$GITHUB_RUN_ATTEMPT" --data-urlencode "variant=p1")
+          echo "$run"
+          echo "$run" | jq -e --arg c1 "$C1" '.commit_sha == $c1'
+
+      # --- phase 2: a change to shop/cart.py -> selective -----------------------------------
+
+      - name: Commit 2 (breaks the bulk discount)
+        id: change
+        run: |
+          cat > shop/cart.py <<'EOF'
+          """A shopping cart: totals with a bulk discount."""
+
+          from shop.prices import price
+
+
+          def total(items: list[str]) -> int:
+              cents = sum(price(item) for item in items)
+              if len(items) >= 10:
+                  cents = cents * 8 // 10  # a bug: 20% off
+              return cents
+          EOF
+          git commit -q -am "a bigger discount"
+          git show --stat HEAD
+          echo "SIFTWISE_HEAD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "c2=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Select (after the change)
+        id: select2
+        uses: ./.siftwise-src/actions/select
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          base-ref: ${{ steps.sample.outputs.c1 }}
+          junit-dir: ${{ runner.temp }}/junit phase 2
+          variant: p2
+          comment: false
+
+      - name: Check the selective selection
+        env:
+          MODE: ${{ steps.select2.outputs.mode }}
+          COMMAND: ${{ steps.select2.outputs.command }}
+          SELECTED: ${{ steps.select2.outputs.selected }}
+          TOTAL: ${{ steps.select2.outputs.total }}
+          REASON: ${{ steps.select2.outputs.reason }}
+        run: |
+          printf 'mode=%s selected=%s total=%s reason=%s\n' "$MODE" "$SELECTED" "$TOTAL" "$REASON"
+          printf 'command=%s\n' "$COMMAND"
+          test "$MODE" = selective
+          test "$SELECTED" = 2
+          test "$TOTAL" = 4
+          case "$COMMAND" in *tests/test_cart.py*) ;; *) echo "test_cart.py not selected"; exit 1;; esac
+          case "$COMMAND" in *test_prices*) echo "test_prices.py selected"; exit 1;; esac
+          case "$COMMAND" in *$'\r'*) echo "a carriage return in the command"; exit 1;; esac
+
+      - name: Tests (the selected command; one test fails on purpose)
+        env:
+          COMMAND: ${{ steps.select2.outputs.command }}
+          JUNIT_DIR: ${{ steps.select2.outputs.junit-dir }}
+        run: |
+          if eval "$COMMAND"; then echo "the broken bulk discount passed"; exit 1; fi
+          ls -l "$JUNIT_DIR"
+          test -n "$(ls "$JUNIT_DIR"/*.xml)"
+
+      - name: Record (phase 2)
+        id: record2
+        uses: ./.siftwise-src/actions/record
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          base-ref: ${{ steps.sample.outputs.c1 }}
+          variant: p2
+          comment: false
+
+      - name: Rollup (phase 2)
+        id: rollup2
+        uses: ./.siftwise-src/actions/rollup
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          comment: false
+
+      # The failing test has no history before this CI run attempt (triage never reads the
+      # attempt's own uploads) and its own file didn't change: unknown (rule 4).
+      - name: Check the failure verdict
+        env:
+          C2: ${{ steps.change.outputs.c2 }}
+          AVAILABLE: ${{ steps.rollup2.outputs.verdicts-available }}
+          COUNTS: ${{ steps.rollup2.outputs.counts }}
+          REPORT: ${{ steps.rollup2.outputs.report }}
+        run: |
+          printf 'verdicts-available=%s counts=%s report=%s\n' "$AVAILABLE" "$COUNTS" "$REPORT"
+          test "$AVAILABLE" = true
+          echo "$COUNTS" | jq -e '.unknown == 1 and ([.[]] | add) == 1'
+          test -f "$REPORT"
+          grep -F "test_bulk_discount" "$REPORT"
+          run=$(curl -sf -H "Authorization: Bearer $TOKEN" --get "$SERVER/runs/lookup" \
+            --data-urlencode "repo=$REPO_NAME" --data-urlencode "ci_run_id=$GITHUB_RUN_ID" \
+            --data-urlencode "run_attempt=$GITHUB_RUN_ATTEMPT" --data-urlencode "variant=p2")
+          echo "$run" | jq -e --arg c2 "$C2" '.commit_sha == $c2'
+
+      # fail-on is the one way siftwise fails a job on purpose: the exit code must get through.
+      - name: Rollup with fail-on unknown (must fail)
+        id: gate
+        continue-on-error: true
+        uses: ./.siftwise-src/actions/rollup
+        with:
+          server-url: ${{ env.SERVER }}
+          token: ${{ env.TOKEN }}
+          repo: ${{ env.REPO_NAME }}
+          comment: false
+          fail-on: unknown
+
+      - name: Check the gate failed
+        env:
+          OUTCOME: ${{ steps.gate.outcome }}
+        run: test "$OUTCOME" = failure
+
+      - name: Server log
+        if: failure()
+        run: |
+          for log in "$RUNNER_TEMP/server.log" "$RUNNER_TEMP/server.err.log"; do
+            echo "::group::$log"; cat "$log" || true; echo "::endgroup::"
+          done
+
+      - name: Stop the server
+        if: always()
+        shell: pwsh
+        run: |
+          $pidFile = Join-Path $env:RUNNER_TEMP 'server.pid'
+          if (Test-Path $pidFile) {
+            Stop-Process -Id ([int](Get-Content $pidFile)) -Force -ErrorAction SilentlyContinue
+          }

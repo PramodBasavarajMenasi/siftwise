@@ -249,6 +249,126 @@ def test_base_ref_input_wins(tmp_path: Path, repo: dict[str, str]) -> None:
     assert ctx.base == "origin/release"
 
 
+# --- SIFTWISE_HEAD_SHA (advanced: the run tested another commit than the event's) ----------
+
+
+def test_head_sha_override_replaces_the_events_commit_with_a_notice(
+    tmp_path: Path, repo: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    event = {"before": "0" * 40, "repository": {"default_branch": "main"}}
+    # GITHUB_SHA ("f" * 40) isn't in this checkout; the override is, in upper case too.
+    ctx = context(tmp_path, "push", event, SIFTWISE_HEAD_SHA=repo["head"].upper())
+    assert ctx.head_sha == repo["head"]
+    assert ctx.base == f"{repo['head']}^"  # a new branch's first parent: of the override
+    out = capsys.readouterr().out
+    assert (f"::notice::siftwise: using SIFTWISE_HEAD_SHA {repo['head']} instead of the "
+            f"event's commit {'f' * 40}") in out  # fmt: skip
+    assert "not checked" not in out
+
+
+def test_without_the_override_nothing_changes(
+    tmp_path: Path, repo: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    ctx = context(tmp_path, "pull_request", pr_event(repo), SIFTWISE_HEAD_SHA="  ")
+    assert ctx.head_sha == repo["head"]
+    assert "SIFTWISE_HEAD_SHA" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "value", ["HEAD", "main", "abc1234", "a" * 39, "a" * 41, "g" * 40, f"{'a' * 40}^"]
+)
+def test_head_sha_override_must_be_a_full_hex_sha(
+    tmp_path: Path, repo: dict[str, str], value: str
+) -> None:
+    with pytest.raises(gha.HeadShaError, match="full 40-character hex commit SHA"):
+        context(tmp_path, "pull_request", pr_event(repo), SIFTWISE_HEAD_SHA=value)
+
+
+def test_head_sha_override_must_exist_in_the_checkout(tmp_path: Path, repo: dict[str, str]) -> None:
+    with pytest.raises(gha.HeadShaError, match=f"{'1' * 40} is not a commit in this repo"):
+        context(tmp_path, "pull_request", pr_event(repo), SIFTWISE_HEAD_SHA="1" * 40)
+    # A blob or tree SHA is not a commit either.
+    tree = git(Path.cwd(), "rev-parse", "HEAD^{tree}")
+    with pytest.raises(gha.HeadShaError, match="is not a commit"):
+        context(tmp_path, "pull_request", pr_event(repo), SIFTWISE_HEAD_SHA=tree)
+
+
+def test_head_sha_override_outside_a_checkout_is_used_unchecked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """rollup needs no checkout: the SHA's format is checked, and the notice says the rest
+    wasn't."""
+    empty = tmp_path / "no-checkout"
+    empty.mkdir()
+    monkeypatch.chdir(empty)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))  # don't find a parent repo
+    env = {"GITHUB_EVENT_NAME": "push", "GITHUB_SHA": "f" * 40, "SIFTWISE_HEAD_SHA": "1" * 40}
+    loaded = gha.load_context(env, has_commit=lambda _ref: False,
+                              head_exists=gha.checkout_has_commit)  # fmt: skip
+    assert loaded.head_sha == "1" * 40
+    assert "(not checked: no git checkout here)" in capsys.readouterr().out
+    with pytest.raises(gha.HeadShaError, match="full 40-character"):
+        gha.load_context({**env, "SIFTWISE_HEAD_SHA": "HEAD"}, has_commit=lambda _ref: False,
+                         head_exists=gha.checkout_has_commit)  # fmt: skip
+
+
+@pytest.mark.parametrize("step", ["select", "record", "rollup"])
+@pytest.mark.parametrize("value", ["not-a-sha", "1" * 40])
+def test_every_step_fails_on_an_unusable_head_sha(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter, step: str, value: str
+) -> None:
+    """No silent fallback to the event's commit: the step fails before calling the server."""
+    result = gh.run(step, "pull_request", pr_event(repo), SIFTWISE_HEAD_SHA=value)
+
+    assert result.exit_code == 2, result.output
+    assert "::error::siftwise: SIFTWISE_HEAD_SHA" in result.output
+    assert not [call for call in api.calls if call.request.url.host == "siftwise.test"]
+
+
+def test_select_and_record_diff_and_record_the_override(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    """A push event whose GITHUB_SHA isn't in the checkout (as in action-os.yml)."""
+    select = api.post(f"{SERVER}/select").respond(json=selection())
+    event = {"before": "0" * 40, "repository": {"default_branch": "main"}}
+    env = {"SIFTWISE_HEAD_SHA": repo["head"], "SIFTWISE_BASE_REF": repo["base"],
+           "GITHUB_REF_NAME": "feature"}  # fmt: skip
+
+    result = gh.run("select", "push", event, **env)
+
+    assert result.exit_code == 0, result.output
+    assert f"::notice::siftwise: using SIFTWISE_HEAD_SHA {repo['head']}" in result.output
+    assert json.loads(select.calls.last.request.content)["changed_files"] == ["src/cart.py"]
+
+    Path("junit.xml").write_text("<testsuite/>")
+    api.get(f"{GH}/repos/{REPO}/actions/runs/555").respond(403)
+    upload = api.post(f"{SERVER}/runs").respond(
+        201, json={"run_id": 9, "created": True, "counts": {"total": 1}})  # fmt: skip
+    api.post(f"{SERVER}/repos/{REPO}/triage").respond(json=triage_response(variants=(None,)))
+
+    result = gh.run("record", "push", event, **env)
+
+    assert result.exit_code == 0, result.output
+    meta, _, _ = upload_metadata(upload)
+    assert (meta["commit_sha"], meta["changed_files"]) == (repo["head"], ["src/cart.py"])
+
+
+def test_github_files_are_written_with_lf_only(
+    gh: Runner, repo: dict[str, str], api: respx.MockRouter
+) -> None:
+    """Text mode writes CRLF on Windows, which could leave a "\\r" on an output value (a
+    command ending in "\\r" breaks `eval`)."""
+    api.post(f"{SERVER}/select").respond(json=selection())
+    no_comments(api)
+
+    assert gh.run("select", "pull_request", pr_event(repo)).exit_code == 0
+
+    for path in (gh.output, gh.github_env, gh.summary):
+        data = path.read_bytes()
+        assert data and b"\r" not in data, path
+    assert gh.outputs()["command"] == "pytest tests/test_cart.py"
+
+
 # --- select -------------------------------------------------------------------------------
 
 
