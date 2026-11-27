@@ -14,6 +14,7 @@ from siftwise.core.schemas import (
     BudgetOut,
     EstimatedMs,
     SelectedTestOut,
+    SelectionInput,
     SelectRequest,
     SelectResponse,
 )
@@ -51,13 +52,7 @@ def post_select(
     ``shadow``, stores it for that (full-suite) run's recall: that needs a write token."""
     authorize(caller, body.repo, write=body.shadow is not None, what="storing a shadow selection")
     _same_run(body)
-    config = SelectorConfig(
-        always_run=tuple(body.always_run),
-        depends=tuple(DependsRule(rule.tests, tuple(rule.on)) for rule in body.depends),
-        go_module=body.go_module,
-        go_modules=tuple(sorted((body.go_modules or {}).items())),
-        generated=tuple(body.generated),
-    )
+    config = selector_config(body)
     # A CI leg's variant (ci and shadow name the same run: _same_run) sizes the estimate and
     # the budget with that leg's tests; without one, every variant together, as before.
     run = body.shadow or body.ci
@@ -75,16 +70,7 @@ def post_select(
         junit_dir=body.junit_dir,
         order=Order(body.order),
         budget_ms=None if body.budget_seconds is None else body.budget_seconds * 1000,
-        js_imports=None
-        if body.js_graph is None
-        else JsImports(
-            nearest={
-                test: JsImport(n.module, n.via, n.depth)
-                for test, n in body.js_graph.nearest.items()
-            },
-            dynamic=dict(body.js_graph.dynamic),
-            notes=tuple(body.js_graph.notes),
-        ),
+        js_imports=js_imports(body),
         java=_java(body),
         import_depths=body.import_depths,
         fixture_refs=body.fixture_refs,
@@ -125,6 +111,30 @@ def post_select(
         shadow_reason=None if body.shadow is None else reason,
         recorded=None if body.ci is None else reason is None,
         record_reason=None if body.ci is None else reason,
+    )
+
+
+def selector_config(body: SelectionInput) -> SelectorConfig:
+    """The selector's config from a request (``/select``, ``/links``)."""
+    return SelectorConfig(
+        always_run=tuple(body.always_run),
+        depends=tuple(DependsRule(rule.tests, tuple(rule.on)) for rule in body.depends),
+        go_module=body.go_module,
+        go_modules=tuple(sorted((body.go_modules or {}).items())),
+        generated=tuple(body.generated),
+    )
+
+
+def js_imports(body: SelectionInput) -> JsImports | None:
+    """The JS/TS graph's details from a request, if sent."""
+    if body.js_graph is None:
+        return None
+    return JsImports(
+        nearest={
+            test: JsImport(n.module, n.via, n.depth) for test, n in body.js_graph.nearest.items()
+        },
+        dynamic=dict(body.js_graph.dynamic),
+        notes=tuple(body.js_graph.notes),
     )
 
 

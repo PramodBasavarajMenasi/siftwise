@@ -122,7 +122,8 @@ path), and configure siftwise as in the client's section with `SIFTWISE_REPO=mcp
 | `Why does siftwise select tests.test_cart::test_total?` | `explain`: known, selected, linked through `shop/cart.py`, `file_path` `tests/test_cart.py` |
 | Stop the API (`docker compose stop api`), then the first prompt again | `select_tests`: mode `full`, "could not reach siftwise ...": run the full suite |
 
-Also check: the client lists three tools (`select_tests`, `triage_failure`, `explain`) and
+Also check: the client lists four tools (`select_tests`, `triage_failure`, `explain`,
+`untested_changes`) and
 shows the server as `siftwise 0.2.0` or later. Record what you see per client, including the client version,
 the OS and any server output (each section says where to find it).
 

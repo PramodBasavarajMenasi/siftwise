@@ -596,6 +596,160 @@ def select_tests(
     return _with_estimate(selection, history, tests)
 
 
+# --- which tests link to each changed file (MCP untested_changes, POST /links) ---------------
+
+
+@dataclass
+class _LinkSink:
+    """What ``_select`` saw per changed file, when asked (``file_links``; never
+    ``select_tests``): the tests each file's signals selected, and the files none did."""
+
+    tests: dict[str, set[str]] = field(default_factory=dict)
+    unmapped: tuple[str, ...] | None = None
+
+
+class LinkStatus(StrEnum):
+    LINKED = "linked"  # tests are linked to it: selection runs them for this file
+    NO_LINKED_TEST = "no_linked_test"  # a source file no test is linked to (full-suite fallback)
+    TEST_FILE = "test_file"  # a test file: it runs itself
+    NOT_CHECKED = "not_checked"  # not a source file selection links tests to (see reason_code)
+
+
+class NotChecked(StrEnum):
+    """Why a changed file isn't checked for linked tests."""
+
+    CHANGED_FILES_UNKNOWN = "changed_files_unknown"
+    NO_HISTORY = "no_history"
+    IGNORABLE = "ignorable"  # docs, licenses, lint-only configs
+    GENERATED = "generated"  # reports and caches, or .siftwise.toml `generated`
+    BUILD_FILE = "build_file"  # a root build/CI file: selection runs the full suite
+    NESTED_BUILD_FILE = "nested_build_file"  # a nested manifest: runs the tests under it
+    FIXTURE = "fixture"  # .siftwise.toml `fixtures`: the test files referencing it run
+    JAVA_BUILD = "java_build"  # what the Java build can't analyse (Kotlin, resources, ...)
+    LANGUAGE_NOT_SUPPORTED = "language_not_supported"
+    DELETED = "deleted"
+
+
+# The languages selection links tests to by imports and paths (others only by rules).
+_LINKED_LANGUAGES = frozenset({".py", ".go", ".java"}) | JS_EXTENSIONS
+
+
+def _is_test_path(path: str) -> bool:
+    """A test file by the selector's own rules (pytest, Go, Jest, Java test roots)."""
+    located = java_class_of(path)
+    return (
+        is_python_test_file(path)
+        or path.endswith("_test.go")
+        or is_jest_test_file(path)
+        or (located is not None and located[2])
+    )
+
+
+@dataclass(frozen=True)
+class FileLink:
+    path: str
+    status: LinkStatus
+    tests: tuple[str, ...] = ()  # the linked tests (LINKED)
+    reason_code: NotChecked | None = None  # NOT_CHECKED only
+    reason: str = ""
+
+
+def file_links(
+    history: RepoHistory | None,
+    changed_files: Iterable[str],
+    changed_files_known: bool,
+    config: SelectorConfig | None = None,
+    *,
+    affected_packages: Mapping[str, Sequence[str]] | None = None,
+    affected_files: Mapping[str, Sequence[str]] | None = None,
+    deleted_files: Iterable[str] = (),
+    js_imports: JsImports | None = None,
+    java: JavaBuildInfo | None = None,
+    fixture_refs: Mapping[str, Sequence[str]] | None = None,
+) -> list[FileLink]:
+    """Per changed file, the tests selection links to it: the same ``_select`` as
+    ``select_tests`` (path mapping, import graphs, Go dependents, ``[[depends]]``, fixture
+    references), run on the files it links tests to, with a sink that records them. A source
+    file with none is exactly one selection would call unmapped (its full-suite fallback).
+    History-only signals (co-change, recently failed, always_run) link tests to no file.
+    "Linked" is imports and history, not line coverage."""
+    config = config or SelectorConfig()
+    paths = sorted({p for p in (normalize_path(f) for f in changed_files) if p})
+    deleted = frozenset(p for p in (normalize_path(f) for f in deleted_files) if p)
+
+    def not_checked(path: str, code: NotChecked, reason: str) -> FileLink:
+        return FileLink(path, LinkStatus.NOT_CHECKED, reason_code=code, reason=reason)
+
+    tests = _index(history.tests.values() if history else ())
+    if java is not None:
+        tests = _with_java(tests, java)
+    if not changed_files_known:
+        why = "changed files are unknown for this change"
+        return [not_checked(p, NotChecked.CHANGED_FILES_UNKNOWN, why) for p in paths]
+    if history is None or not tests:
+        why = "no test history for this repo"
+        return [not_checked(p, NotChecked.NO_HISTORY, why) for p in paths]
+
+    fixtures = {normalize_path(f) for f in (fixture_refs or {})}
+    out: dict[str, FileLink] = {}
+    candidates = []
+    for path in paths:
+        ext = posixpath.splitext(path)[1]
+        if is_generated(path, config.generated):
+            out[path] = not_checked(path, NotChecked.GENERATED, "a generated file: selection "
+                                    "ignores it")  # fmt: skip
+        elif is_ignorable(path, config.generated):
+            out[path] = not_checked(path, NotChecked.IGNORABLE, "not code (docs, licenses, "
+                                    "lint-only configs): selection ignores it")  # fmt: skip
+        elif path in fixtures:
+            out[path] = not_checked(path, NotChecked.FIXTURE, "test data (.siftwise.toml "
+                                    "fixtures): the test files referencing it run")  # fmt: skip
+        elif build_file_scope(path) is not None or (java and path in java.build_scopes):
+            out[path] = not_checked(path, NotChecked.NESTED_BUILD_FILE, "a nested build file: "
+                                    "the tests under its directory run")  # fmt: skip
+        elif is_build_file(path):
+            out[path] = not_checked(path, NotChecked.BUILD_FILE, "a build/config file: "
+                                    "selection runs the full suite")  # fmt: skip
+        elif ext in _OTHER_JVM_SOURCES:
+            # Kotlin (and Groovy, Scala) aren't analysed yet: any change to one runs the full
+            # suite. Issue #102 moves .kt files to the normal path (imports, test names).
+            out[path] = not_checked(
+                path,
+                NotChecked.JAVA_BUILD,
+                f"Kotlin, Groovy or Scala source (not analysed): {path}",
+            )
+        elif java is not None and (problem := _java_problem([path], java)) is not None:
+            out[path] = not_checked(path, NotChecked.JAVA_BUILD, problem[1])
+        else:
+            candidates.append(path)
+
+    sink = _LinkSink()
+    if candidates:
+        _select(
+            history, candidates, True, config, affected_packages, affected_files,
+            deleted_files, None, tests, Order.DEFAULT, None, js_imports or JsImports(), java,
+            None, fixture_refs, sink,
+        )  # fmt: skip
+    unmapped = set(sink.unmapped or ())
+    for path in candidates:
+        linked = sink.tests.get(path)
+        ext = posixpath.splitext(path)[1]
+        if _is_test_path(path) and path not in unmapped and path not in deleted:
+            out[path] = FileLink(path, LinkStatus.TEST_FILE, tests=tuple(sorted(linked or ())))
+        elif linked:
+            out[path] = FileLink(path, LinkStatus.LINKED, tests=tuple(sorted(linked)))
+        elif path in deleted:  # nothing to add a test for
+            out[path] = not_checked(path, NotChecked.DELETED, "deleted")
+        elif path in unmapped and ext not in _LINKED_LANGUAGES:
+            out[path] = not_checked(path, NotChecked.LANGUAGE_NOT_SUPPORTED, "language not "
+                                    "supported: selection links no tests to it")  # fmt: skip
+        elif path in unmapped:
+            out[path] = FileLink(path, LinkStatus.NO_LINKED_TEST)
+        else:  # selected nothing and still not unmapped: a test file, which runs itself
+            out[path] = FileLink(path, LinkStatus.TEST_FILE)
+    return [out[p] for p in paths]
+
+
 def _select(
     history: RepoHistory | None,
     changed_files: Iterable[str],
@@ -612,6 +766,7 @@ def _select(
     java: JavaBuildInfo | None = None,
     import_depths: Mapping[str, int] | None = None,
     fixture_refs: Mapping[str, Sequence[str]] | None = None,
+    sink: _LinkSink | None = None,
 ) -> Selection:
     js_imports = js_imports or JsImports()
     depths = {path: depth for key, depth in (import_depths or {}).items()
@@ -686,11 +841,17 @@ def _select(
     selected: dict[str, list[str]] = {}
     links: dict[str, Link] = {}  # each test's strongest link, for the risk score
 
+    # file_links' sink (never select_tests'): the changed files the next add() calls link to.
+    credit: Sequence[str] = ()
+
     def add(test_id: str, reason: str, link: Link) -> None:
         reasons = selected.setdefault(test_id, [])
         if reason not in reasons:
             reasons.append(reason)
         links[test_id] = max(links.get(test_id, Link.HISTORY), link)
+        if sink is not None:
+            for path in credit:
+                sink.tests.setdefault(path, set()).add(test_id)
 
     # Python test files, by path: the files pytest can be pointed at whole. (Doctests and
     # collection errors point at their module, which may be a source file.)
@@ -733,11 +894,13 @@ def _select(
 
     for path, scope in sorted(java_scoped.items()):
         assert java is not None
+        credit = (path,)
         for scoped in scope:
             run_module(scoped, java_build_reason(path, scoped, java))
     for path in relevant:
         if path in java_scoped:
             continue
+        credit = (path,)
         if java is not None and (module := java.module_of(path)) is not None:
             if path.startswith(module.prefix("src/test/resources")):
                 # Test resources: every test class of the module may read them.
@@ -796,6 +959,7 @@ def _select(
             continue
         first = sorted(modules)[0] if modules else "?"
         more = f" (+{len(modules) - 1} more)" if len(modules) > 1 else ""
+        credit = modules
         for test in known:
             add(test.test_id, f"imports changed module {first}{more}", import_link(file))
         py_whole_files.add(file)
@@ -809,6 +973,7 @@ def _select(
         if not known_js:
             continue
         reason = js_import_reason(modules, js_imports.nearest.get(file), js_imports.notes)
+        credit = modules
         for test in known_js:
             add(test.test_id, reason, import_link(file))
         covered_by_imports.update(modules)
@@ -820,11 +985,13 @@ def _select(
                 continue
             known_java = java_classes.get(located[1], [])
             reason = java_use_reason(modules, java.nearest.get(file), java.notes)
+            credit = modules
             for test in known_java:
                 add(test.test_id, reason, import_link(file))
             if not known_java and located[1] in java.test_classes and _is_test_class(located[1]):
                 java_new.add((java.test_classes[located[1]], located[1]))
             covered_by_imports.update(modules)
+        credit = ()  # dynamic imports select tests but link them to no changed file
         for file, source in sorted(java.dynamic.items()):
             located = java_class_of(file)
             for test in java_classes.get(located[1], []) if located else []:
@@ -832,6 +999,7 @@ def _select(
                     "declare (generated?): it may use changed code", Link.INDIRECT)  # fmt: skip
     # Tests that reach an import the graph can't resolve may load any changed file: they run,
     # but cover nothing (a change no static import reaches still falls back as before).
+    credit = ()
     for file, source in sorted(js_imports.dynamic.items()):
         for test in jest_files.tests_for(file):
             add(test.test_id, f"reaches {source}, whose dynamic import siftwise can't resolve: "
@@ -840,6 +1008,7 @@ def _select(
     # Nested manifests/lockfiles: every known test under their directory runs (Go packages
     # whole). They never force the full suite, even when no known tests live there.
     for path, directory in sorted(scoped_build.items()):
+        credit = (path,)
         for test in tests.values():
             if _test_under_dir(test, directory):
                 reason = f"build file {path} changed (tests under {directory}/)"
@@ -854,6 +1023,10 @@ def _select(
         if imported:
             first = sorted(imported)[0]
             more = f" (+{len(imported) - 1} more)" if len(imported) > 1 else ""
+            if sink is not None:  # the changed .go files of those packages (the rule below)
+                credit = [p for p in relevant if p.endswith(".go") and any(
+                    _go_package_matches(pkg, posixpath.dirname(p), config.go_module,
+                                        config.go_modules) for pkg in imported)]  # fmt: skip
             # Always indirect, whatever its depth: Go's graph is package-level, and a
             # package importing the changed package itself is the common case (83% of the
             # import-linked packages in the substrate replays), not a sign the test is
@@ -872,6 +1045,7 @@ def _select(
         if not matched:
             continue
         covered_by_rules.update(triggers)
+        credit = triggers
         for test in matched:
             reason = f"declared dependency: {rule.tests} on {_list(triggers, 1)}"
             add(test.test_id, reason, Link.INDIRECT)
@@ -881,6 +1055,7 @@ def _select(
     # Changed fixture files: the test files that reference their fixture run (whole).
     fixture_hits: dict[str, list[str]] = {}  # fixture file -> referencing files that ran
     for path, ref_files in sorted(fixtures.items()):
+        credit = (path,)
         for ref in ref_files:
             if ref not in deleted and _run_referencing(
                 ref, f"fixture {path}, referenced by {ref}", tests, py_test_files, jest_files,
@@ -916,6 +1091,9 @@ def _select(
             )
         )
     ]
+    credit = ()  # what follows (history, always_run) links tests to no changed file
+    if sink is not None:
+        sink.unmapped = tuple(unmapped)
     if unmapped:
         return full(f"changed file maps to no known tests: {_list(unmapped)}",
                     FullReason.UNMAPPED_FILE, unmapped)  # fmt: skip

@@ -73,6 +73,7 @@ class Call:
 
 CALLS = {
     "select": Call("POST", "/select", False, json={"repo": "{repo}"}),
+    "links": Call("POST", "/links", False, json={"repo": "{repo}"}),  # untested_changes
     "triage": Call(
         "POST",
         "/triage",

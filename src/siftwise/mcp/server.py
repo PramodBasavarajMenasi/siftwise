@@ -52,6 +52,7 @@ from pydantic import Field
 
 from siftwise import __version__
 from siftwise.cli import main as cli
+from siftwise.cli.nearest import nearest_test
 from siftwise.cli.repoconfig import RepoConfigError
 from siftwise.core import selector
 from siftwise.core.junit import JUnitParseError
@@ -85,7 +86,8 @@ siftwise knows this repository's test history. Before running tests after a chan
 select_tests and run the command it returns instead of the full suite. When tests fail, call
 triage_failure before trying to fix anything: fix new_regression failures; flaky ones need a
 re-run, not a fix; pre_existing ones were already failing on main. Use explain when a
-selection or a verdict surprises you."""
+selection or a verdict surprises you. Before finishing a change, call untested_changes to see
+which changed source files no test is linked to, and the test file to extend for each."""
 
 SELECT_DESCRIPTION = """\
 Call this before running tests after changing code. It returns the command that runs only the
@@ -101,6 +103,15 @@ your change caused it (new_regression: fix these), it was already failing on mai
 tell (unknown). Pass the JUnit XML report paths from the test run, or the failing test IDs
 (pytest node IDs like tests/test_x.py::test_y work as classname::name, e.g.
 tests.test_x::test_y) with optional failure messages."""
+
+UNTESTED_DESCRIPTION = """\
+Call this before finishing a change: it lists the changed source files (committed and
+uncommitted) that no test is linked to, each with the nearest existing test file to extend
+(or none), and how many tests are linked to each other changed file. siftwise links tests to
+files by imports, file paths, declared rules and test history, the same links it selects tests
+by; this is not line coverage, so a linked test may still not exercise your new code. Files it
+doesn't check (docs, config and build files, test data, unsupported languages) are listed
+apart, with the reason."""
 
 EXPLAIN_DESCRIPTION = """\
 Call this to understand one test: its recent results, whether it is flaky or broken on main,
@@ -273,6 +284,17 @@ def build_server(env: Mapping[str, str] | None = None) -> MCPServer:
             c,
             lambda c: _triage(c, where, junit_paths, failures, base, variant, include_uncommitted),
         )
+
+    @server.tool(description=UNTESTED_DESCRIPTION)
+    async def untested_changes(
+        ctx: Context,
+        base: Base = None,
+        include_uncommitted: Uncommitted = True,
+        repo_path: RepoPath = None,
+    ) -> dict[str, Any]:
+        c = config()
+        where = await _where(c, repo_path, ctx)
+        return await _run(c, lambda c: _untested(c, where, base, include_uncommitted))
 
     @server.tool(description=EXPLAIN_DESCRIPTION)
     async def explain(
@@ -469,6 +491,86 @@ def _triage(
     if len(results) > MAX_TRIAGE_RESULTS:
         out["more_results"] = len(results) - MAX_TRIAGE_RESULTS
     return out
+
+
+# How the counts read: never "covered" or "untested code" (links, not line coverage).
+LINKS_NOTE = (
+    "Linked = selection links the test to the file by imports, file paths, declared rules or "
+    "test history; not line coverage."
+)
+MAX_LISTED = 50  # files per group; the rest are counted
+
+
+def _untested(config: Config, where: Where, base: str | None, uncommitted: bool) -> dict[str, Any]:
+    try:
+        checkout = _checkout(config, where)
+        root = checkout.root
+        base = base or config.base or cli.default_base(root)
+        repo = _repo(config, root)
+        try:
+            change = cli.local_change(base, "HEAD", working_tree=uncommitted, cwd=root)
+        except RepoConfigError as exc:
+            raise Unavailable(f"invalid .siftwise.toml ({exc})") from exc
+        body = {"repo": repo, **change.fields, "always_run": list(change.config.always_run)}
+        body.update(change.select_only())
+        result = _post_links(config, body)
+    except Unavailable as exc:
+        return {"available": False, "message": f"siftwise unavailable ({exc})"}
+
+    files = cli.checkout_files(root)
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for f in result["files"]:
+        status = f["status"]
+        if status == "no_linked_test":
+            item: dict[str, Any] = {"file": f["path"],
+                                    "nearest_test": nearest_test(f["path"], files)}  # fmt: skip
+        elif status in ("linked", "test_file"):
+            item = {"file": f["path"], "linked_tests": f["linked_tests"]}
+        else:
+            item = {"file": f["path"], "reason_code": f["reason_code"],
+                    "reason": _short(f["reason"])}  # fmt: skip
+        groups.setdefault(status, []).append(item)
+    counts = result["counts"]
+    summary = (
+        f"{counts.get('no_linked_test', 0)} changed source file(s) with no linked test, "
+        f"{counts.get('linked', 0)} with linked tests, {counts.get('test_file', 0)} test "
+        f"file(s), {counts.get('not_checked', 0)} not checked"
+    )
+    out: dict[str, Any] = {
+        "available": True,
+        "summary": summary,
+        "note": LINKS_NOTE,
+        **checkout.noted(),
+    }
+    for status, key in (("no_linked_test", "no_linked_test"), ("linked", "linked"),
+                        ("test_file", "test_files"), ("not_checked", "not_checked")):  # fmt: skip
+        items = groups.get(status, [])
+        out[key] = items[:MAX_LISTED]
+        if len(items) > MAX_LISTED:
+            out[f"more_{key}"] = len(items) - MAX_LISTED
+    out["next_step"] = (
+        "Add or extend tests for the files with no linked test (nearest_test is the file to "
+        "extend; none means start a new test file), then call select_tests."
+        if counts.get("no_linked_test")
+        else "Every changed source file has linked tests; run select_tests' command."
+    )
+    return out
+
+
+def _post_links(config: Config, body: dict[str, Any]) -> dict[str, Any]:
+    """POST /links. A 404 that isn't the repo's: a server from before untested_changes."""
+    if not config.token:
+        raise Unavailable("SIFTWISE_API_TOKEN is not set")
+    try:
+        return cli.post_json(config.server, config.token, "/links", body, timeout=TIMEOUT)
+    except cli.SiftwiseError as exc:
+        if exc.status == httpx.codes.NOT_FOUND:
+            if "unknown repo" in str(exc.detail or ""):
+                raise Unavailable("no test history for this repo yet") from exc
+            raise Unavailable(
+                "this siftwise server is too old for untested_changes (no POST /links): upgrade it"
+            ) from exc
+        raise Unavailable(str(exc)) from exc
 
 
 def _explain(
