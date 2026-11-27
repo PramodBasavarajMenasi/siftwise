@@ -58,7 +58,10 @@ def post_select(
         go_modules=tuple(sorted((body.go_modules or {}).items())),
         generated=tuple(body.generated),
     )
-    history = load_history(session, body.repo, config)
+    # A CI leg's variant (ci and shadow name the same run: _same_run) sizes the estimate and
+    # the budget with that leg's tests; without one, every variant together, as before.
+    run = body.shadow or body.ci
+    history = load_history(session, body.repo, config, run.variant if run is not None else None)
     if history is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown repo {body.repo!r}")
     selection = select_tests(
@@ -98,7 +101,9 @@ def post_select(
         go_packages_run_whole=list(selection.go_packages_run_whole),
         python_files_run_whole=list(selection.python_files_run_whole),
         estimated_ms=EstimatedMs(
-            total=selection.estimated_ms_total, would_run=selection.estimated_ms_would_run
+            total=selection.estimated_ms_total,
+            would_run=selection.estimated_ms_would_run,
+            variant=selection.estimated_variant,
         ),
         tests=[
             SelectedTestOut(

@@ -66,7 +66,8 @@ sequenceDiagram
    Re-uploads of the same `(repo, ci_run_id, run_attempt, variant, rerun)` are no-ops.
 4. **Rollup** (`POST /repos/{repo}/rollup`). Per-test history (`test_stats`: runs, failures,
    flaky score, broken on main, average duration, last seen) is recomputed over the stats
-   window, once per CI run after every leg.
+   window, once per CI run after every leg, and per (test, variant) runs and durations
+   (`test_variant_stats`) from the same rows.
 5. **Triage** (`POST /repos/{repo}/triage`). Every failing test of the CI run attempt, per
    variant, gets a verdict from history before the run. The Action writes them into the PR
    comment and applies `fail-on`.
@@ -110,6 +111,7 @@ from local JUnit files, and `POST /explain` for one test.
 | `tests` | a test's identity, once per repo | `test_id` = `classname::name`; `file_path` with the time it was reported |
 | `test_results` | raw results, append-only | `(run_id, test_key, attempt)`; status, duration, message (4 KB max); partial indexes on failures, by run and by test |
 | `test_stats` | per-test rollup, recomputed, never incremented | only tests seen in the stats window |
+| `test_variant_stats` | the same rollup per (test, named variant): `runs`, `avg_duration_ms`, `last_seen_at` | only (test, variant) pairs seen in the stats window; none for runs without a variant; sizes a CI leg's `/select` estimate and budget |
 | `ci_selections` | what /select returned in CI, per attempt and variant (NULL = every leg); `shadow` for a shadow run's | the scope `WouldRun` reads; `selected_keys` in risk order when `ranked`; `reason_code` + `reason_items`; budget, order, CI context, `top_risk`; 4 bytes per selected test |
 | `run_outcomes`, `run_failures` | each triaged leg, and each of its failing tests | verdict counts, `failures_selected`, `first_failure_rank`; per failure the verdict, `would_run` (NULL without a selection), `rank`; shadow runs: caught or missed, miss cause, suggested rule |
 | `attempt_outcomes` | one per triaged CI run attempt | `fail_on`: the verdicts the client gates on |
@@ -449,7 +451,11 @@ left out").
   most likely skip again). Any other test with no known duration counts as the 90th
   percentile of the repo's known per-test means, a unit with no known test (a new test file)
   as one such test. That errs towards running less than fits, not more. Without any durations the budget
-  isn't applied (`budget.applied: false`, with a note).
+  isn't applied (`budget.applied: false`, with a note). For a CI leg whose variant has stats
+  (`ci.variant` or `shadow.variant`), a test seen on that variant costs its
+  `test_variant_stats` numbers by the same rules, and one not seen on it costs its
+  all-variant mean; the full-suite estimate (`estimated_ms`) then counts only the known tests
+  seen on that variant. Without a variant, or one with no rows, nothing changes.
 - **Full-suite fallbacks.** When siftwise would run the full suite (an unknown diff, a build
   file, an unmapped file), a budget packs the full suite's known tests the same way, every
   test ranked as history-only, and the result is a *budget-limited full suite*: mode

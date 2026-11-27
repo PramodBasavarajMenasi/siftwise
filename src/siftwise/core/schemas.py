@@ -430,8 +430,16 @@ class SelectRequest(ChangeRequest):
 
 
 class EstimatedMs(BaseModel):
-    total: float = Field(description="Average durations of all known tests (Go: top-level)")
+    total: float = Field(
+        description="Mean durations of the known tests (Go: top-level); with ``variant``, of "
+        "the known tests seen on that variant within the stats window, at its durations"
+    )
     would_run: float = Field(description="Of those, the tests the commands would run")
+    variant: str | None = Field(
+        default=None,
+        description="The CI leg's variant (from ci or shadow) the numbers are for; null: "
+        "every variant together (no variant sent, or none with stats yet)",
+    )
 
 
 class BudgetOut(BaseModel):

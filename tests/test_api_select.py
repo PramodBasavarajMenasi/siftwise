@@ -263,7 +263,7 @@ def test_estimated_time_and_junit_dir(client: TestClient) -> None:
     ).json()
 
     # 1 ms each; the Go subtest's time is inside TestAdd's. test_db::test_query doesn't run.
-    assert body["estimated_ms"] == {"total": 4.0, "would_run": 3.0}
+    assert body["estimated_ms"] == {"total": 4.0, "would_run": 3.0, "variant": None}
     assert body["commands"][0].startswith("pytest --junitxml=reports/siftwise-1.xml ")
 
 

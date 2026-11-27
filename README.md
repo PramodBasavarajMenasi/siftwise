@@ -131,6 +131,11 @@ argument, and `/select` `budget_seconds`.
   ever skipped counts as 0, any other without a duration as the 90th percentile of the known
   ones). One that doesn't fit is skipped and the next is tried. The riskiest one always runs,
   even if it alone is over the budget.
+- **Per leg:** in CI (the select step's `variant` input; GitLab `SIFTWISE_VARIANT`) a test's
+  cost is its mean on that leg's variant; a test never seen on that variant within the stats
+  window costs its mean over all variants (the conservative choice: a budget errs towards
+  running less). The CLI and MCP send no variant, so their budgets use every variant's means,
+  as do legs without a `variant` and variants the server has no stats for yet.
 - **A target, not a cap:** the estimates are mean durations, so a run can take longer than the
   budget. On the eval replays, substrate runs went over in up to 31 of 72 runs, by up to 1.4×
   at 25% and 50% budgets, and by up to 3.9× (rdflib) at 10%, when the riskiest unit alone was
@@ -459,7 +464,21 @@ with one module (`core/ci_stats.py`), so the three show the same values for the 
   returns (each known test's mean duration, summed): matrix legs run different tests
   (platform-only tests, skips), so charging every leg every known test overstated the saving.
   On rdflib that estimate was 413 s for a leg that measured 231 s, so a selective run of 99%
-  of the tests looked like it saved 45%. Summed over runs, and the median per run, with how
+  of the tests looked like it saved 45%. `/select` now sizes a CI leg by its own variant
+  (see the next item), which is much closer, but the baseline stays: it is measured.
+- **`/select`'s estimate for a CI leg (`estimated_ms`):** when the request names the leg's
+  variant (`ci.variant` or `shadow.variant`: the Action's and GitLab's select step send the
+  `variant` input, `SIFTWISE_VARIANT`), the estimate counts only the known tests seen on that
+  variant within the stats window (90 days), at that variant's mean durations;
+  `estimated_ms.variant` says which. A test seen only on other legs isn't in it. Without a
+  variant, or for one the server has no stats for yet, it is every known test at its mean
+  over all variants, as before. `siftwise select` and MCP send no variant: their estimates
+  stay the all-variant ones. Checked on rdflib without peeking (stats from runs before
+  2026-10-02 17:55 UTC, then the 55 full-suite legs of the 5 CI runs after it, 18 variants):
+  estimate ÷ measured went from a median of 2.23 (range 0.96-5.99, 6 legs within 20%) to 1.15
+  (0.89-5.02, 32 within 20%). What remains is durations drifting (the same tests ran faster
+  than their 90-day mean: 3.14 on macOS and Windows at 1.6-1.7×) and one leg whose job
+  changed (3.11-ubuntu-latest: 892 tests from earlier runs in the window no longer ran). Summed over runs, and the median per run, with how
   many runs. These are sums of test durations, not wall-clock CI time (tests run in parallel,
   and setup isn't counted). Legs without a baseline yet or without a measured upload are left
   out (a measured 0 means the upload reported no durations: no measured time), and the page,

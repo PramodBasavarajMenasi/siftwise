@@ -104,7 +104,8 @@ def test_0006_converts_results_in_place_and_back(scratch_engine: tuple[Engine, s
     ]
     assert primary_key == "PRIMARY KEY (run_id, test_key, attempt)"
 
-    # The converted data rolls up.
+    # The converted data rolls up (with today's rollup, so at today's schema).
+    command.upgrade(config, "head")
     with engine.begin() as connection:
         with Session(bind=connection) as session:
             assert recompute_repo_stats(session, 1, 0) == 2
@@ -424,3 +425,42 @@ def test_0018_adds_the_outcome_source_and_drops_it_again(
     command.upgrade(config, "head")
     with engine.connect() as connection:  # back up: every row reads as a live one again
         assert connection.execute(source).all() == [("10", "ci"), ("9", "ci")]
+
+
+def test_0019_adds_test_variant_stats_and_drops_it_again(
+    scratch_engine: tuple[Engine, str],
+) -> None:
+    engine, url = scratch_engine
+    config = alembic_config(url)
+    command.upgrade(config, "0018")
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO repos (id, name) VALUES (1, 'acme/shop');"
+            "INSERT INTO tests (id, repo_id, test_id) VALUES (7, 1, 't::a')"
+        ))  # fmt: skip
+
+    command.upgrade(config, "0019")
+
+    rows = text("SELECT test_key, variant, runs, avg_duration_ms FROM test_variant_stats")
+    with engine.begin() as connection:
+        assert connection.execute(rows).all() == []  # empty: the next rollup fills it
+        connection.execute(text(
+            "INSERT INTO test_variant_stats (repo_id, test_key, variant, runs, avg_duration_ms, "
+            "last_seen_at) VALUES (1, 7, 'linux', 3, 12.5, now())"))  # fmt: skip
+        assert connection.execute(rows).all() == [(7, "linux", 3, 12.5)]
+    with pytest.raises(IntegrityError), engine.begin() as connection:  # one row per variant
+        connection.execute(text(
+            "INSERT INTO test_variant_stats (repo_id, test_key, variant, runs, last_seen_at) "
+            "VALUES (1, 7, 'linux', 1, now())"))  # fmt: skip
+    with engine.begin() as connection:  # rows go with their test
+        connection.execute(text("DELETE FROM tests WHERE id = 7"))
+        assert connection.execute(rows).all() == []
+
+    command.downgrade(config, "0018")
+
+    table = text("SELECT to_regclass('test_variant_stats')")
+    with engine.connect() as connection:
+        assert connection.scalar(table) is None
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        assert connection.scalar(table) is not None

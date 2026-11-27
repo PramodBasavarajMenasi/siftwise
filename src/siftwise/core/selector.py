@@ -326,6 +326,23 @@ class FailedRun:
 
 
 @dataclass(frozen=True)
+class VariantTest:
+    """One test on one variant within the stats window (``test_variant_stats``)."""
+
+    runs: int  # non-skipped runs of that variant
+    avg_duration_ms: float | None
+
+
+@dataclass(frozen=True)
+class VariantHistory:
+    """The variant a CI leg's /select is for: the tests seen on it within the stats window,
+    with that variant's durations. Sizes the estimate and the budget's costs only."""
+
+    name: str
+    tests: Mapping[str, VariantTest]
+
+
+@dataclass(frozen=True)
 class RepoHistory:
     tests: Mapping[str, KnownTest]
     # test_id -> first sha of the current failing streak on main
@@ -336,6 +353,9 @@ class RepoHistory:
     failed_runs: Sequence[FailedRun] = ()
     # The repo's newest run: the risk score's recency is measured back from it, not from now.
     newest_run_at: datetime | None = None
+    # The CI leg's variant, when /select knows it and the variant has stats: the estimate and
+    # the budget then use its tests and durations. None: every variant together, as before.
+    variant: VariantHistory | None = None
 
 
 @dataclass(frozen=True)
@@ -376,9 +396,11 @@ class Selection:
     # shadow mode stores them, so a miss among their tests is a `fixture` miss.
     fixture_files: tuple[str, ...] = ()
     # Estimated test time from history: all known tests, and the ones the commands would run
-    # (see WouldRun). Go subtests are left out: their time is inside their parent's.
+    # (see WouldRun). Go subtests are left out: their time is inside their parent's. With a
+    # variant (estimated_variant), only the known tests seen on it, at its durations.
     estimated_ms_total: float = 0.0
     estimated_ms_would_run: float = 0.0
+    estimated_variant: str | None = None
     # How the commands list their tests (Order.RISK: highest risk first).
     order: Order = Order.DEFAULT
     # A time budget's effect; None when no budget was asked for.
@@ -1117,12 +1139,22 @@ class _Costs:
     definition) counts as 0: it will most likely be skipped again. Any other test with no known
     duration counts as ``unknown_ms``, the ``UNKNOWN_DURATION_PERCENTILE`` of the known
     (positive) durations; a unit with no known test (a new test file) counts as one such test.
+
+    With a variant (``history.variant``), a test seen on it costs that variant's numbers by the
+    same rules; a test not seen on it within the window costs its all-variant mean, as without
+    a variant: a budget errs towards running less, not more than fits.
     """
 
     def __init__(self, tests: Mapping[str, _Test], history: RepoHistory) -> None:
         self.ms: dict[str, float | None] = {}
+        variant = history.variant
         for test_id in tests:
             stats = history.tests[test_id]
+            on_variant = variant.tests.get(test_id) if variant is not None else None
+            if on_variant is not None:
+                skipped_only = on_variant.avg_duration_ms is None and on_variant.runs == 0
+                self.ms[test_id] = 0.0 if skipped_only else on_variant.avg_duration_ms
+                continue
             skipped_only = stats.avg_duration_ms is None and stats.runs == 0
             self.ms[test_id] = 0.0 if skipped_only else stats.avg_duration_ms
         timed = sorted(ms for test_id, ms in self.ms.items() if ms and not is_go_subtest(test_id))
@@ -1420,14 +1452,23 @@ def _with_estimate(
         return selection
     runs = WouldRun(selection, _indexed_py_file(index))
     total = would_run = 0.0
+    variant = history.variant
     for test in history.tests.values():
-        if not test.avg_duration_ms or is_go_subtest(test.test_id):
+        if variant is None:
+            ms = test.avg_duration_ms
+        else:  # the leg's own suite: known tests seen on its variant, at its durations
+            on_variant = variant.tests.get(test.test_id)
+            ms = on_variant.avg_duration_ms if on_variant is not None else None
+        if not ms or is_go_subtest(test.test_id):
             continue
-        total += test.avg_duration_ms
+        total += ms
         if runs(test.test_id):
-            would_run += test.avg_duration_ms
+            would_run += ms
     return dataclasses.replace(
-        selection, estimated_ms_total=total, estimated_ms_would_run=would_run
+        selection,
+        estimated_ms_total=total,
+        estimated_ms_would_run=would_run,
+        estimated_variant=variant.name if variant is not None else None,
     )
 
 
@@ -2489,7 +2530,10 @@ recent AS (
 
 
 def load_history(
-    session: Session, repo: str, config: SelectorConfig | None = None
+    session: Session,
+    repo: str,
+    config: SelectorConfig | None = None,
+    variant: str | None = None,
 ) -> RepoHistory | None:
     """The selector's view of ``repo``'s history, or None if the repo is unknown.
 
@@ -2498,6 +2542,11 @@ def load_history(
     rollup), and the failure queries go through the partial index on failed results. Known
     tests are therefore as fresh as the rollup (stale between a deferred batch ingest and
     ``POST /repos/{repo}/rollup``).
+
+    ``variant`` (a CI leg's): the known tests' rows of ``test_variant_stats`` for it become
+    ``history.variant`` (two more columns on the known-tests query). None, or a variant no
+    known test has a row for (unknown, or not rolled up since migration 0019):
+    ``history.variant`` is None and nothing else changes.
     """
     from sqlalchemy import text
 
@@ -2511,17 +2560,33 @@ def load_history(
 
     # Tests that appeared in one of the latest N CI runs: their last-seen run is in one of them
     # (core/history.py orders "last seen" by the same CI-run order as recent_ci_runs_sql).
+    # With a variant, its numbers come along on the same rows: its rows read once by
+    # (repo_id, variant) and hash-joined by test ID (rdflib: +25 ms; a second query sending
+    # every test ID again cost ~60 ms, probing per known test ~110 ms).
+    with_variant, variant_columns, variant_join = "", "", ""
+    if variant:
+        with_variant = (
+            ", on_variant AS MATERIALIZED (SELECT t.test_id, v.runs, v.avg_duration_ms "
+            "FROM test_variant_stats v JOIN tests t ON t.id = v.test_key "
+            "WHERE v.repo_id = :repo_id AND v.variant = :variant)"
+        )
+        variant_columns = (
+            ", ov.runs AS variant_runs, ov.avg_duration_ms AS variant_ms, "
+            "ov.test_id IS NOT NULL AS on_variant"
+        )
+        variant_join = "LEFT JOIN on_variant ov ON ov.test_id = ts.test_id"
     known = session.execute(
         text(
             f"""
-            WITH {_REPO_RUNS}, {recent_ci_runs_sql("repo_runs")}
+            WITH {_REPO_RUNS}, {recent_ci_runs_sql("repo_runs")}{with_variant}
             SELECT ts.test_id, ts.file_path, ts.avg_duration_ms, ts.runs, ts.failures,
-                   ts.last_failed_at, ts.flaky_score
+                   ts.last_failed_at, ts.flaky_score{variant_columns}
             FROM test_stats ts JOIN recent ON recent.id = ts.last_seen_run_id
+            {variant_join}
             WHERE ts.repo_id = :repo_id
             """
         ),
-        {**params, "n": config.known_test_runs},
+        {**params, "n": config.known_test_runs, **({"variant": variant} if variant else {})},
     ).all()
 
     broken = session.execute(
@@ -2573,6 +2638,14 @@ def load_history(
         params,
     ).scalar_one_or_none()
 
+    on_variant = None
+    if variant:
+        # By position (test_id, ..., variant_runs, variant_ms, on_variant): attribute access
+        # on 18K rows (rdflib) was a visible part of the variant's added time.
+        seen = {row[0]: VariantTest(row[7], row[8]) for row in known if row[9]}
+        if seen:  # no known test seen on it (unknown, or not rolled up since 0019): as before
+            on_variant = VariantHistory(variant, seen)
+
     return RepoHistory(
         tests={
             row.test_id: KnownTest(
@@ -2593,6 +2666,7 @@ def load_history(
             for run_id, sha, test_ids in failed
         ),
         newest_run_at=newest_run_at,
+        variant=on_variant,
     )
 
 
