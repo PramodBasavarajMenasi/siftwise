@@ -70,9 +70,11 @@ inputs:
     default: ""
   variant:
     description: >-
-      Matrix leg, the same value as actions/record's variant. Only matters in shadow runs:
-      each leg's selection is stored for its own variant (legs can differ, e.g. Go graphs per
-      OS). Empty: one selection for every leg of the run.
+      Matrix leg, the same value as actions/record's variant. Sizes the estimated test time
+      and a time budget with this leg's own tests and durations (once the server has stats
+      for that variant), and in shadow runs stores each leg's selection for its own variant
+      (legs can differ, e.g. Go graphs per OS). Never changes which tests are selected.
+      Empty: every variant's tests together, and one selection for every leg of the run.
     required: false
     default: ""
 outputs:

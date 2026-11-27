@@ -8,6 +8,22 @@ All notable changes to siftwise. The format follows
 
 ### Added
 
+- `/select` estimates a CI leg and packs its time budget with that leg's own variant
+  ([#104](https://github.com/PramodBasavarajMenasi/siftwise/issues/104)). With `ci.variant`
+  or `shadow.variant` (the Action's and GitLab's select step send the `variant` input), the
+  full-suite estimate (`estimated_ms.total`) counts only the known tests seen on that variant
+  within the stats window, at that variant's mean durations, and a budget prices each test at
+  its mean on that variant (a test never seen on it: its all-variant mean, the conservative
+  cost). `estimated_ms.variant` names the variant used. Selection is unchanged. Without a
+  variant, or with one that has no stats yet, every number is what it was. Per-variant numbers
+  come from a new table, `test_variant_stats` (migration 0019), filled by the rollup. On
+  rdflib, measured without peeking (stats from before a cutoff, the 55 full-suite legs after
+  it, 18 variants): estimate ÷ measured from a median of 2.23 (range 0.96-5.99) to 1.15
+  (0.89-5.02), legs within 20% from 6 to 32. `/select` with a variant, median of 11 against
+  the same request with a null variant: rdflib 764 to 818 ms, substrate 395 to 478 ms (full-suite
+  change, no budget); with a 60 s budget 1,618 to 1,748 ms and 751 to 808 ms. `siftwise select`
+  and MCP send no variant: their numbers are unchanged.
+
 - `siftwise token list --active` (only tokens not revoked) and `--json` (a JSON array with
   the table's fields: `id`, `name`, `repo` (`*` for every repo), `scope`, `created`,
   `last_used`, `revoked`, times in ISO 8601 UTC, `null` when empty; never the token or its
@@ -173,10 +189,19 @@ All notable changes to siftwise. The format follows
 
 ### Upgrading
 
-- **Migrations in this release: 0013 to 0018. Back up the database first.**
+- **Migrations in this release: 0013 to 0019. Back up the database first.**
   `siftwise server start` (or `siftwise server migrate`) applies them: 0013 `api_tokens`,
   0014 fixture files and the fixture miss cause, 0015 `runs.known_flaky_expired`, 0016
-  `ui_sessions`, 0017 the CI selection tables (below), 0018 `attempt_outcomes.source` (below).
+  `ui_sessions`, 0017 the CI selection tables (below), 0018 `attempt_outcomes.source` (below),
+  0019 `test_variant_stats` (below).
+- **Migration 0019** creates `test_variant_stats`, empty. **Run the repo rollup once per repo
+  after migrating** (`POST /repos/{repo}/rollup`; the Action's rollup step calls it after
+  every CI run, and in a single job each upload's own rollup fills its variant's rows for the
+  tests it ran): until then no variant has stats, and `/select` estimates every leg as before
+  (all variants together). Size after the rollup: rdflib 312,380 rows (27 variants), substrate
+  18,881 (4); 81 MB with indexes for both (256 bytes a row). Repos without variants get no
+  rows. Each rollup now also recomputes these rows from the same results: about 13% longer
+  (rdflib's repo rollup, median of 3: 77.8 s to 88.3 s; substrate 11.9 s to 13.3 s).
 - **Migration 0018** adds `attempt_outcomes.source` (`ci` for every existing row, `backfill`
   for the outcomes backfill's). A catalog change plus a check of that small table: 0.1 s on a copy of substrate's history (6.4M results, 798 outcomes, median of 3); `test_results` is not touched and no index is built, so uploads are never blocked; outcome writes wait for those 0.1 s (the table is locked while the column is added). Then, to count older runs' failures in the CI
   numbers, run `siftwise outcomes backfill --repo X` once per repo (`--dry-run` first).

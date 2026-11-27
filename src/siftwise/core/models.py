@@ -260,6 +260,30 @@ class TestStats(Base):
     file_path: Mapped[str | None] = mapped_column(Text)
 
 
+class TestVariantStats(Base):
+    """Per (test, named variant) numbers over the stats window, recomputed by the same rollup
+    as ``test_stats`` (core/history.py): /select sizes a CI leg's estimate and time budget
+    with its own variant's tests and durations. Runs without a variant get no rows."""
+
+    __tablename__ = "test_variant_stats"
+    __test__ = False
+    __table_args__ = (Index(None, "repo_id", "variant"),)
+
+    repo_id: Mapped[int] = mapped_column(
+        ForeignKey("repos.id", ondelete="CASCADE"), primary_key=True
+    )
+    test_key: Mapped[int] = mapped_column(
+        ForeignKey("tests.id", ondelete="CASCADE"), primary_key=True
+    )
+    variant: Mapped[str] = mapped_column(String(255), primary_key=True)
+    # Window runs of this variant where the test's outcome wasn't skipped.
+    runs: Mapped[int] = mapped_column(Integer)
+    # Mean over this variant's non-skipped attempts that report a duration.
+    avg_duration_ms: Mapped[float | None] = mapped_column(Float)
+    # The latest run of this variant the test appears in (any status): stale rows are dropped.
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 # --- shadow mode ----------------------------------------------------------------------------
 
 # Why a stored shadow selection was or wasn't compared (``shadow_selections.status``).

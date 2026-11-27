@@ -39,6 +39,13 @@ Definitions (all counts are within the window):
   which is how the selector finds known tests without reading raw results.
 * ``file_path``: the test's latest reported file path (``tests.file_path``).
 
+``test_variant_stats`` holds the same window per (test, named variant), from the same rows in
+the same statement: ``runs`` and ``avg_duration_ms`` as above but over that variant's runs
+only, and ``last_seen_at`` its latest run of that variant. Runs without a variant get no rows.
+A rollup batch replaces its tests' rows, so a (test, variant) not seen within the window has
+none; ``drop_stale_stats`` drops the rest. ``/select`` sizes a CI leg's estimate and time
+budget with its variant's rows (core/selector.py).
+
 Batch ingest (``POST /runs?defer_rollup=true``) skips the rollup; ``recompute_repo_stats``
 (``POST /repos/{repo}/rollup``) then recomputes every test in the window. Until it runs,
 ``test_stats`` is stale.
@@ -200,6 +207,25 @@ broken AS (
                      ORDER BY s.start_ord) AS variants
     FROM streaks s JOIN repo_runs ru ON ru.ord = s.start_ord
     GROUP BY s.test_key
+),
+variant_names AS (  -- named variants only: runs without one get no per-variant rows
+    SELECT DISTINCT variant_no, variant FROM repo_runs WHERE variant IS NOT NULL
+),
+variant_stats AS (  -- per (test, named variant), from the same rows: /select's per-leg numbers
+    INSERT INTO test_variant_stats (repo_id, test_key, variant, runs, avg_duration_ms,
+                                    last_seen_at)
+    SELECT :repo_id, pv.test_key, vn.variant, pv.runs, pv.avg_duration_ms, seen_run.run_at
+    FROM (
+        SELECT test_key, variant_no,
+               count(*) FILTER (WHERE outcome <> {skipped})::int AS runs,
+               (sum(duration_sum)::numeric / NULLIF(sum(duration_count), 0))::float8
+                   AS avg_duration_ms,
+               max(ord) AS last_seen_ord
+        FROM per_run GROUP BY test_key, variant_no
+    ) pv
+    JOIN variant_names vn ON vn.variant_no = pv.variant_no
+    JOIN repo_runs seen_run ON seen_run.ord = pv.last_seen_ord
+    RETURNING 1
 )
 INSERT INTO test_stats AS ts (
     repo_id, test_id, runs, failures, last_failed_at, flaky_score, avg_duration_ms,
@@ -234,12 +260,21 @@ _CODES = {
     "passed": str(PASSED_CODE),
     "skipped": str(SKIPPED_CODE),
 }
+_KEY_FILTER = " AND test_key = ANY(CAST(:keys AS integer[]))"
 # Batch rollup: every test key in [lo, hi].
 _RANGE_ROLLUP_SQL = text(_ROLLUP_SQL.format(key_filter="", **_CODES))
 # After one ingest: only the run's tests within [lo, hi].
-_KEYS_ROLLUP_SQL = text(
-    _ROLLUP_SQL.format(key_filter=" AND test_key = ANY(CAST(:keys AS integer[]))", **_CODES)
-)
+_KEYS_ROLLUP_SQL = text(_ROLLUP_SQL.format(key_filter=_KEY_FILTER, **_CODES))
+
+# Before a batch is recomputed: its per-variant rows go (the statement above inserts them
+# again), so a test no longer seen on a variant within the window loses that row. In its own
+# statement: a DELETE and an INSERT of the same keys can't share one.
+_CLEAR_VARIANTS_SQL = """
+DELETE FROM test_variant_stats
+WHERE repo_id = :repo_id AND test_key BETWEEN :lo AND :hi{key_filter}
+"""
+_RANGE_CLEAR_VARIANTS_SQL = text(_CLEAR_VARIANTS_SQL.format(key_filter=""))
+_KEYS_CLEAR_VARIANTS_SQL = text(_CLEAR_VARIANTS_SQL.format(key_filter=_KEY_FILTER))
 
 
 def _window_days(window_days: int) -> int:
@@ -294,6 +329,19 @@ _DROP_STALE_SQL = text(
 )
 
 
+# The same for per-variant rows: a (test, variant) not seen within the window. Rows of a
+# dropped test_stats row go too (a variant's last sight is never later than the test's).
+_DROP_STALE_VARIANTS_SQL = text(
+    """
+    DELETE FROM test_variant_stats
+    WHERE repo_id = :repo_id
+      AND last_seen_at < (
+          SELECT max(COALESCE(started_at, created_at)) - make_interval(days => :window_days)
+          FROM runs WHERE repo_id = :repo_id)
+    """
+)
+
+
 def drop_stale_stats(session: Session, repo_id: int, window_days: int) -> int:
     """Delete the stats of tests not seen within the window; returns how many.
 
@@ -302,9 +350,9 @@ def drop_stale_stats(session: Session, repo_id: int, window_days: int) -> int:
     a long-gone test "broken on main" forever. Raw results stay: a test that runs again gets
     its row back from the next rollup. Does not commit.
     """
-    result = session.execute(
-        _DROP_STALE_SQL, {"repo_id": repo_id, "window_days": _window_days(window_days)}
-    )
+    params = {"repo_id": repo_id, "window_days": _window_days(window_days)}
+    result = session.execute(_DROP_STALE_SQL, params)
+    session.execute(_DROP_STALE_VARIANTS_SQL, params)
     return int(getattr(result, "rowcount", 0) or 0)
 
 
@@ -320,16 +368,15 @@ def recompute_test_stats(session: Session, repo_id: int, run_id: int, window_day
         )
     )
     for batch in _batches(session, repo_id, days, keys):
-        session.execute(
-            _KEYS_ROLLUP_SQL,
-            {
-                "repo_id": repo_id,
-                "window_days": days,
-                "lo": batch[0],
-                "hi": batch[-1],
-                "keys": list(batch),
-            },
-        )
+        params = {
+            "repo_id": repo_id,
+            "window_days": days,
+            "lo": batch[0],
+            "hi": batch[-1],
+            "keys": list(batch),
+        }
+        session.execute(_KEYS_CLEAR_VARIANTS_SQL, params)
+        session.execute(_KEYS_ROLLUP_SQL, params)
     # Single-job repos never call the repo rollup, so this path drops stale rows too.
     drop_stale_stats(session, repo_id, window_days)
 
@@ -345,15 +392,9 @@ def recompute_repo_stats(session: Session, repo_id: int, window_days: int) -> in
     keys = list(session.scalars(select(Test.id).where(Test.repo_id == repo_id).order_by(Test.id)))
     updated = 0
     for batch in _batches(session, repo_id, days, keys):
-        result = session.execute(
-            _RANGE_ROLLUP_SQL,
-            {
-                "repo_id": repo_id,
-                "window_days": days,
-                "lo": batch[0],
-                "hi": batch[-1],
-            },
-        )
+        params = {"repo_id": repo_id, "window_days": days, "lo": batch[0], "hi": batch[-1]}
+        session.execute(_RANGE_CLEAR_VARIANTS_SQL, params)
+        result = session.execute(_RANGE_ROLLUP_SQL, params)
         updated += int(getattr(result, "rowcount", 0) or 0)
     drop_stale_stats(session, repo_id, window_days)
     return updated
