@@ -33,6 +33,7 @@ ROUTE_SCOPES: dict[tuple[str, str], TokenScope] = {
     # Storing a shadow selection needs WRITE (checked in the route); recording a CI selection
     # (``ci``) too, but a read token still gets its selection, not recorded.
     ("POST", "/select"): READ,
+    ("POST", "/links"): READ,
     ("POST", "/triage"): READ,
     ("POST", "/repos/{repo:path}/triage"): READ,
     ("POST", "/explain"): READ,

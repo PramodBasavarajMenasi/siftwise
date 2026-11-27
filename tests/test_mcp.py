@@ -132,10 +132,11 @@ def test_tools_tell_the_agent_when_to_use_them() -> None:
 
     tools = asyncio.run(go())
 
-    assert set(tools) == {"select_tests", "triage_failure", "explain"}
+    assert set(tools) == {"select_tests", "triage_failure", "explain", "untested_changes"}
     assert "before running tests" in tools["select_tests"]
     assert "when tests fail, before trying to fix them" in tools["triage_failure"]
     assert "surprises you" in tools["explain"]
+    assert "before finishing a change" in tools["untested_changes"]
 
 
 # --- select_tests -------------------------------------------------------------------------
@@ -836,7 +837,7 @@ def test_mcp_serves_over_stdio(tmp_path: Path) -> None:
 
     names, out = asyncio.run(go())
 
-    assert names == ["explain", "select_tests", "triage_failure"]
+    assert names == ["explain", "select_tests", "triage_failure", "untested_changes"]
     assert out["mode"] == "full"  # not a git checkout, nothing listening: fails open
 
 

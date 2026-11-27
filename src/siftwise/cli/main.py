@@ -1542,6 +1542,24 @@ def git_rev_parse(ref: str) -> str:
     return proc.stdout.decode().strip()
 
 
+def checkout_files(cwd: Path | None = None) -> list[str]:
+    """The checkout's files, repo-relative with ``/``: tracked plus untracked ones git doesn't
+    ignore (a new test file counts). Empty if git fails: callers then suggest nothing."""
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            cwd=cwd,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    return [p for p in proc.stdout.decode(errors="replace").split("\0") if p]
+
+
 def git_toplevel(cwd: Path | None = None) -> Path | None:
     """The checkout's root, or None outside a git repository (``cwd``: default the current
     directory)."""

@@ -11,7 +11,7 @@ how the evals measure, [eval methodology](docs/eval-methodology.md).
 | **CLI** (`siftwise`) | on a laptop or a CI runner, in the checkout; `siftwise token` on the server host | `select`, `record`, `triage`, `report`, `rollup` (`siftwise token` manages API tokens in the database): computes the git diff and the Go/Python import graphs, then calls the API | `pip install siftwise` (typer, httpx, defusedxml) |
 | **GitHub Action** (`actions/select`, `record`, `rollup`) | in GitHub Actions jobs | composite actions around `siftwise gha ...` (`cli/gha.py`): run metadata, the sticky PR comment, job summaries, re-runs, `fail-on` | installs the light CLI from the action's checkout |
 | **GitLab CI template** (`gitlab/siftwise.gitlab-ci.yml`) | in GitLab CI jobs | hidden jobs around `siftwise gitlab ...` (`cli/gitlab.py`): the same steps, with dotenv outputs, `.siftwise-ci/` reports and the sticky merge request note | `pip install siftwise==<the template's release>` |
-| **MCP server** (`siftwise mcp`) | started by a coding agent, over stdio | `select_tests`, `triage_failure`, `explain`: the same change computation as the CLI, including uncommitted work | `siftwise[mcp]` |
+| **MCP server** (`siftwise mcp`) | started by a coding agent, over stdio | `select_tests`, `triage_failure`, `explain`, `untested_changes`: the same change computation as the CLI, including uncommitted work | `siftwise[mcp]` |
 | **API server** (FastAPI) | one or more stateless workers | ingest, rollups, selection, triage, shadow comparison, recall | `siftwise[server]`, or the Docker image |
 | **Dashboard** (`/ui`, `api/dashboard/`) | in the API server, only with `SIFTWISE_DASHBOARD=1` | read-only HTML pages: recall by week, misses by cause, recent runs and each run's verdicts, flaky tests; a token login with a server-side session | part of `siftwise[server]` (Jinja2) |
 | **Postgres** | one database | every raw result and every derived table; the only state | Postgres 16 in the compose file |
@@ -99,7 +99,9 @@ commits, and the backfill skips an attempt that has an outcome once it holds it,
 outcome always wins.
 
 The MCP server and `siftwise triage` use the stateless variants: `POST /triage` with failures
-from local JUnit files, and `POST /explain` for one test.
+from local JUnit files, and `POST /explain` for one test. `untested_changes` calls
+`POST /links`: per changed file, the tests `_select` links to it (`selector.file_links`, the
+same code with a sink), no linked test, or why it isn't checked.
 
 ## Data model
 

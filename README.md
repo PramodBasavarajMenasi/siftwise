@@ -1183,7 +1183,7 @@ warns when it sees one. Like GitHub's `pull_request_target`, only do it for code
 
 ## Coding agents (MCP)
 
-`siftwise mcp` is an MCP server (stdio) that gives a coding agent three tools. It keeps no
+`siftwise mcp` is an MCP server (stdio) that gives a coding agent four tools. It keeps no
 state: each call computes the change in the agent's checkout, with the same code as
 `siftwise select`, and asks the siftwise server. It never records runs.
 
@@ -1192,6 +1192,7 @@ state: each call computes the change in the agent's checkout, with the same code
 | `select_tests` | before running tests after a change | `mode`, the command to run (riskiest tests first), the selected tests with a reason and risk rank each |
 | `triage_failure` | when tests fail, before trying to fix them | a verdict per failure (from JUnit paths or test IDs), with reasons and evidence |
 | `explain` | when a selection or verdict surprises it | one test's recent results, flaky evidence, broken-on-main status, and why it would (not) be selected |
+| `untested_changes` | before finishing a change | the changed source files with no linked test, each with the nearest test file to extend; how many tests are linked to each other changed file; files it doesn't check, with the reason |
 
 - **Uncommitted work counts.** The diff runs from the merge base of the base branch and HEAD
   to the working tree, untracked files included. When the tree is dirty, triage sends no
@@ -1200,6 +1201,33 @@ state: each call computes the change in the agent's checkout, with the same code
   the full suite and `triage_failure` says verdicts are unavailable.
 - **Compact output.** Each result stays under 8,000 characters. The API token never appears
   in a result.
+- **"No linked test" is not "no coverage".** `untested_changes` uses the links selection runs
+  tests by: a file's own tests by path, the import graphs (Python, Go, Jest, Java), `[[depends]]`
+  rules and fixture references, from the repo's test history (`POST /links`, the same code as
+  `/select`). A source file with no linked test is one `select_tests` would run the full suite
+  for. A linked test may still not exercise your new lines: siftwise doesn't measure line
+  coverage. Docs, build and config files, test data (`fixtures`), generated files and
+  languages selection doesn't support (Kotlin until
+  [#102](https://github.com/PramodBasavarajMenasi/siftwise/issues/102), Rust, ...) come back
+  as `not_checked` with the reason. The nearest test file is looked up in the checkout: a
+  test named after the file in its own folder (`test_x.py` / `x_test.py`, `x_test.go`,
+  `x.test.ts` / `x.spec.ts`, `XTest.java` / `XTests.java` in the same package under
+  `src/test/java`), else any test file there, else a test named after it elsewhere (the
+  nearest path), else none.
+
+  ```json
+  {"summary": "1 changed source file(s) with no linked test, 1 with linked tests, 0 test file(s), 1 not checked",
+   "no_linked_test": [{"file": "shop/db.py", "nearest_test": "shop/test_cart.py"}],
+   "linked": [{"file": "shop/cart.py", "linked_tests": 3}],
+   "not_checked": [{"file": "README.md", "reason_code": "ignorable",
+                    "reason": "not code (docs, licenses, lint-only configs): selection ignores it"}],
+   "next_step": "Add or extend tests for the files with no linked test (nearest_test is the file to extend; none means start a new test file), then call select_tests."}
+  ```
+
+  Input: `{}` (or `{"base": "origin/main", "include_uncommitted": false}`): the same
+  arguments as `select_tests` without `order`, `budget` and `max_tests` (`base`,
+  `include_uncommitted`, `repo_path`). A read token is enough. An older server
+  (no `POST /links`) gets "this siftwise server is too old for untested_changes".
 
 **Install** the CLI with the `mcp` extra ([Install](#install)):
 
@@ -1213,7 +1241,7 @@ The server reads `SIFTWISE_SERVER` and `SIFTWISE_API_TOKEN`, and optionally `SIF
 (default: `owner/name` from the `origin` remote), `SIFTWISE_BASE_REF` (default: the branch
 `origin/HEAD` points to, else `main`) and `SIFTWISE_REPO_PATH`. Give agents a **read token**
 for their repo (`siftwise token create --repo acme/shop --scope read`, [Tokens](#tokens)):
-the three tools only read, and a leaked read token can't change history. Keep the token out of
+the four tools only read, and a leaked read token can't change history. Keep the token out of
 files you commit: use your user-level config, or environment-variable expansion where the
 client has it.
 

@@ -8,6 +8,17 @@ All notable changes to siftwise. The format follows
 
 ### Added
 
+- MCP tool `untested_changes` ([#103](https://github.com/PramodBasavarajMenasi/siftwise/issues/103)):
+  before finishing a change, the agent gets the changed source files with no linked test,
+  each with the nearest existing test file to extend (or none), a count of linked tests for
+  every other changed file, and the files it doesn't check (docs, build and config files,
+  test data, generated files, deleted files, unsupported languages; Kotlin until #102) with
+  the reason. "Linked" is exactly what selection uses (path mapping, the import graphs,
+  `[[depends]]`, fixture references), not line coverage: the same `_select` runs with a sink
+  that records each file's tests, and `select_tests` never uses it (380 selections from the
+  selector's test files compared equal with and without it). Server side: `POST /links`
+  (read scope). An older server without it gets a "too old" message, nothing else changes.
+
 - `/select` estimates a CI leg and packs its time budget with that leg's own variant
   ([#104](https://github.com/PramodBasavarajMenasi/siftwise/issues/104)). With `ci.variant`
   or `shadow.variant` (the Action's and GitLab's select step send the `variant` input), the

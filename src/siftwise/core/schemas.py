@@ -360,29 +360,10 @@ class JavaIn(BaseModel):
     )
 
 
-class SelectRequest(ChangeRequest):
-    """Body of ``POST /select``."""
+class SelectionInput(ChangeRequest):
+    """The change as selection reads it: ``POST /select``'s and ``POST /links``' common body."""
 
     always_run: list[Glob] = Field(default_factory=list, max_length=1000)
-    shadow: ShadowIn | None = Field(
-        default=None,
-        description="Store the selection for a shadow run (one running the full suite)",
-    )
-    ci: CiIn | None = Field(
-        default=None,
-        description="The CI run this selection is for: stored (with a write token) so the "
-        "dashboard can show what siftwise did. With ``shadow``, both must name the same run",
-    )
-    junit_dir: Annotated[str, StringConstraints(min_length=1, max_length=1024)] | None = Field(
-        default=None,
-        description="Directory for pytest JUnit reports: each pytest command gets "
-        "--junitxml=<junit_dir>/siftwise-<n>.xml",
-    )
-    order: Literal["risk", "default"] = Field(
-        default="risk",
-        description="'risk': the commands list the highest-risk tests, files and packages "
-        "first; 'default': by path, package and test ID. Never changes which tests run",
-    )
     java: JavaIn | None = Field(
         default=None,
         description="The Java build (Maven or Gradle modules, test classes) so Java test classes "
@@ -418,6 +399,30 @@ class SelectRequest(ChangeRequest):
         "the listed test files run, plus [[depends]] rules on them; a fixture file neither "
         "finds a test for runs the full suite. Files the project's build includes are not sent",
     )
+
+
+class SelectRequest(SelectionInput):
+    """Body of ``POST /select``."""
+
+    shadow: ShadowIn | None = Field(
+        default=None,
+        description="Store the selection for a shadow run (one running the full suite)",
+    )
+    ci: CiIn | None = Field(
+        default=None,
+        description="The CI run this selection is for: stored (with a write token) so the "
+        "dashboard can show what siftwise did. With ``shadow``, both must name the same run",
+    )
+    junit_dir: Annotated[str, StringConstraints(min_length=1, max_length=1024)] | None = Field(
+        default=None,
+        description="Directory for pytest JUnit reports: each pytest command gets "
+        "--junitxml=<junit_dir>/siftwise-<n>.xml",
+    )
+    order: Literal["risk", "default"] = Field(
+        default="risk",
+        description="'risk': the commands list the highest-risk tests, files and packages "
+        "first; 'default': by path, package and test ID. Never changes which tests run",
+    )
     budget_seconds: float | None = Field(
         default=None,
         gt=0,
@@ -427,6 +432,38 @@ class SelectRequest(ChangeRequest):
         "complete check; the response says what was left out. A full-suite fallback packs "
         "the full suite's known tests the same way. Null: no budget",
     )
+
+
+class LinksRequest(SelectionInput):
+    """Body of ``POST /links``: the same change as ``/select``'s (nothing is stored)."""
+
+
+class FileLinkOut(BaseModel):
+    path: str
+    status: Literal["linked", "no_linked_test", "test_file", "not_checked"] = Field(
+        description="linked: selection links tests to it (by imports, paths, rules, fixture "
+        "references; not line coverage). no_linked_test: a source file selection links no test "
+        "to (it would run the full suite). test_file: a test file, which runs itself. "
+        "not_checked: not a file selection links tests to (see reason_code)"
+    )
+    linked_tests: int = Field(description="How many tests are linked to it")
+    reason_code: (
+        Literal[
+            "changed_files_unknown", "no_history", "ignorable", "generated", "build_file",
+            "nested_build_file", "fixture", "java_build", "language_not_supported", "deleted",
+        ]
+        | None
+    ) = Field(default=None, description="Why it is not_checked")  # fmt: skip
+    reason: str = ""
+
+
+class LinksResponse(BaseModel):
+    repo: str
+    files: list[FileLinkOut] = Field(
+        description="Every changed file: no_linked_test first, then linked, test_file and "
+        "not_checked, each by path"
+    )
+    counts: dict[str, int] = Field(description="Files per status")
 
 
 class EstimatedMs(BaseModel):
