@@ -470,6 +470,13 @@ class JavaModuleInfo:
 
 
 @dataclass(frozen=True)
+class KotlinFileInfo:
+    package: str
+    # A test file's classes and objects (what a runner can run); a main file's types.
+    classes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class JavaBuildInfo:
     """The checkout's Java build as the CLI read it (``/select``'s ``java``), so Java test
     classes can run per module."""
@@ -491,6 +498,14 @@ class JavaBuildInfo:
     shared_classes: frozenset[str] = frozenset()
     # Module path -> its test classes, as listed (test_classes keeps one module per class).
     module_classes: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    # Kotlin file -> its package and classes (every test file, the changed main files).
+    kotlin_files: Mapping[str, KotlinFileInfo] = field(default_factory=dict)
+    unparsed: frozenset[str] = frozenset()  # Kotlin files the CLI couldn't parse
+    # Gradle build logic (buildSrc, plugin-only included builds): build files, all of it.
+    build_logic: tuple[str, ...] = ()
+
+    def is_build_logic(self, path: str) -> bool:
+        return any(path.startswith(d.rstrip("/") + "/") for d in self.build_logic)
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> JavaBuildInfo:
@@ -522,6 +537,12 @@ class JavaBuildInfo:
                 module: tuple(sorted(classes))
                 for module, classes in (data.get("test_classes") or {}).items()
             },
+            kotlin_files={
+                path: KotlinFileInfo(k.get("package") or "", tuple(k.get("classes") or ()))
+                for path, k in (data.get("kotlin_files") or {}).items()
+            },
+            unparsed=frozenset(data.get("unparsed") or ()),
+            build_logic=tuple(data.get("build_logic") or ()),
         )
 
     @property
@@ -631,7 +652,7 @@ class NotChecked(StrEnum):
 
 
 # The languages selection links tests to by imports and paths (others only by rules).
-_LINKED_LANGUAGES = frozenset({".py", ".go", ".java"}) | JS_EXTENSIONS
+_LINKED_LANGUAGES = frozenset({".py", ".go", ".java", ".kt"}) | JS_EXTENSIONS
 
 
 def _is_test_path(path: str) -> bool:
@@ -707,18 +728,14 @@ def file_links(
         elif build_file_scope(path) is not None or (java and path in java.build_scopes):
             out[path] = not_checked(path, NotChecked.NESTED_BUILD_FILE, "a nested build file: "
                                     "the tests under its directory run")  # fmt: skip
-        elif is_build_file(path):
+        elif is_build_file(path) or (java is not None and java.is_build_logic(path)):
             out[path] = not_checked(path, NotChecked.BUILD_FILE, "a build/config file: "
                                     "selection runs the full suite")  # fmt: skip
         elif ext in _OTHER_JVM_SOURCES:
-            # Kotlin (and Groovy, Scala) aren't analysed yet: any change to one runs the full
-            # suite. Issue #102 moves .kt files to the normal path (imports, test names).
             out[path] = not_checked(
-                path,
-                NotChecked.JAVA_BUILD,
-                f"Kotlin, Groovy or Scala source (not analysed): {path}",
+                path, NotChecked.JAVA_BUILD, f"Groovy or Scala source (not analysed): {path}"
             )
-        elif java is not None and (problem := _java_problem([path], java)) is not None:
+        elif java is not None and (problem := _java_problem([path], java, deleted)) is not None:
             out[path] = not_checked(path, NotChecked.JAVA_BUILD, problem[1])
         else:
             candidates.append(path)
@@ -831,7 +848,10 @@ def _select(
     # with the Java signals below, never the full suite.
     java_scoped = {} if java is None else {
         p: java.build_scopes[p] for p in paths if p in java.build_scopes}  # fmt: skip
-    build = [p for p in paths if is_build_file(p) and p not in scoped_build
+    # Gradle build logic (buildSrc, a plugin-only included build) is build files, all of it.
+    logic = [p for p in paths if java is not None and java.is_build_logic(p)
+             and not is_ignorable(p, config.generated)]  # fmt: skip
+    build = [p for p in paths if (is_build_file(p) or p in logic) and p not in scoped_build
              and p not in java_scoped and p not in fixtures]  # fmt: skip
     if build:
         return full(f"build/config file changed: {_list(build)}", FullReason.BUILD_FILE, build)
@@ -878,7 +898,7 @@ def _select(
             java_classes[test.java_class].append(test)
     java_new: set[tuple[str, str]] = set()  # (module, class) with no known test: run it
     if java is not None:
-        problem = _java_problem([p for p in relevant if p not in fixtures], java)
+        problem = _java_problem([p for p in relevant if p not in fixtures], java, deleted)
         if problem:
             return full(problem[1], FullReason.JAVA_BUILD, (problem[0],))
 
@@ -906,11 +926,11 @@ def _select(
                 # Test resources: every test class of the module may read them.
                 run_module(module.path, f"test resources changed in {module.name or '.'}: {path}")
                 continue
-            located = java_class_of(path)
+            located = jvm_file(path, java)
             if located is not None:
                 hits, new = _java_path_hits(path, located, java, java_classes, path in deleted)
                 java_new.update(new)
-                if not hits and not new and not (located[2] and path in deleted):
+                if not hits and not new and not (located.is_test and path in deleted):
                     unmapped.append(path)
                 for test_id, reason in hits.items():
                     add(test_id, reason, Link.DIRECT)
@@ -980,23 +1000,27 @@ def _select(
     # Java dependents: test classes that use a changed class (run whole, per module).
     if java is not None:
         for file, modules in sorted(affected_files.items()):
-            located = java_class_of(file)
-            if file in deleted or located is None or not located[2] or not modules:
+            located = jvm_file(file, java)
+            if file in deleted or located is None or not located.is_test or not modules:
                 continue
-            known_java = java_classes.get(located[1], [])
             reason = java_use_reason(modules, java.nearest.get(file), java.notes)
             credit = modules
-            for test in known_java:
-                add(test.test_id, reason, import_link(file))
-            if not known_java and located[1] in java.test_classes and _is_test_class(located[1]):
-                java_new.add((java.test_classes[located[1]], located[1]))
+            for cls in located.classes:
+                known_java = java_classes.get(cls, [])
+                for test in known_java:
+                    add(test.test_id, reason, import_link(file))
+                if not known_java and cls in java.test_classes and _is_test_class(cls):
+                    java_new.add((java.test_classes[cls], cls))
             covered_by_imports.update(modules)
         credit = ()  # dynamic imports select tests but link them to no changed file
         for file, source in sorted(java.dynamic.items()):
-            located = java_class_of(file)
-            for test in java_classes.get(located[1], []) if located else []:
-                add(test.test_id, f"uses {source}, which imports a class the sources don't "
-                    "declare (generated?): it may use changed code", Link.INDIRECT)  # fmt: skip
+            located = jvm_file(file, java)
+            why = (f"uses {source}, which siftwise couldn't parse: it may use changed code"
+                   if source in java.unparsed else f"uses {source}, which imports a class the "
+                   "sources don't declare (generated?): it may use changed code")  # fmt: skip
+            for cls in located.classes if located else ():
+                for test in java_classes.get(cls, []):
+                    add(test.test_id, why, Link.INDIRECT)
     # Tests that reach an import the graph can't resolve may load any changed file: they run,
     # but cover nothing (a change no static import reaches still falls back as before).
     credit = ()
@@ -1139,8 +1163,9 @@ def _select(
     gone |= {
         t.test_id
         for path in deleted
-        if (located := java_class_of(path)) is not None and located[2]
-        for t in java_classes.get(located[1], ())
+        if (located := jvm_file(path, java)) is not None and located.is_test
+        for cls in located.classes
+        for t in java_classes.get(cls, ())
     }
     chosen = [
         tests[test_id]
@@ -1263,16 +1288,19 @@ def _run_referencing(
                 whole_packages.add(test.classname)
                 found = True
         return found
-    located = java_class_of(ref) if ref.endswith(".java") else None
+    located = jvm_file(ref, java)
     if located is None:
         return False
-    known_java = java_classes.get(located[1], [])
-    for test in known_java:
-        add(test.test_id, reason, Link.INDIRECT)
-    if not known_java and java is not None and located[1] in java.test_classes:
-        java_new.add((java.test_classes[located[1]], located[1]))
-        return True
-    return bool(known_java)
+    found = False
+    for cls in located.classes:
+        known_java = java_classes.get(cls, [])
+        for test in known_java:
+            add(test.test_id, reason, Link.INDIRECT)
+        if not known_java and java is not None and cls in java.test_classes:
+            java_new.add((java.test_classes[cls], cls))
+            found = True
+        found = found or bool(known_java)
+    return found
 
 
 def _ranked(
@@ -2480,88 +2508,150 @@ def _java_full_command(java: JavaBuildInfo, tests: Mapping[str, _Test]) -> tuple
     return (shlex.join(["./gradlew" if java.wrapper else "gradle", "test"]),)
 
 
+_JVM_ROOTS = (
+    ("src/test/java", True, (".java", ".kt")),
+    ("src/test/kotlin", True, (".kt",)),
+    ("src/main/java", False, (".java", ".kt")),
+    ("src/main/kotlin", False, (".kt",)),
+)
+
+
 def java_class_of(path: str) -> tuple[str, str, bool] | None:
-    """``(module directory, class, is a test)`` of a Java file under a conventional source
-    root: ``core/src/test/java/a/b/FooTest.java`` -> ``("core", "a.b.FooTest", True)``."""
-    if not path.endswith(".java"):
+    """``(module directory, class, is a test)`` of a Java or Kotlin file under a conventional
+    source root, the class named after the path: ``core/src/test/java/a/b/FooTest.java`` ->
+    ``("core", "a.b.FooTest", True)``. Java files only under ``src/*/java`` (javac doesn't
+    compile them under ``src/*/kotlin`` by default); Kotlin under both. A Kotlin file's real
+    classes (any names, any package) come from the CLI: ``jvm_file``."""
+    ext = posixpath.splitext(path)[1]
+    if ext not in (".java", ".kt"):
         return None
-    for root, test in (("src/test/java", True), ("src/main/java", False)):
+    for root, test, exts in _JVM_ROOTS:
+        if ext not in exts:
+            continue
         if path.startswith(root + "/"):
             module, rest = "", path[len(root) + 1 :]
         elif f"/{root}/" in path:
             module, _, rest = path.partition(f"/{root}/")
         else:
             continue
-        return module, rest[: -len(".java")].replace("/", "."), test
+        return module, rest[: -len(ext)].replace("/", "."), test
     return None
 
 
-_OTHER_JVM_SOURCES = (".kt", ".groovy", ".scala")
+@dataclass(frozen=True)
+class JvmFile:
+    """A Java or Kotlin source file as selection sees it."""
+
+    module: str
+    classes: tuple[str, ...]  # its classes (a Kotlin file may have several, or none)
+    is_test: bool
+    named: tuple[str, ...]  # the names its tests are named after (FooTest for Foo)
+
+
+def jvm_file(path: str, java: JavaBuildInfo | None) -> JvmFile | None:
+    """A Java file's class is named after the file. A Kotlin file's, as the CLI read it
+    (``java.kotlin_files``): a test file's runnable classes; a main file's types, plus the
+    file's own name (tests of top-level functions are named after it). Without that (a
+    deleted file, an older CLI) the path decides, like Java's."""
+    located = java_class_of(path)
+    if located is None:
+        return None
+    module, cls, is_test = located
+    kotlin = java.kotlin_files.get(path) if java is not None and path.endswith(".kt") else None
+    if kotlin is None:
+        return JvmFile(module, (cls,), is_test, (cls,))
+
+    def qualified(name: str) -> str:
+        return f"{kotlin.package}.{name}" if kotlin.package else name
+
+    classes = tuple(qualified(c) for c in kotlin.classes)
+    stem = posixpath.splitext(posixpath.basename(path))[0]
+    named = tuple(dict.fromkeys([*classes, qualified(stem)]))
+    return JvmFile(module, classes, is_test, named)
+
+
+_OTHER_JVM_SOURCES = (".groovy", ".scala")
 # Names a main class's tests go by, after Surefire's and Failsafe's default includes.
 JAVA_TEST_NAMES = ("{}Test", "{}Tests", "Test{}", "{}TestCase", "{}IT", "{}ITCase")
 
 
-def _java_problem(paths: Iterable[str], java: JavaBuildInfo) -> tuple[str, str] | None:
-    """Why a change needs the full suite as far as Java goes, as (the file, the reason), or
-    None."""
+def _java_problem(
+    paths: Iterable[str], java: JavaBuildInfo, deleted: Collection[str] = ()
+) -> tuple[str, str] | None:
+    """Why a change needs the full suite as far as Java and Kotlin go, as (the file, the
+    reason), or None."""
     for path in paths:
         ext = posixpath.splitext(path)[1]
         if ext in _OTHER_JVM_SOURCES:
-            return path, f"Kotlin, Groovy or Scala source changed (not analysed): {path}"
+            return path, f"Groovy or Scala source changed (not analysed): {path}"
+        if ext == ".kts" and not is_build_file(path):
+            return path, f"Kotlin script changed (not analysed): {path}"
         module = java.module_of(path)
         if module is not None and path.startswith(module.prefix("src/main/resources")):
             return path, (
                 f"main resources changed: {path} (code anywhere may load them at runtime, "
                 "which no graph sees)"
             )
-        if ext != ".java":
+        if ext not in (".java", ".kt"):
             continue
+        language = "Java" if ext == ".java" else "Kotlin"
         if java.unsupported:
             return path, f"the Java build couldn't be read ({java.unsupported}): {path}"
-        located = java_class_of(path)
-        if module is None or located is None or located[0] != module.path:
-            return path, (
-                f"Java file outside the build's source roots (src/main/java, src/test/java): {path}"
-            )
-        if module.unanalysed:
+        if module is not None and module.unanalysed:
             where = module.name if module.path else "the root project"
             return path, f"{where} isn't analysed ({module.unanalysed[0]}): {path}"
+        located = java_class_of(path)
+        if module is None or located is None or located[0] != module.path:
+            roots = ("src/main/java, src/test/java" if ext == ".java"
+                     else "src/{main,test}/{kotlin,java}")  # fmt: skip
+            return path, f"{language} file outside the build's source roots ({roots}): {path}"
+        if path in java.unparsed:
+            return path, f"Kotlin file siftwise couldn't parse: {path}"
+        if ext == ".kt" and path in deleted and not located[2]:
+            return path, (
+                f"Kotlin file deleted: {path} (the users of its top-level functions and "
+                "properties can't be found once it's gone)"
+            )
     return None
 
 
 def _java_path_hits(
     path: str,
-    located: tuple[str, str, bool],
+    located: JvmFile,
     java: JavaBuildInfo,
     java_classes: Mapping[str, Sequence[_Test]],
     deleted: bool,
 ) -> tuple[dict[str, str], set[tuple[str, str]]]:
-    """A changed Java file's tests by name: (test_id -> reason, new classes to run). A test
-    class: its own tests (or, new, itself). A main class ``a.b.Foo``: ``a.b.FooTest``,
-    ``FooTests``, ``TestFoo``, ``FooIT``... in its module's tests, else in any module's."""
-    module, cls, is_test = located
+    """A changed Java or Kotlin file's tests by name: (test_id -> reason, new classes to run).
+    A test file: its classes' tests (or, new, the class). A main class ``a.b.Foo``:
+    ``a.b.FooTest``, ``FooTests``, ``TestFoo``, ``FooIT``... in its module's tests, else in
+    any module's (a Kotlin file: each of its types', and its file name's)."""
+    module = located.module
     hits: dict[str, str] = {}
     new: set[tuple[str, str]] = set()
-    if is_test:
+    if located.is_test:
         if deleted:
             return hits, new
-        for test in java_classes.get(cls, ()):
-            hits[test.test_id] = f"test file changed: {path}"
-        if not hits and _is_test_class(cls) and java.test_classes.get(cls) == module:
-            new.add((module, cls))
+        for cls in located.classes:
+            known = java_classes.get(cls, ())
+            for test in known:
+                hits[test.test_id] = f"test file changed: {path}"
+            if not known and _is_test_class(cls) and java.test_classes.get(cls) == module:
+                new.add((module, cls))
         return hits, new
-    package, _, simple = cls.rpartition(".")
-    names = [f"{package}.{n.format(simple)}" if package else n.format(simple)
-             for n in JAVA_TEST_NAMES]  # fmt: skip
-    candidates = [c for c in names if java.test_classes.get(c) == module] or [
-        c for c in names if c in java.test_classes
-    ]
-    for candidate in candidates:
-        known = java_classes.get(candidate, ())
-        for test in known:
-            hits[test.test_id] = f"{candidate} tests changed {path}"
-        if not known:
-            new.add((java.test_classes[candidate], candidate))
+    for cls in located.named:
+        package, _, simple = cls.rpartition(".")
+        names = [f"{package}.{n.format(simple)}" if package else n.format(simple)
+                 for n in JAVA_TEST_NAMES]  # fmt: skip
+        candidates = [c for c in names if java.test_classes.get(c) == module] or [
+            c for c in names if c in java.test_classes
+        ]
+        for candidate in candidates:
+            known = java_classes.get(candidate, ())
+            for test in known:
+                hits[test.test_id] = f"{candidate} tests changed {path}"
+            if not known:
+                new.add((java.test_classes[candidate], candidate))
     return hits, new
 
 

@@ -18,3 +18,12 @@ junit*.xml
 .coverage
 coverage.xml
 .gradle/
+# JVM build outputs in the test fixtures (IDEs and manual builds; tests build in temp copies)
+tests/fixtures/**/bin/
+tests/fixtures/**/target/
+tests/fixtures/**/build/
+tests/fixtures/**/out/
+tests/fixtures/**/.gradle/
+tests/fixtures/**/.kotlin/
+*.class
+*.jar

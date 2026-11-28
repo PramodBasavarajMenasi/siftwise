@@ -1075,8 +1075,8 @@ def local_change(
                 fields["affected_files"] = {**fields.get("affected_files", {}), **found.files}
                 depths.update((test, n.depth) for test, n in found.nearest.items())
             java = found.payload()
-    elif changed and any(p.endswith(".java") for p in changed):
-        complete = False  # --no-java-graph: the Java links are unknown
+    elif changed and any(p.endswith((".java", ".kt")) for p in changed):
+        complete = False  # --no-java-graph: the Java and Kotlin links are unknown
     refs = fixture_refs(root, changed, config) if changed and config.fixtures else None
     return LocalChange(
         fields, config, complete, js_graph, java, go_modules, depths or None, refs or None

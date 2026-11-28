@@ -28,7 +28,8 @@ tools usually live in a project environment. Go, Maven and Gradle never get it (
 for one language would break another in a mixed repo); their launchers are found here.
 
 Every command runs without a shell. Names that reach a regex are escaped; Java class and
-method names must be plain identifiers (nothing else reaches Maven's or Gradle's arguments).
+method names must be plain identifiers, or a Kotlin backtick method name of words, spaces,
+``'`` and ``-`` (nothing else reaches Maven's or Gradle's arguments).
 Pure except for the file checks in ``classify``, Maven/Gradle's report backups and
 ``Invocation.reports``/``restore``: tests need no tool.
 """
@@ -59,6 +60,9 @@ _GRADLE_FILES = ("build.gradle", "build.gradle.kts", "settings.gradle", "setting
 _JAVA_CLASS = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\Z", re.ASCII)
 # A method name, then JUnit 5 parameter types and a parameterized index: m, m(), m(int)[1], m[2]
 _JAVA_METHOD = re.compile(r"([A-Za-z_$][\w$]*)(?:\([^()]*\))?(?:\[[^\[\]]*\])?\Z", re.ASCII)
+# A Kotlin backtick method name, as the JVM names it: words, spaces, ' and - only (nothing
+# Surefire's -Dtest or Gradle's --tests read as syntax: , + # * . ( ) [ ]).
+_KOTLIN_METHOD = re.compile(r"[\w$][\w$ '-]*\Z")
 _GO_META = frozenset("\\.+*?()|[]{}^$")
 _JS_META = frozenset("\\^$.*+?()[]{}|/")
 # Re-run failure output kept per converted Go test.
@@ -193,12 +197,19 @@ class Checkout:
         """(class, method) a Java test's reported name is, from the class's source (JUnit 5
         display names), a reason it can't be told, or None if the source doesn't say."""
         outer = javatests.outer_class(classname)
+        tests = [p for p in self.files()
+                 if p.suffix in (".java", ".kt") and "/src/test/" in p.as_posix()]  # fmt: skip
         if outer is not None:
-            suffix = "/" + outer.replace(".", "/") + ".java"
-            files = [p for p in self.files() if p.as_posix().endswith(suffix)]
-        else:  # a phrased classname (display names): any test class may carry it
+            path = outer.replace(".", "/")
             files = [p for p in self.files()
-                     if p.suffix == ".java" and "/src/test/" in p.as_posix()]  # fmt: skip
+                     if p.as_posix().endswith((f"/{path}.java", f"/{path}.kt"))]  # fmt: skip
+            if not files:
+                # A Kotlin class needn't be in a file of its name, nor in its package's folder.
+                files = [p for p in tests if p.suffix == ".kt"
+                         and any(c.qualified.split("$", 1)[0] == outer
+                                 for c in self._java_classes(p))]  # fmt: skip
+        else:  # a phrased classname (display names): any test class may carry it
+            files = tests
         answers = {javatests.find_method(self._java_classes(p), classname, name) for p in files}
         answers.discard(None)
         if not answers:
@@ -213,7 +224,9 @@ class Checkout:
                 source = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 source = ""
-            self._java[path] = javatests.parse_test_classes(source)
+            parse = (javatests.parse_kotlin_test_classes if path.suffix == ".kt"
+                     else javatests.parse_test_classes)  # fmt: skip
+            self._java[path] = parse(source)
         return self._java[path]
 
     def jest_dir(self, file: Path) -> Path | None:
@@ -277,6 +290,8 @@ def classify(test_id: str, file_path: str | None, checkout: Checkout) -> Target 
     # carries the name, from the class's source.
     resolved = checkout.java_method(classname, name)
     if isinstance(resolved, tuple):
+        if not _JAVA_METHOD.match(resolved[1]) and not _KOTLIN_METHOD.match(resolved[1]):
+            return f"a test method name siftwise won't pass to {tool}: {resolved[1]!r}"
         return Target(test_id, tool, f"{resolved[0]}\0{resolved[1]}")
     if isinstance(resolved, str):
         return f"a JUnit 5 display name siftwise can't map to one method: {resolved}"

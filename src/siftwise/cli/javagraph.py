@@ -47,13 +47,19 @@ from xml.etree.ElementTree import Element
 
 from defusedxml import ElementTree
 
+from siftwise.cli.kotlinsrc import KotlinSource, Token, parse_kotlin
 from siftwise.core.selector import java_class_of
 
 MAVEN = "maven"
 GRADLE = "gradle"
 MAIN_JAVA = "src/main/java"
 TEST_JAVA = "src/test/java"
-OTHER_LANGUAGES = ("kotlin", "groovy", "scala")
+MAIN_KOTLIN = "src/main/kotlin"
+TEST_KOTLIN = "src/test/kotlin"
+# JVM languages whose sources aren't analysed: a module with them isn't analysed.
+OTHER_LANGUAGES = ("groovy", "scala")
+# Kotlin Multiplatform source sets (src/commonMain, src/jvmTest...): anything but main/test.
+_KMP_SOURCE_SET = re.compile(r"[a-z][A-Za-z0-9]*(Main|Test)")
 GRADLE_BUILD_FILES = ("build.gradle", "build.gradle.kts")
 GRADLE_SETTINGS = ("settings.gradle", "settings.gradle.kts")
 # Annotation processors that generate types other code uses (by artifact ID). Lombok isn't
@@ -78,12 +84,13 @@ class JavaModule:
     unanalysed: tuple[str, ...] = ()  # why its Java sources aren't analysed (full suite)
 
     @property
-    def main_root(self) -> str:
-        return posixpath.join(self.path, MAIN_JAVA) if self.path else MAIN_JAVA
+    def main_roots(self) -> tuple[str, ...]:
+        """``src/main/java`` and ``src/main/kotlin`` (Kotlin files may be in either)."""
+        return tuple(posixpath.join(self.path, r) for r in (MAIN_JAVA, MAIN_KOTLIN))
 
     @property
-    def test_root(self) -> str:
-        return posixpath.join(self.path, TEST_JAVA) if self.path else TEST_JAVA
+    def test_roots(self) -> tuple[str, ...]:
+        return tuple(posixpath.join(self.path, r) for r in (TEST_JAVA, TEST_KOTLIN))
 
 
 @dataclass(frozen=True)
@@ -100,6 +107,9 @@ class JavaBuild:
     dependents: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     unscoped: Mapping[str, str] = field(default_factory=dict)
     scopes_known: bool = False
+    # Gradle build logic outside the projects: buildSrc and plugin-only included builds
+    # (``includeBuild("build-logic")``). A change to any file in one is a build file change.
+    build_logic: tuple[str, ...] = ()
 
 
 def detect_build(root: Path) -> JavaBuild | None:
@@ -139,10 +149,17 @@ def _children(element: Element | None, name: str) -> list[Element]:
     return [] if element is None else [c for c in element if _local(str(c.tag)) == name]
 
 
+def _spellings(*dirs: str) -> tuple[str, ...]:
+    return tuple(f"{prefix}{d}" for d in dirs for prefix in ("", "${project.basedir}/",
+                                                             "${basedir}/"))  # fmt: skip
+
+
 _DEFAULT_SOURCE_DIRS = {
-    name: (default, f"${{project.basedir}}/{default}", f"${{basedir}}/{default}")
-    for name, default in (("sourceDirectory", MAIN_JAVA), ("testSourceDirectory", TEST_JAVA))
+    "sourceDirectory": _spellings(MAIN_JAVA, MAIN_KOTLIN),
+    "testSourceDirectory": _spellings(TEST_JAVA, TEST_KOTLIN),
 }
+# kotlin-maven-plugin's <sourceDirs>: the conventional directories only.
+_KOTLIN_SOURCE_DIRS = _spellings(MAIN_JAVA, MAIN_KOTLIN, TEST_JAVA, TEST_KOTLIN)
 
 
 def _maven_build(root: Path, wrapper: bool) -> JavaBuild:
@@ -301,6 +318,12 @@ def _pom_flags(project: Element, text: str) -> list[str]:
             flags.append(f"custom {name} {(configured.text or '').strip()!r}")
     if "build-helper-maven-plugin" in text:
         flags.append("generated or added sources (build-helper-maven-plugin)")
+    for block in re.findall(r"<sourceDirs>(.*?)</sourceDirs>", _xml_without_comments(text), re.S):
+        for directory in re.findall(r"<(?:sourceDir|source)>\s*([^<]*?)\s*</", block):
+            if directory.rstrip("/") not in _KOTLIN_SOURCE_DIRS:
+                flags.append(f"custom Kotlin sourceDirs {directory!r}")
+    if re.search(r"<goal>\s*kapt\s*</goal>", text):
+        flags.append("annotation processors (kapt: generated sources aren't analysed)")
     paths = re.findall(r"<annotationProcessorPaths>(.*?)</annotationProcessorPaths>", text, re.S)
     processors = [
         artifact
@@ -323,13 +346,23 @@ def _pom_flags(project: Element, text: str) -> list[str]:
 
 
 def _language_dirs(root: Path, directory: str) -> list[str]:
+    """Flags for sources siftwise doesn't analyse: Groovy or Scala directories, Kotlin
+    Multiplatform source sets (``src/commonMain``, ``src/jvmTest``...)."""
     base = root / directory if directory else root
-    return [
+    flags = [
         f"{language.capitalize()} sources (src/{kind}/{language} isn't analysed)"
         for language in OTHER_LANGUAGES
         for kind in ("main", "test")
         if (base / "src" / kind / language).is_dir()
     ]
+    try:
+        sets = sorted(e.name for e in (base / "src").iterdir()
+                      if e.is_dir() and _KMP_SOURCE_SET.fullmatch(e.name))  # fmt: skip
+    except OSError:
+        sets = []
+    if sets:
+        flags.append(f"Kotlin Multiplatform source sets (src/{sets[0]} isn't analysed)")
+    return flags
 
 
 _INCLUDE_WORD = re.compile(r"\binclude\b(?!Build|Flat)")
@@ -343,12 +376,15 @@ def _gradle_build(root: Path, wrapper: bool) -> JavaBuild:
     settings_name = next((f for f in GRADLE_SETTINGS if (root / f).is_file()), None)
     settings = _without_comments(_read(root / settings_name)) if settings_name else ""
     for construct, why in (
-        ("includeBuild", "a composite build (includeBuild)"),
         ("includeFlat", "includeFlat (projects outside the checkout)"),
         ("projectDir", "projects in custom directories (projectDir)"),
     ):
         if construct in settings:
             return JavaBuild(GRADLE, wrapper, unsupported=f"{settings_name} uses {why}")
+    included, problem = _plugin_builds(root, settings)
+    if problem:
+        return JavaBuild(GRADLE, wrapper, unsupported=f"{settings_name} uses {problem}")
+    settings = _INCLUDE_BUILD.sub("", settings)  # not projects of this build
     calls = list(_INCLUDE_CALL.finditer(settings))
     if len(calls) != len(_INCLUDE_WORD.findall(settings)):
         return JavaBuild(GRADLE, wrapper, unsupported=f"{settings_name} includes projects by "
@@ -359,7 +395,11 @@ def _gradle_build(root: Path, wrapper: bool) -> JavaBuild:
             path = name.strip(":").replace(":", "/")
             if path and path not in paths:
                 paths.append(path)
-    shared = _gradle_shared(root)
+    if any(i == m or m.startswith(i + "/") or i.startswith(m + "/") for i in included
+           for m in paths if m):  # fmt: skip
+        return JavaBuild(GRADLE, wrapper, unsupported=f"{settings_name} includes a build that "
+                         "is (or holds) one of its own projects")  # fmt: skip
+    shared = _gradle_shared(root, included)
     if "com.android" in shared:
         return JavaBuild(GRADLE, wrapper, unsupported="an Android build (its source sets aren't "
                          "the standard ones)")  # fmt: skip
@@ -370,24 +410,33 @@ def _gradle_build(root: Path, wrapper: bool) -> JavaBuild:
             return JavaBuild(GRADLE, wrapper, unsupported=f"{path or '.'} is an Android project")
         text = _without_comments(own) + shared
         flags = []
-        if re.search(r"\bsourceSets\b", text) and re.search(r"\bsrcDirs?\b|setSrcDirs", text):
+        # Any added source directory: sourceSets' java.srcDir, Kotlin's
+        # compilations.create(...) { defaultSourceSet.kotlin.srcDir(...) } (moshi's java16).
+        if re.search(r"\bsrcDirs?\b|setSrcDirs", text):
             flags.append("custom source sets")
         processors = [
             line.strip()
-            for line in text.splitlines()
+            for line in _without_buildscript(text).splitlines()
             if re.search(r"\b(annotationProcessor|kapt|ksp)\b", line)
             and not any(checker in line for checker in CHECKERS)
+            and not re.search(r"\bapply\s*\(?\s*false\b", line)  # declared, not applied
         ]
         if processors:
             flags.append("annotation processors (generated sources aren't analysed)")
-        if re.search(r"org\.jetbrains\.kotlin|kotlin\(\s*\"jvm\"", own):
-            flags.append("the Kotlin plugin")
+        if re.search(
+            r"""org\.jetbrains\.kotlin\.multiplatform|kotlin\(\s*["']multiplatform"""
+            r"""|["']kotlin-multiplatform["']""",
+            text,
+        ):
+            flags.append("Kotlin Multiplatform (its source sets aren't analysed)")
         flags += _language_dirs(root, path)
         name = ":" + path.replace("/", ":") if path else ""
         modules.append(JavaModule(path, name, tuple(dict.fromkeys(flags))))
     dependents, unscoped, known = _gradle_scoping(root, paths, shared)
+    logic = tuple(sorted({*included, *(["buildSrc"] if (root / "buildSrc").is_dir() else [])}))
     return JavaBuild(GRADLE, wrapper, tuple(sorted(modules, key=lambda m: m.path)),
-                     dependents=dependents, unscoped=unscoped, scopes_known=known)  # fmt: skip
+                     dependents=dependents, unscoped=unscoped, scopes_known=known,
+                     build_logic=logic)  # fmt: skip
 
 
 _PROJECT_REF = re.compile(r"""\bproject\s*\(\s*(?:path\s*[:=]\s*)?(['"])(:[^'"]*)\1""")
@@ -467,12 +516,84 @@ def _hides_tests(module: JavaModule) -> bool:
     return any(not flag.startswith("annotation processors") for flag in module.unanalysed)
 
 
-def _gradle_shared(root: Path) -> str:
+_INCLUDE_BUILD = re.compile(r"\bincludeBuild\s*\(\s*(['\"])([^'\"\n$]*)\1\s*\)")
+_PLUGIN_DEVELOPMENT = re.compile(
+    r"`kotlin-dsl`|\bkotlin-dsl\b|java-gradle-plugin|groovy-gradle-plugin|\bgradlePlugin\s*\{"
+)
+_APPLIES = re.compile(r"\bplugins\s*\{|\bapply\s*\(|\bapply\s+plugin\b")
+
+
+def _plugin_builds(root: Path, settings: str) -> tuple[list[str], str]:
+    """The included builds of a settings file that only supply plugins, or why one may do
+    more (then the build is unsupported, as any composite build was before). Accepted, each a
+    literal path in the checkout, with no configuration block (no dependencySubstitution),
+    and either inside ``pluginManagement { }`` (Gradle resolves only plugins from it) or a
+    plugin build: its settings include no build of its own and every build file it has
+    develops plugins (``kotlin-dsl``, ``java-gradle-plugin``...) or applies nothing."""
+    words = len(re.findall(r"\bincludeBuild\b", settings))
+    calls = list(_INCLUDE_BUILD.finditer(settings))
+    if len(calls) != words:
+        return [], "an included build siftwise can't read (includeBuild of a non-literal)"
+    management = _block(settings, "pluginManagement")
+    found: list[str] = []
+    for call in calls:
+        after = settings[call.end() :].lstrip()
+        if after.startswith("{"):
+            return [], "an included build configured in a block (dependency substitution?)"
+        path = posixpath.normpath(call.group(2).strip())
+        if path in (".", "") or path.startswith("..") or posixpath.isabs(path):
+            return [], f"an included build outside the checkout ({call.group(2)!r})"
+        directory = root / path
+        if not directory.is_dir():
+            return [], f"an included build that isn't in the checkout ({path})"
+        in_management = any(start <= call.start() < end for start, end in management)
+        if not in_management:
+            why = _not_plugin_only(directory)
+            if why:
+                return [], f"an included build that may supply more than plugins ({path}: {why})"
+        found.append(path)
+    return sorted(set(found)), ""
+
+
+def _not_plugin_only(directory: Path) -> str:
+    """Why an included build may contribute more than plugins, or "" when it can't."""
+    settings_name = next((f for f in GRADLE_SETTINGS if (directory / f).is_file()), None)
+    settings = _without_comments(_read(directory / settings_name)) if settings_name else ""
+    if re.search(r"\bincludeBuild\b|\bincludeFlat\b|\bprojectDir\b", settings):
+        return "it includes builds or projects of its own siftwise can't follow"
+    calls = list(_INCLUDE_CALL.finditer(settings))
+    if len(calls) != len(_INCLUDE_WORD.findall(settings)):
+        return "it includes projects by something other than string literals"
+    projects = [""] + [name.strip(":").replace(":", "/") for call in calls
+                       for _, name in _STRING.findall(call.group(1))]  # fmt: skip
+    for project in projects:
+        text = _without_comments("".join(_read(directory / project / n)
+                                         for n in GRADLE_BUILD_FILES))  # fmt: skip
+        if text.strip() and not _PLUGIN_DEVELOPMENT.search(text) and _APPLIES.search(text):
+            return f"{project or 'its root project'} applies plugins but develops none"
+    return ""
+
+
+def _block(text: str, name: str) -> list[tuple[int, int]]:
+    """The spans of ``name { ... }`` blocks."""
+    spans = []
+    for m in re.finditer(rf"\b{name}\s*\{{", text):
+        depth, j = 1, m.end()
+        while j < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[j], 0)
+            j += 1
+        spans.append((m.start(), j))
+    return spans
+
+
+def _gradle_shared(root: Path, included: Sequence[str] = ()) -> str:
     """Build logic every project gets: the root build file (``subprojects``/``allprojects``)
-    and convention plugins in buildSrc."""
+    and convention plugins in buildSrc and the plugin-only included builds."""
     parts = [_read(root / name) for name in GRADLE_BUILD_FILES]
-    build_src = root / "buildSrc"
-    if build_src.is_dir():
+    for logic in ["buildSrc", *included]:
+        build_src = root / logic
+        if not build_src.is_dir():
+            continue
         for dirpath, dirnames, filenames in os.walk(build_src):
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
             parts += [
@@ -481,6 +602,23 @@ def _gradle_shared(root: Path) -> str:
                 if f.endswith((".gradle", ".gradle.kts", ".kt", ".groovy", ".java"))
             ]
     return _without_comments("\n".join(parts))
+
+
+def _without_buildscript(text: str) -> str:
+    """Build text without its ``buildscript { ... }`` blocks: they put plugins on the build's
+    classpath (``classpath("...ksp...")``) without applying them to any project."""
+    out, i = [], 0
+    for m in re.finditer(r"\bbuildscript\s*\{", text):
+        if m.start() < i:
+            continue
+        depth, j = 1, m.end()
+        while j < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[j], 0)
+            j += 1
+        out.append(text[i : m.start()])
+        i = j
+    out.append(text[i:])
+    return "".join(out)
 
 
 def _read(path: Path) -> str:
@@ -513,12 +651,6 @@ _JAVA_TOKEN = re.compile(
     """,
     re.S | re.X,
 )
-
-
-@dataclass(frozen=True)
-class Token:
-    kind: str  # "id", "str" (a string's or text block's content), "punct"
-    value: str
 
 
 def tokenize(source: str) -> list[Token]:
@@ -634,8 +766,11 @@ class Notes:
 class JavaGraph:
     edges: Mapping[str, frozenset[str]]  # file -> files it uses
     tests: frozenset[str]  # files under test roots
-    dynamic_files: Mapping[str, str]  # file -> the generated class it imports
+    dynamic_files: Mapping[str, str]  # file -> the generated class it imports (or itself)
     notes: tuple[str, ...] = ()
+    # Kotlin files siftwise couldn't parse (``kotlinsrc``): dynamic, and a change to one runs
+    # the full suite.
+    unparsed: frozenset[str] = frozenset()
 
     def affected(self, changed_files: Iterable[str]) -> tuple[
         dict[str, list[str]], dict[str, Nearest], dict[str, str]
@@ -685,33 +820,79 @@ class JavaGraph:
         return files, dict(sorted(nearest.items())), dynamic
 
 
+JVM_SOURCES = (".java", ".kt")
+
+
 def _java_files(root: Path, directory: str) -> list[str]:
+    """The source files of a root: ``.java`` and ``.kt`` under ``src/*/java``, ``.kt`` only
+    under ``src/*/kotlin`` (javac doesn't compile Java there by default)."""
     base = root / directory
     found: list[str] = []
     if not base.is_dir():
         return found
+    suffixes = JVM_SOURCES if directory.endswith("java") else (".kt",)
     for dirpath, dirnames, filenames in os.walk(base):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         rel = Path(dirpath).relative_to(root).as_posix()
-        found += [f"{rel}/{f}" for f in filenames if f.endswith(".java")]
+        found += [f"{rel}/{f}" for f in filenames if f.endswith(suffixes)]
     return sorted(found)
 
 
-def build_java_graph(root: Path, build: JavaBuild, deleted: Iterable[str] = ()) -> JavaGraph:
-    """The graph of every module's ``src/main/java`` and ``src/test/java``. ``deleted`` Java
-    files still count as classes (named after their path), so their users are found."""
+def _module_files(root: Path, build: JavaBuild, test: bool | None = None) -> list[str]:
+    """Every module's source files: main and test roots (``test`` None), or one kind."""
     files: list[str] = []
     for module in build.modules:
-        files += _java_files(root, module.main_root) + _java_files(root, module.test_root)
+        roots = (module.main_roots if test is not True else ()) + (
+            module.test_roots if test is not False else ()
+        )
+        for directory in roots:
+            files += _java_files(root, directory)
+    return files
+
+
+_PARSED: dict[tuple[str, int, int], KotlinSource] = {}
+
+
+def read_kotlin(path: Path) -> KotlinSource:
+    """A Kotlin file, parsed (cached by path, size and modification time). Raises OSError."""
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    if key not in _PARSED:
+        if len(_PARSED) > 50_000:
+            _PARSED.clear()
+        _PARSED[key] = parse_kotlin(path.read_text(encoding="utf-8", errors="replace"))
+    return _PARSED[key]
+
+
+def _stem(file: str) -> str:
+    return posixpath.splitext(posixpath.basename(file))[0]
+
+
+def build_java_graph(root: Path, build: JavaBuild, deleted: Iterable[str] = ()) -> JavaGraph:
+    """The graph of every module's Java and Kotlin sources (``src/{main,test}/{java,kotlin}``).
+    ``deleted`` files still count as classes (named after their path), so their users are
+    found. Kotlin's top-level functions and properties are members of their package (and of
+    the file's facade class, for Java): a file using one links to the file declaring it."""
+    files = _module_files(root, build)
     index: dict[str, str] = {}  # class -> file
     by_package: dict[str, dict[str, str]] = defaultdict(dict)  # package -> simple name -> file
+    # Kotlin top-level functions and properties: overloads and extensions of one name may be
+    # in several files, all of them linked.
+    members: dict[str, set[str]] = defaultdict(set)  # a.b.fn -> files
+    package_members: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    operators: dict[str, set[str]] = defaultdict(set)  # package -> files with operator funs
     parsed: dict[str, JavaSource] = {}
+    kotlin: dict[str, KotlinSource] = {}
     for file in files:
         try:
-            source = parse_java((root / file).read_text(encoding="utf-8", errors="replace"))
+            if file.endswith(".kt"):
+                kotlin[file] = read_kotlin(root / file)
+            else:
+                text = (root / file).read_text(encoding="utf-8", errors="replace")
+                parsed[file] = parse_java(text)
         except OSError:
             continue
-        parsed[file] = source
+    for file, source in parsed.items():
         names = set(source.types)
         located = class_of(file)
         if located:  # the file's name is its public class's, by Java convention
@@ -720,16 +901,37 @@ def build_java_graph(root: Path, build: JavaBuild, deleted: Iterable[str] = ()) 
             fqn = f"{source.package}.{name}" if source.package else name
             index.setdefault(fqn, file)
             by_package[source.package].setdefault(name, file)
+    for file, ks in kotlin.items():
+        for name in [*ks.types, *([ks.facade(_stem(file))] if ks.members else [])]:
+            fqn = f"{ks.package}.{name}" if ks.package else name
+            index.setdefault(fqn, file)
+            by_package[ks.package].setdefault(name, file)
+        for name in ks.members:
+            members[f"{ks.package}.{name}" if ks.package else name].add(file)
+            package_members[ks.package][name].add(file)
+        if ks.operators:
+            operators[ks.package].add(file)
     for file in deleted:
         located = class_of(file)
         if located:
             package, _, name = located[1].rpartition(".")
             index.setdefault(located[1], file)
             by_package[package].setdefault(name, file)
-    packages = set(by_package)
+    packages = set(by_package) | set(package_members)
     notes = Notes()
     edges: dict[str, frozenset[str]] = {}
     dynamic: dict[str, str] = {}
+
+    def simple_names(targets: set[str], package: str, identifiers: Iterable[str],
+                     kotlin_members: bool) -> None:  # fmt: skip
+        found = by_package.get(package, {})
+        own = package_members.get(package, {}) if kotlin_members else {}
+        for identifier in identifiers:
+            if identifier in found:
+                targets.add(found[identifier])
+            if identifier in own:
+                targets.update(own[identifier])
+
     for file, source in parsed.items():
         targets: set[str] = set()
         on_demand: list[str] = []
@@ -742,28 +944,66 @@ def build_java_graph(root: Path, build: JavaBuild, deleted: Iterable[str] = ()) 
                 targets.add(target)
             elif _in_repo_package(name, packages) and not static:
                 dynamic.setdefault(file, name)  # a generated class, most likely
-        same = by_package.get(source.package, {})
-        for identifier in source.identifiers:
-            if identifier in same:
-                targets.add(same[identifier])
-            for package in on_demand:
-                found = by_package.get(package, {}).get(identifier)
-                if found:
-                    targets.add(found)
-        for chain in source.dotted:
-            target = _resolve(".".join(chain), index)
+        for package in [source.package, *on_demand]:
+            simple_names(targets, package, source.identifiers, kotlin_members=False)
+        _chains_and_strings(targets, source.dotted, source.strings, index, members)
+        targets.discard(file)
+        edges[file] = frozenset(targets)
+    for file, ks in kotlin.items():
+        targets = set()
+        on_demand = []
+        for imported in ks.imports:
+            if imported.star:
+                if imported.name in index:  # import a.b.Obj.*: its members
+                    targets.add(index[imported.name])
+                elif imported.name in packages:
+                    on_demand.append(imported.name)
+                continue
+            target = _resolve(imported.name, index)
+            used = members.get(imported.name, set())
             if target:
                 targets.add(target)
-        for literal in source.strings:
-            if literal in index:
-                targets.add(index[literal])
+            targets.update(used)
+            if not target and not used and _in_repo_package(imported.name, packages):
+                dynamic.setdefault(file, imported.name)  # generated, most likely
+        for package in [ks.package, *on_demand]:
+            simple_names(targets, package, ks.identifiers, kotlin_members=True)
+            targets.update(operators.get(package, ()))  # `a + b` names no function
+        _chains_and_strings(targets, ks.dotted, ks.strings, index, members)
         targets.discard(file)
         edges[file] = frozenset(targets)
     for file, name in sorted(dynamic.items())[:2]:
         notes.add(f"{file} imports {name}, which the sources don't declare (generated?): tests "
                   "that use it run for any Java change")  # fmt: skip
+    unparsed = frozenset(f for f, ks in kotlin.items() if not ks.ok)
+    for file in sorted(unparsed):
+        dynamic[file] = file
+    for file in sorted(unparsed)[:2]:
+        notes.add(f"{file} couldn't be parsed: tests that use it run for any Java or Kotlin "
+                  "change")  # fmt: skip
     tests = frozenset(f for f in files if (c := class_of(f)) is not None and c[2])
-    return JavaGraph(edges, tests, dynamic, tuple(notes.items))
+    return JavaGraph(edges, tests, dynamic, tuple(notes.items), unparsed)
+
+
+def _chains_and_strings(
+    targets: set[str],
+    dotted: Iterable[tuple[str, ...]],
+    strings: Iterable[str],
+    index: Mapping[str, str],
+    members: Mapping[str, set[str]],
+) -> None:
+    """Fully qualified names in code (``a.b.C.x``, Kotlin's ``a.b.fn()``) and string literals
+    naming a class."""
+    for chain in dotted:
+        target = _resolve(".".join(chain), index)
+        if target:
+            targets.add(target)
+        if members:
+            for end in range(2, len(chain) + 1):
+                targets.update(members.get(".".join(chain[:end]), ()))
+    for literal in strings:
+        if literal in index:
+            targets.add(index[literal])
 
 
 def _resolve(name: str, index: Mapping[str, str]) -> str | None:
@@ -794,6 +1034,10 @@ class JavaChange:
     notes: tuple[str, ...] = ()
     # Changed module build file -> the modules to run (``build_scopes``).
     build_scopes: dict[str, list[str]] = field(default_factory=dict)
+    # Kotlin files (every test file, the changed main files) -> (package, classes): a Kotlin
+    # file may hold several classes, under any name (``kotlin_files``).
+    kotlin_files: dict[str, KotlinFile] = field(default_factory=dict)
+    unparsed: tuple[str, ...] = ()  # Kotlin files the graph couldn't parse
 
     def payload(self) -> dict[str, Any]:
         """``/select``'s ``java``."""
@@ -815,35 +1059,87 @@ class JavaChange:
             # Only when there is one: an older server rejects the key (and then all of
             # `java`), but it runs the full suite for any build file change anyway.
             **({"build_scopes": dict(self.build_scopes)} if self.build_scopes else {}),
+            # Likewise: an older server ran the full suite for any Kotlin change.
+            **(
+                {"kotlin_files": {f: k.json() for f, k in self.kotlin_files.items()}}
+                if self.kotlin_files
+                else {}
+            ),
+            **({"unparsed": list(self.unparsed)} if self.unparsed else {}),
+            # Likewise: an older server read no build at all when settings used includeBuild.
+            **({"build_logic": list(self.build.build_logic)} if self.build.build_logic else {}),
         }
+
+
+@dataclass(frozen=True)
+class KotlinFile:
+    """What the server needs of a Kotlin file: its package and its classes. A test file's
+    classes are the ones a test runner can run (classes and objects); a main file's are all
+    its top-level types (its tests are named after them, or after the file)."""
+
+    package: str
+    classes: tuple[str, ...]
+
+    def json(self) -> dict[str, Any]:
+        return {"package": self.package, "classes": list(self.classes)}
+
+
+def kotlin_files(
+    root: Path, build: JavaBuild, changed: Iterable[str] = ()
+) -> dict[str, KotlinFile]:
+    """Every Kotlin test file of the build's modules and the changed Kotlin main files that
+    exist, with their package and classes."""
+    changed = set(changed)
+    found: dict[str, KotlinFile] = {}
+    tests = set(_module_files(root, build, test=True))
+    for file in sorted(tests | {f for f in _module_files(root, build, test=False) if f in changed}):
+        if not file.endswith(".kt"):
+            continue
+        try:
+            ks = read_kotlin(root / file)
+        except OSError:
+            continue
+        found[file] = KotlinFile(ks.package, ks.classes if file in tests else ks.types)
+    return found
 
 
 def java_change(
     root: Path, changed: Sequence[str], deleted: Sequence[str] = ()
 ) -> JavaChange | None:
     """The checkout's Java build and the change's effect on its test classes (the graph only
-    when a ``.java`` file changed); None without a Java build. Raises OSError, ValueError."""
+    when a ``.java`` or ``.kt`` file changed); None without a Java build. Raises OSError,
+    ValueError."""
     build = detect_build(root)
     if build is None:
         return None
-    test_classes = test_classes_of(root, build)
-    if build.unsupported or not any(p.endswith(".java") for p in changed):
-        return change_from(build, test_classes, None, changed)
-    graph = build_java_graph(root, build, [p for p in deleted if p.endswith(".java")])
-    return change_from(build, test_classes, graph, changed)
+    kotlin = kotlin_files(root, build, changed)
+    test_classes = test_classes_of(root, build, kotlin)
+    if build.unsupported or not any(p.endswith(JVM_SOURCES) for p in changed):
+        return change_from(build, test_classes, None, changed, kotlin)
+    graph = build_java_graph(root, build, [p for p in deleted if p.endswith(JVM_SOURCES)])
+    return change_from(build, test_classes, graph, changed, kotlin)
 
 
-def test_classes_of(root: Path, build: JavaBuild) -> dict[str, list[str]]:
-    """Module path -> the classes under its src/test/java (named after their files)."""
+def test_classes_of(
+    root: Path, build: JavaBuild, kotlin: Mapping[str, KotlinFile] | None = None
+) -> dict[str, list[str]]:
+    """Module path -> the classes under its test roots: a Java file's is named after it, a
+    Kotlin file's are the classes and objects it declares (``kotlin_files``)."""
+    if kotlin is None:
+        kotlin = kotlin_files(root, build)
     found: dict[str, list[str]] = {}
     for module in build.modules:
-        classes = [
-            located[1]
-            for file in _java_files(root, module.test_root)
-            if (located := class_of(file)) is not None
-        ]
+        classes: list[str] = []
+        for directory in module.test_roots:
+            for file in _java_files(root, directory):
+                if file.endswith(".kt"):
+                    k = kotlin.get(file)
+                    if k is not None:
+                        classes += [f"{k.package}.{c}" if k.package else c for c in k.classes]
+                elif (located := class_of(file)) is not None:
+                    classes.append(located[1])
         if classes:
-            found[module.path] = classes
+            found[module.path] = list(dict.fromkeys(classes))
     return found
 
 
@@ -852,14 +1148,17 @@ def change_from(
     test_classes: Mapping[str, Sequence[str]],
     graph: JavaGraph | None,
     changed: Sequence[str],
+    kotlin: Mapping[str, KotlinFile] | None = None,
 ) -> JavaChange:
-    """What a change does to the test classes, given the build's graph (None: no Java file
-    changed, so no graph is needed)."""
+    """What a change does to the test classes, given the build's graph (None: no Java or
+    Kotlin file changed, so no graph is needed)."""
     scopes = build_scopes(build, changed)
-    if graph is None or build.unsupported or not any(p.endswith(".java") for p in changed):
-        return JavaChange(build, test_classes, build_scopes=scopes)
+    kotlin = dict(kotlin or {})
+    if graph is None or build.unsupported or not any(p.endswith(JVM_SOURCES) for p in changed):
+        return JavaChange(build, test_classes, build_scopes=scopes, kotlin_files=kotlin)
     files, nearest, dynamic = graph.affected(changed)
-    return JavaChange(build, test_classes, files, nearest, dynamic, graph.notes, scopes)
+    return JavaChange(build, test_classes, files, nearest, dynamic, graph.notes, scopes,
+                      kotlin, tuple(sorted(graph.unparsed)))  # fmt: skip
 
 
 def snapshot_json(
@@ -875,6 +1174,7 @@ def snapshot_json(
             "dependents": {m: list(d) for m, d in build.dependents.items()},
             "unscoped": dict(build.unscoped),
             "scopes_known": build.scopes_known,
+            "build_logic": list(build.build_logic),
         },
         "test_classes": {m: list(c) for m, c in test_classes.items()},
         "graph": None
@@ -884,6 +1184,7 @@ def snapshot_json(
             "tests": sorted(graph.tests),
             "dynamic": dict(graph.dynamic_files),
             "notes": list(graph.notes),
+            "unparsed": sorted(graph.unparsed),
         },
     }
 
@@ -900,6 +1201,7 @@ def snapshot_from_json(
         {m: tuple(d) for m, d in (b.get("dependents") or {}).items()},
         dict(b.get("unscoped") or {}),
         bool(b.get("scopes_known")),  # an older snapshot: unknown, nothing scoped
+        tuple(b.get("build_logic") or ()),
     )
     g = data["graph"]
     graph = (
@@ -910,6 +1212,7 @@ def snapshot_from_json(
             frozenset(g["tests"]),
             dict(g["dynamic"]),
             tuple(g["notes"]),
+            frozenset(g.get("unparsed") or ()),
         )
     )
     return build, {m: list(c) for m, c in data["test_classes"].items()}, graph

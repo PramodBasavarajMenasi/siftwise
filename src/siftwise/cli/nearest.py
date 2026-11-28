@@ -5,13 +5,13 @@ Pure: it gets the checkout's file list. The order, first that finds a file:
 1. a test file named by the language's convention, in the source file's own folder (Java: the
    same package under ``src/test/java``; Jest also ``__tests__/``):
    Python ``test_x.py`` / ``x_test.py``, Go ``x_test.go``, JS/TS ``x.test.*`` / ``x.spec.*``,
-   Java ``XTest.java`` / ``XTests.java``;
+   Java ``XTest.java`` / ``XTests.java``; Kotlin ``XTest.kt`` / ``XTests.kt`` under the mirrored
+   ``src/test/kotlin`` (``src/test/java`` for a Kotlin file under ``src/main/java``);
 2. any other test file in that folder or package (Go: the package's tests);
 3. a convention-named test file anywhere else, the one sharing the longest leading path
    with the source file (``src/shop/cart.py`` -> ``tests/shop/test_cart.py``).
 
-Test files are recognised by the selector's own rules. Kotlin isn't analysed by the selector
-yet (issue #102), so no suggestion is made for ``.kt`` files.
+Test files are recognised by the selector's own rules.
 """
 
 import posixpath
@@ -49,6 +49,18 @@ def _rule(path: str) -> tuple[str, list[str], Callable[[str], bool]] | None:
         if "/src/main/java/" in f"/{folder}/":
             folder = f"/{folder}/".replace("/src/main/java/", "/src/test/java/", 1).strip("/")
         return folder, [f"{stem}Test.java", f"{stem}Tests.java"], _is_java_test
+    if ext == ".kt":
+        located = java_class_of(path)
+        if located is None or located[2]:
+            return None
+        for main, test in (
+            ("src/main/kotlin", "src/test/kotlin"),
+            ("src/main/java", "src/test/java"),
+        ):
+            if f"/{main}/" in f"/{folder}/":
+                folder = f"/{folder}/".replace(f"/{main}/", f"/{test}/", 1).strip("/")
+                break
+        return folder, [f"{stem}Test.kt", f"{stem}Tests.kt"], _is_java_test
     return None
 
 

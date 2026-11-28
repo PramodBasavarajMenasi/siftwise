@@ -330,6 +330,15 @@ class JavaModuleIn(BaseModel):
     )
 
 
+class KotlinFileIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    package: Annotated[str, StringConstraints(max_length=1024)] = ""
+    classes: list[Annotated[str, StringConstraints(max_length=1024)]] = Field(
+        default_factory=list, max_length=1_000
+    )
+
+
 class JavaIn(BaseModel):
     """The checkout's Java build as the CLI read it, and its dependency graph's details."""
 
@@ -344,7 +353,8 @@ class JavaIn(BaseModel):
     test_classes: dict[Path4K, list[Annotated[str, StringConstraints(max_length=1024)]]] = Field(
         default_factory=dict,
         max_length=5_000,
-        description="Module path -> the test classes under its src/test/java",
+        description="Module path -> the test classes under its test roots (src/test/java, "
+        "src/test/kotlin)",
     )
     nearest: dict[str, JsImportIn] = Field(default_factory=dict, max_length=100_000)
     dynamic: dict[str, Path4K] = Field(default_factory=dict, max_length=100_000)
@@ -357,6 +367,23 @@ class JavaIn(BaseModel):
         description="Changed module build file (pom.xml, build.gradle[.kts]) -> the module "
         "paths whose tests it can affect (its module and every module depending on it): their "
         "test classes run instead of the full suite",
+    )
+    kotlin_files: dict[Path4K, KotlinFileIn] = Field(
+        default_factory=dict,
+        max_length=100_000,
+        description="Kotlin file -> its package and classes (a test file's runnable classes, a "
+        "changed main file's types): every Kotlin test file and the changed main files",
+    )
+    build_logic: list[Path4K] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Gradle build logic directories (buildSrc, plugin-only included builds): "
+        "a change to any file in one runs the full suite, as a build file does",
+    )
+    unparsed: list[Path4K] = Field(
+        default_factory=list,
+        max_length=100_000,
+        description="Kotlin files the CLI couldn't parse: a change to one runs the full suite",
     )
 
 

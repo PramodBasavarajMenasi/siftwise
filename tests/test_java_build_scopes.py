@@ -2,7 +2,6 @@
 dependents', not the full suite (#54); everything siftwise can't scope stays full."""
 
 import json
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -29,6 +28,7 @@ from siftwise.core.selector import (
     RepoHistory,
     select_tests,
 )
+from tests.jvmfixture import copy_fixture
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MAVEN_FIXTURE = FIXTURES / "java_maven"
@@ -92,7 +92,7 @@ def test_maven_scopes(changed: list[str], expected: dict[str, list[str]]) -> Non
     [
         (["core/build.gradle.kts"], {"core/build.gradle.kts": ["app/web", "core"]}),
         (["app/web/build.gradle.kts"], {"app/web/build.gradle.kts": ["app/web"]}),
-        (["kt/build.gradle.kts"], {}),  # a Kotlin project isn't analysed
+        (["kt/build.gradle.kts"], {"kt/build.gradle.kts": ["kt"]}),  # Kotlin is analysed
         (["build.gradle.kts"], {}),  # the root
         (["settings.gradle.kts", "gradle/libs.versions.toml"], {}),
     ],
@@ -331,7 +331,7 @@ def test_the_cli_sends_the_scope_of_a_changed_module_pom(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "repo"
-    shutil.copytree(MAVEN_FIXTURE, root, ignore=shutil.ignore_patterns(".gradle", "target"))
+    copy_fixture(MAVEN_FIXTURE, root)
     git(root, "init", "-b", "main")
     git(root, "config", "user.email", "t@example.com")
     git(root, "config", "user.name", "t")
@@ -359,8 +359,8 @@ def test_the_schema_checks_build_scopes() -> None:
 
 
 def test_a_scope_with_tests_the_class_lists_may_miss_stays_full(tmp_path: Path) -> None:
-    """b has Kotlin tests (not in the class lists): a's POM reaches b, so it stays full."""
-    root = maven(tmp_path, {"b/src/test/kotlin/BTest.kt": "class BTest"})
+    """b has Groovy tests (not in the class lists): a's POM reaches b, so it stays full."""
+    root = maven(tmp_path, {"b/src/test/groovy/BTest.groovy": "class BTest {}"})
     assert scopes(root, "a/pom.xml") == {}
     assert scopes(root, "c/pom.xml") == {"c/pom.xml": ["c"]}
 

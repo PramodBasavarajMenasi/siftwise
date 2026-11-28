@@ -7,12 +7,33 @@ All notable changes to siftwise. The format follows
 ## [Unreleased]
 
 ### Added
+- Java selection supports Kotlin (#102): `.kt` sources and tests under `src/{main,test}/kotlin`
+  (and `src/*/java`), Gradle and Maven (`kotlin-maven-plugin`). Kotlin files are parsed for
+  their package, imports (member imports of top-level functions and properties, aliases, star
+  imports), declared types (several per file) and top-level members, which Java sees as
+  `FileNameKt` or `@file:JvmName`; links go both ways in mixed Java/Kotlin projects. Kotlin test
+  classes come from the sources (a file may hold several, under any name), so history,
+  selection, the Gradle `--tests` / Maven `-Dtest` commands and `rerun-unknown` (backtick names
+  like ``fun `adds two`()``) name the right classes. `/select`'s `java` gains `kotlin_files` and
+  `unparsed` (sent only when non-empty; an older server drops `java` and runs the full suite, as
+  it did for any Kotlin change). Still the full suite, with the reason: Groovy and Scala,
+  Kotlin Multiplatform, kapt/KSP modules, Kotlin scripts that aren't build files, a Kotlin file
+  siftwise can't parse, a deleted Kotlin main file. `untested_changes` checks `.kt` files like
+  any other source, and suggests `XTest.kt` under `src/test/kotlin`.
+- Gradle builds with convention plugins in a plugin-only included build
+  (`includeBuild("build-logic")`) are read, for Java and Kotlin alike. Before, any
+  `includeBuild` made the build unreadable (every change: the full suite). Accepted only when
+  it supplies plugins: inside `pluginManagement { }`, or a build whose projects all develop
+  plugins (`kotlin-dsl`, `java-gradle-plugin`); a literal path in the checkout, no
+  configuration block (dependency substitution), not one of the build's own projects. Anything
+  else stays unreadable. A change to any file in it (or in `buildSrc`) runs the full suite, as a
+  build file does: `/select`'s `java` gains `build_logic` (sent only when non-empty).
 
 - MCP tool `untested_changes` ([#103](https://github.com/PramodBasavarajMenasi/siftwise/issues/103)):
   before finishing a change, the agent gets the changed source files with no linked test,
   each with the nearest existing test file to extend (or none), a count of linked tests for
   every other changed file, and the files it doesn't check (docs, build and config files,
-  test data, generated files, deleted files, unsupported languages; Kotlin until #102) with
+  test data, generated files, deleted files, unsupported languages) with
   the reason. "Linked" is exactly what selection uses (path mapping, the import graphs,
   `[[depends]]`, fixture references), not line coverage: the same `_select` runs with a sink
   that records each file's tests, and `select_tests` never uses it (380 selections from the
@@ -238,6 +259,13 @@ All notable changes to siftwise. The format follows
 
 ### Fixed
 
+- A Gradle module with an added source directory outside `sourceSets` (a Kotlin
+  compilation's `defaultSourceSet.kotlin.srcDir(...)`, as moshi's `src/main/java16`) wasn't
+  flagged: any `srcDir`/`srcDirs`/`setSrcDirs` now marks the module unanalysed (its changes run
+  the full suite). Before #102 such modules were unanalysed anyway, for their Kotlin plugin.
+  The other way, `ksp`/`kapt` mentioned only in a root `buildscript {}` block (the plugin's
+  classpath) or with `apply false` no longer marks every module as using annotation
+  processors: neither applies anything.
 - The Action writes `$GITHUB_OUTPUT`, `$GITHUB_ENV`, the job summary and the failures report
   with LF line endings on every OS. On Windows, Python's text mode wrote CRLF, which could
   leave a `\r` on an output value such as `command`.

@@ -34,7 +34,7 @@ sequenceDiagram
     CLI->>API: POST /select (changed files, links, ci, shadow?)
     API->>DB: history: known tests, recent failures, co-change
     API-->>CLI: mode, tests with reasons, command
-    Note over API,DB: from CI: the selection is recorded (ci_selections); a shadow run runs the full suite
+    Note over API,DB: from CI: the selection is recorded (ci_selections) - a shadow run runs the full suite
     CI->>CI: run the command (or the full suite)
     CI->>CLI: record JUnit
     CLI->>API: POST /runs?defer_rollup=true (one per matrix leg)
@@ -46,7 +46,7 @@ sequenceDiagram
     API->>DB: history before the run's cut-off
     API-->>CLI: a verdict per failing test → PR comment, fail-on
     CLI->>API: POST /repos/{repo}/outcome (fail-on verdicts)
-    API->>DB: each leg's verdicts vs its selection (rank, ran or not); shadow: caught / missed
+    API->>DB: each leg's verdicts vs its selection (rank, ran or not) - shadow: caught / missed
 ```
 
 1. **Select** (`POST /select`). The client sends the changed files, what they link to (Go
@@ -227,19 +227,28 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   reason's "via") and in `import_depths`, which the risk order reads (depth 1 = a direct
   link), as for the other graphs.
 
-### Java (Maven and Gradle)
+### Java and Kotlin (Maven and Gradle)
 
-`cli/javagraph.py`, built by the CLI in the checkout, with no JVM, Maven or Gradle.
+`cli/javagraph.py` (Kotlin files: `cli/kotlinsrc.py`), built by the CLI in the checkout, with
+no JVM, Maven, Gradle or Kotlin compiler.
 
 - **Build model** (`detect_build`): Maven's `pom.xml` and its `<modules>` (profiles' too),
   recursively; Gradle's `settings.gradle[.kts]` `include` of string literals (a single project
-  without one). Each module's sources are `src/main/java` and `src/test/java`. Settings are
-  inherited along `<parent>` (relativePath) for Maven, from the root build file and buildSrc
-  for Gradle. A module is *not analysed* (a change to its Java sources runs the full suite)
-  with custom source directories (`<sourceDirectory>`, `sourceSets ... srcDir`), annotation
-  processors that may generate code (anything but Lombok and checkers: ErrorProne, NullAway,
-  the Checker Framework), or Kotlin, Groovy or Scala sources. A build it can't read (an
-  `include` of anything but literals, `includeBuild`, `projectDir`, Android, Maven and Gradle
+  without one). Each module's sources are `src/{main,test}/java` (Java and Kotlin) and
+  `src/{main,test}/kotlin` (Kotlin only). Settings are inherited along `<parent>`
+  (relativePath) for Maven, from the root build file and buildSrc for Gradle. A module is *not
+  analysed* (a change to its sources runs the full suite) with custom source directories
+  (`<sourceDirectory>` other than the conventional ones, kotlin-maven-plugin `<sourceDirs>`,
+  any Gradle `srcDir`), annotation processors that may generate code (kapt, KSP, anything but
+  Lombok and checkers: ErrorProne, NullAway, the Checker Framework; a `buildscript {}` classpath
+  or `apply false` doesn't count), Kotlin Multiplatform (its plugin, `src/commonMain`-style
+  source sets), or Groovy or Scala sources. Plugin-only included builds
+  (`_plugin_builds`: `includeBuild("x")` of a literal path in the checkout with no block,
+  inside `pluginManagement { }` or naming a build whose every build file develops plugins or
+  applies none, never one of the build's own projects) are read like buildSrc (shared build
+  logic for the flags) and sent as `java.build_logic` with buildSrc: any changed file in one is
+  a build file (the full suite). A build it can't read (an
+  `include` of anything but literals, any other `includeBuild`, `projectDir`, Android, Maven and Gradle
   side by side with no wrapper to decide) is *unsupported*: every Java change runs the full
   suite.
 - **Graph:** a tokenizer skips comments, strings, text blocks and char literals; each file's
@@ -251,6 +260,20 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   nearest change, the file on the way and the depth. An import of a class no source declares
   in one of the repo's packages (generated code) makes the file *dynamic*: tests that reach it
   run for any Java change but never count as covering it.
+- **Kotlin** (#102): a tokenizer (nested comments, strings and raw strings whose `$name` and
+  `${...}` templates are code, char literals, backtick names; newlines end an `import`) and
+  `parse_kotlin` read the package, imports (a class or a top-level member, `as` aliases, star
+  imports), the top-level types (several per file, any name) and top-level functions and
+  properties. Types and the file's facade class (`FileNameKt`, or `@file:JvmName`) join the
+  Java index, so Java and Kotlin resolve each other; members are indexed per package and by
+  fully qualified name, overloads in several files linking to all of them. Same-package and
+  star-imported simple names match types and members; a file with a top-level `operator fun`
+  links every file of its package and every star importer (an operator call names no
+  function). A file the tokenizer or brace count can't close is *unparsed*: dynamic, and a
+  change to it runs the full suite. Test classes of Kotlin files come from the source
+  (classes and objects, not interfaces, enums or annotations), sent as `java.kotlin_files`
+  (every test file and the changed main files: package and classes), with `java.unparsed`;
+  both only when non-empty, so a Java-only payload is unchanged.
 - **What is sent:** `affected_files` gets test file → changed files (every server takes it;
   one from before Java support ignores them), and `/select` alone gets `java`: the tool,
   wrapper, modules (with why one isn't analysed), every module's test classes (from file
@@ -262,8 +285,12 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   else in any module (direct links); a changed or new test class runs itself; the graph's
   users are import links, like imports (direct when the test class uses the changed class
   itself, else indirect: see "Import depth"). `src/test/resources` selects the module's test
-  classes. Main resources, other JVM languages, unanalysed modules and an unsupported build
-  run the full suite; so does a changed class nothing reaches.
+  classes. A Kotlin file is its classes (`selector.jvm_file`): a test file's classes run, a
+  main file maps by each type's name and by its file name (tests of top-level functions);
+  without `kotlin_files` (a deleted file, an older CLI) the path names the class, as for
+  Java. Main resources, Groovy and Scala, Kotlin scripts that aren't build files, unanalysed
+  modules, an unparsed or deleted Kotlin main file and an unsupported build run the full
+  suite; so does a changed class nothing reaches.
 - **Module build files** (#54, `javagraph.build_scopes`): the build model also reads which
   modules depend on which. Maven: any `<artifactId>` a POM names outside
   `<dependencyManagement>` and comments (dependencies, plugins and their dependencies,
@@ -304,7 +331,9 @@ Migrations live in `src/siftwise/migrations` and ship in the wheel; see
   order only orders the commands. The full suite is `mvn -B verify` (with integration tests
   in history; else `test`) or `gradle test`.
 - **Triage** links Java tests without the build model (recorded runs keep only the edges): a
-  changed test class (high), name mapping (high), a graph user (medium).
+  changed test class (high), name mapping (high), a graph user (medium). A Kotlin test file
+  maps to the class its path names: one holding other classes links them only through the
+  graph's edges of the path-named class.
 - **Limits:** reflection by computed name (Spring component scanning, `ServiceLoader`),
   resources loaded by name, and code generated outside annotation processors are invisible:
   declare them with `[[depends]]` rules. A module per command means Maven builds shared
@@ -555,10 +584,10 @@ flowchart LR
     B[Browser] -->|HTTPS| P[TLS proxy]
     P -->|X-Forwarded-Proto/-Host| F[ForwardedMiddleware]
     F --> A[BearerAuthMiddleware]
-    A -->|/ui paths| D[DashboardAuthMiddleware]
+    A -->|"/ui paths"| D[DashboardAuthMiddleware]
     A -->|API paths: Bearer only| R[API routes]
-    D -->|valid session| U[/ui pages]
-    D -->|no session| L[303 to /ui/login]
+    D -->|valid session| U["/ui pages"]
+    D -->|no session| L["303 to /ui/login"]
     U --> C[core: shadow.recall, flaky.flaky_tests, triage.triage_ci_run]
     D -.->|every request| S[(ui_sessions + api_tokens)]
 ```
