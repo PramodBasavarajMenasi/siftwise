@@ -1361,7 +1361,9 @@ Replays measure recall only on failures CI happened to record, and most recorded
 are in tests any selection runs. This eval makes the failures: it plants small bugs
 (mutants) on the lines a real merged PR changed, and asks whether siftwise's selection for
 that PR runs a test that catches each one ([#74](https://github.com/PramodBasavarajMenasi/siftwise/issues/74);
-`scripts/eval/mutation.py`, `scripts/eval/mutation_jest.py`; run in November 2026).
+`scripts/eval/mutation.py`, `scripts/eval/mutation_jest.py`; run in November 2026). Kotlin
+([#102](https://github.com/PramodBasavarajMenasi/siftwise/issues/102)) went through the same
+kill rule with `scripts/eval/mutation_jvm.py`: see [Kotlin (Gradle)](#kotlin-gradle-ktlintktlint-and-squaremoshi).
 
 ### Summary
 
@@ -1370,6 +1372,8 @@ that PR runs a test that catches each one ([#74](https://github.com/PramodBasava
 | RDFLib/rdflib (pytest) | Windows | 26 of 26 (95% CI 87.1-100%) | none: every selection ran ~99% of the suite | median 0.3%, mean 0.4% |
 | quantumlib/Cirq (pytest) | Linux | 63 of 63 (94.3-100%) | 13 of 13 in 5 selections skipping 93-98% (77.2-100%) | median 1.3%, mean 19.6% |
 | mobxjs/mobx (Jest) | Linux | 40 of 40 (91.2-100%), one seeded history run per change | 6 of 6 in 3 selections skipping 54-92% of test files (61.0-100%) | median 11.6%, mean 22.5% |
+| ktlint/ktlint (Kotlin, Gradle) | Linux | 28 of 28 (87.9-100%), one seeded history run per change | 13 of 13 in 5 selections (77.2-100%) | not measured; tests selected in the 5: median 14.2% |
+| square/moshi (Kotlin + Java, Gradle), partial | Linux | 15 of 15 (79.6-100%), one seeded history run per change | 3 of 3 in 1 selection (43.9-100%) | not measured; tests selected: 1.1% |
 
 **No mutant was missed.** The 100% is an observed rate on a few dozen mutants: read the
 intervals, not the point estimate. The narrow-selection figures are the meaningful test of
@@ -1526,6 +1530,79 @@ through one file every test reaches).
 - **Time:** 1.38 h; setup per change median 140 s (two installs and builds, the seed run);
   per mutant median 46 s (max 116 s); peak memory 5.8 GB, no OOM kill.
 
+### Kotlin (Gradle): ktlint/ktlint and square/moshi
+
+`scripts/eval/mutation_jvm.py` in the same Linux image (JDKs 17, 21 and 26 in
+`/usr/lib/jvm`; the JDK Gradle runs on follows the commit's wrapper version: 17 before 8.5,
+21 before 9.0, else 26, which ktlint's build logic needs). What differs from the repos above:
+
+- **History: one full run per base, no co-change.** Neither repo uploads JUnit, so, as for
+  mobx, each change's history is ONE full-suite run at the PR's base commit, recorded through
+  siftwise's ingest into a scratch database and read back with `load_history`. Selection rests
+  on the Java/Kotlin graph and test-name mapping only: no co-change, no flakiness, nothing
+  recently failed.
+- **Selection as `siftwise select` makes it** (`javagraph` at the head, the PR's diff,
+  `select_tests` with `java`), and the selection's own Gradle commands run (`./gradlew
+  :m:test --tests C ...`). A test counts as selected when its outer class is in those
+  commands (Gradle runs whole classes).
+- **Mutants:** 4 token-level operators on the changed lines of main Kotlin sources (flip a
+  comparison, negate a condition, integer + 1, replace a boolean return), up to 3 per change,
+  seed 102; each is compiled (`:<module>:classes`) first, and one that doesn't compile is
+  replaced. Kill rule, recall and Wilson interval as in [Method](#method); an init script
+  makes every Test task re-run (never up to date or cached), so a confirming re-run really
+  runs.
+- **Narrow** = a selective selection, smaller than the full suite.
+- **Memory limits** (after moshi's unbounded run ran the 7.75 GB Docker VM out of memory):
+  container `--memory=5g`; Gradle `--no-daemon --max-workers=2`, daemon JVM `-Xmx1536m
+  -XX:MaxMetaspaceSize=512m`, the Kotlin compiler in-process; test JVMs `maxHeapSize=768m`,
+  `maxParallelForks=1`. Per run 1,800 s.
+
+**ktlint/ktlint** (Kotlin only; 165-174 test classes, 2,704-2,910 known tests; a plugin-only
+`includeBuild("build-logic")`, readable since #102):
+
+- **Changes:** 153 of 234 merged PRs sampled (365 days); 12 had a mutable changed Kotlin line.
+  32 mutants from 480 candidates, 0 didn't compile.
+- **Outcomes:** caught 28, missed 0, not killed 4, timeout 0, undecided 0.
+  **All mutants: 28 of 28 (95% CI 87.9-100%).**
+- **Narrow selections (5 changes): 13 of 13 (77.2-100%)**, share of tests selected median
+  14.2% (3.3%, 4.8%, 14.2%, 41.4%, 94.6%): #3268 6 of 165 test classes, #3312 5 of 167, #3486 7
+  of 174, #3461 38 of 174, #3429 136 of 174.
+- **Full-suite fallbacks (7 of 12):** 3 a changed file no signal covers, 3 a build or CI
+  file, 1 a deleted Kotlin main file.
+- **Directions:** every mutant with linked tests (30) is reached by Kotlin tests only (28
+  caught, 2 not killed); 2 are in `build-logic`, which no test links to. All 28 kills are by
+  Kotlin tests.
+- **Not killed (4):** `ktlint-cli/.../KtlintServiceLoader.kt:56`,
+  `build-logic/src/main/kotlin/KotlinCommonPlugin.kt:54` (twice), `ktlint-ruleset-standard/
+  .../rules/KdocDelimiterRule.kt:314`; all int_plus_one.
+- **Baseline failures:** 0.
+- **Skipped (not counted): 28 changes** whose base didn't build here: Gradle exited 1 on a
+  failed HTTPS connection while downloading (the stored message is the end of the stack
+  trace, so the host isn't recorded; `services.gradle.org` answered, slowly). None hung.
+- **Time:** 2.54 h of a 3 h cap; seed run median 265 s; per mutant median 111 s (max 253 s).
+  Timed first: a clean full run 331 s, a warm full run 73 s, one test class 31 s.
+
+**square/moshi, partial** (Kotlin and Java, Java tests reaching Kotlin code): stopped at
+1.25 h because, before the limits above, it ran the Docker VM out of memory (OOM kills,
+engine errors); its records were kept and it wasn't resumed.
+
+- **Changes:** 92 sampled, 7 with mutants; 21 mutants from 615 candidates, 1 didn't compile,
+  20 decided.
+- **Outcomes:** caught 15, missed 0, not killed 5, undecided 0. **15 of 15 (79.6-100%).**
+- **Narrow selections: 1 change**, #2056: 1 of 71 test classes (1.1% of tests), 3 of 3
+  caught (43.9-100%).
+- **Full-suite fallbacks (6 of 7):** 3 build files; 2 moshi core isn't analysed (custom
+  source sets: its java16 `srcDir`); 1 `moshi-kotlin-codegen` isn't analysed (annotation
+  processors: generated sources).
+- **Directions:** Java tests only 3 (3 caught), Java and Kotlin tests 14 (11 caught, 3 not
+  killed), Kotlin tests only 3 (1 caught, 2 not killed). In the narrow selection: Java 3.
+  Killing tests: Java 9, both 3, Kotlin 3.
+- **Not killed (5):** `internal/AdapterMethodsFactory.kt:225`,
+  `kotlin/reflect/KotlinJsonAdapterFactory.kt:349` and `:359`, `-JsonUtf8Writer.kt:270`,
+  `kotlin/codegen/api/AdapterGenerator.kt:544`.
+- **Skipped:** #2114, its seed run at the base timed out (1,800 s).
+- **Time:** 1.25 h; seed run median 154 s; per mutant median 61 s (max 184 s).
+
 ### Why most selections are wide
 
 Checked on one change each (the import graph at its commit):
@@ -1556,6 +1633,11 @@ Checked on one change each (the import graph at its commit):
 - mobx's history is one seeded run, not CI history; mobx runs Jest with 3 workers, not CI's
   `-i`. rdflib ran on Windows (29 baseline failures; their tests can't be killers).
 - Jest runs don't block the network (not checked whether any mobx test uses it).
+- Kotlin: ktlint has no Java tests, so Kotlin code reached by Java tests is shown only by
+  moshi's partial run, and mostly in full-suite selections (14 of the 17 mutants Java tests
+  reach; 3 in its one narrow selection). Both repos' histories are one seeded run; 28 ktlint
+  changes were skipped for failed downloads at the base. Gradle and JVM runs don't block the
+  network either.
 - Time skipped is estimated from history durations (pytest repos: `test_stats`; mobx: the
   seed run), not measured per selection.
 
@@ -1574,5 +1656,12 @@ docker run -d --name siftwise-eval-cirq --network siftwise_default \
   --mutants-per-commit 3 --max-commits 25 --workers 7 --time-cap-hours 8'
 # mobx: the same, with a database of its own for the seeded histories (create it, then
 # `siftwise server migrate` with that URL), and --repo mobxjs/mobx (no --workers: Jest's own)
+# Kotlin (a scratch database for the seeded histories, as for mobx; the memory limits):
+docker run -d --name siftwise-eval-ktlint --memory=5g --network siftwise_default \
+  -v "$PWD:/repo:ro" -v siftwise_kotlin_eval:/state \
+  -e SIFTWISE_DATABASE_URL=postgresql+psycopg://siftwise:siftwise@postgres:5432/<scratch db> \
+  siftwise-mutation-eval bash -c 'uv sync -q --frozen && /state/siftwise-venv/bin/python -m \
+  scripts.eval.mutation_jvm --repo ktlint/ktlint --state-dir /state/mutation \
+  --mutants-per-commit 3 --max-commits 12 --time-cap-hours 3'
 # Any repo: the same command with --report prints the summary from the state directory.
 ```

@@ -42,6 +42,7 @@ from siftwise.core.selector import (
     java_command,
     select_tests,
 )
+from tests.jvmfixture import copy_fixture
 from tests.test_reruns import real_tools, require
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -85,7 +86,7 @@ def test_the_gradle_fixture_build() -> None:
     # The commented-out include doesn't count; "app:web" is in app/web.
     assert names == {"": "", "core": ":core", "app/web": ":app:web", "kt": ":kt"}
     kt = next(m for m in build.modules if m.path == "kt")
-    assert kt.unanalysed == ("Kotlin sources (src/main/kotlin isn't analysed)",)
+    assert kt.unanalysed == ()  # Kotlin sources are analysed (#102)
 
 
 def test_maven_modules_nest_and_inherit_their_parents_processors(tmp_path: Path) -> None:
@@ -147,7 +148,7 @@ def test_maven_custom_source_directories_are_not_analysed(tmp_path: Path) -> Non
             "module 'gone' of ./pom.xml isn't in the checkout",
         ),
         ({"settings.gradle": "include(projects)"}, "includes projects by something other than"),
-        ({"settings.gradle": "includeBuild('logic')"}, "a composite build"),
+        ({"settings.gradle": "includeBuild('logic')"}, "an included build that isn't in"),
         (
             {"settings.gradle": "include 'a'\nproject(':a').projectDir = file('x')"},
             "custom directories",
@@ -175,18 +176,30 @@ def test_gradle_custom_source_sets_and_processors(tmp_path: Path) -> None:
     write(
         tmp_path,
         {
-            "settings.gradle.kts": 'include("a", "b", "c")',
+            "settings.gradle.kts": 'include("a", "b", "c", "d", "e", "f")',
             "a/build.gradle.kts": 'sourceSets { main { java.srcDirs("gen") } }',
             "b/build.gradle.kts": 'dependencies { annotationProcessor("g:dagger") }',
             "c/build.gradle.kts": 'dependencies { annotationProcessor("g:lombok") }',
+            # A Kotlin compilation's added source directory (moshi's src/main/java16).
+            "d/build.gradle.kts": 'kotlin.target { compilations.create("x") {\n'
+            '  defaultSourceSet.kotlin.srcDir("src/main/java16") } }',
+            # Declared but not applied: on the classpath (buildscript), or `apply false`.
+            "e/build.gradle.kts": "",
+            "build.gradle.kts": "buildscript { dependencies {\n"
+            '  classpath("com.google.devtools.ksp:symbol-processing-gradle-plugin:1") } }\n'
+            "plugins { alias(libs.plugins.ksp) apply false }\n",
+            "f/build.gradle.kts": 'plugins { id("com.google.devtools.ksp") }',
         },
     )
     build = detect_build(tmp_path)
     assert build is not None
     flags = {m.path: m.unanalysed for m in build.modules}
-    assert flags["a"] == ("custom source sets",)
-    assert flags["b"] == ("annotation processors (generated sources aren't analysed)",)
+    assert flags["a"] == flags["d"] == ("custom source sets",)
+    assert (
+        flags["b"] == flags["f"] == ("annotation processors (generated sources aren't analysed)",)
+    )
     assert flags["c"] == ()  # Lombok only
+    assert flags["e"] == ()
 
 
 def test_a_gradle_wrapper_decides_between_two_builds(tmp_path: Path) -> None:
@@ -513,7 +526,12 @@ def test_test_resources_run_their_modules_tests() -> None:
     ("path", "why"),
     [
         ("core/src/main/resources/app.properties", "main resources changed"),
-        ("core/src/main/kotlin/acme/X.kt", "Kotlin, Groovy or Scala source changed"),
+        ("core/src/main/groovy/acme/X.groovy", "Groovy or Scala source changed"),
+        ("core/src/main/scala/acme/X.scala", "Groovy or Scala source changed"),
+        ("scripts/release.main.kts", "Kotlin script changed (not analysed)"),
+        ("core/src/main/kotlin/acme/Unused.kt", "changed file maps to no known tests"),
+        ("core/src/main/kotlin/acme/Odd.java", "Java file outside the build's source roots"),
+        ("core/src/kotlin/acme/Odd.kt", "Kotlin file outside the build's source roots"),
         ("extras/src/main/java/acme/extras/Mapper.java", "extras isn't analysed (annotation"),
         ("core/src/java/acme/Odd.java", "Java file outside the build's source roots"),
         ("core/src/main/java/acme/core/Unused.java", "changed file maps to no known tests"),
@@ -680,7 +698,7 @@ def git(cwd: Path, *args: str) -> None:
 @pytest.fixture
 def maven_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "repo"
-    shutil.copytree(MAVEN_FIXTURE, root)
+    copy_fixture(MAVEN_FIXTURE, root)
     git(root, "init", "-b", "main")
     git(root, "config", "user.email", "t@example.com")
     git(root, "config", "user.name", "t")
@@ -733,7 +751,7 @@ def test_an_older_server_gets_the_request_again_without_java() -> None:
 def run_selected(fixture: Path, root: Path, ids: tuple[str, ...]) -> set[str]:
     """Copy a fixture, select for a Money.java change, run the commands, and return the test
     classes that reported."""
-    shutil.copytree(fixture, root)
+    copy_fixture(fixture, root)
     java_info, files = info(fixture)
     selection = select_tests(
         history(*ids), [MONEY], True, affected_files=files, java=java_info, order=Order.RISK
@@ -801,3 +819,100 @@ def test_a_class_run_whole_credits_its_new_tests() -> None:
     runs = WouldRun(selection)
     assert runs("a.NewTest::brandNew()") and runs("a.NewTest$Nested::deep()")
     assert not runs("a.OldTest::t")
+
+
+# --- plugin-only included builds (build-logic) --------------------------------------------
+
+LOGIC = {
+    "build-logic/settings.gradle.kts": 'include("convention")\n',
+    "build-logic/convention/build.gradle.kts": "plugins { `kotlin-dsl` }\n",
+    "build-logic/convention/src/main/kotlin/shop.java.gradle.kts": "plugins { java }\n",
+    "core/build.gradle.kts": 'plugins { id("shop.java") }\n',
+    "core/src/main/java/a/Money.java": "package a; public class Money {}\n",
+    "core/src/test/java/a/MoneyTest.java": "package a; class MoneyTest { Money m; }\n",
+}
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        'pluginManagement { includeBuild("build-logic") }\ninclude("core")\n',
+        'includeBuild("build-logic")\ninclude("core")\n',  # a plugin build: kotlin-dsl only
+    ],
+)
+def test_a_plugin_only_included_build_is_read(tmp_path: Path, settings: str) -> None:
+    write(tmp_path, {**LOGIC, "settings.gradle.kts": settings})
+    build = detect_build(tmp_path)
+    assert build is not None and build.unsupported == ""
+    assert [m.path for m in build.modules] == ["", "core"]  # not a project of this build
+    assert build.build_logic == ("build-logic",)
+    assert all(not m.unanalysed for m in build.modules)
+
+
+@pytest.mark.parametrize(
+    ("files", "why"),
+    [
+        ({"settings.gradle.kts": 'includeBuild("build-logic") {\n'
+          '  dependencySubstitution { substitute(module("a:b")).using(project(":")) } }\n'},
+         "configured in a block (dependency substitution?)"),
+        ({"settings.gradle.kts": 'includeBuild("build-logic")\n',
+          "build-logic/convention/build.gradle.kts": "plugins { `java-library` }\n"},
+         "may supply more than plugins (build-logic: convention applies plugins but develops"),
+        ({"settings.gradle.kts": 'includeBuild("core")\ninclude("core")\n',
+          "core/build.gradle.kts": "plugins { `kotlin-dsl` }\n"},
+         "is (or holds) one of its own projects"),
+        ({"settings.gradle.kts": "includeBuild(logicDir)\n"}, "includeBuild of a non-literal"),
+        ({"settings.gradle.kts": 'includeBuild("../elsewhere")\n'}, "outside the checkout"),
+        ({"settings.gradle.kts": 'includeBuild("build-logic")\n',
+          "build-logic/settings.gradle.kts": 'includeBuild("../other")\n'},
+         "includes builds or projects of its own"),
+    ],
+)  # fmt: skip
+def test_an_included_build_that_may_do_more_is_unsupported(
+    tmp_path: Path, files: dict[str, str], why: str
+) -> None:
+    write(tmp_path, {**LOGIC, **files})
+    build = detect_build(tmp_path)
+    assert build is not None
+    assert why in build.unsupported, build.unsupported
+
+
+def logic_info(tmp_path: Path, changed: list[str]) -> tuple[JavaBuildInfo, dict[str, list[str]]]:
+    settings = 'pluginManagement { includeBuild("build-logic") }\ninclude("core")\n'
+    write(tmp_path, {**LOGIC, "settings.gradle.kts": settings})
+    change = java_change(tmp_path, changed)
+    assert change is not None
+    return JavaBuildInfo.from_json(change.payload()), change.files
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "build-logic/convention/src/main/kotlin/shop.java.gradle.kts",
+        "build-logic/convention/src/main/kotlin/Versions.kt",
+        "build-logic/gradle.properties",
+        "buildSrc/src/main/java/Conventions.java",
+    ],
+)
+def test_a_change_inside_build_logic_runs_the_full_suite(tmp_path: Path, path: str) -> None:
+    write(tmp_path, {"buildSrc/build.gradle.kts": "plugins { `kotlin-dsl` }\n"})
+    java_info, files = logic_info(tmp_path, [path])
+    assert set(java_info.build_logic) == {"build-logic", "buildSrc"}
+    selection = select_tests(history("a.MoneyTest::m"), [path], True, java=java_info,
+                             affected_files=files)  # fmt: skip
+    assert selection.mode is Mode.FULL
+    assert selection.reason == f"build/config file changed: {path}"
+    from siftwise.core.selector import NotChecked, file_links
+
+    [link] = file_links(history("a.MoneyTest::m"), [path], True, java=java_info)
+    assert link.reason_code is NotChecked.BUILD_FILE
+
+
+def test_a_java_only_repo_with_build_logic_selects(tmp_path: Path) -> None:
+    money = "core/src/main/java/a/Money.java"
+    java_info, files = logic_info(tmp_path, [money])
+    selection = select_tests(history("a.MoneyTest::m"), [money], True, java=java_info,
+                             affected_files=files)  # fmt: skip
+    assert selection.mode is Mode.SELECTIVE
+    assert selection.commands == ("gradle :core:test --tests a.MoneyTest",)
+    assert java_info.build_logic == ("build-logic",)

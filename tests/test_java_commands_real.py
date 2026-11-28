@@ -11,6 +11,7 @@ from pathlib import Path
 
 from siftwise.cli.javagraph import java_change
 from siftwise.core.selector import JavaBuildInfo, KnownTest, RepoHistory, select_tests
+from tests.jvmfixture import copy_fixture
 from tests.test_reruns import real_tools, require
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -143,7 +144,7 @@ def test_one_gradle_command_filters_each_project_on_its_own(tmp_path: Path) -> N
 def test_a_module_pom_change_runs_its_modules_and_dependents_tests(tmp_path: Path) -> None:
     require("mvn")
     root = tmp_path / "shop"
-    shutil.copytree(FIXTURES / "java_maven", root, ignore=shutil.ignore_patterns("target"))
+    copy_fixture(FIXTURES / "java_maven", root)
     change = java_change(root, ["core/pom.xml"])
     assert change is not None
     ids = ("acme.core.MoneyTest::plus", "acme.app.CartTest::total",

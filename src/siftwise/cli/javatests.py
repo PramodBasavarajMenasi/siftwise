@@ -1,4 +1,5 @@
-"""JUnit 5 test methods from Java source, for re-runs: which method a report's test name is.
+"""JUnit 5 test methods from Java and Kotlin source, for re-runs: which method a report's test
+name is.
 
 Gradle's JUnit XML names a test by its display name (``@DisplayName("adds up the total")``,
 or a parameterized invocation's ``[1] 1`` / ``1 plus 2``), and Surefire's phrased reporter
@@ -24,7 +25,9 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from siftwise.cli.javagraph import Token, tokenize
+from siftwise.cli import kotlinsrc
+from siftwise.cli.javagraph import tokenize
+from siftwise.cli.kotlinsrc import Token
 
 # A method's or template's text siftwise can't read (a constant, a generator).
 UNKNOWN = "\0unknown"
@@ -165,6 +168,9 @@ def find_method(
     plain = _plain_method(name)
     if plain is not None and any(m.name == plain for m in cls.methods) and not exact:
         return cls.qualified, plain  # the report names the method itself
+    bare = _BARE.match(name)
+    if bare and plain is None and any(m.name == bare[1] for m in cls.methods) and not exact:
+        return cls.qualified, bare[1]  # a Kotlin `name with spaces`, as the JVM names it
     if len(exact) == 1 and not unknown:
         return cls.qualified, exact[0].name
     if exact or unknown:
@@ -193,6 +199,8 @@ def outer_class(classname: str) -> str | None:
 
 _FQN = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\Z", re.ASCII)
 _PLAIN = re.compile(r"([A-Za-z_$][\w$]*)(?:\([^()]*\))?(?:\[[^\[\]]*\])?\Z", re.ASCII)
+# Any method name (a Kotlin backtick one has spaces), then JUnit 5 parameter types and index.
+_BARE = re.compile(r"([^()\[\]]+?)(?:\([^()]*\))?(?:\[[^\[\]]*\])?\Z")
 
 
 def _is_fqn(classname: str) -> bool:
@@ -328,3 +336,109 @@ def _template_regex(template: str) -> str:
         else:
             out.append(re.escape(part).replace(r"\ ", " ?").replace(" ", " ?"))
     return "".join(out)
+
+
+# --- Kotlin ---------------------------------------------------------------------------------
+
+_KOTLIN_CLASS_WORDS = frozenset({"class", "object", "interface"})
+_DECLARATION_STARTS = frozenset({"class", "object", "interface", "fun", "val", "var", "@"})
+
+
+def parse_kotlin_test_classes(source: str) -> list[JavaClass]:
+    """Every class and object in a Kotlin file (nested ones too, ``Outer$Inner``) with its
+    ``fun``s: names as the JVM sees them (a backtick name keeps its spaces), and the same
+    annotations as Java's (``@DisplayName``, ``@ParameterizedTest``...)."""
+    tokens = [t for t in kotlinsrc.tokenize(source)[0] if t.kind != "nl"]
+    package = _package(tokens)
+    classes: list[JavaClass] = []
+    stack: list[tuple[JavaClass, int]] = []
+    pending: list[tuple[str, list[Token]]] = []
+    depth = paren = 0
+    i, n = 0, len(tokens)
+    while i < n:
+        t = tokens[i]
+        body = bool(stack) and depth == stack[-1][1] and paren == 0
+        top = not stack and paren == 0 and depth == 0
+        if t.value == "@" and t.kind == "punct" and (body or top):
+            name, i = _qualified(tokens, i + 1)
+            if i < n and tokens[i].value == ":" and name in ("file", "field", "get", "param"):
+                name, i = _qualified(tokens, i + 1)  # a use-site target: @file:JvmName
+            args: list[Token] = []
+            if i < n and tokens[i].value == "(":
+                args, i = _group(tokens, i)
+            pending.append((name.rsplit(".", 1)[-1], args))
+            continue
+        if (
+            t.kind == "id"
+            and t.value in _KOTLIN_CLASS_WORDS
+            and (body or top)
+            and i + 1 < n
+            and tokens[i + 1].kind == "id"
+            and (i == 0 or tokens[i - 1].value not in (".", "::"))
+        ):
+            outer = stack[-1][0] if stack else None
+            simple = tokens[i + 1].value
+            qualified = (f"{outer.qualified}${simple}" if outer
+                         else f"{package}.{simple}" if package else simple)  # fmt: skip
+            display = _display(pending)
+            own = simple if display is None or display == UNKNOWN else display
+            names = {a for a, _ in pending}
+            cls = JavaClass(
+                qualified,
+                f"{outer.phrased} {own}" if outer else own,
+                bool(names & _GENERATORS) or (outer.generated if outer else False),
+            )
+            if display == UNKNOWN:
+                cls.phrased = UNKNOWN
+            pending = []
+            j, level = i + 2, 0
+            while j < n:
+                v = tokens[j].value
+                if v in ("(", "<"):
+                    level += 1
+                elif v in (")", ">"):
+                    level -= 1
+                elif level == 0 and v == "{":
+                    break
+                elif level == 0 and v == ":":
+                    cls.extends = True
+                elif level == 0 and v in _DECLARATION_STARTS:
+                    break  # no body: the next declaration starts
+                j += 1
+            if j < n and tokens[j].value == "{":
+                classes.append(cls)
+                depth += 1
+                stack.append((cls, depth))
+                i = j + 1
+            else:
+                i = j
+            continue
+        if body and t.kind == "id" and t.value == "fun":
+            j = i + 1
+            if j < n and tokens[j].value == "<":
+                while j < n and tokens[j].value != ">":
+                    j += 1
+                j += 1
+            if j + 1 < n and tokens[j].kind == "id" and tokens[j + 1].value == "(":
+                stack[-1][0].methods.append(
+                    _method(tokens[j].value, pending, stack[-1][0].generated)
+                )
+            pending = []
+            i = j
+            continue
+        if t.value == "(":
+            paren += 1
+        elif t.value == ")":
+            paren = max(paren - 1, 0)
+        elif t.value == "{":
+            if body:
+                pending = []
+            depth += 1
+        elif t.value == "}":
+            if stack and depth == stack[-1][1]:
+                stack.pop()
+            depth = max(depth - 1, 0)
+        elif t.value in (";", "=") and body:
+            pending = []
+        i += 1
+    return classes

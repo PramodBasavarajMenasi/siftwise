@@ -118,7 +118,7 @@ def test_a_declared_rule_links_even_an_unsupported_language() -> None:
         (".github/workflows/ci.yml", NotChecked.BUILD_FILE),
         ("web/package.json", NotChecked.NESTED_BUILD_FILE),
         ("junit.xml", NotChecked.GENERATED),
-        ("app/src/main/kotlin/Cart.kt", NotChecked.JAVA_BUILD),  # until #102
+        ("app/src/main/groovy/Cart.groovy", NotChecked.JAVA_BUILD),
     ],
 )
 def test_non_source_files_are_not_checked_with_the_selectors_reason(
@@ -203,6 +203,8 @@ FILES = [
     "web/src/cart.ts", "web/src/__tests__/cart.test.ts", "web/src/orders.ts",
     "core/src/main/java/a/b/Cart.java", "core/src/test/java/a/b/CartTests.java",
     "core/src/main/java/a/b/Orders.java", "core/src/main/java/a/c/Lonely.java",
+    "core/src/main/kotlin/a/b/Price.kt", "core/src/test/kotlin/a/b/PriceTest.kt",
+    "core/src/main/kotlin/a/b/Tax.kt", "core/src/main/java/a/b/Mixed.kt",
 ]  # fmt: skip
 
 
@@ -220,7 +222,10 @@ FILES = [
         ("core/src/main/java/a/b/Cart.java", "core/src/test/java/a/b/CartTests.java"),
         ("core/src/main/java/a/b/Orders.java", "core/src/test/java/a/b/CartTests.java"),
         ("core/src/main/java/a/c/Lonely.java", None),
-        ("app/src/main/kotlin/Cart.kt", None),  # not analysed (#102)
+        ("app/src/main/kotlin/Cart.kt", None),
+        ("core/src/main/kotlin/a/b/Price.kt", "core/src/test/kotlin/a/b/PriceTest.kt"),
+        ("core/src/main/kotlin/a/b/Tax.kt", "core/src/test/kotlin/a/b/PriceTest.kt"),
+        ("core/src/main/java/a/b/Mixed.kt", "core/src/test/java/a/b/CartTests.java"),
     ],
 )
 def test_nearest_test(path: str, nearest: str | None) -> None:

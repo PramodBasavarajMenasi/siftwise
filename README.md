@@ -1207,12 +1207,11 @@ state: each call computes the change in the agent's checkout, with the same code
   `/select`). A source file with no linked test is one `select_tests` would run the full suite
   for. A linked test may still not exercise your new lines: siftwise doesn't measure line
   coverage. Docs, build and config files, test data (`fixtures`), generated files and
-  languages selection doesn't support (Kotlin until
-  [#102](https://github.com/PramodBasavarajMenasi/siftwise/issues/102), Rust, ...) come back
-  as `not_checked` with the reason. The nearest test file is looked up in the checkout: a
-  test named after the file in its own folder (`test_x.py` / `x_test.py`, `x_test.go`,
-  `x.test.ts` / `x.spec.ts`, `XTest.java` / `XTests.java` in the same package under
-  `src/test/java`), else any test file there, else a test named after it elsewhere (the
+  languages selection doesn't support (Groovy, Scala, Rust, ...) come back as `not_checked`
+  with the reason. The nearest test file is looked up in the checkout: a test named after the
+  file in its own folder (`test_x.py` / `x_test.py`, `x_test.go`, `x.test.ts` / `x.spec.ts`,
+  `XTest.java` / `XTests.java` in the same package under `src/test/java`, `XTest.kt` under
+  `src/test/kotlin`), else any test file there, else a test named after it elsewhere (the
   nearest path), else none.
 
   ```json
@@ -1395,7 +1394,7 @@ on = ["**/*.go", "!**/*_test.go"]         # ! excludes
 | **Python** (pytest) | `foo.py` → `test_foo.py`; test files importing a changed module (static graph incl. parent packages, conftests, plugin strings); changed test files | `pytest` node IDs, whole test files, `pytest --doctest-modules` for doctests |
 | **Go** | changed package and every package whose tests import it (`go list -deps -test`, in every module of the checkout: `go.work`, nested `go.mod`) | `go test ./pkg` (whole) or `-run '^(TestA\|TestB)$'`; `go test -C <module> ./pkg` for a module below the root |
 | **JS/TS** (Jest) | `foo.ts` → `foo.test.*`, `foo.spec.*`, `__tests__/foo.*`; test files importing a changed file (static graph, no Node needed: relative paths, tsconfig/jsconfig `paths`, workspace packages, a JSON Jest `moduleNameMapper`) (needs each test's file: jest-junit's `addFileAttribute` or `usePathForSuiteName`, or `record` finds it, see below) | `jest <files>` |
-| **Java** (Maven/Gradle) | `a/b/Foo.java` → `FooTest`, `FooTests`, `TestFoo`, `FooIT` in its module (else any module); test classes that use a changed class (static graph, no JVM: imports, static and on-demand imports, same-package names, fully-qualified names), across modules; a module's tests for its `src/test/resources` | per module: `./mvnw -B -pl <module> -am test -Dtest=A,B` (`verify -Dit.test=...` for `*IT`), `./gradlew :<module>:test --tests A` |
+| **Java and Kotlin** (Maven/Gradle) | `a/b/Foo.java` or `Foo.kt` → `FooTest`, `FooTests`, `TestFoo`, `FooIT` in its module (else any module); test classes that use a changed class or Kotlin top-level function (static graph, no JVM or compiler, both ways in mixed projects: imports, static, on-demand, member and alias imports, same-package names, fully-qualified names), across modules; a module's tests for its `src/test/resources` | per module: `./mvnw -B -pl <module> -am test -Dtest=A,B` (`verify -Dit.test=...` for `*IT`), `./gradlew :<module>:test --tests A` |
 
 The JS/TS graph is safe where it can't see: a test that reaches a `require()` or `import()`
 of a computed path runs for every JS change (but never counts as covering one), a changed
@@ -1417,8 +1416,17 @@ match. Like bundlers, this assumes the computed part doesn't climb out with `..`
 jestjs/jest, 2 of its 40 files with computed imports became bounded: almost all of them
 `require` a variable.
 
-For Java, siftwise reads `pom.xml` modules or `settings.gradle[.kts]` includes (no Maven,
-Gradle or JVM runs) and each module's `src/main/java` and `src/test/java`. A change to a
+For Java and Kotlin, siftwise reads `pom.xml` modules or `settings.gradle[.kts]` includes
+(no Maven, Gradle or JVM runs) and each module's `src/{main,test}/java` and
+`src/{main,test}/kotlin` (Kotlin files in either; Java files only under `java/`, as javac
+compiles them). Kotlin files are read for their package, imports (classes, top-level functions
+and properties, `import a.b.C as D`, `import a.b.*`), the types they declare (several per file,
+under any name) and their top-level functions and properties, which Java sees as the
+`FileNameKt` class (or `@file:JvmName`). A file declaring a top-level `operator fun` links to
+every file of its package and every file importing it (`a + b` names no function). Kotlin test
+classes come from the sources, so a file `ReceiptTests.kt` holding `class ReceiptTest` runs as
+`--tests a.b.ReceiptTest` / `-Dtest=a.b.ReceiptTest`, and `rerun-unknown` re-runs a backtick
+test (``fun `adds two`()``, reported as `adds two()` by Gradle) by its name. A change to a
 module's own build file (its `pom.xml` or `build.gradle[.kts]`) runs the test classes of that
 module and of every module that depends on it, transitively (Maven: a POM naming its
 artifactId outside `<dependencyManagement>`, its parent included; Gradle: `project(':x')`,
@@ -1429,12 +1437,23 @@ inherit from or configure through (a parent or aggregator POM, `packaging pom`,
 `<dependencyManagement>`/`<pluginManagement>`, a Gradle build file with `subprojects`,
 `allprojects`, `configure(...)` or the like), when the build's dependencies can't be read
 (an artifactId built from a `${property}`, typesafe `projects.x` accessors, a non-literal
-`project(...)`), when the scope holds a module whose tests the class lists may miss (Kotlin,
-Groovy or Scala tests, custom source directories), when main resources
-change (any code may load them at runtime), when Kotlin, Groovy or Scala sources change, when
-a changed Java file is in a module it doesn't analyse (custom source directories, annotation
-processors that generate code; Lombok and checkers like ErrorProne don't count), or when it
-can't read the build (`include` of non-literals, `includeBuild`, Android). Reflection can't
+`project(...)`), when the scope holds a module whose tests the class lists may miss (Groovy
+or Scala tests, custom source directories), when main resources change (any code may load them
+at runtime), when Groovy or Scala sources change, when a Kotlin script that isn't a build file
+changes (`*.main.kts`), when a changed Java or Kotlin file is in a module it doesn't analyse
+(custom source directories or a Kotlin compilation's extra `srcDir`, annotation processors that
+generate code (kapt, KSP); Lombok and checkers like ErrorProne don't count; Kotlin
+Multiplatform: its plugin or `src/commonMain`-style source sets), when a changed Kotlin file
+can't be parsed (an unclosed string, comment or brace: tests reaching an unparsable file run for
+any change, never counting as covering it) or a Kotlin main file is deleted (its top-level
+functions' users can't be found), or when it can't read the build (`include` of non-literals,
+`projectDir`, Android, an included build that may do more than supply plugins). Convention
+plugins in `buildSrc` or a plugin-only included build (`includeBuild("build-logic")` inside
+`pluginManagement { }`, or one whose projects all develop plugins: `kotlin-dsl`,
+`java-gradle-plugin`) are read like the root build file, and a change to any file in them runs
+the full suite. An included build with a configuration block (dependency substitution), a
+non-literal path, one of the build's own projects, or a project that applies plugins without
+developing any still makes the build unreadable. Reflection can't
 be seen statically (Spring component scanning, `ServiceLoader`, `Class.forName` of a computed
 name): declare those dependencies with `[[depends]]` rules. `--no-java-graph` turns the graph
 off.

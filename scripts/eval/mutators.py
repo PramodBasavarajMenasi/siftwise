@@ -18,6 +18,9 @@ TypeScript ones (``js_mutants``) are a limited, token-level approach with no par
 comparisons, integer literals and ``return <value>;`` on the changed lines, with strings,
 template literals and comments masked out. They are checked for parsing separately, with the
 target repo's own TypeScript parser (``ts_parse_check.js``); the eval drops the ones that fail.
+Kotlin ones (``kotlin_mutants``) are token-level too, and only of kinds that keep the types:
+comparisons flipped, integers + 1, an ``if``/``while`` condition negated, a ``return true``
+<-> ``return false``. The JVM eval compiles each and drops those that don't compile.
 """
 
 from __future__ import annotations
@@ -399,3 +402,136 @@ def choose(mutants: Sequence[Mutant], k: int, seed: str) -> list[Mutant]:
             if by_operator[operator] and len(chosen) < k:
                 chosen.append(by_operator[operator].pop(0))
     return chosen
+
+
+# --- Kotlin ----------------------------------------------------------------------------------
+
+_KT_COMPARISON = re.compile(r"(?<=\s)(===|!==|==|!=|<=|>=|<|>)(?=\s)")
+_KT_INT = re.compile(r"(?<![\w.$])(\d+)(?![\w.$])")
+_KT_RETURN_BOOL = re.compile(r"\breturn\s+(true|false)\s*$")
+_KT_CONDITION = re.compile(r"\b(if|while)\s*\(")
+
+
+def kotlin_mutants(path: str, source: str, lines: Iterable[int]) -> list[Mutant]:
+    """Token-level mutants of Kotlin ``lines`` that keep the code's types: a comparison
+    flipped (``<`` -> ``>=``, ``==`` -> ``!=``...), an integer literal + 1, an ``if``/``while``
+    condition negated (``if (!(x))``, when its parentheses close on the line) and ``return
+    true`` <-> ``return false``. Strings (templates included), chars, backtick names and
+    comments are masked out; a line one of them crosses is skipped. A replaced return value
+    of any other type would rarely compile (``null`` isn't a ``String``): not offered."""
+    wanted = set(lines)
+    data = source.encode("utf-8")
+    masked = _mask_kotlin(source)
+    found: list[Mutant] = []
+    line_start = 0
+    for number, (row, mask) in enumerate(
+        zip(source.splitlines(keepends=True), masked.splitlines(keepends=True), strict=True),
+        start=1,
+    ):
+        base = len(source[:line_start].encode("utf-8"))
+        line_start += len(row)
+        if number not in wanted or mask.strip() == "" or "\0" in mask.rstrip("\r\n"):
+            continue
+        if mask.lstrip().startswith(("import ", "package ", "@")):
+            continue
+
+        def mutant(
+            operator: str,
+            begin: int,
+            end: int,
+            text: str,
+            row: str = row,
+            base: int = base,
+            number: int = number,
+        ) -> Mutant:
+            start = base + len(row[:begin].encode("utf-8"))
+            stop = base + len(row[:end].encode("utf-8"))
+            return Mutant(path, operator, number, start, stop, row[begin:end], text)
+
+        for m in _KT_COMPARISON.finditer(mask):
+            found.append(mutant(FLIP_COMPARISON, m.start(), m.end(), _JS_FLIPPED[m[1]]))
+        for m in _KT_INT.finditer(mask):
+            found.append(mutant(INT_PLUS_ONE, m.start(), m.end(), str(int(m[1]) + 1)))
+        for m in _KT_CONDITION.finditer(mask):
+            close = _closing(mask, m.end() - 1)
+            if close is not None and close > m.end():
+                inner = row[m.end() : close]
+                found.append(mutant(NEGATE_CONDITION, m.end(), close, f"!({inner})"))
+        ret = _KT_RETURN_BOOL.search(mask.rstrip("\r\n"))
+        if ret:
+            value = ret[1]
+            found.append(mutant(REPLACE_RETURN, ret.start(1), ret.end(1),
+                                "false" if value == "true" else "true"))  # fmt: skip
+    assert all(data[m.start : m.end].decode("utf-8") == m.original for m in found)
+    return sorted(found, key=lambda m: (m.start, OPERATORS.index(m.operator)))
+
+
+def _closing(text: str, open_at: int) -> int | None:
+    """The index of the parenthesis closing the one at ``open_at``, on the same line."""
+    depth = 0
+    for k in range(open_at, len(text)):
+        c = text[k]
+        if c == "\n":
+            return None
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return k
+    return None
+
+
+def _mask_kotlin(source: str) -> str:
+    """``source`` with comments (nested ones too), strings and raw strings (their templates
+    too), char literals and backtick names blanked, as ``_mask_js`` does."""
+    out = list(source)
+    i, n = 0, len(source)
+
+    def blank(begin: int, end: int, keep_quotes: bool) -> None:
+        crosses = "\n" in source[begin:end]
+        fill = "\0" if crosses else " "
+        lo, hi = (begin + 1, end - 1) if keep_quotes else (begin, end)
+        for k in range(lo, hi):
+            if out[k] not in "\r\n":
+                out[k] = fill
+        if crosses:
+            for k in (begin, max(begin, end - 1)):
+                if out[k] not in "\r\n":
+                    out[k] = "\0"
+
+    while i < n:
+        c = source[i]
+        if source.startswith("//", i):
+            end = source.find("\n", i)
+            end = n if end < 0 else end
+            blank(i, end, False)
+            i = end
+        elif source.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if source.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif source.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            blank(i, j, False)
+            i = j
+        elif source.startswith('"""', i):
+            end = source.find('"""', i + 3)
+            end = n if end < 0 else end + 3
+            while end < n and source[end] == '"':
+                end += 1
+            blank(i, end, True)
+            i = end
+        elif c in "\"'`":
+            j = i + 1
+            while j < n and source[j] != c and (c == "`" or source[j] != "\n"):
+                j += 2 if source[j] == "\\" and c != "`" else 1
+            end = min(j + 1, n)
+            blank(i, end, True)
+            i = end
+        else:
+            i += 1
+    return "".join(out)
